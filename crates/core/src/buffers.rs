@@ -257,11 +257,11 @@ impl BufferPool {
 
     /// (ptr, len, rio_cookie) per region of a class, for one-time
     /// RIORegisterBuffer at slab creation (R-043).
-    pub fn regions_mut(&mut self, class: SizeClass) -> impl Iterator<Item = (*mut u8, usize, &mut Option<u64>)> {
-        self.class_mut(class)
-            .regions
-            .iter_mut()
-            .map(|r| (r.ptr, REGION_SIZE, &mut r.rio_buffer_id))
+    pub fn regions_mut(
+        &mut self,
+        class: SizeClass,
+    ) -> impl Iterator<Item = (*mut u8, usize, &mut Option<u64>)> {
+        self.class_mut(class).regions.iter_mut().map(|r| (r.ptr, REGION_SIZE, &mut r.rio_buffer_id))
     }
 
     pub fn any_large_pages(&self) -> bool {
@@ -319,8 +319,10 @@ mod tests {
     fn distinct_slots_do_not_overlap() {
         let mut p = BufferPool::new();
         let ids: Vec<_> = (0..10).map(|_| p.acquire(SizeClass::S4K)).collect();
-        let mut ranges: Vec<_> =
-            ids.iter().map(|&id| (p.slot_ptr(id) as usize, p.slot_ptr(id) as usize + id.class.size())).collect();
+        let mut ranges: Vec<_> = ids
+            .iter()
+            .map(|&id| (p.slot_ptr(id) as usize, p.slot_ptr(id) as usize + id.class.size()))
+            .collect();
         ranges.sort();
         for w in ranges.windows(2) {
             assert!(w[0].1 <= w[1].0, "slots overlap");

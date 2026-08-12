@@ -10,9 +10,9 @@
 pub mod backend;
 pub mod buffers;
 pub mod opslab;
-pub mod ready;
 pub mod reactor;
-pub mod timer;
+pub mod ready;
 pub mod time;
+pub mod timer;
 
 pub use reactor::{Reactor, ReactorConfig};

@@ -35,23 +35,21 @@ use std::time::Duration;
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_TIMEOUT,
+    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    bind, closesocket, getsockopt, setsockopt, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl,
-    WSARecv, WSASend, WSASocketW, WSAStartup, AF_INET, AF_INET6,
-    LPFN_ACCEPTEX, LPFN_CONNECTEX, LPFN_DISCONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER,
-    SIO_LOOPBACK_FAST_PATH, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, SO_PROTOCOL_INFOW, SO_UPDATE_ACCEPT_CONTEXT,
-    SO_UPDATE_CONNECT_CONTEXT, TCP_FASTOPEN, TCP_NODELAY, TF_REUSE_SOCKET, WSABUF, WSADATA,
-    WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
-    WSA_IO_PENDING, XP1_IFS_HANDLES, IPPROTO_TCP,
+    bind, closesocket, getsockopt, setsockopt, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv,
+    WSASend, WSASocketW, WSAStartup, AF_INET, AF_INET6, IPPROTO_TCP, LPFN_ACCEPTEX, LPFN_CONNECTEX,
+    LPFN_DISCONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_LOOPBACK_FAST_PATH, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_PROTOCOL_INFOW,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TCP_FASTOPEN, TCP_NODELAY, TF_REUSE_SOCKET, WSABUF,
+    WSADATA, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
+    WSA_IO_PENDING, XP1_IFS_HANDLES,
 };
 use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows_sys::Win32::System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus,
-    OVERLAPPED, OVERLAPPED_ENTRY,
+    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus, OVERLAPPED,
+    OVERLAPPED_ENTRY,
 };
 
 use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup, MAX_GATHER};
@@ -136,7 +134,7 @@ fn ext_fns() -> io::Result<&'static ExtFns> {
         let probe = WSASocketW(
             AF_INET as i32,
             1, // SOCK_STREAM
-            IPPROTO_TCP as i32,
+            IPPROTO_TCP,
             std::ptr::null(),
             0,
             WSA_FLAG_OVERLAPPED,
@@ -146,17 +144,32 @@ fn ext_fns() -> io::Result<&'static ExtFns> {
         }
         let result = (|| {
             Ok(ExtFns {
-                accept_ex: Some(load_ext_fn::<unsafe extern "system" fn(
-                    SOCKET, SOCKET, *mut core::ffi::c_void, u32, u32, u32, *mut u32,
-                    *mut OVERLAPPED,
-                ) -> i32>(probe, &WSAID_ACCEPTEX)?),
-                connect_ex: Some(load_ext_fn::<unsafe extern "system" fn(
-                    SOCKET, *const SOCKADDR, i32, *const core::ffi::c_void, u32, *mut u32,
-                    *mut OVERLAPPED,
-                ) -> i32>(probe, &WSAID_CONNECTEX)?),
-                disconnect_ex: Some(load_ext_fn::<unsafe extern "system" fn(
-                    SOCKET, *mut OVERLAPPED, u32, u32,
-                ) -> i32>(probe, &WSAID_DISCONNECTEX)?),
+                accept_ex: Some(load_ext_fn::<
+                    unsafe extern "system" fn(
+                        SOCKET,
+                        SOCKET,
+                        *mut core::ffi::c_void,
+                        u32,
+                        u32,
+                        u32,
+                        *mut u32,
+                        *mut OVERLAPPED,
+                    ) -> i32,
+                >(probe, &WSAID_ACCEPTEX)?),
+                connect_ex: Some(load_ext_fn::<
+                    unsafe extern "system" fn(
+                        SOCKET,
+                        *const SOCKADDR,
+                        i32,
+                        *const core::ffi::c_void,
+                        u32,
+                        *mut u32,
+                        *mut OVERLAPPED,
+                    ) -> i32,
+                >(probe, &WSAID_CONNECTEX)?),
+                disconnect_ex: Some(load_ext_fn::<
+                    unsafe extern "system" fn(SOCKET, *mut OVERLAPPED, u32, u32) -> i32,
+                >(probe, &WSAID_DISCONNECTEX)?),
             })
         })();
         closesocket(probe);
@@ -301,7 +314,7 @@ impl IocpBackend {
                     getsockopt(
                         listener,
                         SOL_SOCKET,
-                        SO_PROTOCOL_INFOW as i32,
+                        SO_PROTOCOL_INFOW,
                         (&mut info as *mut WSAPROTOCOL_INFOW).cast(),
                         &mut len,
                     )
@@ -385,7 +398,7 @@ impl IocpBackend {
                         setsockopt(
                             (*op_ptr).socket,
                             SOL_SOCKET,
-                            SO_UPDATE_CONNECT_CONTEXT as i32,
+                            SO_UPDATE_CONNECT_CONTEXT,
                             std::ptr::null(),
                             0,
                         );
@@ -404,8 +417,7 @@ impl IocpBackend {
 impl IoBackend for IocpBackend {
     fn register_socket(&mut self, socket: RawSocket) -> io::Result<()> {
         let handle = socket as HANDLE;
-        let rc =
-            unsafe { CreateIoCompletionPort(handle, self.port.0, KEY_IO, 0) };
+        let rc = unsafe { CreateIoCompletionPort(handle, self.port.0, KEY_IO, 0) };
         if rc.is_null() {
             return Err(win_error());
         }
@@ -417,7 +429,7 @@ impl IoBackend for IocpBackend {
             getsockopt(
                 socket,
                 SOL_SOCKET,
-                SO_PROTOCOL_INFOW as i32,
+                SO_PROTOCOL_INFOW,
                 (&mut info as *mut WSAPROTOCOL_INFOW).cast(),
                 &mut len,
             )
@@ -551,7 +563,7 @@ impl IoBackend for IocpBackend {
         };
         if ok != 0 {
             unsafe {
-                setsockopt(socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT as i32, std::ptr::null(), 0);
+                setsockopt(socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0);
             }
             self.complete_inline(id, 0);
             return Ok(id);
@@ -622,7 +634,7 @@ impl IoBackend for IocpBackend {
             setsockopt(
                 accepted,
                 SOL_SOCKET,
-                SO_UPDATE_ACCEPT_CONTEXT as i32,
+                SO_UPDATE_ACCEPT_CONTEXT,
                 (&listener as *const SOCKET).cast(),
                 size_of::<SOCKET>() as i32,
             )
@@ -686,13 +698,7 @@ impl IoBackend for IocpBackend {
 pub fn prepare_conn_socket(socket: RawSocket, loopback_fast_path: bool) -> io::Result<()> {
     let on: u32 = 1;
     let rc = unsafe {
-        setsockopt(
-            socket,
-            IPPROTO_TCP as i32,
-            TCP_NODELAY as i32,
-            (&on as *const u32).cast(),
-            size_of::<u32>() as i32,
-        )
+        setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, (&on as *const u32).cast(), size_of::<u32>() as i32)
     };
     if rc == SOCKET_ERROR {
         return Err(wsa_error());
@@ -724,13 +730,7 @@ pub fn prepare_listener(socket: RawSocket, tfo: bool) -> io::Result<()> {
     if tfo {
         let on: u32 = 1;
         let rc = unsafe {
-            setsockopt(
-                socket,
-                IPPROTO_TCP as i32,
-                TCP_FASTOPEN as i32,
-                (&on as *const u32).cast(),
-                size_of::<u32>() as i32,
-            )
+            setsockopt(socket, IPPROTO_TCP, TCP_FASTOPEN, (&on as *const u32).cast(), size_of::<u32>() as i32)
         };
         if rc == SOCKET_ERROR {
             return Err(wsa_error());

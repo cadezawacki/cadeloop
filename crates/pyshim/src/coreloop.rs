@@ -15,8 +15,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cadeloop_core::backend::{BackendKind, Wakeup};
-use cadeloop_core::ready::CrossThreadQueue;
 use cadeloop_core::reactor::{Reactor, ReactorConfig};
+use cadeloop_core::ready::CrossThreadQueue;
 use cadeloop_core::time::{secs_f64_to_ticks, ticks_to_secs_f64, Ticks};
 use cadeloop_core::timer::TimerToken;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -119,8 +119,7 @@ impl CoreLoop {
         let poll_result: std::io::Result<()> = self.state.with(|st| {
             st.reactor.prepare_tick();
             self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
-            let timeout =
-                if stopping { Duration::ZERO } else { st.reactor.poll_timeout() };
+            let timeout = if stopping { Duration::ZERO } else { st.reactor.poll_timeout() };
             let reactor = &mut st.reactor;
             // R-021: the only GIL release point; sound because `claim`
             // guarantees no other thread can enter this state.
@@ -177,9 +176,7 @@ impl CoreLoop {
     #[pyo3(signature = (backend="auto", spin_us=20))]
     fn new(backend: &str, spin_us: u64) -> PyResult<Self> {
         let kind = BackendKind::parse(backend).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "invalid backend {backend:?}: expected 'auto', 'iocp' or 'rio'"
-            ))
+            PyValueError::new_err(format!("invalid backend {backend:?}: expected 'auto', 'iocp' or 'rio'"))
         })?;
         let cfg = ReactorConfig { backend: kind, spin_us, ..Default::default() };
         let reactor: Reactor<Py<PyAny>> = Reactor::new(cfg)?;
@@ -282,8 +279,7 @@ impl CoreLoop {
         context: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle =
-            self.make_handle(py, &callback, &args, context.as_ref(), "call_soon_threadsafe")?;
+        let handle = self.make_handle(py, &callback, &args, context.as_ref(), "call_soon_threadsafe")?;
         let handle = Py::new(py, handle)?;
         if self.xqueue.push(handle.clone_ref(py).into_any()) {
             self.waker.wake();
@@ -339,8 +335,9 @@ impl CoreLoop {
     // ---- introspection (R-103) --------------------------------------------
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (stats, ready, timers) =
-            self.state.with(|st| (st.reactor.stats.clone(), st.reactor.ready_len(), st.reactor.timers_len()))?;
+        let (stats, ready, timers) = self
+            .state
+            .with(|st| (st.reactor.stats.clone(), st.reactor.ready_len(), st.reactor.timers_len()))?;
         let d = PyDict::new(py);
         d.set_item("backend", self.backend_name)?;
         d.set_item("ticks", stats.ticks)?;
@@ -375,8 +372,7 @@ impl CoreLoop {
         };
         let handle = Py::new(py, PyClassInitializer::from(base).add_subclass(timer))?;
         let payload: Py<PyAny> = handle.clone_ref(py).into_any();
-        self.state
-            .with(move |st| st.reactor.schedule_timer_with_token(deadline_ns, payload, token))?;
+        self.state.with(move |st| st.reactor.schedule_timer_with_token(deadline_ns, payload, token))?;
         Ok(handle)
     }
 }

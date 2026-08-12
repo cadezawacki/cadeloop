@@ -129,9 +129,8 @@ pub fn run_handle(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DispatchOu
     }
 
     let name = intern!(py, "run");
-    let result = unsafe {
-        ffi::PyObject_VectorcallMethod(name.as_ptr(), stack.as_ptr(), total, std::ptr::null_mut())
-    };
+    let result =
+        unsafe { ffi::PyObject_VectorcallMethod(name.as_ptr(), stack.as_ptr(), total, std::ptr::null_mut()) };
     if result.is_null() {
         let err = PyErr::fetch(py);
         if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {

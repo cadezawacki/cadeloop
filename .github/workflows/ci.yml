@@ -1,0 +1,129 @@
+# CI per R-113: build, unit, asyncio-conformance, stress soak,
+# benchmark-regression, clippy/fmt/deny/audit.
+#
+# Spec asks for windows-2022 + windows-11 runners; GitHub-hosted labels
+# provide windows-2022 and windows-2025 (Windows Server 2025). A windows-11
+# (client) self-hosted runner can be added to the matrix when available.
+name: ci
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *" # nightly: full soak + benchmark regression
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p cadeloop-core --all-targets -- -D warnings
+      - name: clippy (windows target)
+        run: |
+          cargo clippy -p cadeloop-core --target x86_64-pc-windows-msvc -- -D warnings
+          PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.11 \
+            cargo clippy -p cadeloop-pyshim --no-default-features \
+            --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo-deny (licenses: R-014) + cargo-audit
+        run: |
+          cargo install --locked cargo-deny cargo-audit
+          cargo deny check licenses bans sources
+          cargo audit
+
+  test-linux:
+    # Portable dev backend: scheduling semantics + facade on Linux.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: cargo test --workspace
+      - name: build extension + pytest
+        run: |
+          cargo build -p cadeloop-pyshim --release
+          cp target/release/lib_core.so python/cadeloop/_core.so
+          pip install pytest
+          PYTHONPATH=python python -m pytest tests/unit tests/conformance -q
+
+  build-windows:
+    # R-113: the authoritative build/test platform.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: cargo test --workspace
+      - name: build wheel (cp311-win_amd64, R-110)
+        run: |
+          pip install maturin pytest
+          maturin build --release --out dist
+          pip install --no-index --find-links dist cadeloop
+      - name: unit + conformance subset
+        run: python -m pytest tests/unit tests/conformance -q
+      - name: CPython asyncio conformance suite (R-120)
+        run: python tests/conformance/run_cpython_suite.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl
+
+  stress:
+    # R-113/R-122: soak. Short on PRs; the nightly schedule runs the full
+    # 10-minute soak with RSS-growth assertion (<5%).
+    runs-on: windows-2022
+    needs: build-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install maturin
+          maturin build --release --out dist
+          pip install --no-index --find-links dist cadeloop
+      - name: soak
+        run: python tests/stress/soak_timers.py --seconds ${{ github.event_name == 'schedule' && '600' || '30' }}
+
+  benchmark-regression:
+    # R-113: fail on >5% regression vs stored baseline JSON. Until a
+    # Windows baseline is recorded under bench/baselines/, the check
+    # records results as artifacts and passes.
+    runs-on: windows-2022
+    needs: build-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install maturin
+          maturin build --release --out dist
+          pip install --no-index --find-links dist cadeloop
+      - name: scheduling benchmark
+        run: python bench/harness/harness.py --suite sched --loops cadeloop --out bench-results.json
+      - name: regression gate (>5%)
+        run: python bench/harness/check_regression.py bench-results.json bench/baselines/windows-sched.json --threshold 0.05
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json

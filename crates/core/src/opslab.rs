@@ -147,7 +147,7 @@ impl<D> OpSlab<D> {
 
     pub fn get_mut(&mut self, id: OpId) -> Option<&mut OpSlot<D>> {
         let slot = self.slot_mut(id.index);
-        (slot.generation == id.generation && slot.state != OpState::Free).then(move || slot)
+        (slot.generation == id.generation && slot.state != OpState::Free).then_some(slot)
     }
 
     /// Posted -> Cancelled (CancelIoEx issued). Idempotent for already

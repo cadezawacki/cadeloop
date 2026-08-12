@@ -21,10 +21,10 @@ use crate::opslab::OpId;
 
 #[cfg(windows)]
 pub mod iocp;
-#[cfg(windows)]
-pub mod rio;
 #[cfg(not(windows))]
 pub mod portable;
+#[cfg(windows)]
+pub mod rio;
 
 /// A reaped completion, translated out of backend-specific form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

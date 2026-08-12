@@ -28,9 +28,8 @@ use std::mem::{size_of, zeroed};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Networking::WinSock::{
-    closesocket, WSAGetLastError, WSAIoctl, WSASocketW, AF_INET,
-    RIO_EXTENSION_FUNCTION_TABLE, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKET_ERROR,
-    WSAID_MULTIPLE_RIO, WSA_FLAG_OVERLAPPED, IPPROTO_TCP,
+    closesocket, WSAGetLastError, WSAIoctl, WSASocketW, AF_INET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
+    SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKET_ERROR, WSAID_MULTIPLE_RIO, WSA_FLAG_OVERLAPPED,
 };
 
 use super::IoBackend;
@@ -46,7 +45,7 @@ fn resolve_table() -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
         let probe = WSASocketW(
             AF_INET as i32,
             1, // SOCK_STREAM
-            IPPROTO_TCP as i32,
+            IPPROTO_TCP,
             std::ptr::null(),
             0,
             WSA_FLAG_OVERLAPPED,
@@ -84,9 +83,8 @@ impl RioBackend {
     pub fn new() -> io::Result<Self> {
         // Probe so the error distinguishes "no RIO on this OS" from
         // "not implemented yet".
-        let _table = resolve_table().map_err(|e| {
-            io::Error::new(e.kind(), format!("RIO unavailable on this system: {e}"))
-        })?;
+        let _table = resolve_table()
+            .map_err(|e| io::Error::new(e.kind(), format!("RIO unavailable on this system: {e}")))?;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the RIO backend lands in milestone M3; use backend=\"auto\" or \"iocp\"",
@@ -115,11 +113,7 @@ impl IoBackend for RioBackend {
     fn cancel(&mut self, _: crate::opslab::OpId) -> io::Result<()> {
         unreachable!("RioBackend cannot be constructed before M3")
     }
-    fn poll(
-        &mut self,
-        _: &mut Vec<super::Completion>,
-        _: Option<std::time::Duration>,
-    ) -> io::Result<usize> {
+    fn poll(&mut self, _: &mut Vec<super::Completion>, _: Option<std::time::Duration>) -> io::Result<usize> {
         unreachable!("RioBackend cannot be constructed before M3")
     }
     fn wakeup_handle(&self) -> std::sync::Arc<dyn super::Wakeup> {
