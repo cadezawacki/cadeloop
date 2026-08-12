@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cadeloop"
+description = "Maximum-performance asyncio event loop + ASGI stack for Windows / CPython 3.11"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Cade Zawacki" }]
+# R-010: CPython 3.11.x only for v1 (cp311-win_amd64 wheels; abi3 not used).
+requires-python = ">=3.11,<3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Rust",
+    "Framework :: AsyncIO",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/cadezawacki/cadeloop"
+
+[tool.maturin]
+manifest-path = "crates/pyshim/Cargo.toml"
+python-source = "python"
+module-name = "cadeloop._core"
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/conformance"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"

@@ -1,0 +1,16 @@
+# R-120 conformance skip-list. One `TestClass.test_name` per line; every
+# entry MUST carry a justification. This list must shrink monotonically
+# across milestones (checked in review; a milestone exit criterion).
+#
+# ---- M0: pre-transport skips (whole feature areas gated on M1/M2/M4) ----
+# The M0 suite selection (run_cpython_suite.py) only runs the events /
+# base_events scheduling subsets; within those, socket-dependent tests fail
+# fast with NotImplementedError and are skipped here until M1.
+EventLoopTestsMixin.test_create_connection            # M1: TCP transports (R-013/M1)
+EventLoopTestsMixin.test_create_server                # M1: TCP transports
+EventLoopTestsMixin.test_create_datagram_endpoint     # M4: UDP (R-058)
+EventLoopTestsMixin.test_add_signal_handler           # Windows-native layer (R-052)
+EventLoopTestsMixin.test_reader_callback              # M1: add_reader emulation (R-057)
+EventLoopTestsMixin.test_writer_callback              # M1: add_writer emulation (R-057)
+EventLoopTestsMixin.test_subprocess_exec              # M5 / cfg.enable_subprocess (R-051)
+EventLoopTestsMixin.test_subprocess_shell             # M5 / cfg.enable_subprocess (R-051)
