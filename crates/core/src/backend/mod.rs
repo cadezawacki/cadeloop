@@ -59,6 +59,19 @@ pub const MAX_GATHER: usize = 16;
 /// a no-op on IOCP and required on RIO; the reactor calls it whenever the
 /// buffer pool grows a slab.
 pub trait IoBackend {
+    /// Associate a socket with the completion mechanism before posting ops
+    /// on it. On IOCP this binds the handle to the port and applies
+    /// `SetFileCompletionNotificationModes` (R-031, with the LSP guard).
+    fn register_socket(&mut self, _socket: RawSocket) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "register_socket"))
+    }
+
+    /// Fetch the accepted socket of a completed accept op and release the
+    /// op slot. Applies `SO_UPDATE_ACCEPT_CONTEXT` (R-032).
+    fn take_accept_socket(&mut self, _op: OpId) -> io::Result<RawSocket> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "take_accept_socket"))
+    }
+
     fn post_accept(&mut self, listener: RawSocket) -> io::Result<OpId>;
     fn post_recv(&mut self, socket: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId>;
     fn post_send(&mut self, socket: RawSocket, bufs: &[IoSlice]) -> io::Result<OpId>;

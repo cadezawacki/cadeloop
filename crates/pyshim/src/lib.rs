@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 
 // R-070: mimalloc as the extension's global allocator. Python's own object
 // allocator is untouched.
+#[cfg(feature = "mimalloc-allocator")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
