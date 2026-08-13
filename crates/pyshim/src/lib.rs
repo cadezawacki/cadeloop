@@ -3,6 +3,7 @@
 mod coreloop;
 mod gil_boundary;
 mod handles;
+mod http;
 mod net;
 
 use pyo3::prelude::*;
@@ -19,6 +20,12 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<handles::Handle>()?;
     m.add_class::<handles::TimerHandle>()?;
     m.add_class::<net::Transport>()?;
+    m.add_class::<http::CompletedAwaitable>()?;
+    m.add_class::<http::ValueAwaitable>()?;
+    m.add_class::<http::HttpReceive>()?;
+    m.add_class::<http::HttpSend>()?;
+    m.add_class::<http::AppTask>()?;
+    m.add_class::<http::HttpTaskDone>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

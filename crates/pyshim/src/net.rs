@@ -28,6 +28,7 @@ use std::io;
 
 use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
+use cadeloop_core::http::Limits;
 use cadeloop_core::netsys;
 use cadeloop_core::opslab::OpId;
 use pyo3::exceptions::PyRuntimeError;
@@ -36,6 +37,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::coreloop::CoreLoop;
+use crate::http::HttpConn;
 
 /// R-035: cork flush threshold.
 const CORK_FLUSH_BYTES: usize = 64 * 1024;
@@ -105,10 +107,19 @@ pub(crate) struct ProtoRefs {
     pub resume_writing: Py<PyAny>,
 }
 
+/// What consumes inbound bytes on a transport: a Python protocol object
+/// (asyncio surface) or the native HTTP/ASGI engine (M2, R-080).
+pub(crate) enum ProtoKind {
+    Py(ProtoRefs),
+    Http(Box<HttpConn>),
+}
+
 pub(crate) struct TransportEntry {
     pub socket: RawSocket,
-    pub proto: ProtoRefs,
-    pub pyobj: Py<Transport>,
+    pub proto: ProtoKind,
+    /// Python Transport facade; `None` for native HTTP connections (no
+    /// user-visible object ever references them).
+    pub pyobj: Option<Py<Transport>>,
     recv_slot: Option<SlotId>,
     recv_op: Option<OpId>,
     send_op: Option<OpId>,
@@ -127,9 +138,19 @@ pub(crate) struct TransportEntry {
     pub sockname: Option<Py<PyAny>>,
 }
 
+/// What an accepted connection turns into.
+pub(crate) enum ListenerKind {
+    /// asyncio create_server: `protocol_factory()` per accept.
+    Factory(Py<PyAny>),
+    /// Native HTTP engine (M2): every accept becomes an [`HttpConn`].
+    /// `pyloop` is the facade loop (receive() waiter futures need it);
+    /// `state` is the lifespan state dict, shallow-copied per scope.
+    Http { app: Py<PyAny>, pyloop: Py<PyAny>, state: Py<PyAny>, limits: Limits, eager: bool },
+}
+
 pub(crate) struct ListenerEntry {
     pub socket: RawSocket,
-    pub factory: Py<PyAny>,
+    pub kind: ListenerKind,
     accept_ops: Vec<OpId>,
     target: usize,
     closing: bool,
@@ -153,9 +174,15 @@ pub(crate) struct NetState {
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
+    pub graveyard_protos: Vec<ProtoKind>,
     pub stats_bytes_rx: u64,
     pub stats_bytes_tx: u64,
     pub stats_conns_accepted: u64,
+    /// HTTP `Date:` header cache (R-084): rebuilt when the unix second ticks.
+    pub http_date_secs: u64,
+    pub http_date_line: Vec<u8>,
+    /// unix wall time = monotonic seconds + this offset (captured once).
+    unix_offset_secs: i64,
 }
 
 // SAFETY: thread-affine by the gil_boundary protocol — only the owner
@@ -164,9 +191,49 @@ pub(crate) struct NetState {
 unsafe impl Send for NetState {}
 
 impl NetState {
-    fn next_id(&mut self) -> u64 {
+    pub(crate) fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Unix wall seconds derived from the reactor's cached monotonic clock.
+    /// The wall/monotonic offset is captured once — Date headers tolerate
+    /// the (sub-second, non-cumulative) drift.
+    pub(crate) fn unix_now_secs(&mut self, now_ns: u64) -> u64 {
+        let mono = (now_ns / 1_000_000_000) as i64;
+        if self.unix_offset_secs == 0 {
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0) as i64;
+            self.unix_offset_secs = unix - mono;
+        }
+        (mono + self.unix_offset_secs).max(0) as u64
+    }
+
+    /// The native HTTP connection behind `tid`, if that transport is one.
+    /// NOTE: borrows the whole NetState — take what you need out of the
+    /// returned `&mut HttpConn` before touching other NetState fields.
+    pub(crate) fn http_conn_mut(&mut self, tid: u64) -> Option<&mut HttpConn> {
+        match self.transports.get_mut(&tid) {
+            Some(TransportEntry { proto: ProtoKind::Http(conn), .. }) => Some(conn),
+            _ => None,
+        }
+    }
+
+    /// (peername, sockname) for ASGI scope construction.
+    pub(crate) fn peer_local(
+        &self,
+        py: Python<'_>,
+        tid: u64,
+    ) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
+        match self.transports.get(&tid) {
+            Some(e) => (
+                e.peername.as_ref().map(|p| p.clone_ref(py)),
+                e.sockname.as_ref().map(|p| p.clone_ref(py)),
+            ),
+            None => (None, None),
+        }
     }
 }
 
@@ -207,6 +274,15 @@ pub(crate) enum NetEvent {
         fut: Py<PyAny>,
         sock: RawSocket,
         err: u32,
+    },
+    /// Native HTTP: parsed request(s) queued — run the request pump.
+    HttpPump {
+        tid: u64,
+    },
+    /// Native HTTP: resolve a pending `receive()` waiter with
+    /// `http.disconnect`.
+    HttpDisconnect {
+        fut: Py<PyAny>,
     },
 }
 
@@ -288,7 +364,18 @@ pub(crate) fn teardown_with(
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
-    net.events.push(NetEvent::ConnLost { connection_lost: entry.proto.connection_lost.clone_ref(py), err });
+    match &mut entry.proto {
+        ProtoKind::Py(p) => {
+            net.events
+                .push(NetEvent::ConnLost { connection_lost: p.connection_lost.clone_ref(py), err });
+        }
+        ProtoKind::Http(conn) => {
+            conn.disconnected = true;
+            if let Some(fut) = conn.take_recv_waiter() {
+                net.events.push(NetEvent::HttpDisconnect { fut });
+            }
+        }
+    }
     net.graveyard_entries.push(entry);
 }
 
@@ -307,6 +394,54 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
         net.buffers.release(slot);
     }
     net.graveyard_entries.push(entry);
+}
+
+/// Queue native HTTP response bytes on a transport's corked write queue
+/// (R-035/R-084: same-tick flush via flush_list). In-cell.
+pub(crate) fn http_enqueue(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    tid: u64,
+    data: Vec<u8>,
+) {
+    if data.is_empty() {
+        return;
+    }
+    let Some(entry) = net.transports.get_mut(&tid) else { return };
+    if entry.conn_lost || entry.closing {
+        return;
+    }
+    entry.queued_bytes += data.len();
+    entry.wq.push_back(WriteBuf::Owned { data, off: 0 });
+    let no_send = entry.send_op.is_none();
+    let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
+    let unscheduled = !entry.flush_scheduled;
+    if no_send {
+        if big {
+            flush_pending(py, net, backend, tid);
+        } else if unscheduled {
+            if let Some(e) = net.transports.get_mut(&tid) {
+                e.flush_scheduled = true;
+            }
+            net.flush_list.push(tid);
+        }
+    }
+}
+
+/// Mark a native HTTP connection to close once its write queue drains
+/// (`connection: close`, parse errors, app failures). In-cell.
+pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
+    let Some(entry) = net.transports.get_mut(&tid) else { return };
+    if entry.conn_lost || entry.closing {
+        return;
+    }
+    entry.closing = true;
+    if let Some(op) = entry.recv_op.take() {
+        // Mapping stays; the completion is discarded by the closing check.
+        let _ = backend.cancel(op);
+    }
+    maybe_finish_shutdown(py, net, backend, tid);
 }
 
 /// Post the next recv on a transport. In-cell.
@@ -341,13 +476,13 @@ fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64)
     }
 }
 
-pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, factory: Py<PyAny>, target: usize) -> u64 {
+pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: ListenerKind, target: usize) -> u64 {
     let lid = net.next_id();
     net.listeners.insert(
         lid,
         ListenerEntry {
             socket: sock,
-            factory,
+            kind,
             accept_ops: Vec::new(),
             target: target.max(1),
             closing: false,
@@ -369,7 +504,14 @@ pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u
     }
     backend.detach_socket(listener.socket);
     netsys::close(listener.socket);
-    net.graveyard_py.push(listener.factory);
+    match listener.kind {
+        ListenerKind::Factory(factory) => net.graveyard_py.push(factory),
+        ListenerKind::Http { app, pyloop, state, .. } => {
+            net.graveyard_py.push(app);
+            net.graveyard_py.push(pyloop);
+            net.graveyard_py.push(state);
+        }
+    }
 }
 
 fn post_accepts(net: &mut NetState, backend: Backend<'_>, lid: u64) {
@@ -457,38 +599,82 @@ fn on_recv_done(
         return;
     }
     if bytes == 0 {
-        // Peer EOF. Recv is NOT re-posted; phase 2 decides close-vs-keep
-        // from eof_received()'s return value.
-        net.events.push(NetEvent::Eof {
-            eof_received: entry.proto.eof_received.clone_ref(py),
-            transport: entry.pyobj.clone_ref(py),
-        });
+        // Peer EOF. Recv is NOT re-posted.
+        let (http_idle, waiter) = match &mut entry.proto {
+            ProtoKind::Py(p) => {
+                // Phase 2 decides close-vs-keep from eof_received().
+                let ev = NetEvent::Eof {
+                    eof_received: p.eof_received.clone_ref(py),
+                    transport: entry
+                        .pyobj
+                        .as_ref()
+                        .expect("py protocol entries always carry a Transport")
+                        .clone_ref(py),
+                };
+                net.events.push(ev);
+                return;
+            }
+            ProtoKind::Http(conn) => {
+                // Idle keep-alive connection: tear down now. Mid-request:
+                // keep writing the response; finish_request closes it.
+                conn.disconnected = true;
+                (!conn.active && conn.pending.is_empty(), conn.take_recv_waiter())
+            }
+        };
+        if let Some(fut) = waiter {
+            net.events.push(NetEvent::HttpDisconnect { fut });
+        }
+        if http_idle {
+            teardown_with(py, net, backend, tid, None);
+        }
         return;
     }
     net.stats_bytes_rx += bytes as u64;
     debug_assert_eq!(entry.recv_slot, Some(slot), "op slot / transport slot mismatch");
-    if let Some(data_received) = &entry.proto.data_received {
-        // Plain Protocol: materialize bytes now (non-GC-tracked allocation,
-        // safe in-cell) and re-post into the SAME slot immediately so the
-        // kernel refills while Python processes this chunk.
-        let data_received = data_received.clone_ref(py);
-        let ptr = net.buffers.slot_ptr(slot);
-        let payload = unsafe {
-            let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
-            Py::from_owned_ptr(py, obj)
-        };
-        net.events.push(NetEvent::Data { data_received, payload });
-        post_recv(py, net, backend, tid);
-    } else {
-        // BufferedProtocol: the transport's slot reference transfers to
-        // the phase-2 event (released there after the copy); a fresh slot
-        // is acquired for the next read.
-        let get_buffer = entry.proto.get_buffer.as_ref().unwrap().clone_ref(py);
-        let buffer_updated = entry.proto.buffer_updated.as_ref().unwrap().clone_ref(py);
-        entry.recv_slot = None; // ref now owned by the BufData event
-        net.events.push(NetEvent::BufData { get_buffer, buffer_updated, slot, len: bytes as usize });
-        post_recv(py, net, backend, tid);
+    let mut parse_err = None;
+    match &mut entry.proto {
+        ProtoKind::Py(p) => {
+            if let Some(data_received) = &p.data_received {
+                // Plain Protocol: materialize bytes now (non-GC-tracked
+                // allocation, safe in-cell) and re-post into the SAME slot
+                // immediately so the kernel refills while Python processes.
+                let data_received = data_received.clone_ref(py);
+                let ptr = net.buffers.slot_ptr(slot);
+                let payload = unsafe {
+                    let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
+                    Py::from_owned_ptr(py, obj)
+                };
+                net.events.push(NetEvent::Data { data_received, payload });
+            } else {
+                // BufferedProtocol: the transport's slot reference transfers
+                // to the phase-2 event (released there after the copy); a
+                // fresh slot is acquired for the next read.
+                let get_buffer = p.get_buffer.as_ref().unwrap().clone_ref(py);
+                let buffer_updated = p.buffer_updated.as_ref().unwrap().clone_ref(py);
+                entry.recv_slot = None; // ref now owned by the BufData event
+                net.events.push(NetEvent::BufData { get_buffer, buffer_updated, slot, len: bytes as usize });
+            }
+        }
+        ProtoKind::Http(conn) => {
+            // In-cell parse (R-080): llhttp over the recv slot; the parser
+            // copies what it keeps, so the slot re-posts immediately below.
+            let ptr = net.buffers.slot_ptr(slot);
+            let data = unsafe { std::slice::from_raw_parts(ptr, bytes as usize) };
+            match crate::http::conn_feed(conn, data) {
+                Ok(true) => net.events.push(NetEvent::HttpPump { tid }),
+                Ok(false) => {}
+                Err(e) => parse_err = Some(e),
+            }
+        }
     }
+    if let Some(err) = parse_err {
+        // R-086: malformed request answered entirely in-cell, then closed.
+        let resp = crate::http::error_response(err);
+        http_enqueue(py, net, backend, tid, resp);
+        http_close_after_write(py, net, backend, tid);
+        return; // no recv re-post
+    }
+    post_recv(py, net, backend, tid);
 }
 
 fn on_send_done(
@@ -529,8 +715,10 @@ fn on_send_done(
     }
     if entry.proto_paused && entry.queued_bytes <= entry.low_water {
         entry.proto_paused = false;
-        let resume_writing = entry.proto.resume_writing.clone_ref(py);
-        net.events.push(NetEvent::ResumeWriting { resume_writing });
+        if let ProtoKind::Py(p) = &entry.proto {
+            let resume_writing = p.resume_writing.clone_ref(py);
+            net.events.push(NetEvent::ResumeWriting { resume_writing });
+        }
     }
     let entry = net.transports.get_mut(&tid).unwrap();
     if !entry.wq.is_empty() {
@@ -609,22 +797,58 @@ pub(crate) fn dispatch_events(
                 core.guard_protocol_call(py, resume_writing.call0(py))?;
             }
             NetEvent::Accepted { lid, sock } => {
-                let factory =
-                    core.with_net(|net, _| net.listeners.get(&lid).map(|l| l.factory.clone_ref(py)))?;
-                let Some(factory) = factory else {
-                    netsys::close(sock);
-                    continue;
-                };
-                match factory.call0(py) {
-                    Ok(protocol) => {
-                        if let Err(e) = wire_stream(py, slf, sock, protocol.into_bound(py)) {
+                enum Action {
+                    Factory(Py<PyAny>),
+                    Http {
+                        app: Py<PyAny>,
+                        pyloop: Py<PyAny>,
+                        state: Py<PyAny>,
+                        limits: Limits,
+                        eager: bool,
+                    },
+                }
+                let action = core.with_net(|net, _| {
+                    net.listeners.get(&lid).map(|l| match &l.kind {
+                        ListenerKind::Factory(f) => Action::Factory(f.clone_ref(py)),
+                        ListenerKind::Http { app, pyloop, state, limits, eager } => Action::Http {
+                            app: app.clone_ref(py),
+                            pyloop: pyloop.clone_ref(py),
+                            state: state.clone_ref(py),
+                            limits: *limits,
+                            eager: *eager,
+                        },
+                    })
+                })?;
+                match action {
+                    None => netsys::close(sock),
+                    Some(Action::Factory(factory)) => match factory.call0(py) {
+                        Ok(protocol) => {
+                            if let Err(e) = wire_stream(py, slf, sock, protocol.into_bound(py)) {
+                                core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
+                            }
+                        }
+                        Err(e) => {
+                            netsys::close(sock);
+                            core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
+                        }
+                    },
+                    Some(Action::Http { app, pyloop, state, limits, eager }) => {
+                        if let Err(e) = wire_http(py, slf, sock, app, pyloop, state, limits, eager) {
                             core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                         }
                     }
-                    Err(e) => {
-                        netsys::close(sock);
-                        core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
-                    }
+                }
+            }
+            NetEvent::HttpPump { tid } => {
+                crate::http::pump_requests(py, slf, tid)?;
+            }
+            NetEvent::HttpDisconnect { fut } => {
+                let fut = fut.bind(py);
+                let done: bool =
+                    fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                if !done {
+                    let msg = crate::http::disconnect_message(py)?;
+                    let _ = fut.call_method1("set_result", (msg,));
                 }
             }
             NetEvent::AcceptError { err } => {
@@ -739,8 +963,8 @@ pub(crate) fn wire_stream(
             tid,
             TransportEntry {
                 socket: sock,
-                proto,
-                pyobj: transport.clone_ref(py),
+                proto: ProtoKind::Py(proto),
+                pyobj: Some(transport.clone_ref(py)),
                 recv_slot: None,
                 recv_op: None,
                 send_op: None,
@@ -767,6 +991,61 @@ pub(crate) fn wire_stream(
     core.with_net(|net, reactor| post_recv(py, net, reactor.backend_mut(), tid))?;
     core.drain_graveyards(py)?;
     Ok(transport)
+}
+
+/// Wire an accepted socket into a native HTTP connection (M2). Phase-2.
+/// No Python protocol, no Transport pyobj — the connection lives entirely
+/// inside the state cell until requests are dispatched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wire_http(
+    py: Python<'_>,
+    slf: &Bound<'_, CoreLoop>,
+    sock: RawSocket,
+    app: Py<PyAny>,
+    pyloop: Py<PyAny>,
+    state: Py<PyAny>,
+    limits: Limits,
+    eager: bool,
+) -> PyResult<()> {
+    let core = slf.get();
+    let _ = netsys::set_nodelay(sock, true); // R-038
+    let peer = addr_tuple(py, netsys::peername(sock).ok());
+    let name = addr_tuple(py, netsys::sockname(sock).ok());
+    let (high, low) = core.water_marks();
+    let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
+    if let Err(e) = reg {
+        netsys::close(sock);
+        return Err(e.into());
+    }
+    core.with_net(|net, reactor| {
+        let tid = net.next_id();
+        net.transports.insert(
+            tid,
+            TransportEntry {
+                socket: sock,
+                proto: ProtoKind::Http(Box::new(HttpConn::new(app, pyloop, state, limits, eager))),
+                pyobj: None,
+                recv_slot: None,
+                recv_op: None,
+                send_op: None,
+                wq: VecDeque::new(),
+                queued_bytes: 0,
+                high_water: high,
+                low_water: low,
+                reading_paused: false,
+                proto_paused: false,
+                closing: false,
+                conn_lost: false,
+                eof_wanted: false,
+                eof_sent: false,
+                flush_scheduled: false,
+                peername: peer,
+                sockname: name,
+            },
+        );
+        post_recv(py, net, reactor.backend_mut(), tid);
+    })?;
+    Ok(())
 }
 
 // --------------------------------------------------------------------- //
@@ -852,7 +1131,9 @@ impl Transport {
             if let Some(entry) = net.transports.get_mut(&tid) {
                 if entry.queued_bytes > entry.high_water && !entry.proto_paused {
                     entry.proto_paused = true;
-                    pause = Some(entry.proto.pause_writing.clone_ref(py));
+                    if let ProtoKind::Py(p) = &entry.proto {
+                        pause = Some(p.pause_writing.clone_ref(py));
+                    }
                 }
             }
             dirty |= !net.graveyard_bufs.is_empty() || !net.graveyard_entries.is_empty();
@@ -1002,20 +1283,29 @@ impl Transport {
         let core = self.core_ref(py);
         core.with_net(|net, _| {
             if let Some(entry) = net.transports.get_mut(&self.tid) {
-                let old = std::mem::replace(&mut entry.proto, refs);
-                net.graveyard_py.push(old.protocol);
-                net.graveyard_py.push(old.connection_lost);
-                net.graveyard_py.push(old.eof_received);
-                net.graveyard_py.push(old.pause_writing);
-                net.graveyard_py.push(old.resume_writing);
-                if let Some(m) = old.data_received {
-                    net.graveyard_py.push(m);
-                }
-                if let Some(m) = old.get_buffer {
-                    net.graveyard_py.push(m);
-                }
-                if let Some(m) = old.buffer_updated {
-                    net.graveyard_py.push(m);
+                // Drops must happen out-of-cell — Py refs land in
+                // graveyard_py, an HttpConn (unreachable here in practice:
+                // no Transport pyobj exists for HTTP conns) in
+                // graveyard_protos.
+                let old = std::mem::replace(&mut entry.proto, ProtoKind::Py(refs));
+                match old {
+                    ProtoKind::Py(old) => {
+                        net.graveyard_py.push(old.protocol);
+                        net.graveyard_py.push(old.connection_lost);
+                        net.graveyard_py.push(old.eof_received);
+                        net.graveyard_py.push(old.pause_writing);
+                        net.graveyard_py.push(old.resume_writing);
+                        if let Some(m) = old.data_received {
+                            net.graveyard_py.push(m);
+                        }
+                        if let Some(m) = old.get_buffer {
+                            net.graveyard_py.push(m);
+                        }
+                        if let Some(m) = old.buffer_updated {
+                            net.graveyard_py.push(m);
+                        }
+                    }
+                    old @ ProtoKind::Http(_) => net.graveyard_protos.push(old),
                 }
             } else {
                 net.graveyard_py.push(refs.protocol);
@@ -1027,7 +1317,10 @@ impl Transport {
     fn get_protocol(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let core = self.core_ref(py);
         core.with_net(|net, _| {
-            net.transports.get(&self.tid).map(|e| e.proto.protocol.clone_ref(py)).unwrap_or_else(|| py.None())
+            match net.transports.get(&self.tid) {
+                Some(TransportEntry { proto: ProtoKind::Py(p), .. }) => p.protocol.clone_ref(py),
+                _ => py.None(),
+            }
         })
     }
 

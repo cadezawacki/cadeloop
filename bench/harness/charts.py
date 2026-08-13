@@ -19,18 +19,24 @@ import pathlib
 # entity, never the rank).
 LIGHT = {
     "cadeloop": "#2a78d6",
+    "cadeloop-native": "#164a9e",
     "asyncio": "#eb6834",
     "uvloop": "#1baf7a",
     "rloop": "#eda100",
     "rsloop": "#e87ba4",
+    "aiofastnet": "#00879e",
+    "aiofastnet-cadeloop": "#79aede",
     "hypercorn": "#4a3aa7",
 }
 DARK = {
     "cadeloop": "#3987e5",
+    "cadeloop-native": "#6fa9ef",
     "asyncio": "#d95926",
     "uvloop": "#199e70",
     "rloop": "#c98500",
     "rsloop": "#d55181",
+    "aiofastnet": "#1fa2b8",
+    "aiofastnet-cadeloop": "#5e93c9",
     "hypercorn": "#9085e9",
 }
 

@@ -32,7 +32,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-053 | 4-ary timer heap, tombstones, >50% compaction | ✅ (proptested) | timer.rs |
 | R-054 | 128-batch dispatch, vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, handles.rs, net.rs |
 | R-055 | DNS thread pool min(8,cpus) + 5s LRU cache | ✅ | loop.py |
-| R-056 | Eager task fast path, zero-Task completions | 📅 M2 (config flag ✅) | config.py |
+| R-056 | Eager task fast path, zero-Task completions | ✅ `PyIter_Send` stepping; non-suspending requests allocate no Task/Future; AppTask registers via `_enter_task` (anyio-compatible); `eager_tasks=False` stdlib path | http.rs (pyshim), config.py |
 | R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP zero-byte probes compile-verified (harden M4) | epoll.rs, iocp.rs, coreloop.rs |
 | R-058 | UDP endpoints | 📅 M4 | loop.py (gated) |
 | R-059 | Native TLS (memory BIOs), SSLContext compat | 🔶 sslproto MemoryBIO fallback ✅ (spec-sanctioned, tested); native engine 📅 M4 | tcp.py |
@@ -43,11 +43,19 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-072 | Zero-copy memoryview via BufferedProtocol | 🔶 BufferedProtocol supported (single copy into app buffer); recv-into-app-buffer zero-copy 📅 | net.rs |
 | R-073 | Slot lifetime refcounts + poison | ✅ (proptested; kernel ops hold slot refs released at completion reap) | buffers.rs, net.rs |
 | R-074 | Write retention semantics (bytes zero-copy, bytearray copy) | ✅ (bytes-backed memoryview currently copied — documented deviation) | net.rs |
-| R-075 | gc.freeze warmup policy | 🔶 config ✅, applied in M2 server | config.py |
-| R-080..088 | HTTP/ASGI engine | 📅 M2 (limits in Config ✅; llhttp pin ✅) | config.py, vendor/llhttp |
+| R-075 | gc.freeze warmup policy | 🔶 freeze/disable applied post-lifespan-startup in serve(); per-request warmup counter 📅 | server.py |
+| R-080 | llhttp strict, limits (64K headers/100 count/8K URL) | ✅ in-callback enforcement → 414/431/413; request-line/idle timeouts 📅 | core/http.rs, vendor/llhttp |
+| R-081 | ASGI 3.0 scope + lifespan | ✅ native scope (percent-decode, latin-1 fallback, client/server tuples, lifespan state copy); lifespan `auto` in facade | http.rs (pyshim), server.py |
+| R-082 | Header-name/method interning | ✅ interned common methods + scope keys | http.rs (pyshim) |
+| R-083 | Per-connection cached receive/send; scope reuse opt-in | 🔶 receive/send cached per conn ✅; `reuse_scope` 📅 | http.rs (pyshim) |
+| R-084 | Native response assembly, Date cache, framing at first body chunk | ✅ zero Python objects on the wire path; per-second civil-from-days Date; HEAD suppression; HTTP/1.0 close-delimited | http.rs (pyshim) |
+| R-085 | Keep-alive + pipelined drain, strict ordering | ✅ iterative pump; request finishes at coro return (background-task safe) | http.rs (pyshim) |
+| R-086 | Error paths: in-cell 4xx, 500-or-abort, disconnect futures | ✅ | core/http.rs, http.rs (pyshim) |
+| R-087 | WebSockets | 📅 M4 | — |
+| R-088 | Fallback to pure-Python h11 path | ➖ not planned (native engine + uvicorn interop cover it) | — |
 | R-090..093 | Worker model, affinity, supervision | 📅 M3 (config ✅) | config.py |
 | R-100 | new_event_loop/EventLoopPolicy/install/run | ✅ | policy.py |
-| R-101 | serve() signature + CLI 1:1 cfg mapping | ✅ (engine M2) | server.py, __main__.py |
+| R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy; workers>1 📅 M3 | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
 | R-103 | loop.stats() introspection | ✅ (M0 counters incl. syscalls_saved_inline plumbing) | coreloop.rs |
 | R-110 | maturin cp311-win_amd64 wheels; v2/v3 variants | 🔶 packaging ✅; v3 variant + publish 📅 M5 | pyproject.toml, ci.yml |
@@ -58,11 +66,11 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-120 | CPython suite subsets + shrinking skip-list | ✅ runner + skiplist; suites broaden per milestone | tests/conformance |
 | R-121 | Rust unit ≥80% on L0/L1 state machines; proptests | ✅ proptests for R-037/R-053/R-073; coverage tracked in CI later | crates/core |
 | R-122 | Edge-case matrix | 🔶 half-close, backpressure water marks, abort, refused, close-with-pending, cancel races ✅ (Linux); RST/drip-feed/slowloris + Windows runs 📅 | tests/unit/test_transports.py |
-| R-123 | ASGI compliance + Starlette/FastAPI | 📅 M2 | — |
-| R-124 | Interop smoke (aiohttp/asyncpg/aiofastnet) | 🔶 uvicorn + aiohttp ✅ (Linux); asyncpg/aiofastnet 📅 M4 | tests/unit/test_interop.py |
+| R-123 | ASGI compliance + Starlette/FastAPI | ✅ real-socket suites: scope, streaming (anyio task groups), background tasks, FastAPI validation | tests/unit/test_http_engine.py |
+| R-124 | Interop smoke (aiohttp/asyncpg/aiofastnet) | 🔶 uvicorn + aiohttp ✅; aiofastnet stacked-on-cadeloop benched ✅; asyncpg 📅 M4 | tests/unit/test_interop.py, bench/ |
 | R-130 | Harness: warmups, medians, JSON baselines | ✅ | bench/harness |
 | R-131 | bombardier/rewrk/custom client; two-machine authority | 🔶 loopback echo/HTTP harness ✅ (labeled non-authoritative); two-machine + bombardier/rewrk 📅 Windows | bench/ |
-| R-132 | Comparison matrix | 📅 M1/M2 | bench |
+| R-132 | Comparison matrix | ✅ Linux subset: {cadeloop, asyncio, uvloop, rloop, rsloop, aiofastnet, aiofastnet-cadeloop} × {sched, echo, http} + cadeloop-native/hypercorn; Windows contenders (winloop) 📅 | bench |
 | R-133 | Metrics incl. ETW/VTune traces on perf PRs | 📅 M1 | bench/http/README |
 | R-140 | Structured logging; opt-in access log | 🔶 logger ✅ ("cadeloop"); ring-buffer access log 📅 M2 | loop.py |
 | R-141 | stats endpoint | 📅 M2 (config ✅) | config.py |

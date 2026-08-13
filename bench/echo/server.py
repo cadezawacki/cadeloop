@@ -26,6 +26,15 @@ class Echo(asyncio.Protocol):
 def install(kind: str):
     if kind == "asyncio":
         return
+    if kind.startswith("aiofastnet"):
+        # aiofastnet is a transport layer over a base loop (spec paragraph 17):
+        # "aiofastnet" = asyncio base; "aiofastnet-<loop>" = stacked on that loop.
+        base = kind.split("-", 1)[1] if "-" in kind else "asyncio"
+        install(base)
+        import aiofastnet
+
+        aiofastnet.install_policy()
+        return
     module = __import__(kind)  # cadeloop | uvloop | rloop | rsloop
     factory = module.new_event_loop
 

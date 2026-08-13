@@ -83,3 +83,38 @@ the PyO3 method with no Python wrapper frame. The facade supplies the
 long-tail surface: futures/tasks, executors, DNS pool + 5s cache (R-055),
 exception-handler machinery, asyncgen shutdown, and milestone-gated
 `NotImplementedError`s for I/O that hasn't landed.
+
+## The M2 native HTTP/ASGI engine (R-080..R-086)
+
+One connection = one `HttpConn` living INSIDE the transport entry
+(`ProtoKind::Http` — the same L2 state machine that runs Python
+protocols, with no `Transport` pyobj and no protocol callbacks). Data
+path per recv completion:
+
+```text
+in-cell (phase 1/translate):  llhttp feed over the recv slot
+                              -> completed Requests queue on the conn
+                              -> slot re-posted immediately
+                              -> parse error? serialize 4xx + close, done
+phase 2 (GIL, out-of-cell):   HttpPump event -> scope dict (interned keys,
+                              lifespan-state copy) -> app(scope, recv, send)
+                              stepped eagerly via PyIter_Send (R-056)
+send() (app -> wire):         validate + serialize head/body in Rust ->
+                              corked write queue (same R-035 machinery as
+                              transport writes; flushed same tick)
+```
+
+Framing is decided at the FIRST `http.response.body`: complete responses
+get `content-length`, streams get chunked (HTTP/1.1) or close-delimited
+(HTTP/1.0), caller-supplied `content-length` streams raw, HEAD suppresses
+body bytes. `date:` comes from a per-second cache; `server: cadeloop` is
+fixed (R-084).
+
+The request cycle ends when the app coroutine RETURNS (ADR-18). A request
+that never suspends allocates no Task and no Future; a suspending one
+gets an `AppTask` driver that registers itself as
+`asyncio.current_task()` while stepping (ADR-19) — this is what keeps
+Starlette/anyio task groups working on the eager path. `receive()` after
+the body has been delivered parks on a real future resolved with
+`http.disconnect` at EOF/teardown/request-end, so disconnect listeners
+never poll.

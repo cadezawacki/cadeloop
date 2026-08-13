@@ -24,6 +24,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cadeloop_core::backend::{BackendKind, RawSocket, Wakeup};
+use cadeloop_core::http::Limits;
 use cadeloop_core::netsys;
 use cadeloop_core::reactor::{Reactor, ReactorConfig};
 use cadeloop_core::ready::CrossThreadQueue;
@@ -101,15 +102,16 @@ impl CoreLoop {
 
     /// Drop graveyarded Python refs / buffers outside the state cell.
     pub(crate) fn drain_graveyards(&self, _py: Python<'_>) -> PyResult<()> {
-        let (entries, bufs, pys, timers) = self.state.with(|st| {
+        let (entries, bufs, pys, protos, timers) = self.state.with(|st| {
             (
                 std::mem::take(&mut st.net.graveyard_entries),
                 std::mem::take(&mut st.net.graveyard_bufs),
                 std::mem::take(&mut st.net.graveyard_py),
+                std::mem::take(&mut st.net.graveyard_protos),
                 st.reactor.take_graveyard(),
             )
         })?;
-        drop((entries, bufs, pys, timers));
+        drop((entries, bufs, pys, protos, timers));
         Ok(())
     }
 
@@ -312,14 +314,20 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-type Graveyards =
-    (Vec<crate::net::TransportEntry>, Vec<crate::net::WriteBuf>, Vec<Py<PyAny>>, Vec<Py<PyAny>>);
+type Graveyards = (
+    Vec<crate::net::TransportEntry>,
+    Vec<crate::net::WriteBuf>,
+    Vec<Py<PyAny>>,
+    Vec<crate::net::ProtoKind>,
+    Vec<Py<PyAny>>,
+);
 
 fn take_graveyards(st: &mut LoopState) -> Graveyards {
     (
         std::mem::take(&mut st.net.graveyard_entries),
         std::mem::take(&mut st.net.graveyard_bufs),
         std::mem::take(&mut st.net.graveyard_py),
+        std::mem::take(&mut st.net.graveyard_protos),
         st.reactor.take_graveyard(),
     )
 }
@@ -526,26 +534,52 @@ impl CoreLoop {
         start: bool,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
-        let addr: std::net::IpAddr =
-            ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
-        let sockaddr = std::net::SocketAddr::new(addr, port);
-        let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
-        let sock = netsys::create_tcp(family)?;
-        let setup = (|| -> std::io::Result<()> {
-            if reuse_addr {
-                netsys::set_reuse_addr(sock, true)?;
-            }
-            if reuse_port {
-                netsys::set_reuse_port(sock, true)?;
-            }
-            netsys::bind(sock, &netsys::build_sockaddr(sockaddr))?;
-            netsys::listen(sock, backlog)
-        })();
-        if let Err(e) = setup {
-            netsys::close(sock);
-            return Err(e.into());
+        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port)?;
+        self.listen_socket(py, sock, net::ListenerKind::Factory(factory.unbind()), accept_pool, start)
+    }
+
+    /// Bind + listen for the native HTTP/ASGI engine (M2, R-080). Every
+    /// accepted connection is parsed and answered natively; `pyloop` is
+    /// the facade loop (receive() waiters / non-eager tasks need it).
+    #[pyo3(signature = (ip, port, app, pyloop, state=None, backlog=1024, reuse_addr=true,
+                        reuse_port=false, accept_pool=64, eager=true, max_header_bytes=65536,
+                        max_headers=100, max_url=8192, max_body=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn http_listen(
+        &self,
+        py: Python<'_>,
+        ip: &str,
+        port: u16,
+        app: Bound<'_, PyAny>,
+        pyloop: Bound<'_, PyAny>,
+        state: Option<Bound<'_, PyAny>>,
+        backlog: i32,
+        reuse_addr: bool,
+        reuse_port: bool,
+        accept_pool: usize,
+        eager: bool,
+        max_header_bytes: usize,
+        max_headers: usize,
+        max_url: usize,
+        max_body: Option<usize>,
+    ) -> PyResult<(u64, Py<PyAny>, u64)> {
+        self.check_closed()?;
+        if !app.is_callable() {
+            return Err(PyTypeError::new_err("ASGI app must be callable"));
         }
-        self.listen_socket(py, sock, factory, accept_pool, start)
+        let state: Py<PyAny> = match state {
+            Some(s) if !s.is_none() => s.unbind(),
+            _ => PyDict::new(py).into_any().unbind(),
+        };
+        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port)?;
+        let kind = net::ListenerKind::Http {
+            app: app.unbind(),
+            pyloop: pyloop.unbind(),
+            state,
+            limits: Limits { max_header_bytes, max_headers, max_url, max_body },
+            eager,
+        };
+        self.listen_socket(py, sock, kind, accept_pool, true)
     }
 
     /// Adopt an existing listening socket fd (create_server(sock=...)).
@@ -559,7 +593,13 @@ impl CoreLoop {
         start: bool,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
-        self.listen_socket(py, fd as RawSocket, factory, accept_pool, start)
+        self.listen_socket(
+            py,
+            fd as RawSocket,
+            net::ListenerKind::Factory(factory.unbind()),
+            accept_pool,
+            start,
+        )
     }
 
     /// Start (or restart) accepting on a listener created with start=false.
@@ -806,7 +846,7 @@ impl CoreLoop {
         &self,
         py: Python<'_>,
         sock: RawSocket,
-        factory: Bound<'_, PyAny>,
+        kind: net::ListenerKind,
         accept_pool: usize,
         start: bool,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
@@ -818,10 +858,9 @@ impl CoreLoop {
             })
             .transpose()?
             .unwrap_or_else(|| py.None());
-        let factory: Py<PyAny> = factory.unbind();
         let lid = self.with_net(|net, reactor| -> std::io::Result<u64> {
             reactor.backend_mut().register_socket(sock)?;
-            let lid = net::listener_create(net, sock, factory, accept_pool);
+            let lid = net::listener_create(net, sock, kind, accept_pool);
             if start {
                 net::listener_start(net, reactor.backend_mut(), lid);
             }
@@ -829,4 +868,35 @@ impl CoreLoop {
         })??;
         Ok((lid, name_obj, sock as u64))
     }
+}
+
+/// Create, bind, and listen a TCP socket (shared by tcp_listen /
+/// http_listen).
+fn bind_listen_socket(
+    ip: &str,
+    port: u16,
+    backlog: i32,
+    reuse_addr: bool,
+    reuse_port: bool,
+) -> PyResult<RawSocket> {
+    let addr: std::net::IpAddr =
+        ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
+    let sockaddr = std::net::SocketAddr::new(addr, port);
+    let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
+    let sock = netsys::create_tcp(family)?;
+    let setup = (|| -> std::io::Result<()> {
+        if reuse_addr {
+            netsys::set_reuse_addr(sock, true)?;
+        }
+        if reuse_port {
+            netsys::set_reuse_port(sock, true)?;
+        }
+        netsys::bind(sock, &netsys::build_sockaddr(sockaddr))?;
+        netsys::listen(sock, backlog)
+    })();
+    if let Err(e) = setup {
+        netsys::close(sock);
+        return Err(e.into());
+    }
+    Ok(sock)
 }

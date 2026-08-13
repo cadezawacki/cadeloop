@@ -5,6 +5,7 @@ Contenders (R-132 matrix, Linux-runnable subset):
   uvicorn+<loop>   — uvicorn (h11) on {asyncio, uvloop, cadeloop, rloop, rsloop}
   hypercorn        — hypercorn on stdlib asyncio
   socketify        — socketify.py (C/uWebSockets; the reference ceiling)
+  cadeloop-native  — cadeloop.serve(): the M2 native llhttp/ASGI engine
 """
 
 import argparse
@@ -17,7 +18,15 @@ def install_loop(kind: str):
     if kind == "asyncio":
         return
     import asyncio
+    if kind.startswith("aiofastnet"):
+        # aiofastnet is a transport layer over a base loop (spec paragraph 17):
+        # "aiofastnet" = asyncio base; "aiofastnet-<loop>" = stacked on that loop.
+        base = kind.split("-", 1)[1] if "-" in kind else "asyncio"
+        install_loop(base)
+        import aiofastnet
 
+        aiofastnet.install_policy()
+        return
     module = __import__(kind)  # cadeloop | uvloop | rloop | rsloop
     factory = module.new_event_loop
 
@@ -30,12 +39,21 @@ def install_loop(kind: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server", required=True, choices=["uvicorn", "hypercorn", "socketify"])
+    parser.add_argument(
+        "--server",
+        required=True,
+        choices=["uvicorn", "hypercorn", "socketify", "cadeloop-native"],
+    )
     parser.add_argument("--loop", default="asyncio")
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
 
-    if args.server == "uvicorn":
+    if args.server == "cadeloop-native":
+        import cadeloop
+
+        print(f"READY {args.port}", flush=True)
+        cadeloop.serve(app, "127.0.0.1", args.port)
+    elif args.server == "uvicorn":
         import uvicorn
 
         install_loop(args.loop)

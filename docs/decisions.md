@@ -100,3 +100,52 @@ R-059 explicitly allows "a compatibility path built on ssl.MemoryBIO in
 Python (correctness first)" — that is asyncio.sslproto.SSLProtocol over
 our transports, exactly uvloop's approach. HTTPS works today; the native
 OpenSSL-BIO engine remains the M4 performance item.
+
+## ADR-16: pyo3 freelist rejected after measurement
+rsloop uses `#[pyclass(freelist=1024)]` on its handle types. Measured
+here, pyo3's freelist LOCKS (a `parking_lot`-style mutex on every
+alloc/dealloc): call_soon went 343ns → 781ns. Reverted; plain mimalloc
+allocation wins. Lesson recorded because the flag looks like a free win.
+
+## ADR-17: HTTP parsing is llhttp-in-cell; ASGI dispatch is phase 2
+The M2 engine parses inside the state cell (vendored llhttp 9.2.1,
+strict mode, C + Rust accumulators — no Python execution, satisfying the
+gil_boundary contract) and queues completed requests. Python runs only in
+phase 2: scope dict, app coroutine, send/receive. Response bytes are
+serialized in Rust and enter the same corked write queue as transport
+writes (R-035/R-084), so the wire path materializes zero Python objects.
+Malformed input never reaches Python at all (R-086: 400/413/414/431
+answered in-cell).
+
+## ADR-18: A request finishes when its app coroutine returns
+Not when the response completes. Consequences: (a) post-response code —
+Starlette BackgroundTask — runs before the next pipelined request, same
+serialization uvicorn provides; (b) the pipelined pump stays iterative
+(step never re-enters the pump, so a burst of N sync requests costs no
+recursion); (c) response-completion bookkeeping needs no per-request
+sequence numbers. The cost — a slow background task delays the next
+request on THAT connection — matches uvicorn's observable behavior.
+
+## ADR-19: Eager AppTask registers as asyncio.current_task()
+The R-056 eager path steps app coroutines without allocating asyncio
+Tasks. anyio (Starlette's task groups, StreamingResponse) weakrefs and
+interrogates `current_task()` — with None it crashes. AppTask therefore
+calls `_asyncio._enter_task`/`_leave_task` around every step and exposes
+the Task surface anyio touches (weakref slot, cancel→awaited-future
+forwarding, done/get_loop/get_name/uncancel/cancelling). Verified against
+Starlette streaming + background tasks. `eager_tasks=False` remains the
+full-fidelity escape hatch (§16).
+
+## ADR-20: aiofastnet findings — stacked transports beat proactor emulation
+aiofastnet (Cython transports patched onto any base loop via add_reader)
+was benched standalone AND stacked on cadeloop. On echo-rtt the stack
+"aiofastnet-cadeloop" beat cadeloop's own native transports by ~12%
+(42.8K vs 38.3K msg/s): on the epoll dev backend, a reader-callback
+transport recv()s inline in the poll tick, while our proactor emulation
+pays a completion-slot repost hop. Two conclusions recorded: (1) the M2
+native HTTP engine bypasses that hop entirely (parse happens on the recv
+completion in-cell); (2) an inline-recv-on-readable fast path for the
+epoll backend is queued as M2.5 — it does not affect Windows/IOCP, where
+completions are the native kernel interface, and it validates that
+cadeloop's scheduler core composes: aiofastnet-on-cadeloop was the
+fastest non-native stack measured.

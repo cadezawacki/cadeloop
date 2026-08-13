@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod buffers;
+pub mod http;
 pub mod netsys;
 pub mod opslab;
 pub mod reactor;

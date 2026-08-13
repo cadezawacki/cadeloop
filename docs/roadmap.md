@@ -33,16 +33,42 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [ ] Echo ≥1.15x winloop on two-machine Windows hardware (the M1 gate,
       R-131 — cannot be measured from this Linux environment)
 
-## M2 — HTTP/ASGI engine; plaintext ≥2.0x uvicorn+winloop
+## M2 — HTTP/ASGI engine (Linux-verified; ≥2.0x gate beaten at 5x)
 
-- [ ] Vendored llhttp in strict mode (R-080), limits enforced
-- [ ] ASGI 3.0 scope/lifespan (R-081), header interning (R-082), scope
-      reuse opt-in (R-083), Date cache + gather-write responses (R-084),
-      keep-alive pipelined-drain (R-085), error paths (R-086)
-- [ ] Eager task fast path (R-056): zero-Task completions on 3.11 via
-      `PyIter_Send` stepping; `cfg.eager_tasks` escape hatch (§16)
-- [ ] gc.freeze warmup policy (R-075)
-- [ ] Starlette/FastAPI real-socket suites green (R-123)
+- [x] Vendored llhttp 9.2.1 in strict mode (R-080), limits enforced
+      in-callback (414/431/413), malformed answered fully in-cell (R-086)
+- [x] ASGI 3.0 scope (R-081) built natively: interned methods/keys
+      (R-082), percent-decoded path w/ latin-1 fallback, lifespan state
+      shallow-copied per scope; lifespan protocol in the facade
+      (uvicorn-style `auto`)
+- [x] Native response assembly (R-084): head buffered until the first
+      body chunk decides content-length vs chunked framing; per-second
+      Date cache; `server: cadeloop`; HEAD body suppression; HTTP/1.0
+      close-delimited streaming
+- [x] Keep-alive + strict pipelined ordering, iterative pump (R-085)
+- [x] Eager task fast path (R-056): `PyIter_Send` stepping, zero
+      Tasks/Futures for non-suspending requests, singleton completed
+      awaitable; suspensions get an `AppTask` registered via
+      `_enter_task` so `asyncio.current_task()`/anyio task groups work
+      (Starlette StreamingResponse + BackgroundTask verified);
+      `cfg.eager_tasks=False` stdlib-Task escape hatch (§16)
+- [x] receive() disconnect futures (no busy-wait disconnect listeners)
+- [x] gc.freeze at post-startup (R-075; per-request warmup counter TBD)
+- [x] Starlette/FastAPI real-socket suites green (R-123)
+- [x] Loopback plaintext: 35.1K req/s vs uvicorn+uvloop 6.7K (~5x) — the
+      authoritative ≥2.0x uvicorn+winloop gate still needs Windows
+      hardware (R-131)
+- [ ] Request-line/keep-alive idle timeouts (R-080 timers; config wired)
+- [ ] Access log (R-140) on the native engine
+
+## M2.5 — transport-layer follow-ups (from competitive analysis)
+
+- [ ] Inline-recv-on-readable for the epoll dev backend: aiofastnet's
+      reader-callback transports stacked ON cadeloop beat our
+      proactor-emulation recv path by ~12% on echo-rtt — recv directly in
+      the poll tick when a parked completion fires, skipping the
+      slot-repost hop (Windows IOCP is unaffected; completions are native
+      there)
 
 ## M3 — RIO backend; latency targets; multi-worker
 
