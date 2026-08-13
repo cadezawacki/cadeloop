@@ -1,4 +1,4 @@
-# cadeloop Windows validation — one-shot orchestrator (v3).
+﻿# cadeloop Windows validation -- one-shot orchestrator (v3).
 #
 # v3: pins Python to the REPO'S .venv (creating it with Python 3.11 if
 # missing) so a stray system interpreter can never hijack the run (the
@@ -26,7 +26,7 @@ if (-not (Test-Path $PY)) {
 }
 $ver = & $PY -c "import sys; print('%d.%d' % sys.version_info[:2])"
 if ($ver -ne "3.11") {
-    Write-Host "FATAL: .venv python reports $ver — need 3.11 (delete .venv and install Python 3.11)" -ForegroundColor Red
+    Write-Host "FATAL: .venv python reports $ver -- need 3.11 (delete .venv and install Python 3.11)" -ForegroundColor Red
     exit 1
 }
 Write-Host "using $PY (Python $ver)" -ForegroundColor Green
