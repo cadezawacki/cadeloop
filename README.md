@@ -39,7 +39,7 @@ the winloop gates riding on Windows CI/hardware. Full R-xxx map:
 |---|---|
 | Scheduling (call_soon, timers, threadsafe, tasks) | ✅ tested |
 | TCP transports, `create_server`/`create_connection`, streams | ✅ tested (Linux/epoll; Windows/IOCP compile-verified) |
-| TLS (`ssl=` / `start_tls`) | ✅ via stdlib sslproto (native engine M4) |
+| TLS: native termination on the engine (`serve(ssl=...)`, https/wss) | ✅ tested (Rust-driven `wrap_bio` memory-BIO; client `ssl=`/`start_tls` via stdlib sslproto) |
 | `sock_*`, `add_reader`/`add_writer`, signals (SIGINT/SIGBREAK incl. idle-park delivery) | ✅ tested |
 | Drop-in: uvicorn (HTTP/1.1), aiohttp | ✅ interop-tested |
 | Native HTTP/1.1 + ASGI engine (`cadeloop.serve`, CLI, lifespan) | ✅ tested (Starlette/FastAPI, keep-alive/pipelining, chunked, limits, R-080 timeouts, access log) |
@@ -47,7 +47,7 @@ the winloop gates riding on Windows CI/hardware. Full R-xxx map:
 | UDP datagram endpoints (`create_datagram_endpoint`) | ✅ tested (native recv_from/send_to on both backends) |
 | Multi-worker (`--workers N`) | ✅ tested (fork + SO_REUSEPORT on POSIX; spawn + shared listener — WSADuplicateSocketW on Windows, fd-passing e2e test) |
 | RIO backend (`backend="rio"`: CQ/RQ, registered buffers, staging) | 🔶 implemented; blocked by an OS-level RIO failure on the test machine (Win11 beta 26200) — `auto` stays IOCP; see Windows benchmarks |
-| Native TLS · subprocess/pipes · native `loop.sendfile` | M4 (stdlib fallback ✅) · M5 · M1-Windows |
+| Subprocess/pipes · native `loop.sendfile` | M5 · M1-Windows |
 
 ## Benchmarks (Linux, loopback)
 

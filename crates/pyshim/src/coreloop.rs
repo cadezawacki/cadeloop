@@ -614,7 +614,7 @@ impl CoreLoop {
     #[pyo3(signature = (ip, port, app, pyloop, state=None, backlog=1024, reuse_addr=true,
                         reuse_port=false, accept_pool=64, eager=true, max_header_bytes=65536,
                         max_headers=100, max_url=8192, max_body=None,
-                        request_line_timeout=5.0, keepalive_idle=75.0))]
+                        request_line_timeout=5.0, keepalive_idle=75.0, tls=None))]
     #[allow(clippy::too_many_arguments)]
     fn http_listen(
         &self,
@@ -635,6 +635,7 @@ impl CoreLoop {
         max_body: Option<usize>,
         request_line_timeout: f64,
         keepalive_idle: f64,
+        tls: Option<Bound<'_, PyAny>>,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
         if !app.is_callable() {
@@ -656,6 +657,7 @@ impl CoreLoop {
                 head_timeout_ns: secs_to_ns(request_line_timeout),
                 idle_timeout_ns: secs_to_ns(keepalive_idle),
             },
+            tls: tls.filter(|t| !t.is_none()).map(|t| t.unbind()),
         };
         self.listen_socket(py, sock, kind, accept_pool, true)
     }
@@ -666,7 +668,7 @@ impl CoreLoop {
     /// a pre-bound socket exists. The engine owns the socket from here.
     #[pyo3(signature = (fd, app, pyloop, state=None, accept_pool=64, eager=true,
                         max_header_bytes=65536, max_headers=100, max_url=8192, max_body=None,
-                        request_line_timeout=5.0, keepalive_idle=75.0))]
+                        request_line_timeout=5.0, keepalive_idle=75.0, tls=None))]
     #[allow(clippy::too_many_arguments)]
     fn http_listen_fd(
         &self,
@@ -683,6 +685,7 @@ impl CoreLoop {
         max_body: Option<usize>,
         request_line_timeout: f64,
         keepalive_idle: f64,
+        tls: Option<Bound<'_, PyAny>>,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
         if !app.is_callable() {
@@ -703,6 +706,7 @@ impl CoreLoop {
                 head_timeout_ns: secs_to_ns(request_line_timeout),
                 idle_timeout_ns: secs_to_ns(keepalive_idle),
             },
+            tls: tls.filter(|t| !t.is_none()).map(|t| t.unbind()),
         };
         self.listen_socket(py, fd as RawSocket, kind, accept_pool, true)
     }

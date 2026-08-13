@@ -162,6 +162,8 @@ pub(crate) enum ListenerKind {
         limits: Limits,
         eager: bool,
         tuning: HttpTuning,
+        /// R-059: ssl.SSLContext for native TLS termination (None = plaintext).
+        tls: Option<Py<PyAny>>,
     },
 }
 
@@ -304,6 +306,16 @@ pub(crate) enum NetEvent {
     WsWake {
         tid: u64,
         fut: Py<PyAny>,
+    },
+    /// R-059: inbound ciphertext for a TLS connection (record processing
+    /// needs Python's _ssl, so it runs in phase 2).
+    TlsData {
+        tid: u64,
+        data: Vec<u8>,
+    },
+    /// R-059: staged plaintext awaiting encryption (see http_enqueue).
+    TlsFlush {
+        tid: u64,
     },
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
@@ -462,6 +474,32 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
 /// Queue native HTTP response bytes on a transport's corked write queue
 /// (R-035/R-084: same-tick flush via flush_list). In-cell.
 pub(crate) fn http_enqueue(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    tid: u64,
+    data: Vec<u8>,
+) {
+    if data.is_empty() {
+        return;
+    }
+    // R-059: TLS connections stage plaintext; a TlsFlush event encrypts
+    // it (needs _ssl, so phase 2) and re-enters via http_enqueue_raw.
+    if let Some(ProtoKind::Http(conn)) = net.transports.get_mut(&tid).map(|e| &mut e.proto) {
+        if let Some(tls) = conn.tls.as_mut() {
+            let first = tls.staged.is_empty();
+            tls.staged.extend_from_slice(&data);
+            if first {
+                net.events.push(NetEvent::TlsFlush { tid });
+            }
+            return;
+        }
+    }
+    http_enqueue_raw(py, net, backend, tid, data)
+}
+
+/// Bypass TLS staging: wire-ready bytes (ciphertext, or plaintext conns).
+pub(crate) fn http_enqueue_raw(
     py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
@@ -808,6 +846,16 @@ pub(crate) fn http_sweep(
 /// (`connection: close`, parse errors, app failures). In-cell.
 pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
+    // R-059: staged plaintext must reach the wire first — defer to the
+    // TlsFlush that will encrypt it.
+    if let ProtoKind::Http(conn) = &mut entry.proto {
+        if let Some(tls) = conn.tls.as_mut() {
+            if !tls.staged.is_empty() {
+                tls.close_after = true;
+                return;
+            }
+        }
+    }
     if entry.conn_lost || entry.closing {
         return;
     }
@@ -1056,7 +1104,10 @@ fn on_recv_done(
         ProtoKind::Http(conn) => {
             let ptr = net.buffers.slot_ptr(slot);
             let data = unsafe { std::slice::from_raw_parts(ptr, bytes as usize) };
-            if conn.ws.is_some() {
+            if conn.tls.is_some() {
+                // R-059: ciphertext — record processing needs _ssl (phase 2).
+                net.events.push(NetEvent::TlsData { tid, data: data.to_vec() });
+            } else if conn.ws.is_some() {
                 // R-087: WS mode — bytes go to the frame parser, not llhttp.
                 // Copied out first: ws_ingest needs &mut NetState.
                 let owned = data.to_vec();
@@ -1226,12 +1277,13 @@ pub(crate) fn dispatch_events(
                         limits: Limits,
                         eager: bool,
                         tuning: HttpTuning,
+                        tls: Option<Py<PyAny>>,
                     },
                 }
                 let action = core.with_net(|net, _| {
                     net.listeners.get(&lid).map(|l| match &l.kind {
                         ListenerKind::Factory(f) => Action::Factory(f.clone_ref(py)),
-                        ListenerKind::Http { app, pyloop, state, limits, eager, tuning } => {
+                        ListenerKind::Http { app, pyloop, state, limits, eager, tuning, tls } => {
                             Action::Http {
                                 app: app.clone_ref(py),
                                 pyloop: pyloop.clone_ref(py),
@@ -1239,6 +1291,7 @@ pub(crate) fn dispatch_events(
                                 limits: *limits,
                                 eager: *eager,
                                 tuning: *tuning,
+                                tls: tls.as_ref().map(|t| t.clone_ref(py)),
                             }
                         }
                     })
@@ -1256,9 +1309,9 @@ pub(crate) fn dispatch_events(
                             core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                         }
                     },
-                    Some(Action::Http { app, pyloop, state, limits, eager, tuning }) => {
+                    Some(Action::Http { app, pyloop, state, limits, eager, tuning, tls }) => {
                         if let Err(e) =
-                            wire_http(py, slf, sock, app, pyloop, state, limits, eager, tuning)
+                            wire_http(py, slf, sock, app, pyloop, state, limits, eager, tuning, tls)
                         {
                             core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                         }
@@ -1315,6 +1368,12 @@ pub(crate) fn dispatch_events(
                     }
                     (true, None) => {}
                 }
+            }
+            NetEvent::TlsData { tid, data } => {
+                crate::http::tls_ingest(py, slf, tid, &data)?;
+            }
+            NetEvent::TlsFlush { tid } => {
+                crate::http::tls_flush_conn(py, slf, tid)?;
             }
             NetEvent::AcceptError { err } => {
                 core.report_net_error(py, "Accept failed", os_err(py, err));
@@ -1472,6 +1531,7 @@ pub(crate) fn wire_http(
     limits: Limits,
     eager: bool,
     tuning: HttpTuning,
+    tls: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     let core = slf.get();
     let _ = netsys::set_nodelay(sock, true); // R-038
@@ -1483,21 +1543,27 @@ pub(crate) fn wire_http(
         netsys::close(sock);
         return Err(e.into());
     }
+    let tls_state = match &tls {
+        Some(ctx) => Some(Box::new(crate::http::tls_wrap(py, ctx)?)),
+        None => None,
+    };
     core.with_net(|net, reactor| {
         let tid = net.next_id();
+        let mut conn = HttpConn::new(
+            app,
+            pyloop,
+            state,
+            limits,
+            eager,
+            tuning.head_timeout_ns,
+            tuning.idle_timeout_ns,
+        );
+        conn.tls = tls_state;
         net.transports.insert(
             tid,
             TransportEntry {
                 socket: sock,
-                proto: ProtoKind::Http(Box::new(HttpConn::new(
-                    app,
-                    pyloop,
-                    state,
-                    limits,
-                    eager,
-                    tuning.head_timeout_ns,
-                    tuning.idle_timeout_ns,
-                ))),
+                proto: ProtoKind::Http(Box::new(conn)),
                 pyobj: None,
                 recv_slot: None,
                 recv_op: None,

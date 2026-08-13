@@ -111,6 +111,22 @@ pub(crate) struct HttpConn {
     pub(crate) ws_trailing: Vec<u8>,
     /// Some(_) once the connection is a WebSocket session.
     pub(crate) ws: Option<Box<WsConn>>,
+    /// R-059: Some(_) on TLS-terminated connections.
+    pub(crate) tls: Option<Box<TlsState>>,
+}
+
+/// R-059 native TLS termination: OpenSSL via the interpreter's own _ssl
+/// (SSLContext.wrap_bio over a MemoryBIO pair) driven from Rust in
+/// phase 2 — full SSLContext fidelity, zero new dependencies, and none
+/// of asyncio.sslproto's Python-side state machine. Outbound plaintext
+/// stages here; a TlsFlush event encrypts it at the wire boundary.
+pub(crate) struct TlsState {
+    pub(crate) sslobj: Py<PyAny>,
+    pub(crate) inbio: Py<PyAny>,
+    pub(crate) outbio: Py<PyAny>,
+    pub(crate) handshaking: bool,
+    pub(crate) staged: Vec<u8>,
+    pub(crate) close_after: bool,
 }
 
 /// R-087 per-connection WebSocket session state.
@@ -180,6 +196,7 @@ impl HttpConn {
             log_start_ns: 0,
             ws_trailing: Vec::new(),
             ws: None,
+            tls: None,
         }
     }
 
@@ -353,6 +370,7 @@ fn build_scope<'py>(
     local: Option<&Py<PyAny>>,
     state: &Py<PyAny>,
     ws: bool,
+    tls: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let scope = PyDict::new(py);
     if ws {
@@ -388,7 +406,15 @@ fn build_scope<'py>(
     if !ws {
         scope.set_item(intern!(py, "method"), method_obj(py, req.method))?;
     }
-    scope.set_item(intern!(py, "scheme"), if ws { intern!(py, "ws") } else { intern!(py, "http") })?;
+    scope.set_item(
+        intern!(py, "scheme"),
+        match (ws, tls) {
+            (true, true) => intern!(py, "wss"),
+            (true, false) => intern!(py, "ws"),
+            (false, true) => intern!(py, "https"),
+            (false, false) => intern!(py, "http"),
+        },
+    )?;
 
     // Split path / query, decode path (R-081: percent-decoded, UTF-8 with
     // latin-1 fallback).
@@ -811,6 +837,221 @@ fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
 // request pump + completion handling (R-056, R-085)                     //
 // --------------------------------------------------------------------- //
 
+// --------------------------------------------------------------------- //
+// native TLS termination (R-059)                                        //
+// --------------------------------------------------------------------- //
+
+static SSL_WANT_READ: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+static SSL_WANT_WRITE: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+
+fn ssl_exc<'py>(
+    py: Python<'py>,
+    cell: &'static GILOnceCell<Py<PyAny>>,
+    name: &str,
+) -> PyResult<&'py Py<PyAny>> {
+    cell.get_or_try_init(py, || Ok(py.import("ssl")?.getattr(name)?.unbind()))
+}
+
+/// Build the per-connection SSLObject over a MemoryBIO pair (phase 2).
+pub(crate) fn tls_wrap(py: Python<'_>, ctx: &Py<PyAny>) -> PyResult<TlsState> {
+    let ssl_mod = py.import("ssl")?;
+    let inbio = ssl_mod.call_method0(intern!(py, "MemoryBIO"))?;
+    let outbio = ssl_mod.call_method0(intern!(py, "MemoryBIO"))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(intern!(py, "server_side"), true)?;
+    let sslobj =
+        ctx.bind(py).call_method(intern!(py, "wrap_bio"), (&inbio, &outbio), Some(&kwargs))?;
+    Ok(TlsState {
+        sslobj: sslobj.unbind(),
+        inbio: inbio.unbind(),
+        outbio: outbio.unbind(),
+        handshaking: true,
+        staged: Vec::new(),
+        close_after: false,
+    })
+}
+
+/// Drain the outgoing BIO onto the wire (ciphertext).
+fn tls_pump_out(py: Python<'_>, core: &CoreLoop, tid: u64, outbio: &Py<PyAny>) -> PyResult<()> {
+    let cipher: Vec<u8> = outbio.call_method0(py, intern!(py, "read"))?.extract(py)?;
+    if !cipher.is_empty() {
+        core.with_net(|net, reactor| {
+            net::http_enqueue_raw(py, net, reactor.backend_mut(), tid, cipher);
+        })?;
+    }
+    Ok(())
+}
+
+/// Inbound ciphertext for a TLS connection (phase 2, R-059): feed the
+/// incoming BIO, drive the handshake, decrypt, and hand plaintext to the
+/// HTTP/WS engine exactly as the plain recv path would.
+pub(crate) fn tls_ingest(
+    py: Python<'_>,
+    slf: &Bound<'_, CoreLoop>,
+    tid: u64,
+    data: &[u8],
+) -> PyResult<()> {
+    let core = slf.get();
+    let Some((sslobj, inbio, outbio, mut handshaking)) = core.with_net(|net, _| {
+        net.http_conn_mut(tid).and_then(|c| c.tls.as_ref()).map(|t| {
+            (
+                t.sslobj.clone_ref(py),
+                t.inbio.clone_ref(py),
+                t.outbio.clone_ref(py),
+                t.handshaking,
+            )
+        })
+    })?
+    else {
+        return Ok(());
+    };
+    inbio.call_method1(py, intern!(py, "write"), (PyBytes::new(py, data),))?;
+
+    let want_read = ssl_exc(py, &SSL_WANT_READ, "SSLWantReadError")?.bind(py);
+    let want_write = ssl_exc(py, &SSL_WANT_WRITE, "SSLWantWriteError")?.bind(py);
+    if handshaking {
+        match sslobj.call_method0(py, intern!(py, "do_handshake")) {
+            Ok(_) => {
+                handshaking = false;
+                let flush = core.with_net(|net, _| {
+                    if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
+                        t.handshaking = false;
+                        !t.staged.is_empty()
+                    } else {
+                        false
+                    }
+                })?;
+                if flush {
+                    tls_flush_conn(py, slf, tid)?;
+                }
+            }
+            Err(e)
+                if e.matches(py, want_read).unwrap_or(false)
+                    || e.matches(py, want_write).unwrap_or(false) =>
+            {
+                tls_pump_out(py, core, tid, &outbio)?;
+                return Ok(());
+            }
+            Err(_) => {
+                // Handshake failure (bad ClientHello, cert rejection,
+                // plain HTTP on a TLS port): drop the connection.
+                core.with_net(|net, reactor| {
+                    net::teardown_with(py, net, reactor.backend_mut(), tid, None);
+                })?;
+                core.drain_graveyards(py)?;
+                return Ok(());
+            }
+        }
+        tls_pump_out(py, core, tid, &outbio)?;
+    }
+    if handshaking {
+        return Ok(());
+    }
+
+    // Decrypt everything available, then feed the engine.
+    let mut plaintext: Vec<u8> = Vec::new();
+    loop {
+        match sslobj.call_method1(py, intern!(py, "read"), (65536,)) {
+            Ok(obj) => {
+                let chunk: Vec<u8> = obj.extract(py)?;
+                if chunk.is_empty() {
+                    // close_notify: orderly TLS shutdown.
+                    core.with_net(|net, reactor| {
+                        net::http_close_after_write(py, net, reactor.backend_mut(), tid);
+                    })?;
+                    break;
+                }
+                plaintext.extend_from_slice(&chunk);
+            }
+            Err(e) if e.matches(py, want_read).unwrap_or(false) => break,
+            Err(_) => {
+                core.with_net(|net, reactor| {
+                    net::teardown_with(py, net, reactor.backend_mut(), tid, None);
+                })?;
+                core.drain_graveyards(py)?;
+                return Ok(());
+            }
+        }
+    }
+    tls_pump_out(py, core, tid, &outbio)?;
+    if plaintext.is_empty() {
+        return Ok(());
+    }
+    let pump = core.with_net(|net, reactor| {
+        let backend = reactor.backend_mut();
+        let Some(conn) = net.http_conn_mut(tid) else { return false };
+        if conn.ws.is_some() {
+            ws_ingest(py, net, backend, tid, &plaintext);
+            false
+        } else {
+            match conn_feed(conn, &plaintext) {
+                Ok(pump) => pump,
+                Err(e) => {
+                    // R-086 parity: answer in-cell (staged via TLS), close.
+                    let resp = error_response(e);
+                    net::http_enqueue(py, net, backend, tid, resp);
+                    net::http_close_after_write(py, net, backend, tid);
+                    false
+                }
+            }
+        }
+    })?;
+    if pump {
+        pump_requests(py, slf, tid)?;
+    }
+    Ok(())
+}
+
+/// Encrypt staged plaintext and hand ciphertext to the write queue
+/// (phase 2, R-059). Consumes a deferred close once the stage is empty.
+pub(crate) fn tls_flush_conn(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64) -> PyResult<()> {
+    let core = slf.get();
+    let Some((sslobj, outbio, staged, close_after, handshaking)) = core.with_net(|net, _| {
+        net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()).map(|t| {
+            (
+                t.sslobj.clone_ref(py),
+                t.outbio.clone_ref(py),
+                std::mem::take(&mut t.staged),
+                t.close_after,
+                t.handshaking,
+            )
+        })
+    })?
+    else {
+        return Ok(());
+    };
+    if handshaking {
+        // Not ready: re-stage; the handshake completion re-flushes.
+        core.with_net(|net, _| {
+            if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
+                let mut back = staged;
+                back.extend_from_slice(&t.staged);
+                t.staged = back;
+            }
+        })?;
+        return Ok(());
+    }
+    if !staged.is_empty()
+        && sslobj.call_method1(py, intern!(py, "write"), (PyBytes::new(py, &staged),)).is_err()
+    {
+        core.with_net(|net, reactor| {
+            net::teardown_with(py, net, reactor.backend_mut(), tid, None);
+        })?;
+        core.drain_graveyards(py)?;
+        return Ok(());
+    }
+    tls_pump_out(py, core, tid, &outbio)?;
+    if close_after {
+        core.with_net(|net, reactor| {
+            if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
+                t.close_after = false;
+            }
+            net::http_close_after_write(py, net, reactor.backend_mut(), tid);
+        })?;
+    }
+    Ok(())
+}
+
 /// R-087: websocket.* sends (accept / send / close).
 fn ws_send(
     py: Python<'_>,
@@ -1129,11 +1370,12 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                     conn.pyloop.clone_ref(py),
                     conn.eager,
                     conn.ws.is_some(),
+                    conn.tls.is_some(),
                     bad_upgrade,
                 )
             })
         })?;
-        let Some((req, app, state, pyloop, eager, is_ws, bad_upgrade)) = next else {
+        let Some((req, app, state, pyloop, eager, is_ws, is_tls, bad_upgrade)) = next else {
             return Ok(());
         };
         if bad_upgrade {
@@ -1152,7 +1394,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         }
 
         let (peer, local) = core.with_net(|net, _| net.peer_local(py, tid))?;
-        let scope = build_scope(py, &req, peer.as_ref(), local.as_ref(), &state, is_ws)?;
+        let scope = build_scope(py, &req, peer.as_ref(), local.as_ref(), &state, is_ws, is_tls)?;
         drop(req);
 
         // Per-connection cached receive/send callables (R-083).

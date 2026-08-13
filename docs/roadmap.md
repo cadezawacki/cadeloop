@@ -123,8 +123,18 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 
 ## M4 — TLS, WebSockets, UDP, readiness hardening
 
-- [ ] Native OpenSSL memory-BIO TLS engine, stdlib SSLContext extraction +
-      MemoryBIO fallback (R-059)
+- [x] Native TLS termination (R-059): the engine drives OpenSSL through
+      the interpreter's own `SSLContext.wrap_bio` MemoryBIO pair FROM
+      RUST in phase 2 — full SSLContext fidelity, zero new dependencies,
+      none of asyncio.sslproto's Python-side machinery on the server
+      path. Outbound plaintext stages per-connection and encrypts once
+      at the wire boundary (TlsFlush); inbound records decrypt straight
+      into the native HTTP/WS engine (https/wss schemes).
+      `cadeloop.serve(ssl=ctx)` works (fork workers inherit the ctx;
+      spawn model rejects it explicitly). Client-side `ssl=` /
+      `start_tls` remain on the stdlib sslproto path (R-059's blessed
+      fallback). Tested against the stdlib client: HTTPS keep-alive,
+      WSS, plaintext-to-TLS-port drop, trustme certs
 - [x] RFC 6455 WebSockets (R-087): upgrade via llhttp pause semantics,
       handshake validation + accept-key (inline SHA-1/base64, zero new
       deps), Rust frame codec (masking, fragmentation, control frames,

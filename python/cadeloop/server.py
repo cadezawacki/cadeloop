@@ -158,7 +158,11 @@ def serve(
         access_log=access_log,
         **cfg,
     )
-    del ssl  # accepted (stable signature); native TLS engine lands in M4
+    if ssl is not None:
+        import ssl as _ssl_mod
+
+        if not isinstance(ssl, _ssl_mod.SSLContext):
+            raise TypeError(f"ssl must be an ssl.SSLContext, got {type(ssl).__name__}")
     app_spec = app if isinstance(app, str) else None
     if isinstance(app, str):
         app = load_app(app)
@@ -168,7 +172,13 @@ def serve(
     n = config.workers if config.workers > 0 else (os.cpu_count() or 1)
     if n > 1:
         if hasattr(os, "fork"):
-            return _serve_multi(app, host, port, config, n)
+            return _serve_multi(app, host, port, config, n, ssl_ctx=ssl)
+        if ssl is not None:
+            raise ValueError(
+                "workers > 1 with ssl requires the fork worker model "
+                "(an SSLContext cannot cross a spawn boundary); run one "
+                "worker or terminate TLS upstream"
+            )
         if app_spec is not None:
             # Windows spawn model (R-090): one shared listener duplicated
             # into each worker via WSADuplicateSocketW (socket.share).
@@ -180,7 +190,7 @@ def serve(
             '("module:attribute"); running a single worker',
             n,
         )
-    return _serve_single(app, host, port, config)
+    return _serve_single(app, host, port, config, ssl_ctx=ssl)
 
 
 def _serve_single(
@@ -193,6 +203,7 @@ def _serve_single(
     worker_id=None,
     listen_sock=None,
     control_reader=None,
+    ssl_ctx=None,
 ):
     """One worker: loop + lifespan + native listener (the M2 path).
 
@@ -234,6 +245,7 @@ def _serve_single(
                 max_body=config.max_body,
                 request_line_timeout=config.request_line_timeout,
                 keepalive_idle=config.keepalive_idle,
+                tls=ssl_ctx,
             )
         else:
             lid, bound, _fd = loop._core.http_listen(
@@ -251,6 +263,7 @@ def _serve_single(
                 max_body=config.max_body,
                 request_line_timeout=config.request_line_timeout,
                 keepalive_idle=config.keepalive_idle,
+                tls=ssl_ctx,
             )
         if control_reader is not None:
             threading.Thread(
@@ -356,7 +369,7 @@ _CRASH_STREAK_LIMIT = 5
 _CRASH_FAST_SECS = 1.0
 
 
-def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int) -> int:
+def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=None) -> int:
     pid = os.fork()
     if pid != 0:
         return pid
@@ -374,7 +387,7 @@ def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int) -> int:
                 os.sched_setaffinity(0, {idx % ncpu})
             except OSError:
                 pass
-        _serve_single(app, host, port, config, reuse_port=True, worker_id=idx)
+        _serve_single(app, host, port, config, reuse_port=True, worker_id=idx, ssl_ctx=ssl_ctx)
         status = 0
     except BaseException:  # noqa: BLE001 — worker death is the supervisor's signal
         logger.exception("worker %d crashed", idx)
@@ -383,7 +396,7 @@ def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int) -> int:
     return 0  # unreachable
 
 
-def _serve_multi(app, host, port, config: Config, n: int):
+def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
     """Supervisor: fork N workers each binding with SO_REUSEPORT (the
     kernel load-balances accepts), restart crashed ones (R-092), forward
     SIGTERM/SIGINT, and drain within ``config.grace`` seconds."""
@@ -396,7 +409,7 @@ def _serve_multi(app, host, port, config: Config, n: int):
     logger.info("cadeloop supervisor: %d workers on http://%s:%s", n, host, port)
     children: dict[int, tuple[int, float]] = {}  # pid -> (idx, spawn_time)
     for idx in range(n):
-        pid = _spawn_worker(app, host, port, config, idx, ncpu)
+        pid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
         children[pid] = (idx, time.monotonic())
 
     stopping = False
@@ -446,7 +459,7 @@ def _serve_multi(app, host, port, config: Config, n: int):
                 _forward(None, None)
                 continue
             logger.warning("worker %d died (status %d) — restarting", idx, status)
-            npid = _spawn_worker(app, host, port, config, idx, ncpu)
+            npid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
             children[npid] = (idx, time.monotonic())
         # Drain: give survivors `grace` seconds, then SIGKILL (R-092).
         deadline = time.monotonic() + config.grace
