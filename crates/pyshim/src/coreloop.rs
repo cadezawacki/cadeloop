@@ -194,103 +194,133 @@ impl CoreLoop {
     }
 
     /// One full tick — see module docs for the phase ordering.
+    ///
+    /// A pure-scheduling tick (no net events — the call_soon-chain shape)
+    /// enters the state cell exactly ONCE: flush + prepare + poll +
+    /// translate + batch-take all under a single claim. rloop's tick
+    /// anatomy showed the per-tick claim/release rounds are what a
+    /// queue-depth-1 chain actually benchmarks.
     fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>) -> PyResult<()> {
         let stopping = self.stopping.load(Ordering::Acquire);
-        // Phase 1: flush corked writes from last tick's callbacks, then poll.
-        let (poll_result, parked): (std::io::Result<()>, bool) = self.state.with(|st| {
-            if !st.net.flush_list.is_empty() {
-                let list = std::mem::take(&mut st.net.flush_list);
-                for tid in list {
-                    net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
-                }
-            }
-            st.reactor.prepare_tick();
-            self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
-            let timeout = if stopping || !st.net.events.is_empty() {
-                Duration::ZERO
-            } else {
-                st.reactor.poll_timeout()
-            };
-            let reactor = &mut st.reactor;
-            if timeout.is_zero() {
-                // Non-blocking reap: keeping the GIL is legal (nothing can
-                // block) and skips a save/restore of the thread state.
-                (reactor.poll(timeout), false)
-            } else {
-                // R-021: the only GIL release point; sound because `claim`
-                // guarantees no other thread can enter this state.
-                (py.allow_threads(move || reactor.poll(timeout)), true)
-            }
-        })?;
-        poll_result?;
-
-        // Ctrl-C responsiveness: a parked poll returns promptly on EINTR, so
-        // check right after it; busy (non-parked) ticks check every 64th
-        // tick (~tens of microseconds) instead of paying the call per tick.
-        let tick_no = self.tick_no.fetch_add(1, Ordering::Relaxed);
-        if parked || tick_no & 63 == 0 {
-            unsafe {
-                if ffi::PyErr_CheckSignals() != 0 {
-                    return Err(PyErr::fetch(py));
-                }
-            }
-        }
-
-        // Phase 2: translate completions in-cell; collect events/graveyards
-        // in ONE cell entry (`graveyard` items must drop out-of-cell).
-        let (events, graveyard) = self.state.with(|st| {
-            st.reactor.finish_poll_after(parked);
-            if parked {
-                self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
-            }
-            let mut comps = std::mem::take(&mut st.completions_scratch);
-            st.reactor.drain_completions(&mut comps);
-            if !comps.is_empty() {
-                net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
-                comps.clear();
-            }
-            st.completions_scratch = comps;
-            // Readiness watch callbacks join the ordinary ready queue.
-            if !st.net.ready_scratch.is_empty() {
-                let ready: Vec<Py<PyAny>> = std::mem::take(&mut st.net.ready_scratch);
-                for h in ready {
-                    st.reactor.push_ready(h);
-                }
-            }
-            (std::mem::take(&mut st.net.events), take_graveyards(st))
-        })?;
-        drop(graveyard);
-
-        // Phases 3-5 only exist when network events fired: dispatch protocol
-        // callbacks, flush the writes they corked (same tick, R-035), then
-        // dispatch teardowns produced by that flush. Writes made by plain
-        // ready callbacks (phase 6) flush at the next tick's phase 1,
-        // before any park. Pure-scheduling ticks skip all of this.
-        if !events.is_empty() {
-            net::dispatch_events(py, slf, events)?;
-            let events = self.flush_corked(py)?;
-            self.drain_graveyards(py)?;
-            if !events.is_empty() {
-                net::dispatch_events(py, slf, events)?;
-            }
-        }
-
-        // Phase 6: ready-callback batch (R-054) — taken from the cell in
-        // ONE entry (rloop/rsloop batch-swap pattern); the buffer lives in
-        // loop-thread TLS and is always drained before being parked again.
         DISPATCH_BUF.with_borrow_mut(|batch| -> PyResult<()> {
             debug_assert!(batch.is_empty());
-            self.state.with(|st| {
-                while let Some(token) = st.reactor.pop_ready_batched() {
-                    batch.push(token);
+            type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Graveyards);
+            let (poll_result, parked, events, graveyard): TickOut = self.state.with(|st| {
+                // Phase 1: flush corked writes from last tick's callbacks.
+                if !st.net.flush_list.is_empty() {
+                    let list = std::mem::take(&mut st.net.flush_list);
+                    for tid in list {
+                        net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
+                    }
                 }
+                st.reactor.prepare_tick();
+                self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
+                let timeout = if stopping || !st.net.events.is_empty() {
+                    Duration::ZERO
+                } else {
+                    st.reactor.poll_timeout()
+                };
+                let reactor = &mut st.reactor;
+                let (poll_result, parked) = if timeout.is_zero() {
+                    // Non-blocking reap: keeping the GIL is legal (nothing
+                    // can block) and skips a save/restore of thread state.
+                    (reactor.poll(timeout), false)
+                } else {
+                    // R-021: the only GIL release point; sound because
+                    // `claim` guarantees no other thread enters this state.
+                    (py.allow_threads(move || reactor.poll(timeout)), true)
+                };
+                if poll_result.is_err() {
+                    return (poll_result, parked, Vec::new(), (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                }
+                // Phase 2: translate completions (no Python execution).
+                st.reactor.finish_poll_after(parked);
+                if parked {
+                    self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
+                }
+                let mut comps = std::mem::take(&mut st.completions_scratch);
+                st.reactor.drain_completions(&mut comps);
+                if !comps.is_empty() {
+                    net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
+                    comps.clear();
+                }
+                st.completions_scratch = comps;
+                // Readiness watch callbacks join the ordinary ready queue.
+                if !st.net.ready_scratch.is_empty() {
+                    let ready: Vec<Py<PyAny>> = std::mem::take(&mut st.net.ready_scratch);
+                    for h in ready {
+                        st.reactor.push_ready(h);
+                    }
+                }
+                let events = std::mem::take(&mut st.net.events);
+                if events.is_empty() {
+                    // Pure-scheduling tick: take the dispatch batch in the
+                    // SAME cell entry (batch_left was snapshotted by
+                    // prepare_tick, so semantics match a later take).
+                    while let Some(token) = st.reactor.pop_ready_batched() {
+                        batch.push(token);
+                    }
+                }
+                (Ok(()), parked, events, take_graveyards(st))
             })?;
+            drop(graveyard);
+            poll_result?;
+
+            // Ctrl-C responsiveness: a parked poll returns promptly on
+            // EINTR, so check right after it; busy ticks check every 64th
+            // tick instead of paying the call per tick. The batch may
+            // already be filled — hand tokens back (front, reverse order)
+            // so an interrupt loses nothing and preserves FIFO.
+            let tick_no = self.tick_no.fetch_add(1, Ordering::Relaxed);
+            if parked || tick_no & 63 == 0 {
+                let interrupted = unsafe { ffi::PyErr_CheckSignals() != 0 };
+                if interrupted {
+                    let err = PyErr::fetch(py);
+                    if !batch.is_empty() {
+                        self.state.with(|st| {
+                            for token in batch.drain(..).rev() {
+                                st.reactor.unpop_ready(token);
+                            }
+                        })?;
+                    }
+                    return Err(err);
+                }
+            }
+
+            // Phases 3-5 only exist when network events fired: dispatch
+            // protocol callbacks, flush the writes they corked (same tick,
+            // R-035), then dispatch teardowns produced by that flush.
+            if !events.is_empty() {
+                net::dispatch_events(py, slf, events)?;
+                let events = self.flush_corked(py)?;
+                self.drain_graveyards(py)?;
+                if !events.is_empty() {
+                    net::dispatch_events(py, slf, events)?;
+                }
+                // The batch was not taken in-cell on this path.
+                self.state.with(|st| {
+                    while let Some(token) = st.reactor.pop_ready_batched() {
+                        batch.push(token);
+                    }
+                })?;
+            }
+
+            // Phase 6: ready-callback batch (R-054); the buffer lives in
+            // loop-thread TLS and is always emptied before being parked —
+            // a fatal error (KeyboardInterrupt/SystemExit from a callback)
+            // returns the undispatched tail to the queue front so nothing
+            // is lost and FIFO order holds across the unwind.
             let debug = self.debug.load(Ordering::Relaxed);
-            for token in batch.drain(..) {
+            let mut fatal: Option<(usize, PyErr)> = None;
+            for (idx, token) in batch.iter().enumerate() {
                 let started = debug.then(std::time::Instant::now);
-                match run_handle(py, token.bind(py))? {
-                    DispatchOutcome::Done => {}
-                    DispatchOutcome::Failed(err) => self.report_failure(py, &token, err),
+                match run_handle(py, token.bind(py)) {
+                    Ok(DispatchOutcome::Done) => {}
+                    Ok(DispatchOutcome::Failed(err)) => self.report_failure(py, token, err),
+                    Err(e) => {
+                        fatal = Some((idx, e));
+                        break;
+                    }
                 }
                 if let Some(started) = started {
                     let elapsed = started.elapsed();
@@ -303,6 +333,19 @@ impl CoreLoop {
                     }
                 }
             }
+            if let Some((idx, err)) = fatal {
+                // idx ran (and raised); everything after it goes back.
+                if idx + 1 < batch.len() {
+                    self.state.with(|st| {
+                        for token in batch.drain(idx + 1..).rev() {
+                            st.reactor.unpop_ready(token);
+                        }
+                    })?;
+                }
+                batch.clear();
+                return Err(err);
+            }
+            batch.clear();
             Ok(())
         })
     }

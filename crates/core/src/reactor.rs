@@ -136,6 +136,15 @@ impl<T> Reactor<T> {
         self.ready.push(token);
     }
 
+    /// Undo a `pop_ready_batched`: return tokens to the queue FRONT so
+    /// FIFO order survives an exceptional unwind (e.g. KeyboardInterrupt
+    /// between batch take and dispatch). Feed tokens in REVERSE pop order.
+    pub fn unpop_ready(&mut self, token: T) {
+        self.ready.push_front(token);
+        self.batch_left += 1;
+        self.stats.callbacks_dispatched = self.stats.callbacks_dispatched.saturating_sub(1);
+    }
+
     pub fn schedule_timer(&mut self, deadline: Ticks, token: T) -> Arc<TimerToken> {
         self.timers.schedule(deadline, token)
     }

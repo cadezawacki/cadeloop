@@ -47,6 +47,13 @@ impl<T> ReadyQueue<T> {
         self.queue.pop_front()
     }
 
+    /// Return an item to the FRONT (undo of `pop` — exceptional unwind
+    /// paths that must preserve FIFO order).
+    #[inline]
+    pub fn push_front(&mut self, item: T) {
+        self.queue.push_front(item);
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.queue.len()

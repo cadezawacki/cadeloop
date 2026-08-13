@@ -82,6 +82,16 @@ struct FdEntry {
     watch_r: bool,
     watch_w: bool,
     registered: bool,
+    /// Event mask currently installed in the kernel. May be a SUPERSET of
+    /// `interest()` between an op completing and its re-post (lazy disarm
+    /// — see `sync_interest`), which is what removes the per-message
+    /// `epoll_ctl` pair from steady-state connections.
+    kernel: u32,
+    /// The last recv returned less than the buffer: the socket buffer is
+    /// drained, so the next `post_recv` parks without the speculative
+    /// inline `recv` (it would EAGAIN). Mirrors the readiness-transport
+    /// pattern aiofastnet/uvloop use (ADR-20).
+    drained: bool,
 }
 
 impl FdEntry {
@@ -96,9 +106,6 @@ impl FdEntry {
         ev
     }
 
-    fn is_empty(&self) -> bool {
-        self.interest() == 0
-    }
 }
 
 struct WakeShared {
@@ -154,23 +161,39 @@ impl EpollBackend {
         })
     }
 
-    fn update_interest(&mut self, fd: RawFd) -> io::Result<()> {
-        let entry = self.fds.entry(fd).or_default();
+    /// Bring the kernel's event mask in line with `interest()`.
+    ///
+    /// `lazy=true` (op completion paths): a kernel mask that is a SUPERSET
+    /// of the interest is left stale — the transport re-posts within the
+    /// same tick, at which point desired == kernel and no `epoll_ctl` runs
+    /// at all. If nothing re-posts, the next spurious event disarms it
+    /// (`poll` calls back with `lazy=false`). This is the aiofastnet
+    /// mirror (ADR-20): steady-state connections keep one persistent
+    /// level-triggered registration instead of a DEL/ADD pair per message.
+    fn sync_interest(&mut self, fd: RawFd, lazy: bool) -> io::Result<()> {
+        let Some(entry) = self.fds.get_mut(&fd) else { return Ok(()) };
         let interest = entry.interest();
+        if interest == entry.kernel {
+            return Ok(());
+        }
+        if lazy && interest & !entry.kernel == 0 {
+            return Ok(()); // kernel is a superset: leave it armed
+        }
         let mut ev = libc::epoll_event { events: interest, u64: fd as u64 };
         if entry.registered {
             if interest == 0 {
                 cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) })?;
                 entry.registered = false;
-                if entry.is_empty() {
-                    self.fds.remove(&fd);
-                }
+                entry.kernel = 0;
+                self.fds.remove(&fd);
             } else {
                 cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) })?;
+                entry.kernel = interest;
             }
         } else if interest != 0 {
             cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) })?;
-            self.fds.get_mut(&fd).unwrap().registered = true;
+            entry.registered = true;
+            entry.kernel = interest;
         } else {
             self.fds.remove(&fd);
         }
@@ -182,7 +205,7 @@ impl EpollBackend {
         let slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
         debug_assert!(slot.is_none(), "one parked op per side per fd");
         *slot = Some(id);
-        self.update_interest(fd)?;
+        self.sync_interest(fd, false)?;
         Ok(id)
     }
 
@@ -280,17 +303,33 @@ impl EpollBackend {
         }
     }
 
-    /// Run the parked op for one side of a ready fd.
-    fn drive_side(&mut self, fd: RawFd, write_side: bool, out: &mut Vec<Completion>) {
-        let Some(entry) = self.fds.get_mut(&fd) else { return };
+    /// Run the parked op for one side of a ready fd. Returns whether the
+    /// event had a consumer (a parked op on that side), so `poll` can
+    /// lazily disarm stale kernel interest only when nothing wanted it.
+    fn drive_side(&mut self, fd: RawFd, write_side: bool, out: &mut Vec<Completion>) -> bool {
+        let Some(entry) = self.fds.get_mut(&fd) else { return false };
         let op_slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
-        let Some(id) = *op_slot else { return };
+        let Some(id) = *op_slot else { return false };
+        // Buffer size of a recv op, read before `attempt` releases the slot
+        // (feeds the drained-socket heuristic below).
+        let recv_len = self.slab.get(id).and_then(|s| match s.data.pending {
+            Pending::Recv { len, .. } => Some(len),
+            _ => None,
+        });
         if let Some((bytes, os_error)) = self.attempt(id) {
             if let Some(entry) = self.fds.get_mut(&fd) {
                 let op_slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
                 *op_slot = None;
+                // A short read means the socket buffer is drained: the next
+                // post_recv should park straight away instead of paying a
+                // speculative recv that will EAGAIN (ADR-20).
+                if let Some(len) = recv_len {
+                    entry.drained = os_error == 0 && bytes < len;
+                }
             }
-            let _ = self.update_interest(fd);
+            // Lazy: leave the kernel mask armed — the transport re-posts
+            // within this tick and the re-park then costs no epoll_ctl.
+            let _ = self.sync_interest(fd, true);
             let kind = self.slab.get(id).map(|s| s.kind);
             self.slab.complete(id);
             match kind {
@@ -299,6 +338,7 @@ impl EpollBackend {
             }
             out.push(Completion::Io { op: id, bytes, os_error });
         }
+        true
     }
 }
 
@@ -316,6 +356,19 @@ impl IoBackend for EpollBackend {
         // Registration is lazy (first parked op / watch); just enforce
         // non-blocking mode, which the completion emulation requires.
         let fd = socket as RawFd;
+        // Re-register guard, two cases sharing one rule: (a) fd-number
+        // reuse — a previous owner's lazily-kept entry outlived its close;
+        // (b) same-socket re-register (connect → attach_stream) — the
+        // connect op's lazily-kept EPOLLOUT is still armed in the kernel.
+        // Reset both views: drop the entry AND best-effort-DEL the kernel
+        // registration (ENOENT for case (a), success for case (b)) so the
+        // next park's ADD starts from a clean slate.
+        if let Some(entry) = self.fds.remove(&fd) {
+            if entry.registered {
+                let mut ev: libc::epoll_event = unsafe { zeroed() };
+                unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) };
+            }
+        }
         let flags = cvt(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
         cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
         Ok(())
@@ -360,9 +413,20 @@ impl IoBackend for EpollBackend {
             let s = self.slab.get_mut(id).unwrap();
             s.data = EpollOp { fd, pending: Pending::Recv { buf, len }, accepted: -1 };
         }
+        // Drained socket (last recv came up short): the speculative inline
+        // recv would EAGAIN — park directly. Level-triggered epoll covers
+        // the race where data arrived in between: the next poll reports it
+        // immediately (ADR-20).
+        if self.fds.get(&fd).is_some_and(|e| e.drained) {
+            return self.park(id, fd, false);
+        }
         match self.attempt(id) {
             Some((bytes, err)) => {
                 self.syscalls_saved_inline += 1;
+                if err == 0 {
+                    let entry = self.fds.entry(fd).or_default();
+                    entry.drained = bytes < len;
+                }
                 self.slab.complete(id);
                 self.slab.release(id);
                 self.inline_completions.push(Completion::Io { op: id, bytes, os_error: err });
@@ -446,7 +510,7 @@ impl IoBackend for EpollBackend {
             let op_slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
             if *op_slot == Some(op) {
                 *op_slot = None;
-                let _ = self.update_interest(fd);
+                let _ = self.sync_interest(fd, true);
             }
         }
         if is_accept && accepted >= 0 {
@@ -465,7 +529,13 @@ impl IoBackend for EpollBackend {
             entry.watch_r = readable;
             entry.watch_w = writable;
         }
-        self.update_interest(fd)
+        // Watches sync EAGERLY. Lazy removal would let an entry outlive
+        // remove_reader() + close(); when the kernel recycles the fd
+        // number, the next add_reader would see desired == stale kernel
+        // mask and silently skip the epoll_ctl the new fd needs. The lazy
+        // path is reserved for transport ops, whose teardown always
+        // detaches (removing the entry) before close.
+        self.sync_interest(fd, false)
     }
 
     fn detach_socket(&mut self, socket: RawSocket) {
@@ -542,11 +612,13 @@ impl IoBackend for EpollBackend {
                 flags & (libc::EPOLLIN as u32 | libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0;
             let write_ready =
                 flags & (libc::EPOLLOUT as u32 | libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0;
+            let mut read_used = false;
+            let mut write_used = false;
             if read_ready {
-                self.drive_side(fd, false, out);
+                read_used = self.drive_side(fd, false, out);
             }
             if write_ready {
-                self.drive_side(fd, true, out);
+                write_used = self.drive_side(fd, true, out);
             }
             // Watches: emit readiness for whatever remains watched.
             if let Some(entry) = self.fds.get(&fd) {
@@ -554,7 +626,17 @@ impl IoBackend for EpollBackend {
                 let ww = entry.watch_w && write_ready;
                 if wr || ww {
                     out.push(Completion::Ready { socket: fd as RawSocket, readable: wr, writable: ww });
+                    read_used |= wr;
+                    write_used |= ww;
                 }
+            }
+            // A side fired with no consumer: its kernel bit is stale (op
+            // completed and was never re-posted, or a watch was removed).
+            // Pay the epoll_ctl NOW to quiet it — this is the only place
+            // lazily-kept interest is torn down, so level-triggered epoll
+            // can never storm.
+            if (read_ready && !read_used) || (write_ready && !write_used) {
+                let _ = self.sync_interest(fd, false);
             }
         }
         Ok(out.len() - before)
@@ -651,6 +733,81 @@ mod tests {
         let mut got = [0u8; 5];
         client.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello");
+        unsafe { libc::close(accepted as RawFd) };
+    }
+
+    #[test]
+    fn steady_state_pingpong_keeps_lazy_interest_correct() {
+        // The ADR-20 fast path: after a parked recv completes, the next
+        // post_recv parks without a speculative syscall (drained flag) and
+        // without touching epoll_ctl (kernel mask stays armed) — and data
+        // must still be delivered reliably across many messages.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let lfd = listener.into_raw_fd();
+        let mut b = EpollBackend::new().unwrap();
+        b.register_socket(lfd as RawSocket).unwrap();
+        b.post_accept(lfd as RawSocket).unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let out = drain(&mut b, Duration::from_secs(2));
+        let accepted = match out.as_slice() {
+            [Completion::Io { op, os_error: 0, .. }] => b.take_accept_socket(*op).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        b.register_socket(accepted).unwrap();
+
+        let mut buf = [0u8; 64 * 1024];
+        let inline_before = b.syscalls_saved_inline;
+        for i in 0..50u8 {
+            let op = b.post_recv(accepted, buf.as_mut_ptr(), buf.len() as u32).unwrap();
+            client.write_all(&[i; 8]).unwrap();
+            let out = drain(&mut b, Duration::from_secs(2));
+            assert_eq!(out, vec![Completion::Io { op, bytes: 8, os_error: 0 }]);
+            assert_eq!(&buf[..8], &[i; 8]);
+        }
+        // After the first short read the drained flag suppresses every
+        // speculative inline recv: at most the very first post attempts.
+        assert!(
+            b.syscalls_saved_inline - inline_before <= 1,
+            "speculative recvs not suppressed: {}",
+            b.syscalls_saved_inline - inline_before
+        );
+        unsafe { libc::close(accepted as RawFd) };
+    }
+
+    #[test]
+    fn full_buffer_read_keeps_inline_attempt() {
+        // Streaming pattern: a read that FILLS the buffer clears the
+        // drained flag, so the next post_recv drains the socket inline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let lfd = listener.into_raw_fd();
+        let mut b = EpollBackend::new().unwrap();
+        b.register_socket(lfd as RawSocket).unwrap();
+        b.post_accept(lfd as RawSocket).unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let out = drain(&mut b, Duration::from_secs(2));
+        let accepted = match out.as_slice() {
+            [Completion::Io { op, os_error: 0, .. }] => b.take_accept_socket(*op).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        b.register_socket(accepted).unwrap();
+
+        let mut buf = [0u8; 4];
+        // Park, then send 10 bytes: first completion fills the 4-byte
+        // buffer (bytes == len -> NOT drained).
+        let op = b.post_recv(accepted, buf.as_mut_ptr(), 4).unwrap();
+        client.write_all(&[7u8; 10]).unwrap();
+        let out = drain(&mut b, Duration::from_secs(2));
+        assert_eq!(out, vec![Completion::Io { op, bytes: 4, os_error: 0 }]);
+        // Next post must complete INLINE (drained flag clear, data queued).
+        let before = b.syscalls_saved_inline;
+        let op2 = b.post_recv(accepted, buf.as_mut_ptr(), 4).unwrap();
+        assert_eq!(b.syscalls_saved_inline, before + 1, "inline attempt suppressed wrongly");
+        let out = drain(&mut b, Duration::ZERO);
+        assert_eq!(out, vec![Completion::Io { op: op2, bytes: 4, os_error: 0 }]);
         unsafe { libc::close(accepted as RawFd) };
     }
 
