@@ -266,7 +266,10 @@ def _serve_single(
         elif config.gc_mode == "disable":
             gc.collect()
             gc.disable()
-        for sig in (_signal.SIGINT, _signal.SIGTERM):
+        stop_signals = [_signal.SIGINT, _signal.SIGTERM]
+        if hasattr(_signal, "SIGBREAK"):
+            stop_signals.append(_signal.SIGBREAK)  # CTRL+BREAK (R-052)
+        for sig in stop_signals:
             try:
                 loop.add_signal_handler(sig, loop.stop)
                 installed_signals.append(sig)

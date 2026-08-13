@@ -467,3 +467,51 @@ def test_stats_shape(loop):
     ):
         assert key in stats
     assert stats["ticks"] > 0
+
+
+def test_sigint_interrupts_idle_park_promptly():
+    # R-052: with no timers scheduled the loop parks indefinitely; the
+    # run_forever wakeup fd must surface a signal immediately anyway.
+    import signal
+    import threading
+    import time as time_mod
+
+    lp = cadeloop.new_event_loop()
+    try:
+        killer = threading.Timer(0.3, signal.raise_signal, args=(signal.SIGINT,))
+        killer.start()
+        t0 = time_mod.monotonic()
+        try:
+            lp.run_forever()  # parks with NOTHING scheduled
+            raise AssertionError("run_forever returned without KeyboardInterrupt")
+        except KeyboardInterrupt:
+            pass
+        elapsed = time_mod.monotonic() - t0
+        assert elapsed < 2.0, f"SIGINT took {elapsed:.2f}s to interrupt an idle park"
+        killer.cancel()
+    finally:
+        lp.close()
+
+
+def test_signal_handler_fires_during_idle_park():
+    # A handled signal (no KeyboardInterrupt) must also wake the park and
+    # run its callback promptly (R-052).
+    import signal
+    import sys
+    import threading
+    import time as time_mod
+
+    sig = signal.SIGBREAK if sys.platform == "win32" else signal.SIGUSR1
+    lp = cadeloop.new_event_loop()
+    hits = []
+    try:
+        lp.add_signal_handler(sig, lambda: (hits.append(1), lp.stop()))
+        threading.Timer(0.3, signal.raise_signal, args=(sig,)).start()
+        t0 = time_mod.monotonic()
+        lp.run_forever()
+        elapsed = time_mod.monotonic() - t0
+        assert hits == [1]
+        assert elapsed < 2.0, f"handled signal took {elapsed:.2f}s"
+        lp.remove_signal_handler(sig)
+    finally:
+        lp.close()

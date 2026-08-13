@@ -40,8 +40,6 @@ _MILESTONES = {
     "milestone M1 and is hardened in M4 (R-057)",
     "subprocess": "subprocess support is gated behind "
     "Config(enable_subprocess=True) and arrives in milestone M5 (R-051)",
-    "signals": "add_signal_handler (SIGINT/SIGBREAK via "
-    "SetConsoleCtrlHandler) arrives with the Windows-native layer (R-052)",
     "sendfile": "loop.sendfile (TransmitFile, R-036) arrives in milestone M1",
 }
 
@@ -146,11 +144,65 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             finalizer=self._asyncgen_finalizer_hook,
         )
         events._set_running_loop(self)
+        wakeup = self._install_signal_wakeup()
         try:
             self._core.run_forever()
         finally:
+            self._remove_signal_wakeup(wakeup)
             events._set_running_loop(None)
             sys.set_asyncgen_hooks(*old_agen_hooks)
+
+    def _install_signal_wakeup(self):
+        """R-052: CPython's C-level signal handler writes one byte to the
+        wakeup fd; watching the read end makes a parked kernel poll return
+        immediately, so CTRL+C interrupts an idle loop at once. This is
+        the proactor CTRL+C fix on Windows, and on POSIX it also closes
+        the race of a signal landing between the tick's signal check and
+        the park. Main thread only (set_wakeup_fd's own rule)."""
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        import signal as signal_module
+
+        try:
+            rsock, csock = socket.socketpair()
+            rsock.setblocking(False)
+            csock.setblocking(False)
+            old_fd = signal_module.set_wakeup_fd(csock.fileno(), warn_on_full_buffer=False)
+        except (ValueError, OSError, AttributeError):
+            return None
+
+        def drain():
+            try:
+                while rsock.recv(4096):
+                    pass
+            except (BlockingIOError, InterruptedError, OSError):
+                pass
+
+        try:
+            self._core.add_reader(rsock.fileno(), drain)
+        except OSError:
+            signal_module.set_wakeup_fd(old_fd)
+            rsock.close()
+            csock.close()
+            return None
+        return (rsock, csock, old_fd)
+
+    def _remove_signal_wakeup(self, wakeup):
+        if wakeup is None:
+            return
+        import signal as signal_module
+
+        rsock, csock, old_fd = wakeup
+        try:
+            self._core.remove_reader(rsock.fileno())
+        except OSError:
+            pass
+        try:
+            signal_module.set_wakeup_fd(old_fd)
+        except (ValueError, OSError):
+            pass
+        rsock.close()
+        csock.close()
 
     def run_until_complete(self, future):
         self._check_closed()
@@ -460,14 +512,20 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
 
     def add_signal_handler(self, sig, callback, *args):
-        """POSIX implementation. The signal interrupts the kernel poll
-        (EINTR); the tick's PyErr_CheckSignals runs this Python-level
-        handler, which enqueues the callback thread-safely. Windows
-        (SetConsoleCtrlHandler, R-052) arrives with M4."""
-        if sys.platform == "win32":
-            _not_yet("add_signal_handler()", "signals")
+        """R-052. The Python-level handler runs on the main thread once
+        the parked poll wakes (the run_forever wakeup fd guarantees that
+        promptly) and enqueues the callback thread-safely. On Windows the
+        deliverable console signals are SIGINT (CTRL+C) and SIGBREAK
+        (CTRL+BREAK); SIGTERM is accepted for artificial delivery
+        (os.kill / raise_signal) like CPython itself."""
         import signal as signal_module
 
+        if sys.platform == "win32":
+            allowed = {signal_module.SIGINT, signal_module.SIGTERM}
+            if hasattr(signal_module, "SIGBREAK"):
+                allowed.add(signal_module.SIGBREAK)
+            if sig not in allowed:
+                raise ValueError(f"signal {sig!r} not supported on this platform")
         if (
             asyncio.iscoroutine(callback)
             or asyncio.iscoroutinefunction(callback)
@@ -486,8 +544,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         signal_module.signal(sig, _dispatch)
 
     def remove_signal_handler(self, sig):
-        if sys.platform == "win32":
-            _not_yet("remove_signal_handler()", "signals")
         import signal as signal_module
 
         if sig not in self._signal_handlers:
