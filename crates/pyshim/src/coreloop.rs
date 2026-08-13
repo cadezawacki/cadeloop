@@ -199,10 +199,12 @@ impl CoreLoop {
 
         let stopping = self.stopping.load(Ordering::Acquire);
         // Phase 1: flush corked writes from last tick's callbacks, then poll.
-        let poll_result: std::io::Result<()> = self.state.with(|st| {
-            let list = std::mem::take(&mut st.net.flush_list);
-            for tid in list {
-                net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
+        let (poll_result, parked): (std::io::Result<()>, bool) = self.state.with(|st| {
+            if !st.net.flush_list.is_empty() {
+                let list = std::mem::take(&mut st.net.flush_list);
+                for tid in list {
+                    net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
+                }
             }
             st.reactor.prepare_tick();
             self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
@@ -212,40 +214,55 @@ impl CoreLoop {
                 st.reactor.poll_timeout()
             };
             let reactor = &mut st.reactor;
-            // R-021: the only GIL release point; sound because `claim`
-            // guarantees no other thread can enter this state.
-            py.allow_threads(move || reactor.poll(timeout))
+            if timeout.is_zero() {
+                // Non-blocking reap: keeping the GIL is legal (nothing can
+                // block) and skips a save/restore of the thread state.
+                (reactor.poll(timeout), false)
+            } else {
+                // R-021: the only GIL release point; sound because `claim`
+                // guarantees no other thread can enter this state.
+                (py.allow_threads(move || reactor.poll(timeout)), true)
+            }
         })?;
         poll_result?;
 
-        // Phase 2: translate completions in-cell; collect events/graveyards.
-        let events: Vec<NetEvent> = self.state.with(|st| {
-            st.reactor.finish_poll();
-            self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
+        // Phase 2: translate completions in-cell; collect events/graveyards
+        // in ONE cell entry (`graveyard` items must drop out-of-cell).
+        let (events, graveyard) = self.state.with(|st| {
+            st.reactor.finish_poll_after(parked);
+            if parked {
+                self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
+            }
             let mut comps = std::mem::take(&mut st.completions_scratch);
             st.reactor.drain_completions(&mut comps);
-            net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
-            comps.clear();
+            if !comps.is_empty() {
+                net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
+                comps.clear();
+            }
             st.completions_scratch = comps;
             // Readiness watch callbacks join the ordinary ready queue.
-            let ready: Vec<Py<PyAny>> = std::mem::take(&mut st.net.ready_scratch);
-            for h in ready {
-                st.reactor.push_ready(h);
+            if !st.net.ready_scratch.is_empty() {
+                let ready: Vec<Py<PyAny>> = std::mem::take(&mut st.net.ready_scratch);
+                for h in ready {
+                    st.reactor.push_ready(h);
+                }
             }
-            std::mem::take(&mut st.net.events)
+            (std::mem::take(&mut st.net.events), take_graveyards(st))
         })?;
-        self.drain_graveyards(py)?;
+        drop(graveyard);
 
-        // Phase 3: protocol callbacks.
+        // Phases 3-5 only exist when network events fired: dispatch protocol
+        // callbacks, flush the writes they corked (same tick, R-035), then
+        // dispatch teardowns produced by that flush. Writes made by plain
+        // ready callbacks (phase 6) flush at the next tick's phase 1,
+        // before any park. Pure-scheduling ticks skip all of this.
         if !events.is_empty() {
             net::dispatch_events(py, slf, events)?;
-        }
-
-        // Phase 4+5: flush writes corked by those callbacks, same tick.
-        let events = self.flush_corked(py)?;
-        self.drain_graveyards(py)?;
-        if !events.is_empty() {
-            net::dispatch_events(py, slf, events)?;
+            let events = self.flush_corked(py)?;
+            self.drain_graveyards(py)?;
+            if !events.is_empty() {
+                net::dispatch_events(py, slf, events)?;
+            }
         }
 
         // Phase 6: ready-callback batch (R-054).
@@ -271,6 +288,18 @@ impl CoreLoop {
         }
         Ok(())
     }
+}
+
+type Graveyards =
+    (Vec<crate::net::TransportEntry>, Vec<crate::net::WriteBuf>, Vec<Py<PyAny>>, Vec<Py<PyAny>>);
+
+fn take_graveyards(st: &mut LoopState) -> Graveyards {
+    (
+        std::mem::take(&mut st.net.graveyard_entries),
+        std::mem::take(&mut st.net.graveyard_bufs),
+        std::mem::take(&mut st.net.graveyard_py),
+        st.reactor.take_graveyard(),
+    )
 }
 
 fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {

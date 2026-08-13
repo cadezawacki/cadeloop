@@ -243,10 +243,16 @@ impl<T> Reactor<T> {
     /// fire timers that expired while parked, and snapshot the dispatch
     /// batch.
     ///
-    /// Returns I/O completions for the transport layer (empty pre-M1).
-    pub fn finish_poll(&mut self) -> &[Completion] {
+    /// `parked` = the poll may have blocked: refresh the tick clock so
+    /// timers fired below use post-park time. A zero-timeout poll keeps
+    /// `prepare_tick`'s timestamp — R-061 requires (at least) one refresh
+    /// per tick, and skipping the redundant read saves a clock syscall on
+    /// the hot path.
+    pub fn finish_poll_after(&mut self, parked: bool) -> &[Completion] {
         self.stats.completions += self.completions.len() as u64;
-        self.clock.refresh();
+        if parked {
+            self.clock.refresh();
+        }
         self.absorb_cancellations();
         self.drain_xthread();
         self.fire_expired_timers();
@@ -254,6 +260,10 @@ impl<T> Reactor<T> {
         self.ready_snapshot = self.ready.len();
         self.batch_left = batch;
         &self.completions
+    }
+
+    pub fn finish_poll(&mut self) -> &[Completion] {
+        self.finish_poll_after(true)
     }
 
     /// Copy this tick's completions out (transport translation happens in

@@ -33,6 +33,10 @@ def make_loop(kind: str):
         import rloop
 
         return rloop.new_event_loop()
+    if kind == "rsloop":
+        import rsloop
+
+        return rsloop.new_event_loop()
     raise SystemExit(f"unknown loop kind: {kind}")
 
 
@@ -146,6 +150,58 @@ def bench_threadsafe_throughput(loop, n):
     return n, dt
 
 
+def bench_future_chain(loop, n):
+    """Future set_result -> await chain: one pending future at a time."""
+
+    async def main():
+        for _ in range(n):
+            fut = loop.create_future()
+            loop.call_soon(fut.set_result, None)
+            await fut
+
+    t0 = time.perf_counter()
+    loop.run_until_complete(main())
+    return n, time.perf_counter() - t0
+
+
+def bench_gather_fanin(loop, n):
+    """gather() over many tiny coroutines (fan-out/fan-in bookkeeping)."""
+
+    async def child():
+        await asyncio.sleep(0)
+
+    async def main():
+        for _ in range(n // 1000):
+            await asyncio.gather(*[child() for _ in range(1000)])
+
+    t0 = time.perf_counter()
+    loop.run_until_complete(main())
+    return (n // 1000) * 1000, time.perf_counter() - t0
+
+
+def bench_queue_pingpong(loop, n):
+    """asyncio.Queue producer/consumer pair (wakeup-heavy pattern)."""
+
+    async def main():
+        q = asyncio.Queue(maxsize=64)
+
+        async def producer():
+            for i in range(n):
+                await q.put(i)
+            await q.put(None)
+
+        async def consumer():
+            while True:
+                if await q.get() is None:
+                    return
+
+        await asyncio.gather(producer(), consumer())
+
+    t0 = time.perf_counter()
+    loop.run_until_complete(main())
+    return n, time.perf_counter() - t0
+
+
 BENCHES = {
     "call_soon_chain": (bench_call_soon_chain, 200_000),
     "call_soon_burst": (bench_call_soon_burst, 200_000),
@@ -154,6 +210,9 @@ BENCHES = {
     "sleep0_chain": (bench_sleep0_chain, 100_000),
     "task_spawn": (bench_task_spawn, 20_000),
     "threadsafe_throughput": (bench_threadsafe_throughput, 50_000),
+    "future_chain": (bench_future_chain, 100_000),
+    "gather_fanin": (bench_gather_fanin, 50_000),
+    "queue_pingpong": (bench_queue_pingpong, 100_000),
 }
 
 

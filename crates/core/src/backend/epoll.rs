@@ -501,6 +501,15 @@ impl IoBackend for EpollBackend {
                 None => 0,
             }
         };
+        // Fast path: a zero-timeout poll with no fds registered and no
+        // pending wakeup has nothing to discover — skip the epoll_wait
+        // syscall entirely. This keeps pure-scheduling ticks (call_soon
+        // chains, timer cascades) at userspace-only cost; the cross-thread
+        // queue is drained by the reactor regardless, and `armed` covers
+        // the eventfd (a Wakeup completion carries no payload).
+        if timeout_ms == 0 && self.fds.is_empty() && !self.wake.armed.load(Ordering::Acquire) {
+            return Ok(out.len() - before);
+        }
         let n = loop {
             let rc = unsafe {
                 libc::epoll_wait(self.epfd, self.events.as_mut_ptr(), self.events.len() as i32, timeout_ms)
