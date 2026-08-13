@@ -104,6 +104,10 @@ def fmt(v):
     return f"{v:.2f}"
 
 
+def fmt_tick(v):
+    return f"{v:g}"
+
+
 def ticks_for(vmax, n=5):
     import math
 
@@ -141,8 +145,12 @@ def chart_speedup(sched, mode, story="cadeloop"):
                 data[b][l] = s
                 vmax = max(vmax, s)
 
-    tks = ticks_for(vmax * 1.06)
-    scale = plot_w / tks[-1]
+    # Cap the axis so one outlier group cannot squash every other group;
+    # clamped bars carry their true value as a label.
+    axis_cap = 8.0
+    capped = min(vmax * 1.06, axis_cap)
+    tks = [i * 2.0 for i in range(int(capped / 2) + 1)] if capped > 4 else ticks_for(capped)
+    scale = plot_w / max(tks[-1], 1e-9)
     out = svg_open(w, h, ink)
     out.append(
         f'<text x="20" y="28" font-size="15" font-weight="600" fill="{ink["primary"]}">'
@@ -157,7 +165,7 @@ def chart_speedup(sched, mode, story="cadeloop"):
         )
         out.append(
             f'<text x="{x:.1f}" y="{h - 20}" font-size="11" fill="{ink["muted"]}" '
-            f'text-anchor="middle">{fmt(t)}x</text>'
+            f'text-anchor="middle">{fmt_tick(t)}x</text>'
         )
     # 1x reference (the stdlib baseline).
     x1 = left + 1.0 * scale
@@ -165,7 +173,7 @@ def chart_speedup(sched, mode, story="cadeloop"):
         f'<line x1="{x1:.1f}" y1="{top}" x2="{x1:.1f}" y2="{h - 36}" stroke="{ink["axis"]}" stroke-width="1.5"/>'
     )
     out.append(
-        f'<text x="{x1:.1f}" y="{top - 6}" font-size="10.5" fill="{ink["muted"]}" '
+        f'<text x="{x1:.1f}" y="{h - 6}" font-size="10.5" fill="{ink["muted"]}" '
         f'text-anchor="middle">asyncio = 1x</text>'
     )
 
@@ -181,10 +189,19 @@ def chart_speedup(sched, mode, story="cadeloop"):
             if s is None:
                 y += BAR + GAP
                 continue
-            out.append(hbar(left, y, s * scale, series_color(mode, l), ink["surface"]))
-            if l == story:
+            clamped = s > tks[-1]
+            drawn = min(s, tks[-1])
+            out.append(hbar(left, y, drawn * scale, series_color(mode, l), ink["surface"]))
+            if clamped:
+                # Off-scale bar: chevron + true value (never silently clip).
+                tip = left + drawn * scale
                 out.append(
-                    f'<text x="{left + s * scale + 6:.1f}" y="{y + BAR - 4}" font-size="11" '
+                    f'<text x="{tip + 4:.1f}" y="{y + BAR - 4}" font-size="11" '
+                    f'font-weight="600" fill="{ink["primary"]}">&#187; {fmt(s)}x</text>'
+                )
+            elif l == story:
+                out.append(
+                    f'<text x="{left + drawn * scale + 6:.1f}" y="{y + BAR - 4}" font-size="11" '
                     f'font-weight="600" fill="{ink["primary"]}">{fmt(s)}x</text>'
                 )
             y += BAR + GAP
@@ -201,10 +218,10 @@ def chart_two_panel(title, entries, left_metric, right_metric, mode):
     entity, value labels on every bar (few bars)."""
     ink = INK[mode]
     names = [n for n, _ in entries]
-    panel_w, lab_w = 300, 150
+    panel_w, lab_w, val_w = 300, 150, 96
     top = 64
     h = top + len(names) * (BAR + 10) + 46
-    w = 2 * (lab_w + panel_w) + 60
+    w = 2 * (lab_w + panel_w + val_w) + 40
 
     out = svg_open(w, h, ink)
     out.append(
@@ -227,7 +244,7 @@ def chart_two_panel(title, entries, left_metric, right_metric, mode):
             )
             parts.append(
                 f'<text x="{x:.1f}" y="{h - 22}" font-size="10.5" fill="{ink["muted"]}" '
-                f'text-anchor="middle">{fmt(t)}</text>'
+                f'text-anchor="middle">{fmt_tick(t)}</text>'
             )
         y = top + 6
         for n in names:
@@ -252,27 +269,24 @@ def chart_two_panel(title, entries, left_metric, right_metric, mode):
         return parts
 
     out += panel(0, "thr", *left_metric)
-    out += panel(lab_w + panel_w + 60, "p99", *right_metric)
+    out += panel(lab_w + panel_w + val_w + 40, "p99", *right_metric)
     out.append("</svg>")
     return "\n".join(out), w, h
 
 
 def build_two_panel(results_json, thr_key, thr_scale, title, thr_header, thr_unit, mode):
-    entries = []
-    for name, e in results_json["results"].items():
-        if e is None:
-            entries.append((name, None))
-        else:
-            entries.append(
-                (name, {"thr": e[thr_key] / thr_scale, "p99": e["median_p99_us"] / 1000.0})
-            )
-    entries = [(n, m) for n, m in entries if m]
+    raw = [(n, e) for n, e in results_json["results"].items() if e]
+    use_ms = any(e["median_p99_us"] >= 1000 for _n, e in raw)
+    div, unit = (1000.0, "ms") if use_ms else (1.0, "us")
+    entries = [
+        (n, {"thr": e[thr_key] / thr_scale, "p99": e["median_p99_us"] / div}) for n, e in raw
+    ]
     entries.sort(key=lambda x: -x[1]["thr"])
     return chart_two_panel(
         title,
         entries,
         (thr_header, thr_unit, "higher is better"),
-        ("p99 latency", "ms", "lower is better"),
+        ("p99 latency", unit, "lower is better"),
         mode,
     )
 
@@ -281,6 +295,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sched")
     parser.add_argument("--echo")
+    parser.add_argument("--echo-title", default="TCP echo — 1 KiB messages, 64 connections (loopback)")
     parser.add_argument("--http")
     parser.add_argument("--outdir", default="docs/assets")
     args = parser.parse_args()
@@ -306,7 +321,7 @@ def main():
                 echo,
                 "median_msgs_per_sec",
                 1e3,
-                "TCP echo — 1 KiB messages, 64 connections (loopback)",
+                args.echo_title,
                 "throughput, K msgs/s",
                 "K/s",
                 m,
