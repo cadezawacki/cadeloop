@@ -105,6 +105,36 @@ pub(crate) struct HttpConn {
     pub(crate) log_target: Vec<u8>,
     pub(crate) log_status: u16,
     pub(crate) log_start_ns: u64,
+    // --- R-087 WebSocket mode -----------------------------------------
+    /// Socket bytes received after an upgrade head, before (or while) the
+    /// WS session runs — fed to the frame parser on accept.
+    pub(crate) ws_trailing: Vec<u8>,
+    /// Some(_) once the connection is a WebSocket session.
+    pub(crate) ws: Option<Box<WsConn>>,
+}
+
+/// R-087 per-connection WebSocket session state.
+pub(crate) struct WsConn {
+    pub(crate) rx: cadeloop_core::ws::WsRx,
+    /// Assembled inbound ASGI events awaiting receive().
+    pub(crate) inbox: std::collections::VecDeque<WsMsg>,
+    /// App accepted the connection (101 sent).
+    pub(crate) accepted: bool,
+    /// Server sent (or queued) a close frame.
+    pub(crate) closing: bool,
+    /// websocket.connect delivered to the app.
+    pub(crate) connect_sent: bool,
+    /// Client's Sec-WebSocket-Key (accept-key derivation at accept time).
+    pub(crate) key: Vec<u8>,
+}
+
+/// R-087: default cap on an assembled inbound message (1009 beyond it).
+const WS_MAX_MESSAGE: usize = 1 << 20;
+
+pub(crate) enum WsMsg {
+    Text(String),
+    Binary(Vec<u8>),
+    Disconnect(u16),
 }
 
 impl HttpConn {
@@ -148,6 +178,8 @@ impl HttpConn {
             log_target: Vec::new(),
             log_status: 0,
             log_start_ns: 0,
+            ws_trailing: Vec::new(),
+            ws: None,
         }
     }
 
@@ -161,7 +193,11 @@ impl HttpConn {
 /// by the caller (R-086).
 pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<bool, ParseError> {
     conn.activity = conn.activity.wrapping_add(1);
-    conn.parser.feed(data)?;
+    if let Some(offset) = conn.parser.feed(data)? {
+        // Upgrade head complete (R-087): bytes past it are NOT HTTP —
+        // they belong to the upgraded protocol (early client WS frames).
+        conn.ws_trailing.extend_from_slice(&data[offset..]);
+    }
     while let Some(req) = conn.parser.next_request() {
         conn.pending.push_back(req);
     }
@@ -316,9 +352,28 @@ fn build_scope<'py>(
     peer: Option<&Py<PyAny>>,
     local: Option<&Py<PyAny>>,
     state: &Py<PyAny>,
+    ws: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let scope = PyDict::new(py);
-    scope.set_item(intern!(py, "type"), intern!(py, "http"))?;
+    if ws {
+        // R-087: ASGI websocket scope — no method; ws scheme; the
+        // client's offered subprotocols.
+        scope.set_item(intern!(py, "type"), intern!(py, "websocket"))?;
+        let subs = PyList::empty(py);
+        for (name, value) in &req.headers {
+            if name == b"sec-websocket-protocol" {
+                for part in value.split(|&b| b == b',') {
+                    let t: Vec<u8> = part.iter().copied().filter(|&b| b != b' ').collect();
+                    if !t.is_empty() {
+                        subs.append(String::from_utf8_lossy(&t).into_owned())?;
+                    }
+                }
+            }
+        }
+        scope.set_item(intern!(py, "subprotocols"), subs)?;
+    } else {
+        scope.set_item(intern!(py, "type"), intern!(py, "http"))?;
+    }
     let asgi = ASGI_INFO.get_or_try_init(py, || -> PyResult<Py<PyDict>> {
         let d = PyDict::new(py);
         d.set_item(intern!(py, "version"), intern!(py, "3.0"))?;
@@ -330,8 +385,10 @@ fn build_scope<'py>(
         intern!(py, "http_version"),
         if req.http_minor == 1 { intern!(py, "1.1") } else { intern!(py, "1.0") },
     )?;
-    scope.set_item(intern!(py, "method"), method_obj(py, req.method))?;
-    scope.set_item(intern!(py, "scheme"), intern!(py, "http"))?;
+    if !ws {
+        scope.set_item(intern!(py, "method"), method_obj(py, req.method))?;
+    }
+    scope.set_item(intern!(py, "scheme"), if ws { intern!(py, "ws") } else { intern!(py, "http") })?;
 
     // Split path / query, decode path (R-081: percent-decoded, UTF-8 with
     // latin-1 fallback).
@@ -370,6 +427,26 @@ fn build_scope<'py>(
     };
     scope.set_item(intern!(py, "state"), state_copy)?;
     Ok(scope)
+}
+
+/// R-087: one inbound WS event as its ASGI message dict.
+pub(crate) fn ws_message_dict(py: Python<'_>, m: WsMsg) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    match m {
+        WsMsg::Text(s) => {
+            d.set_item(intern!(py, "type"), intern!(py, "websocket.receive"))?;
+            d.set_item(intern!(py, "text"), s)?;
+        }
+        WsMsg::Binary(b) => {
+            d.set_item(intern!(py, "type"), intern!(py, "websocket.receive"))?;
+            d.set_item(intern!(py, "bytes"), PyBytes::new(py, &b))?;
+        }
+        WsMsg::Disconnect(code) => {
+            d.set_item(intern!(py, "type"), intern!(py, "websocket.disconnect"))?;
+            d.set_item(intern!(py, "code"), code)?;
+        }
+    }
+    Ok(d.into_any().unbind())
 }
 
 pub(crate) fn disconnect_message(py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -451,9 +528,26 @@ impl HttpReceive {
             Body(Vec<u8>),
             Disconnect,
             Wait(Py<PyAny>),
+            WsConnect,
+            Ws(WsMsg),
         }
         let r = core.with_net(|net, _| match net.http_conn_mut(self.tid) {
             None => R::Disconnect,
+            Some(conn) if conn.ws.is_some() => {
+                let disconnected = conn.disconnected;
+                let pyloop = conn.pyloop.clone_ref(py);
+                let ws = conn.ws.as_mut().unwrap();
+                if !ws.connect_sent {
+                    ws.connect_sent = true;
+                    R::WsConnect
+                } else if let Some(m) = ws.inbox.pop_front() {
+                    R::Ws(m)
+                } else if disconnected {
+                    R::Ws(WsMsg::Disconnect(1006))
+                } else {
+                    R::Wait(pyloop)
+                }
+            }
             Some(conn) => {
                 if conn.disconnected {
                     R::Disconnect
@@ -469,6 +563,12 @@ impl HttpReceive {
         })?;
         match r {
             R::Disconnect => value_awaitable(py, disconnect_message(py)?),
+            R::WsConnect => {
+                let d = PyDict::new(py);
+                d.set_item(intern!(py, "type"), intern!(py, "websocket.connect"))?;
+                value_awaitable(py, d.into_any().unbind())
+            }
+            R::Ws(m) => value_awaitable(py, ws_message_dict(py, m)?),
             R::Body(b) => {
                 let msg = PyDict::new(py);
                 msg.set_item(intern!(py, "type"), intern!(py, "http.request"))?;
@@ -548,6 +648,12 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         .ok_or_else(|| PyRuntimeError::new_err("ASGI message missing 'type'"))?;
     let mtype = mtype.downcast::<PyString>().map_err(PyErr::from)?;
     let kind = mtype.to_str()?;
+
+    let is_ws =
+        core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
+    if is_ws {
+        return ws_send(py, core, tid, kind, message);
+    }
 
     if kind == "http.response.start" {
         let status: u16 = message
@@ -705,6 +811,264 @@ fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
 // request pump + completion handling (R-056, R-085)                     //
 // --------------------------------------------------------------------- //
 
+/// R-087: websocket.* sends (accept / send / close).
+fn ws_send(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    kind: &str,
+    message: &Bound<'_, PyDict>,
+) -> PyResult<()> {
+    use cadeloop_core::ws;
+    match kind {
+        "websocket.accept" => {
+            let subprotocol: Option<String> = match message.get_item(intern!(py, "subprotocol"))? {
+                Some(v) if !v.is_none() => Some(v.extract()?),
+                _ => None,
+            };
+            let mut extra: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            if let Some(headers) = message.get_item(intern!(py, "headers"))? {
+                for item in headers.try_iter()? {
+                    let pair = item?;
+                    extra.push((pair.get_item(0)?.extract()?, pair.get_item(1)?.extract()?));
+                }
+            }
+            let trailing = core.with_net(|net, reactor| {
+                let backend = reactor.backend_mut();
+                let Some(conn) = net.http_conn_mut(tid) else { return Err(SendErr::Gone) };
+                let Some(wsc) = conn.ws.as_mut() else { return Err(SendErr::Gone) };
+                if wsc.accepted {
+                    return Err(SendErr::Proto("websocket.accept sent twice"));
+                }
+                wsc.accepted = true;
+                let mut head = Vec::with_capacity(192);
+                head.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
+                head.extend_from_slice(b"upgrade: websocket\r\nconnection: Upgrade\r\n");
+                head.extend_from_slice(b"sec-websocket-accept: ");
+                head.extend_from_slice(ws::accept_key(&wsc.key).as_bytes());
+                head.extend_from_slice(b"\r\n");
+                if let Some(sp) = &subprotocol {
+                    head.extend_from_slice(b"sec-websocket-protocol: ");
+                    head.extend_from_slice(sp.as_bytes());
+                    head.extend_from_slice(b"\r\n");
+                }
+                for (n, v) in &extra {
+                    head.extend_from_slice(n);
+                    head.extend_from_slice(b": ");
+                    head.extend_from_slice(v);
+                    head.extend_from_slice(b"\r\n");
+                }
+                head.extend_from_slice(b"\r\n");
+                conn.log_status = 101;
+                let trailing = std::mem::take(&mut conn.ws_trailing);
+                net::http_enqueue(py, net, backend, tid, head);
+                Ok(trailing)
+            })?
+            .map_err(send_err)?;
+            if !trailing.is_empty() {
+                // Client frames that raced ahead of the accept.
+                core.with_net(|net, reactor| {
+                    ws_ingest(py, net, reactor.backend_mut(), tid, &trailing)
+                })?;
+            }
+            core.drain_graveyards(py)?;
+            Ok(())
+        }
+        "websocket.send" => {
+            let payload: Vec<u8> = match message.get_item(intern!(py, "text"))? {
+                Some(t) if !t.is_none() => {
+                    let s: String = t.extract()?;
+                    ws::frame(ws::OP_TEXT, s.as_bytes())
+                }
+                _ => match message.get_item(intern!(py, "bytes"))? {
+                    Some(b) if !b.is_none() => {
+                        let v: Vec<u8> = b.extract()?;
+                        ws::frame(ws::OP_BINARY, &v)
+                    }
+                    _ => {
+                        return Err(PyRuntimeError::new_err(
+                            "websocket.send needs 'text' or 'bytes'",
+                        ))
+                    }
+                },
+            };
+            core.with_net(|net, reactor| {
+                let backend = reactor.backend_mut();
+                let ok = net
+                    .http_conn_mut(tid)
+                    .and_then(|c| c.ws.as_ref())
+                    .map(|w| w.accepted && !w.closing)
+                    .unwrap_or(false);
+                if ok {
+                    net::http_enqueue(py, net, backend, tid, payload);
+                    Ok(())
+                } else {
+                    Err(SendErr::Proto("websocket.send before accept or after close"))
+                }
+            })?
+            .map_err(send_err)?;
+            Ok(())
+        }
+        "websocket.close" => {
+            let code: u16 = match message.get_item(intern!(py, "code"))? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => 1000,
+            };
+            let reason: String = match message.get_item(intern!(py, "reason"))? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => String::new(),
+            };
+            core.with_net(|net, reactor| {
+                let backend = reactor.backend_mut();
+                let Some(conn) = net.http_conn_mut(tid) else { return };
+                let Some(wsc) = conn.ws.as_mut() else { return };
+                if wsc.accepted {
+                    if !wsc.closing {
+                        wsc.closing = true;
+                        let f = ws::close_frame(code, &reason);
+                        net::http_enqueue(py, net, backend, tid, f);
+                    }
+                } else {
+                    // ASGI: closing before accept REJECTS the handshake.
+                    wsc.accepted = true;
+                    wsc.closing = true;
+                    conn.log_status = 403;
+                    let body = error_response(ParseError { status: 403, reason: "forbidden" });
+                    net::http_enqueue(py, net, backend, tid, body);
+                }
+                net::http_close_after_write(py, net, backend, tid);
+            })?;
+            core.drain_graveyards(py)?;
+            Ok(())
+        }
+        other => Err(PyRuntimeError::new_err(format!(
+            "unsupported ASGI message {other:?} on a websocket connection"
+        ))),
+    }
+}
+
+/// R-087: inbound socket bytes for a WS-mode connection (called from the
+/// recv path and for handshake-raced bytes at accept). In-cell.
+pub(crate) fn ws_ingest(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: crate::net::Backend<'_>,
+    tid: u64,
+    data: &[u8],
+) {
+    use cadeloop_core::ws::{self, WsEvent};
+    let Some(conn) = net.http_conn_mut(tid) else { return };
+    let Some(wsc) = conn.ws.as_mut() else { return };
+    if !wsc.accepted {
+        // Pre-accept client frames wait for the handshake to finish.
+        conn.ws_trailing.extend_from_slice(data);
+        return;
+    }
+    let mut evs = Vec::new();
+    wsc.rx.push(data, &mut evs);
+    let mut enqueues: Vec<Vec<u8>> = Vec::new();
+    let mut close_after = false;
+    let mut wake = false;
+    for ev in evs {
+        let Some(conn) = net.http_conn_mut(tid) else { return };
+        let wsc = conn.ws.as_mut().unwrap();
+        match ev {
+            WsEvent::Text(s) => {
+                wsc.inbox.push_back(WsMsg::Text(s));
+                wake = true;
+            }
+            WsEvent::Binary(b) => {
+                wsc.inbox.push_back(WsMsg::Binary(b));
+                wake = true;
+            }
+            WsEvent::Ping(p) => enqueues.push(ws::frame(ws::OP_PONG, &p)),
+            WsEvent::Pong => {}
+            WsEvent::Close(code, _reason) => {
+                if !wsc.closing {
+                    wsc.closing = true;
+                    // Echo the close (1005 = no code on the wire -> bare frame).
+                    enqueues.push(if code == 1005 {
+                        ws::frame(ws::OP_CLOSE, b"")
+                    } else {
+                        ws::close_frame(code, "")
+                    });
+                }
+                wsc.inbox.push_back(WsMsg::Disconnect(code));
+                wake = true;
+                close_after = true;
+            }
+            WsEvent::Fail(code, reason) => {
+                if !wsc.closing {
+                    wsc.closing = true;
+                    enqueues.push(ws::close_frame(code, reason));
+                }
+                wsc.inbox.push_back(WsMsg::Disconnect(code));
+                wake = true;
+                close_after = true;
+            }
+        }
+    }
+    for buf in enqueues {
+        net::http_enqueue(py, net, backend, tid, buf);
+    }
+    if close_after {
+        net::http_close_after_write(py, net, backend, tid);
+    }
+    if wake {
+        if let Some(fut) = net.http_conn_mut(tid).and_then(|c| c.take_recv_waiter()) {
+            net.events.push(crate::net::NetEvent::WsWake { tid, fut });
+        }
+    }
+}
+
+/// R-087: the app coroutine returned on a WS connection — close out the
+/// session (1000 if still open; 403 if it never accepted).
+fn ws_app_done(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
+    use cadeloop_core::ws;
+    core.with_net(|net, reactor| {
+        let backend = reactor.backend_mut();
+        let Some(conn) = net.http_conn_mut(tid) else { return };
+        let Some(wsc) = conn.ws.as_mut() else { return };
+        if !wsc.accepted {
+            wsc.accepted = true;
+            wsc.closing = true;
+            conn.log_status = 403;
+            let body = error_response(ParseError { status: 403, reason: "forbidden" });
+            net::http_enqueue(py, net, backend, tid, body);
+        } else if !wsc.closing {
+            wsc.closing = true;
+            net::http_enqueue(py, net, backend, tid, ws::close_frame(1000, ""));
+        }
+        net::http_close_after_write(py, net, backend, tid);
+    })?;
+    finish_request(py, core, tid)
+}
+
+enum WsVerdict {
+    NotWs,
+    Ok(Vec<u8>),
+    Bad,
+}
+
+/// RFC 6455 §4.2.1 server-side handshake validation.
+fn ws_validate(req: &Request) -> WsVerdict {
+    let mut upgrade_ws = false;
+    let mut version_13 = false;
+    let mut key: Option<Vec<u8>> = None;
+    for (name, value) in &req.headers {
+        match name.as_slice() {
+            b"upgrade" => upgrade_ws = value.eq_ignore_ascii_case(b"websocket"),
+            b"sec-websocket-version" => version_13 = value == b"13",
+            b"sec-websocket-key" => key = Some(value.clone()),
+            _ => {}
+        }
+    }
+    match (upgrade_ws, version_13, key, req.method) {
+        (true, true, Some(k), "GET") => WsVerdict::Ok(k),
+        _ => WsVerdict::Bad,
+    }
+}
+
 /// Phase 2: start queued requests until the queue is empty or one
 /// suspends. ITERATIVE — a pipelined burst of N sync requests runs in one
 /// loop, not N nested stacks (AppTask::step never pumps).
@@ -735,6 +1099,28 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                     conn.log_status = 0;
                     conn.log_start_ns = now_ns;
                 }
+                // R-087: a valid WebSocket upgrade flips the connection
+                // into WS mode BEFORE dispatch (the scope/receive/send
+                // surfaces all branch on it). An upgrade we can't take
+                // (missing key, wrong version, non-websocket protocol) is
+                // answered 400 below.
+                let ws_verdict = if req.upgrade { ws_validate(&req) } else { WsVerdict::NotWs };
+                match &ws_verdict {
+                    WsVerdict::Ok(key) => {
+                        conn.keep_alive = false;
+                        conn.ws = Some(Box::new(WsConn {
+                            rx: cadeloop_core::ws::WsRx::new(WS_MAX_MESSAGE),
+                            inbox: std::collections::VecDeque::new(),
+                            accepted: false,
+                            closing: false,
+                            connect_sent: false,
+                            key: key.clone(),
+                        }));
+                    }
+                    WsVerdict::Bad => {}
+                    WsVerdict::NotWs => {}
+                }
+                let bad_upgrade = matches!(ws_verdict, WsVerdict::Bad);
                 conn.req_body = Some(std::mem::take(&mut req.body));
                 (
                     req,
@@ -742,13 +1128,31 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                     conn.state.clone_ref(py),
                     conn.pyloop.clone_ref(py),
                     conn.eager,
+                    conn.ws.is_some(),
+                    bad_upgrade,
                 )
             })
         })?;
-        let Some((req, app, state, pyloop, eager)) = next else { return Ok(()) };
+        let Some((req, app, state, pyloop, eager, is_ws, bad_upgrade)) = next else {
+            return Ok(());
+        };
+        if bad_upgrade {
+            // R-087: malformed upgrade — answered in-cell, connection closed.
+            core.with_net(|net, reactor| {
+                let backend = reactor.backend_mut();
+                if let Some(c) = net.http_conn_mut(tid) {
+                    c.active = false;
+                    c.keep_alive = false;
+                }
+                let body = error_response(ParseError { status: 400, reason: "bad websocket upgrade" });
+                net::http_enqueue(py, net, backend, tid, body);
+                net::http_close_after_write(py, net, backend, tid);
+            })?;
+            return Ok(());
+        }
 
         let (peer, local) = core.with_net(|net, _| net.peer_local(py, tid))?;
-        let scope = build_scope(py, &req, peer.as_ref(), local.as_ref(), &state)?;
+        let scope = build_scope(py, &req, peer.as_ref(), local.as_ref(), &state, is_ws)?;
         drop(req);
 
         // Per-connection cached receive/send callables (R-083).
@@ -822,9 +1226,14 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
 /// The app coroutine returned: verify the response completed (R-086) and
 /// finish the request cycle.
 fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let complete = core.with_net(|net, _| {
-        net.http_conn_mut(tid).map(|c| c.resp == RespPhase::Done).unwrap_or(true)
+    let (complete, is_ws) = core.with_net(|net, _| {
+        net.http_conn_mut(tid)
+            .map(|c| (c.resp == RespPhase::Done, c.ws.is_some()))
+            .unwrap_or((true, false))
     })?;
+    if is_ws {
+        return ws_app_done(py, core, tid);
+    }
     if complete {
         finish_request(py, core, tid)
     } else {
@@ -847,6 +1256,30 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
         || err.is_instance_of::<PyBrokenPipeError>(py);
     if !disconnect {
         core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any());
+    }
+    let is_ws =
+        core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
+    if is_ws {
+        // R-087: app died mid-session -> 1011 (or reject if never accepted).
+        use cadeloop_core::ws;
+        core.with_net(|net, reactor| {
+            let backend = reactor.backend_mut();
+            let Some(conn) = net.http_conn_mut(tid) else { return };
+            let Some(wsc) = conn.ws.as_mut() else { return };
+            if !wsc.accepted {
+                wsc.accepted = true;
+                wsc.closing = true;
+                conn.log_status = 500;
+                let body =
+                    error_response(ParseError { status: 500, reason: "internal server error" });
+                net::http_enqueue(py, net, backend, tid, body);
+            } else if !wsc.closing {
+                wsc.closing = true;
+                net::http_enqueue(py, net, backend, tid, ws::close_frame(1011, ""));
+            }
+            net::http_close_after_write(py, net, backend, tid);
+        })?;
+        return finish_request(py, core, tid);
     }
     let phase =
         core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.resp))?;

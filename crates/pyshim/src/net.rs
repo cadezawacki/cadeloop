@@ -300,6 +300,11 @@ pub(crate) enum NetEvent {
         connection_lost: Py<PyAny>,
         err: Option<u32>,
     },
+    /// R-087: a WS receive() waiter has a queued event to consume.
+    WsWake {
+        tid: u64,
+        fut: Py<PyAny>,
+    },
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
     BufData {
@@ -336,9 +341,10 @@ pub(crate) enum NetEvent {
         tid: u64,
     },
     /// Native HTTP: resolve a pending `receive()` waiter with
-    /// `http.disconnect`.
+    /// `http.disconnect` (or `websocket.disconnect` for WS sessions).
     HttpDisconnect {
         fut: Py<PyAny>,
+        ws: bool,
     },
 }
 
@@ -346,7 +352,7 @@ pub(crate) enum NetEvent {
 // in-cell machinery (no user Python, no Py drops)                       //
 // --------------------------------------------------------------------- //
 
-type Backend<'a> = &'a mut (dyn IoBackend + Send);
+pub(crate) type Backend<'a> = &'a mut (dyn IoBackend + Send);
 
 /// Post (or extend) the gather send for a transport. In-cell.
 pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
@@ -427,8 +433,9 @@ pub(crate) fn teardown_with(
         }
         ProtoKind::Http(conn) => {
             conn.disconnected = true;
+            let ws = conn.ws.is_some();
             if let Some(fut) = conn.take_recv_waiter() {
-                net.events.push(NetEvent::HttpDisconnect { fut });
+                net.events.push(NetEvent::HttpDisconnect { fut, ws });
             }
         }
     }
@@ -1007,11 +1014,13 @@ fn on_recv_done(
                 // Idle keep-alive connection: tear down now. Mid-request:
                 // keep writing the response; finish_request closes it.
                 conn.disconnected = true;
-                (!conn.active && conn.pending.is_empty(), conn.take_recv_waiter())
+                let ws = conn.ws.is_some();
+                ((!conn.active && conn.pending.is_empty(), ws), conn.take_recv_waiter())
             }
         };
+        let (http_idle, waiter_ws) = (http_idle.0, http_idle.1);
         if let Some(fut) = waiter {
-            net.events.push(NetEvent::HttpDisconnect { fut });
+            net.events.push(NetEvent::HttpDisconnect { fut, ws: waiter_ws });
         }
         if http_idle {
             teardown_with(py, net, backend, tid, None);
@@ -1045,14 +1054,21 @@ fn on_recv_done(
             }
         }
         ProtoKind::Http(conn) => {
-            // In-cell parse (R-080): llhttp over the recv slot; the parser
-            // copies what it keeps, so the slot re-posts immediately below.
             let ptr = net.buffers.slot_ptr(slot);
             let data = unsafe { std::slice::from_raw_parts(ptr, bytes as usize) };
-            match crate::http::conn_feed(conn, data) {
-                Ok(true) => net.events.push(NetEvent::HttpPump { tid }),
-                Ok(false) => {}
-                Err(e) => parse_err = Some(e),
+            if conn.ws.is_some() {
+                // R-087: WS mode — bytes go to the frame parser, not llhttp.
+                // Copied out first: ws_ingest needs &mut NetState.
+                let owned = data.to_vec();
+                crate::http::ws_ingest(py, net, backend, tid, &owned);
+            } else {
+                // In-cell parse (R-080): llhttp over the recv slot; the
+                // parser copies what it keeps, so the slot re-posts below.
+                match crate::http::conn_feed(conn, data) {
+                    Ok(true) => net.events.push(NetEvent::HttpPump { tid }),
+                    Ok(false) => {}
+                    Err(e) => parse_err = Some(e),
+                }
             }
         }
     }
@@ -1252,13 +1268,52 @@ pub(crate) fn dispatch_events(
             NetEvent::HttpPump { tid } => {
                 crate::http::pump_requests(py, slf, tid)?;
             }
-            NetEvent::HttpDisconnect { fut } => {
+            NetEvent::HttpDisconnect { fut, ws } => {
                 let fut = fut.bind(py);
                 let done: bool =
                     fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
                 if !done {
-                    let msg = crate::http::disconnect_message(py)?;
+                    let msg = if ws {
+                        crate::http::ws_message_dict(py, crate::http::WsMsg::Disconnect(1006))?
+                    } else {
+                        crate::http::disconnect_message(py)?
+                    };
                     let _ = fut.call_method1("set_result", (msg,));
+                }
+            }
+            NetEvent::WsWake { tid, fut } => {
+                // Deliver ONE queued WS event to the waiter (R-087).
+                let msg = core.with_net(|net, _| {
+                    net.http_conn_mut(tid)
+                        .and_then(|c| c.ws.as_mut())
+                        .and_then(|w| w.inbox.pop_front())
+                })?;
+                let fut = fut.bind(py);
+                let done: bool =
+                    fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                match (done, msg) {
+                    (false, Some(m)) => {
+                        let d = crate::http::ws_message_dict(py, m)?;
+                        let _ = fut.call_method1("set_result", (d,));
+                    }
+                    (false, None) => {
+                        // Spurious wake: park the waiter again.
+                        let stored = fut.clone().unbind();
+                        core.with_net(|net, _| {
+                            if let Some(c) = net.http_conn_mut(tid) {
+                                c.recv_waiter = Some(stored);
+                            }
+                        })?;
+                    }
+                    (true, Some(m)) => {
+                        // Waiter was cancelled: keep the event for the next receive().
+                        core.with_net(|net, _| {
+                            if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
+                                w.inbox.push_front(m);
+                            }
+                        })?;
+                    }
+                    (true, None) => {}
                 }
             }
             NetEvent::AcceptError { err } => {

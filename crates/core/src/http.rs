@@ -82,6 +82,7 @@ extern "C" {
 
 const HTTP_REQUEST: c_int = 1;
 const HPE_OK: c_int = 0;
+const HPE_PAUSED_UPGRADE: c_int = 22;
 /// Our limit violations (callbacks return -1 == HPE_USER... actually
 /// llhttp maps nonzero callback returns to HPE_USER/HPE_CB_*).
 const _HPE_USER: c_int = 24;
@@ -108,6 +109,9 @@ pub struct Request {
     pub method: &'static str,
     pub http_minor: u8,
     pub keep_alive: bool,
+    /// llhttp saw `Connection: upgrade` + `Upgrade:` on this request
+    /// (R-087: the engine decides whether to take the WebSocket path).
+    pub upgrade: bool,
     /// Raw request-target bytes (R-081 raw_path; percent-decoding is the
     /// scope builder's job).
     pub url: Vec<u8>,
@@ -222,11 +226,13 @@ unsafe extern "C" fn on_body(p: *mut Llhttp, at: *const c_char, len: usize) -> c
 
 unsafe extern "C" fn on_message_complete(p: *mut Llhttp) -> c_int {
     let keep_alive = unsafe { llhttp_should_keep_alive(p) } != 0;
+    let upgrade = unsafe { (*p).upgrade } != 0;
     let (method, minor) = unsafe { ((*p).method, (*p).http_minor) };
     let a = unsafe { acc(p) };
     let method_name = method_str(method);
     a.completed.push_back(Request {
         method: method_name,
+        upgrade,
         http_minor: minor,
         keep_alive,
         url: std::mem::take(&mut a.url),
@@ -311,8 +317,16 @@ impl HttpParser {
     }
 
     /// Feed bytes; completed requests become available via `next_request`.
-    pub fn feed(&mut self, data: &[u8]) -> Result<(), ParseError> {
+    /// Feed bytes. `Ok(Some(offset))` means the parser paused after an
+    /// upgrade head (HPE_PAUSED_UPGRADE): bytes from `offset` onward are
+    /// NOT HTTP — they belong to the upgraded protocol's stream (R-087).
+    pub fn feed(&mut self, data: &[u8]) -> Result<Option<usize>, ParseError> {
         let rc = unsafe { llhttp_execute(&mut *self.raw, data.as_ptr().cast(), data.len()) };
+        if rc == HPE_PAUSED_UPGRADE {
+            let consumed = unsafe { (self.raw.error_pos).offset_from(data.as_ptr().cast()) };
+            let consumed = consumed.clamp(0, data.len() as isize) as usize;
+            return Ok(Some(consumed));
+        }
         if rc != HPE_OK {
             if let Some(err) = self.acc.error {
                 return Err(err);
@@ -320,7 +334,7 @@ impl HttpParser {
             let _ = errno_str(rc); // (available for logging)
             return Err(ParseError { status: 400, reason: "malformed request" });
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn next_request(&mut self) -> Option<Request> {
