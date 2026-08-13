@@ -40,6 +40,20 @@
 //! platform-independent bookkeeping is unit-tested in `rio_util`.
 //! Behavioral validation on Windows hardware is the remaining M3 gate,
 //! so `backend="auto"` keeps resolving to IOCP until then.
+//!
+//! Hardware finding (2026-08, examples/rio_probe.rs): on Windows 11
+//! beta build 26200.9168 (native x64), the RIO subsystem itself fails
+//! to initialize — RIORegisterBuffer AND RIOCreateCompletionQueue (all
+//! notification variants, all sizes, socket alive/bound/listening or
+//! not) return their failure sentinels with a freshly-set WSAEFAULT,
+//! despite the function table resolving from genuine unhooked
+//! mswsock.dll, a pristine LSP-free Winsock catalog, and argument
+//! lists containing no pointer (null-notification CQ). The failure is
+//! in mswsock's private first-use handshake with afd.sys, below
+//! anything reachable from user code. Construction failure is
+//! surfaced with both named errors; callers (validate.ps1's gate,
+//! serve()) treat it as RIO-unavailable and stay on IOCP. Behavioral
+//! validation needs a stable x64 build (23H2/24H2 or Server).
 
 use std::collections::HashMap;
 use std::io;
