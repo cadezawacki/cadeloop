@@ -58,8 +58,9 @@ function Step($name, [scriptblock]$body) {
 
 Step "00-env" {
     cmd /c ver
-    Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture | Format-List
-    Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-List
+    Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture | Format-List | Out-String
+    Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-List | Out-String
+    Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE ARCHITEW6432=$env:PROCESSOR_ARCHITEW6432"
     & $PY --version
     & $PY -c "import sys; print('exe:', sys.executable)"
     rustc -V

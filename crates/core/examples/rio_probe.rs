@@ -53,6 +53,7 @@ mod win {
         GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     };
+    use windows_sys::Win32::System::SystemInformation::{GetNativeSystemInfo, SYSTEM_INFO};
     use windows_sys::Win32::System::Threading::CreateEventW;
     use windows_sys::Win32::System::IO::{CreateIoCompletionPort, OVERLAPPED};
 
@@ -172,7 +173,9 @@ mod win {
         let buf = vec![0u8; 65536];
         clear_err();
         let id: RIO_BUFFERID = unsafe { (t.RIORegisterBuffer.unwrap())(buf.as_ptr(), 65536) };
-        if id == -1 {
+        // Header sentinel is (RIO_BUFFERID)0xFFFFFFFF: ZERO-extended on
+        // x64, not -1 (run-6 log printed a failure as "OK: id 0xffffffff").
+        if id == 0xFFFF_FFFF {
             let e = last();
             println!(
                 "  RIORegisterBuffer[{label}] FAILED: WSA {e}{}",
@@ -204,6 +207,17 @@ mod win {
             let mut data: WSADATA = zeroed();
             WSAStartup(0x0202, &mut data);
         }
+
+        // 9 = x64, 12 = ARM64. An x64 binary reporting a native ARM64
+        // system is running under emulation — a strong RIO-breakage
+        // suspect (the ring registration path is not emulation-friendly).
+        let mut si: SYSTEM_INFO = unsafe { zeroed() };
+        unsafe { GetNativeSystemInfo(&mut si) };
+        let arch = unsafe { si.Anonymous.Anonymous.wProcessorArchitecture };
+        println!(
+            "== native machine == arch={arch} (9=x64, 12=ARM64; this probe is an x64 binary{})",
+            if arch == 12 { " -- RUNNING EMULATED" } else { "" }
+        );
 
         println!("== function table ==");
         let _ = table(false);

@@ -69,9 +69,14 @@ use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup};
 use crate::opslab::{OpId, OpKind, OpSlab};
 
 /// Sentinels per MSWSock headers (not exported by windows-sys).
+/// RIO_INVALID_BUFFERID is `((RIO_BUFFERID)0xFFFFFFFF)` in the header: a
+/// 32-bit unsigned constant, so it ZERO-extends to 0x00000000FFFFFFFF on
+/// x64 — comparing against sign-extended -1 silently misses real
+/// failures (run-6 probe caught RIORegisterBuffer "succeeding" with id
+/// 0xffffffff).
 const RIO_INVALID_CQ: RIO_CQ = 0;
 const RIO_INVALID_RQ: RIO_RQ = 0;
-const RIO_INVALID_BUFFERID: RIO_BUFFERID = -1; // 0xFFFFFFFF
+const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0xFFFF_FFFF;
 
 /// R-044: dequeue batch per CQ drain.
 const DEQUEUE_BATCH: usize = 1024;

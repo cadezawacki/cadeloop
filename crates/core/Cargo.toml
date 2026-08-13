@@ -24,6 +24,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader", # rio_probe: resolve which module a fn pointer lives in
+    "Win32_System_SystemInformation", # rio_probe: detect x64-on-ARM64 emulation
 ] }
 
 [dev-dependencies]
