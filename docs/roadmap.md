@@ -175,7 +175,14 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       workload, merges via llvm-profdata, rebuilds with profile-use;
       the x86-64-v3 build ships as a direct-URL release artifact
       (docs/ops.md). Runs on tag push — first publish validates it
-- [ ] Docs complete; conformance skip-list at its floor
+- [x] Conformance skip-list at its floor: every M0 feature-area skip
+      removed (all those features now exist and are covered by in-repo
+      suites); Windows CI's suite-shipping interpreter adjudicates the
+      CPython tests, re-adding any failure with a fresh justification.
+      Docs current through M4 + the Windows validation campaign
+- [ ] M5-Windows remainder: subprocess/pipes need overlapped named-pipe
+      ops in the IOCP backend (pipes are not sockets); TransmitFile
+      sendfile refinement rides along
 
 ## Explicit non-goals (v1, §15)
 
