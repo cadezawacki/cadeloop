@@ -158,7 +158,12 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 
 ## M5 — 1.0
 
-- [ ] Native subprocess (R-051)
+- [x] Subprocess + pipes, POSIX (R-051): connect_read_pipe /
+      connect_write_pipe + the stdlib 3.11 subprocess machinery running
+      on cadeloop (readiness aliases; ThreadedChildWatcher reaping) —
+      asyncio.create_subprocess_exec/shell work unmodified. Windows
+      needs IOCP named-pipe ops (overlapped ReadFile/WriteFile):
+      M5-Windows remainder
 - [ ] PGO-published wheels (R-111), -v3 wheel variant (R-110)
 - [ ] Docs complete; conformance skip-list at its floor
 

@@ -38,8 +38,8 @@ _MILESTONES = {
     "tls": "the native TLS engine arrives in milestone M4 (R-059)",
     "readiness": "add_reader/add_writer readiness emulation arrives in "
     "milestone M1 and is hardened in M4 (R-057)",
-    "subprocess": "subprocess support is gated behind "
-    "Config(enable_subprocess=True) and arrives in milestone M5 (R-051)",
+    "subprocess": "Windows subprocess/pipe support needs IOCP named-pipe "
+    "ops and arrives in milestone M5-Windows (R-051; POSIX works)",
     "sendfile": "loop.sendfile (TransmitFile, R-036) arrives in milestone M1",
 }
 
@@ -619,14 +619,162 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             signal_module.signal(sig, signal_module.SIG_DFL)
         return True
 
-    async def subprocess_shell(self, protocol_factory, cmd, **kwargs):
-        _not_yet("subprocess_shell()", "subprocess")
+    # ---- pipes + subprocess (R-051) ----------------------------------
+    # POSIX rides the stdlib 3.11 machinery (this project pins CPython
+    # 3.11): the _Unix*PipeTransport / _UnixSubprocessTransport classes
+    # drive readiness through the selector-loop-private _add_reader
+    # family, which maps 1:1 onto our public watch surface. Windows needs
+    # IOCP named-pipe ops (overlapped ReadFile/WriteFile) — M5-Windows.
 
-    async def subprocess_exec(self, protocol_factory, *args, **kwargs):
-        _not_yet("subprocess_exec()", "subprocess")
+    def _add_reader(self, fd, callback, *args):
+        return self.add_reader(fd, callback, *args)
+
+    def _remove_reader(self, fd):
+        return self.remove_reader(fd)
+
+    def _add_writer(self, fd, callback, *args):
+        return self.add_writer(fd, callback, *args)
+
+    def _remove_writer(self, fd):
+        return self.remove_writer(fd)
 
     async def connect_read_pipe(self, protocol_factory, pipe):
-        _not_yet("connect_read_pipe()", "tcp")
+        if sys.platform == "win32":
+            _not_yet("connect_read_pipe()", "subprocess")
+        from asyncio import unix_events
+
+        protocol = protocol_factory()
+        waiter = self.create_future()
+        transport = unix_events._UnixReadPipeTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return transport, protocol
 
     async def connect_write_pipe(self, protocol_factory, pipe):
-        _not_yet("connect_write_pipe()", "tcp")
+        if sys.platform == "win32":
+            _not_yet("connect_write_pipe()", "subprocess")
+        from asyncio import unix_events
+
+        protocol = protocol_factory()
+        waiter = self.create_future()
+        transport = unix_events._UnixWritePipeTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return transport, protocol
+
+    async def _make_subprocess_transport(
+        self, protocol, args, shell, stdin, stdout, stderr, bufsize, extra=None, **kwargs
+    ):
+        from asyncio import events as _events
+        from asyncio import unix_events
+
+        with _events.get_child_watcher() as watcher:
+            if not watcher.is_active():
+                raise RuntimeError(
+                    "asyncio child watcher is not activated, "
+                    "subprocess support is not installed"
+                )
+            waiter = self.create_future()
+            transp = unix_events._UnixSubprocessTransport(
+                self,
+                protocol,
+                args,
+                shell,
+                stdin,
+                stdout,
+                stderr,
+                bufsize,
+                waiter=waiter,
+                extra=extra,
+                **kwargs,
+            )
+            watcher.add_child_handler(
+                transp.get_pid(), self._child_watcher_callback, transp
+            )
+            try:
+                await waiter
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException:
+                transp.close()
+                await transp._wait()
+                raise
+        return transp
+
+    def _child_watcher_callback(self, pid, returncode, transp):
+        # Thread-safe: the watcher reaps from its waiter thread.
+        self.call_soon_threadsafe(self.call_soon, transp._process_exited, returncode)
+
+    async def subprocess_shell(
+        self,
+        protocol_factory,
+        cmd,
+        *,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=False,
+        shell=True,
+        bufsize=0,
+        encoding=None,
+        errors=None,
+        text=None,
+        **kwargs,
+    ):
+        if sys.platform == "win32":
+            _not_yet("subprocess_shell()", "subprocess")
+        if not isinstance(cmd, (bytes, str)):
+            raise ValueError("cmd must be a string")
+        if universal_newlines or text or encoding is not None or errors is not None:
+            raise ValueError("text mode is not supported")
+        if not shell:
+            raise ValueError("shell must be True")
+        if bufsize != 0:
+            raise ValueError("bufsize must be 0")
+        protocol = protocol_factory()
+        transport = await self._make_subprocess_transport(
+            protocol, cmd, True, stdin, stdout, stderr, bufsize, **kwargs
+        )
+        return transport, protocol
+
+    async def subprocess_exec(
+        self,
+        protocol_factory,
+        program,
+        *args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=False,
+        shell=False,
+        bufsize=0,
+        encoding=None,
+        errors=None,
+        text=None,
+        **kwargs,
+    ):
+        if sys.platform == "win32":
+            _not_yet("subprocess_exec()", "subprocess")
+        if universal_newlines or text or encoding is not None or errors is not None:
+            raise ValueError("text mode is not supported")
+        if shell:
+            raise ValueError("shell must be False")
+        if bufsize != 0:
+            raise ValueError("bufsize must be 0")
+        popen_args = (program,) + args
+        for arg in popen_args:
+            if not isinstance(arg, (str, bytes)):
+                raise TypeError(
+                    f"program arguments must be a bytes or text string, not {type(arg).__name__}"
+                )
+        protocol = protocol_factory()
+        transport = await self._make_subprocess_transport(
+            protocol, popen_args, False, stdin, stdout, stderr, bufsize, **kwargs
+        )
+        return transport, protocol

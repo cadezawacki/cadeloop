@@ -26,14 +26,16 @@ python -m cadeloop myapp:app --port 8000
 
 ## Status
 
-**M0 + M1 + M2 complete on Linux, M3 well underway** (scheduling core,
-Rust TCP transports, full drop-in surface, TLS via the stdlib `sslproto`
-path, native HTTP/ASGI engine with Starlette/FastAPI verified,
-multi-worker serving). The Windows IOCP backend and the M3 Registered
-I/O backend (CQ/RQ machinery, registered buffer regions, send staging)
-are implemented and compile-verified, with behavioral verification and
-the winloop gates riding on Windows CI/hardware. Full R-xxx map:
-[docs/requirements-traceability.md](docs/requirements-traceability.md).
+**M0–M4 complete; M5 (1.0) underway.** Scheduling core, Rust TCP
+transports, the full drop-in surface, native TLS termination, UDP,
+WebSockets, the native HTTP/ASGI engine (Starlette/FastAPI verified),
+multi-worker serving on both process models, and POSIX subprocess are
+all implemented and tested. The Windows IOCP backend is
+hardware-validated (full test sweep + benchmarks); the M3 Registered
+I/O backend awaits a machine whose OS RIO subsystem works (see the
+Windows benchmarks section). Remaining: Windows subprocess pipes, PGO
+wheels, docs floor, and the two-machine acceptance runs. Full R-xxx
+map: [docs/requirements-traceability.md](docs/requirements-traceability.md).
 
 | Surface | State |
 |---|---|
@@ -47,7 +49,8 @@ the winloop gates riding on Windows CI/hardware. Full R-xxx map:
 | UDP datagram endpoints (`create_datagram_endpoint`) | ✅ tested (native recv_from/send_to on both backends) |
 | Multi-worker (`--workers N`) | ✅ tested (fork + SO_REUSEPORT on POSIX; spawn + shared listener — WSADuplicateSocketW on Windows, fd-passing e2e test) |
 | RIO backend (`backend="rio"`: CQ/RQ, registered buffers, staging) | 🔶 implemented; blocked by an OS-level RIO failure on the test machine (Win11 beta 26200) — `auto` stays IOCP; see Windows benchmarks |
-| Subprocess/pipes · native `loop.sendfile` | M5 · M1-Windows |
+| Subprocess + pipes (`create_subprocess_exec/shell`) | ✅ tested on POSIX (Windows: M5, IOCP named pipes) |
+| Native `loop.sendfile` | M1-Windows (`sock_sendfile` fallback ✅) |
 
 ## Benchmarks (Linux, loopback)
 
