@@ -29,3 +29,26 @@ Install directly:
 pip install wheels/cadeloop-0.0.1-cp311-cp311-win_amd64.whl      # Windows
 pip install wheels/cadeloop-0.0.1-cp311-cp311-manylinux_2_34_x86_64.whl  # Linux
 ```
+
+## Checking RIO on a machine without Rust
+
+The wheel contains the complete RIO backend — Rust is a build-time
+dependency only. On any Windows box with Python 3.11:
+
+```
+pip install cadeloop-0.0.1-cp311-cp311-win_amd64.whl
+
+:: 1. does RIO initialize? (the exact call that failed on the beta box)
+python -c "from cadeloop.loop import Loop; lp = Loop(backend='rio'); print('RIO OK:', lp.stats()['backend']); lp.close()"
+
+:: 2. full behavioral battery, iocp first (proves the wheel), then rio:
+python tools\windows\rio_smoke.py iocp rio --out rio-results.json
+
+:: 3. the entire test suite on RIO (pip install pytest; repo clone, no build):
+set CADELOOP_BACKEND=rio
+python -m pytest tests\unit tests\conformance
+```
+
+Step 1 failing prints the named failing RIO call (e.g.
+`RIOCreateCompletionQueue(IOCP-notify)`); the Rust-built `rio_probe`
+diagnostic is only ever needed to dig further into a failure.

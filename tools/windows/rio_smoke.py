@@ -35,8 +35,13 @@ import threading
 import time
 import traceback
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
-import cadeloop  # noqa: E402
+# Prefer an INSTALLED cadeloop (wheel validation on Rust-less machines);
+# fall back to the repo tree for the in-repo validation flow.
+try:
+    import cadeloop
+except ImportError:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+    import cadeloop  # noqa: E402
 
 CHECK_TIMEOUT = 90.0
 

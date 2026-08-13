@@ -10,9 +10,11 @@ each of them fail slowly against a machine where RIO cannot initialize
 import pathlib
 import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "python"))
-
-from cadeloop.loop import Loop  # noqa: E402
+try:
+    from cadeloop.loop import Loop  # installed wheel first
+except ImportError:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "python"))
+    from cadeloop.loop import Loop  # noqa: E402
 
 try:
     lp = Loop(backend="rio")
