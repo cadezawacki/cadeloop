@@ -235,6 +235,12 @@ pub struct RioBackend {
     polling_only: bool,
     /// Outstanding RIO requests (drives the polling-only park clamp).
     inflight: u32,
+    /// Diagnostics (R-103): KEY_RIO notifications received, and
+    /// completions found by the poll-top drain while a notification was
+    /// armed (nonzero = notifications are not arriving; the watchdog
+    /// park cap is what kept I/O moving).
+    stat_notifies: u64,
+    stat_watchdog_reaps: u64,
     slab: OpSlab<RioOp>,
     results: Box<[RIORESULT; DEQUEUE_BATCH]>,
     entries: Box<[OVERLAPPED_ENTRY; POLL_BATCH]>,
@@ -320,6 +326,8 @@ impl RioBackend {
             notify_armed: false,
             polling_only,
             inflight: 0,
+            stat_notifies: 0,
+            stat_watchdog_reaps: 0,
             slab: OpSlab::new(empty_op),
             results: Box::new(unsafe { zeroed() }),
             entries: Box::new(unsafe { zeroed() }),
@@ -635,7 +643,15 @@ impl IoBackend for RioBackend {
         let before = out.len();
         self.inner.pre_poll(out);
         // Spin path (R-060/R-041): drain the CQ directly, no notification.
+        let drained_before = out.len();
         self.drain_cq(out)?;
+        if self.notify_armed && out.len() > drained_before {
+            // Completions surfaced by the drain while a notification was
+            // armed: the notification path is not delivering (first
+            // observed on hardware as a total stall). Counted for
+            // stats(); the watchdog park cap below is the safety net.
+            self.stat_watchdog_reaps += (out.len() - drained_before) as u64;
+        }
         let mut timeout_ms: u32 = match timeout {
             _ if out.len() > before => 0,
             Some(t) => t.as_millis().min(u32::MAX as u128) as u32,
@@ -645,6 +661,12 @@ impl IoBackend for RioBackend {
             // No CQ notification: keep parks short so completions are
             // drained promptly (degraded mode, see `polling_only`).
             timeout_ms = timeout_ms.min(1);
+        } else if self.inflight > 0 {
+            // Watchdog (defense-in-depth after the hardware stall): even
+            // in full-notify mode never park unbounded while RIO ops are
+            // outstanding — a lost notification then costs <=50ms, not a
+            // hang. 20 wakeups/s while idle-with-pending-recvs is noise.
+            timeout_ms = timeout_ms.min(50);
         }
         if timeout_ms > 0 && !self.polling_only && !self.notify_armed {
             // Arm exactly when we might park; RIONotify posts to the inner
@@ -652,6 +674,12 @@ impl IoBackend for RioBackend {
             let rc = unsafe { (self.t.RIONotify.unwrap())(self.cq) };
             if rc == 0 {
                 self.notify_armed = true;
+            } else {
+                // Arming failed: parking blind would strand every CQ
+                // completion until an unrelated wakeup. Degrade to
+                // polling mode permanently (name() reflects it).
+                self.polling_only = true;
+                timeout_ms = timeout_ms.min(1);
             }
         }
         let mut n: u32 = 0;
@@ -675,6 +703,7 @@ impl IoBackend for RioBackend {
         for i in 0..n as usize {
             let entry = self.entries[i];
             if entry.lpCompletionKey == KEY_RIO {
+                self.stat_notifies += 1;
                 self.notify_armed = false;
                 self.drain_cq(out)?;
             } else {
@@ -694,5 +723,9 @@ impl IoBackend for RioBackend {
         } else {
             "rio"
         }
+    }
+
+    fn diag(&self) -> Option<(u64, u64)> {
+        Some((self.stat_notifies, self.stat_watchdog_reaps))
     }
 }

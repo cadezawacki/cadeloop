@@ -166,6 +166,12 @@ pub trait IoBackend {
 
     /// Human-readable backend name for stats/diagnostics.
     fn name(&self) -> &'static str;
+
+    /// Backend diagnostic counters (R-103): RIO reports
+    /// (notifications_received, watchdog_reaps); None elsewhere.
+    fn diag(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// Cross-thread wakeup poster. Must be safe to call from any thread and

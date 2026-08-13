@@ -66,7 +66,6 @@ pub struct CoreLoop {
     net_error_hook: OnceLock<Py<PyAny>>,
     /// Facade hook: `(handle, seconds) -> None` (R-142 slow callbacks).
     slow_callback_hook: OnceLock<Py<PyAny>>,
-    backend_name: &'static str,
     high_water: usize,
     low_water: usize,
 }
@@ -418,7 +417,6 @@ impl CoreLoop {
         let reactor: Reactor<Py<PyAny>> = Reactor::new(cfg)?;
         let (xqueue, waker) = reactor.cross_thread_handles();
         let timer_cancels = reactor.timer_cancel_counter();
-        let backend_name = reactor.backend_name();
         Ok(CoreLoop {
             state: StateCell::new(LoopState {
                 reactor,
@@ -436,7 +434,6 @@ impl CoreLoop {
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
             slow_callback_hook: OnceLock::new(),
-            backend_name,
             high_water,
             low_water,
         })
@@ -991,7 +988,7 @@ impl CoreLoop {
     // ---- introspection (R-103) --------------------------------------------
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (stats, ready, timers, netstats) = self.state.with(|st| {
+        let (stats, ready, timers, netstats, diag, live_name) = self.state.with(|st| {
             (
                 st.reactor.stats.clone(),
                 st.reactor.ready_len(),
@@ -1004,10 +1001,14 @@ impl CoreLoop {
                     st.net.stats_bytes_tx,
                     st.net.stats_conns_accepted,
                 ),
+                st.reactor.backend_mut().diag(),
+                // Live, not the construction-time cache: RIO downgrades its
+                // name to "rio-polling" if RIONotify starts failing mid-run.
+                st.reactor.backend_name(),
             )
         })?;
         let d = PyDict::new(py);
-        d.set_item("backend", self.backend_name)?;
+        d.set_item("backend", live_name)?;
         d.set_item("ticks", stats.ticks)?;
         d.set_item("polls", stats.polls)?;
         d.set_item("completions", stats.completions)?;
@@ -1023,6 +1024,10 @@ impl CoreLoop {
         d.set_item("bytes_received", netstats.3)?;
         d.set_item("bytes_sent", netstats.4)?;
         d.set_item("connections_accepted", netstats.5)?;
+        if let Some((notifies, reaps)) = diag {
+            d.set_item("rio_notifies", notifies)?;
+            d.set_item("rio_watchdog_reaps", reaps)?;
+        }
         Ok(d)
     }
 }

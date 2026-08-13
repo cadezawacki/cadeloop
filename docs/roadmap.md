@@ -109,11 +109,16 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       msvc cross-check. `backend="rio"` selects it; `auto` stays IOCP
       until the item below
 - [ ] RIO behavioral validation + benchmarks on Windows hardware (the
-      gate for flipping `auto` to probe-RIO-first) — BLOCKED on the
-      available machine: its Win11 Insider build (26200.9168) fails to
-      initialize the OS RIO subsystem itself (rio_probe.rs has the full
-      diagnosis; validate.ps1 gates RIO steps in 2s). Needs a stable
-      x64 build (23H2/24H2 or Server)
+      gate for flipping `auto` to probe-RIO-first) — in progress across
+      two machines. Machine 1 (Win11 Insider 26200.9168): the OS RIO
+      subsystem itself fails to initialize (rio_probe.rs has the full
+      diagnosis; validate.ps1 gates RIO steps in 2s). Machine 2: RIO
+      constructs in full-notify mode but the data path stalled on the
+      first run; the backend now carries stall countermeasures (50ms
+      watchdog park cap while ops are in flight, RIONotify-failure
+      downgrade to `rio-polling`) plus `stats()` diagnosis counters,
+      and tools/windows/rio_bisect.py localizes any remaining stall
+      per-machinery in ~30s
 - [x] Fork-free worker model (Windows flavor, §8): supervisor binds one
       listener and hands it to spawned workers — WSADuplicateSocketW
       (socket.share over stdin) on win32, fd inheritance on POSIX so the

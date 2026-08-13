@@ -45,11 +45,32 @@ except ImportError:
 
 CHECK_TIMEOUT = 90.0
 
+# Final stats() snapshot of the last loop a check closed. Carries the RIO
+# diagnosis counters (rio_notifies / rio_watchdog_reaps) and the LIVE
+# backend name (a mid-run RIONotify failure downgrades "rio" to
+# "rio-polling") into the per-check result rows.
+LAST_STATS: dict = {}
+_STAT_KEYS = ("backend", "polls", "completions", "rio_notifies", "rio_watchdog_reaps")
+
 
 def _loop(backend: str, **kw) -> "cadeloop.Loop":
     from cadeloop.loop import Loop
 
-    return Loop(backend=backend, **kw)
+    lp = Loop(backend=backend, **kw)
+    orig_close = lp.close
+
+    def close_with_snapshot():
+        try:
+            st = lp.stats()
+            for k in _STAT_KEYS:
+                if k in st:
+                    LAST_STATS[k] = st[k]
+        except Exception:
+            pass
+        orig_close()
+
+    lp.close = close_with_snapshot
+    return lp
 
 
 async def _echo_server(loop):
@@ -174,9 +195,7 @@ def check_many_conns(backend):
 
 
 def check_http_native(backend):
-    from cadeloop.loop import Loop
-
-    lp = Loop(backend=backend)
+    lp = _loop(backend)
     asyncio.set_event_loop(lp)
     try:
         async def app(scope, receive, send):
@@ -373,22 +392,31 @@ def main() -> int:
         results["backends"][backend] = {}
         for name, fn in CHECKS:
             t0 = time.perf_counter()
+            LAST_STATS.clear()
             try:
                 detail = fn(backend)
                 dt = time.perf_counter() - t0
-                print(f"  PASS  {name:16s} ({dt:.2f}s)  {detail}", flush=True)
-                results["backends"][backend][name] = {"ok": True, "secs": round(dt, 3), **(detail or {})}
+                stats = dict(LAST_STATS)
+                print(f"  PASS  {name:16s} ({dt:.2f}s)  {detail}  stats={stats}", flush=True)
+                results["backends"][backend][name] = {
+                    "ok": True,
+                    "secs": round(dt, 3),
+                    **(detail or {}),
+                    "stats": stats,
+                }
             except BaseException as e:  # noqa: BLE001 — report and continue
                 dt = time.perf_counter() - t0
                 failures += 1
                 tb = traceback.format_exc()
-                print(f"  FAIL  {name:16s} ({dt:.2f}s)  {type(e).__name__}: {e}", flush=True)
+                stats = dict(LAST_STATS)
+                print(f"  FAIL  {name:16s} ({dt:.2f}s)  {type(e).__name__}: {e}  stats={stats}", flush=True)
                 print("        " + tb.replace("\n", "\n        "), flush=True)
                 results["backends"][backend][name] = {
                     "ok": False,
                     "secs": round(dt, 3),
                     "error": f"{type(e).__name__}: {e}",
                     "traceback": tb,
+                    "stats": stats,
                 }
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
