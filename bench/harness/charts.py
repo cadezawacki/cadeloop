@@ -20,6 +20,7 @@ import pathlib
 LIGHT = {
     "cadeloop": "#2a78d6",
     "cadeloop-native": "#164a9e",
+    "cadeloop-native-w2": "#3d6fc2",
     "asyncio": "#eb6834",
     "uvloop": "#1baf7a",
     "rloop": "#eda100",
@@ -31,6 +32,7 @@ LIGHT = {
 DARK = {
     "cadeloop": "#3987e5",
     "cadeloop-native": "#6fa9ef",
+    "cadeloop-native-w2": "#4f88d8",
     "asyncio": "#d95926",
     "uvloop": "#199e70",
     "rloop": "#c98500",

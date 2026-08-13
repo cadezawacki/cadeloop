@@ -27,6 +27,7 @@ pub mod iocp;
 pub mod portable;
 #[cfg(windows)]
 pub mod rio;
+pub mod rio_util;
 
 /// A reaped completion, translated out of backend-specific form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,35 +169,49 @@ impl BackendKind {
     }
 }
 
+/// Backend construction options (R-041/R-042 RIO sizing; ignored by
+/// backends that have no use for them).
+#[derive(Debug, Clone, Copy)]
+pub struct BackendOptions {
+    pub rio_cq_size: u32,
+    pub rio_rq_recv: u32,
+    pub rio_rq_send: u32,
+}
+
+impl Default for BackendOptions {
+    fn default() -> Self {
+        BackendOptions { rio_cq_size: 65536, rio_rq_recv: 32, rio_rq_send: 32 }
+    }
+}
+
 /// Instantiate the platform backend.
 ///
-/// On Windows: `auto` resolves RIO via
-/// `SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER` and falls back to IOCP.
-/// On other platforms every kind resolves to the portable dev backend so
-/// that loop-semantics tests run unmodified everywhere.
-pub fn create(kind: BackendKind) -> io::Result<Box<dyn IoBackend + Send>> {
+/// On Windows: `"rio"` builds the Registered I/O hybrid (R-040..R-044).
+/// `"auto"` resolves to IOCP for now — the RIO machinery is implemented
+/// and compile-verified, but its behavioral validation is the remaining
+/// M3 Windows-hardware gate; auto flips to probe-RIO-first once that
+/// lands. On other platforms every kind resolves to the dev backend so
+/// loop-semantics tests run unmodified everywhere.
+pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn IoBackend + Send>> {
     #[cfg(windows)]
     {
         match kind {
-            BackendKind::Iocp => Ok(Box::new(iocp::IocpBackend::new()?)),
-            BackendKind::Rio => match rio::RioBackend::new() {
-                Ok(b) => Ok(Box::new(b)),
-                Err(e) => Err(e),
-            },
-            BackendKind::Auto => match rio::RioBackend::new() {
-                Ok(b) => Ok(Box::new(b)),
-                Err(_) => Ok(Box::new(iocp::IocpBackend::new()?)),
-            },
+            BackendKind::Iocp | BackendKind::Auto => Ok(Box::new(iocp::IocpBackend::new()?)),
+            BackendKind::Rio => Ok(Box::new(rio::RioBackend::new(
+                opts.rio_cq_size,
+                opts.rio_rq_recv,
+                opts.rio_rq_send,
+            )?)),
         }
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = kind;
+        let _ = (kind, opts);
         Ok(Box::new(epoll::EpollBackend::new()?))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = kind;
+        let _ = (kind, opts);
         Ok(Box::new(portable::PortableBackend::new()))
     }
 }

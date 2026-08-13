@@ -82,9 +82,19 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       balancing), supervisor restart with fast-crash cutoff, SIGTERM
       forward + grace drain, round-robin CPU pinning (R-090..R-093);
       end-to-end tested via the CLI (balancing, SIGKILL restart, drain)
+- [x] RIO CQ/RQ machinery implemented (R-040..R-044): hybrid over IOCP
+      (AcceptEx/ConnectEx/probes stay IOCP; recv/send go through
+      per-socket RQs into one CQ with IOCP-notification), slab regions
+      registered once via the R-043 hook, sends staged into registered
+      64 KiB slots, CQ growth by doubling (overflow = creation-time
+      refusal, §16), cancel-via-close translated to OPERATION_ABORTED
+      (R-037 parity). Pure-Rust bookkeeping (region map, staging ledger,
+      CQ ledger) unit-tested on Linux; FFI glue compile-verified via the
+      msvc cross-check. `backend="rio"` selects it; `auto` stays IOCP
+      until the item below
+- [ ] RIO behavioral validation + benchmarks on Windows hardware (the
+      gate for flipping `auto` to probe-RIO-first)
 - [ ] Windows worker model: WSADuplicateSocketW handle passing (fork-free)
-- [ ] RIO CQ/RQ machinery (R-040..R-044) on the existing probe + buffer
-      registration hooks
 - [ ] p99 ≤ 0.6x uvicorn+winloop at 80% saturation (R-003 — Windows
       two-machine measurement)
 

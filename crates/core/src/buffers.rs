@@ -162,6 +162,10 @@ impl ClassPool {
 
 pub struct BufferPool {
     classes: [ClassPool; 3],
+    /// Set when a slab region was allocated since the last
+    /// `take_regions_dirty` — the reactor's cue to run the backend's
+    /// `register_buffers` hook (R-043; no-op on IOCP/epoll).
+    regions_dirty: bool,
 }
 
 impl Default for BufferPool {
@@ -178,6 +182,7 @@ impl BufferPool {
                 ClassPool::new(SizeClass::S16K),
                 ClassPool::new(SizeClass::S64K),
             ],
+            regions_dirty: false,
         }
     }
 
@@ -193,6 +198,9 @@ impl BufferPool {
 
     /// Acquire a slot with refcount 1.
     pub fn acquire(&mut self, class: SizeClass) -> SlotId {
+        if self.class(class).freelist.is_empty() {
+            self.regions_dirty = true;
+        }
         let pool = self.class_mut(class);
         if pool.freelist.is_empty() {
             pool.grow();
@@ -266,6 +274,22 @@ impl BufferPool {
 
     pub fn any_large_pages(&self) -> bool {
         self.classes.iter().any(|c| c.regions.iter().any(|r| r.large_pages))
+    }
+
+    /// True once after any slab growth (R-043 registration cue).
+    pub fn take_regions_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.regions_dirty)
+    }
+
+    /// All not-yet-registered regions across every class, for one
+    /// `register_buffers` call (the backend fills the cookies).
+    pub fn unregistered_regions_mut(&mut self) -> Vec<(*mut u8, usize, &mut Option<u64>)> {
+        self.classes
+            .iter_mut()
+            .flat_map(|c| c.regions.iter_mut())
+            .filter(|r| r.rio_buffer_id.is_none())
+            .map(|r| (r.ptr, REGION_SIZE, &mut r.rio_buffer_id))
+            .collect()
     }
 }
 

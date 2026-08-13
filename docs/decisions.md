@@ -180,3 +180,31 @@ rloop's remaining threadsafe edge comes from reusing a loop-init context
 snapshot instead of copying the caller's context per call — declined:
 call_soon_threadsafe capturing the calling thread's context is
 observable drop-in behavior (R-013).
+
+## ADR-23: RIO is a hybrid over IOCP, implemented ahead of its hardware
+Owner-directed: implement RIO (R-040..R-044) even though this
+environment cannot execute it. Shape: RIO has no accept/connect/cancel
+and no readiness story, so the backend wraps the IOCP backend — AcceptEx
+(accept sockets now created WSA_FLAG_REGISTERED_IO), ConnectEx, probes,
+and the PQCS wakeup stay IOCP; recv/send flow through per-socket request
+queues into ONE completion queue whose notification posts to the same
+IOCP port (KEY_RIO), so the loop keeps a single park point and the spin
+phase drains RIODequeueCompletion syscall-free (R-041/R-060). Sockets
+that cannot take an RQ (foreign fds) silently keep IOCP ops — mixed mode
+is by design. Recv buffers resolve ptr → (RIO_BUFFERID, offset) against
+slab regions registered once via the R-043 hook; sends copy into
+registered 64 KiB staging slots (RIO takes one registered buffer per
+request; oversize payloads ride the existing partial-send resumption).
+CQ capacity is reserved at RQ creation and grown by doubling — overflow
+is a visible creation-time refusal, never silent loss (§16). cancel()
+marks the op and lets closesocket flush the completion, translated to
+WSA_OPERATION_ABORTED for R-037 parity. RIO op ids carry a namespace bit
+so the two slabs share net.ops safely. Discipline for untestable code:
+everything that can be wrong in pure logic (region map, staging ledger,
+CQ ledger) lives in platform-free rio_util with Linux-run unit tests;
+the FFI file is thin, msvc-cross-checked at zero warnings, and
+`backend="auto"` keeps resolving to IOCP until Windows-hardware
+validation flips it (the recorded M3 gate). One side effect: the local
+msvc cross-check had silently broken when M2 vendored llhttp (no MSVC C
+compiler on Linux); build.rs now skips the C build for cross-CHECKS
+(which never link) and real Windows builds compile it natively.

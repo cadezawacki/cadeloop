@@ -74,9 +74,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         high_water: int = 64 * 1024,
         low_water: int = 16 * 1024,
         accept_pool: int = 64,
+        rio_cq_size: int = 65536,
+        rio_rq_recv: int = 32,
+        rio_rq_send: int = 32,
     ):
         core = _core.CoreLoop(
-            backend=backend, spin_us=spin_us, high_water=high_water, low_water=low_water
+            backend=backend,
+            spin_us=spin_us,
+            high_water=high_water,
+            low_water=low_water,
+            rio_cq_size=rio_cq_size,
+            rio_rq_recv=rio_rq_recv,
+            rio_rq_send=rio_rq_send,
         )
         self._core = core
         self._accept_pool = accept_pool  # R-032

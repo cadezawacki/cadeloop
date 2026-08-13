@@ -177,6 +177,9 @@ def _serve_single(app, host, port, config: Config, *, reuse_port: bool = False, 
         high_water=config.write_high_water,
         low_water=config.write_low_water,
         accept_pool=config.accept_pool,
+        rio_cq_size=config.rio_cq_size,
+        rio_rq_recv=config.rio_rq_recv,
+        rio_rq_send=config.rio_rq_send,
     )
     asyncio.set_event_loop(loop)
     lifespan = _Lifespan(app, loop)

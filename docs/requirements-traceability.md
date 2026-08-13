@@ -25,7 +25,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-036 | TransmitFile sendfile + pathsend | 📅 M1 | — |
 | R-037 | Pinned OVERLAPPED slab + state machine + CancelIoEx | ✅ (proptested) | opslab.rs, iocp.rs |
 | R-038 | TCP_NODELAY, loopback fast path, TFO | ✅ helpers | iocp.rs |
-| R-040..044 | RIO backend | 🔶 probe ✅ (R-040), rest 📅 M3 | rio.rs |
+| R-040..044 | RIO backend | 🔶 implemented: CQ+IOCP-notify (R-041), per-socket RQs (R-042), slab-region registration + send staging (R-043), 1024-batch dequeue + doubling CQ growth (R-044); bookkeeping unit-tested on Linux, FFI cross-compile-verified; Windows behavioral validation 📅 (gates auto-selection) | rio.rs, rio_util.rs |
 | R-050 | AbstractEventLoop surface + native fast paths | ✅ scheduling + TCP/server/sock_*/readers native; remaining gates: datagrams (M4), subprocess/pipes (M5), sendfile (R-036) | coreloop.rs, net.rs, loop.py |
 | R-051 | Subprocess gated (default off) | ✅ gate + message | config.py, loop.py |
 | R-052 | SIGINT/SIGBREAK handlers | 🔶 POSIX ✅ (EINTR-prompt); Windows SetConsoleCtrlHandler 📅 M4 | loop.py |
@@ -55,7 +55,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-088 | Fallback to pure-Python h11 path | ➖ not planned (native engine + uvicorn interop cover it) | — |
 | R-090..093 | Worker model, affinity, supervision | 🔶 Linux ✅: SO_REUSEPORT pool, supervisor restart + fast-crash cutoff, grace drain, sched_setaffinity pinning; Windows (WSADuplicateSocketW) 📅 M3 | server.py, tests/unit/test_multiworker.py |
 | R-100 | new_event_loop/EventLoopPolicy/install/run | ✅ | policy.py |
-| R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy; workers>1 📅 M3 | server.py, __main__.py |
+| R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy, multi-worker pool | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
 | R-103 | loop.stats() introspection | ✅ (M0 counters incl. syscalls_saved_inline plumbing) | coreloop.rs |
 | R-110 | maturin cp311-win_amd64 wheels; v2/v3 variants | 🔶 packaging ✅; v3 variant + publish 📅 M5 | pyproject.toml, ci.yml |

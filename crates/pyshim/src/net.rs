@@ -444,6 +444,20 @@ pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend
     maybe_finish_shutdown(py, net, backend, tid);
 }
 
+/// R-043: after slab growth, hand the new regions to the backend for
+/// registration (RIORegisterBuffer on RIO; no-op elsewhere). In-cell.
+fn ensure_buffers_registered(net: &mut NetState, backend: Backend<'_>) {
+    if !net.buffers.take_regions_dirty() {
+        return;
+    }
+    let mut regions = net.buffers.unregistered_regions_mut();
+    if !regions.is_empty() {
+        // Failure leaves cookies unset; RIO post_recv will then refuse the
+        // buffer and the connection errors visibly (never silent loss).
+        let _ = backend.register_buffers(&mut regions);
+    }
+}
+
 /// Post the next recv on a transport. In-cell.
 fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
@@ -454,6 +468,7 @@ fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64)
         Some(s) => s,
         None => {
             let s = net.buffers.acquire(RECV_CLASS);
+            ensure_buffers_registered(net, backend);
             net.transports.get_mut(&tid).unwrap().recv_slot = Some(s);
             s
         }

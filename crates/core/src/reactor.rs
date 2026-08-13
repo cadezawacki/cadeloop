@@ -41,11 +41,18 @@ pub struct ReactorConfig {
     pub spin_us: u64,
     /// R-030: completion batch size per GetQueuedCompletionStatusEx call.
     pub poll_batch: usize,
+    /// R-041/R-042: RIO completion/request queue sizing.
+    pub backend_opts: backend::BackendOptions,
 }
 
 impl Default for ReactorConfig {
     fn default() -> Self {
-        ReactorConfig { backend: BackendKind::Auto, spin_us: 20, poll_batch: 256 }
+        ReactorConfig {
+            backend: BackendKind::Auto,
+            spin_us: 20,
+            poll_batch: 256,
+            backend_opts: backend::BackendOptions::default(),
+        }
     }
 }
 
@@ -87,7 +94,7 @@ pub struct Reactor<T> {
 
 impl<T> Reactor<T> {
     pub fn new(cfg: ReactorConfig) -> io::Result<Self> {
-        let backend = backend::create(cfg.backend)?;
+        let backend = backend::create(cfg.backend, &cfg.backend_opts)?;
         let wakeup = backend.wakeup_handle();
         Ok(Reactor {
             clock: Clock::new(),

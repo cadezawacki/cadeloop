@@ -60,12 +60,14 @@ use crate::opslab::{OpId, OpKind, OpSlab};
 const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
 const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
 
-/// Completion keys distinguishing wakeups from socket I/O.
+/// Completion keys distinguishing wakeups from socket I/O. KEY_RIO marks
+/// the RIO completion queue's IOCP notification (rio.rs).
 const KEY_IO: usize = 1;
 const KEY_WAKEUP: usize = 2;
+pub(crate) const KEY_RIO: usize = 3;
 
 /// R-030: dequeue batch size.
-const POLL_BATCH: usize = 256;
+pub(crate) const POLL_BATCH: usize = 256;
 
 /// R-033: free-socket pool cap.
 const SOCKET_POOL_CAP: usize = 4096;
@@ -256,6 +258,9 @@ pub struct IocpBackend {
     /// for LSP/non-IFS sockets the port still queues a completion even on
     /// immediate success, and treating it inline would double-complete.
     skip_ok: std::collections::HashSet<SOCKET>,
+    /// WSASocketW flags for accept sockets. The RIO hybrid adds
+    /// WSA_FLAG_REGISTERED_IO so accepted connections are RQ-capable.
+    accept_socket_flags: u32,
 }
 
 // SAFETY: thread-affine by loop contract; raw handles are moved with it.
@@ -280,6 +285,7 @@ impl IocpBackend {
             watch_rearm: Vec::new(),
             probe_ops: HashMap::new(),
             skip_ok: std::collections::HashSet::new(),
+            accept_socket_flags: WSA_FLAG_OVERLAPPED,
         })
     }
 
@@ -411,7 +417,7 @@ impl IocpBackend {
                 info.iProtocol,
                 std::ptr::null(),
                 0,
-                WSA_FLAG_OVERLAPPED,
+                self.accept_socket_flags,
             )
         };
         if s == !0usize {
@@ -420,7 +426,27 @@ impl IocpBackend {
         Ok(s)
     }
 
-    fn translate_entry(&mut self, entry: &OVERLAPPED_ENTRY, out: &mut Vec<Completion>) {
+    /// RIO-hybrid hooks: the RioBackend shares this backend's completion
+    /// port (its CQ notification arrives under KEY_RIO) and drives the
+    /// GetQueuedCompletionStatusEx loop itself.
+    pub(crate) fn set_accept_socket_flags(&mut self, flags: u32) {
+        self.accept_socket_flags = flags;
+    }
+
+    pub(crate) fn port_handle(&self) -> HANDLE {
+        self.port.0
+    }
+
+    /// Pre-poll work shared with the hybrid: re-arm readiness probes and
+    /// surface inline (never-queued) completions.
+    pub(crate) fn pre_poll(&mut self, out: &mut Vec<Completion>) {
+        self.rearm_watch_probes();
+        if !self.inline_completions.is_empty() {
+            out.append(&mut self.inline_completions);
+        }
+    }
+
+    pub(crate) fn translate_entry(&mut self, entry: &OVERLAPPED_ENTRY, out: &mut Vec<Completion>) {
         if entry.lpCompletionKey == KEY_WAKEUP {
             out.push(Completion::Wakeup);
             return;

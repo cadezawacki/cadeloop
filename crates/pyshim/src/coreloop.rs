@@ -388,12 +388,31 @@ fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
 #[pymethods]
 impl CoreLoop {
     #[new]
-    #[pyo3(signature = (backend="auto", spin_us=20, high_water=65536, low_water=16384))]
-    fn new(backend: &str, spin_us: u64, high_water: usize, low_water: usize) -> PyResult<Self> {
+    #[pyo3(signature = (backend="auto", spin_us=20, high_water=65536, low_water=16384,
+                        rio_cq_size=65536, rio_rq_recv=32, rio_rq_send=32))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        backend: &str,
+        spin_us: u64,
+        high_water: usize,
+        low_water: usize,
+        rio_cq_size: u32,
+        rio_rq_recv: u32,
+        rio_rq_send: u32,
+    ) -> PyResult<Self> {
         let kind = BackendKind::parse(backend).ok_or_else(|| {
             PyValueError::new_err(format!("invalid backend {backend:?}: expected 'auto', 'iocp' or 'rio'"))
         })?;
-        let cfg = ReactorConfig { backend: kind, spin_us, ..Default::default() };
+        let cfg = ReactorConfig {
+            backend: kind,
+            spin_us,
+            backend_opts: cadeloop_core::backend::BackendOptions {
+                rio_cq_size,
+                rio_rq_recv,
+                rio_rq_send,
+            },
+            ..Default::default()
+        };
         let reactor: Reactor<Py<PyAny>> = Reactor::new(cfg)?;
         let (xqueue, waker) = reactor.cross_thread_handles();
         let timer_cancels = reactor.timer_cancel_counter();
