@@ -117,13 +117,15 @@ pub fn probe_available() -> bool {
 fn resolve_table() -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
     super::iocp::ensure_winsock();
     unsafe {
+        // The canonical RIO pattern (per the SDK samples) resolves the
+        // table from a socket created WITH the REGISTERED_IO flag.
         let probe = WSASocketW(
             AF_INET as i32,
             1, // SOCK_STREAM
             IPPROTO_TCP,
             std::ptr::null(),
             0,
-            WSA_FLAG_OVERLAPPED,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
         );
         if probe == !0usize {
             return Err(io::Error::from_raw_os_error(WSAGetLastError()));
@@ -150,8 +152,12 @@ fn resolve_table() -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
     }
 }
 
-fn wsa_error() -> io::Error {
-    io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+/// WSAGetLastError, naming the failing RIO call — hardware validation reports
+/// arrive as log files, so every failure must identify its site.
+fn wsa_named(call: &'static str) -> io::Error {
+    let raw = unsafe { WSAGetLastError() };
+    let base = io::Error::from_raw_os_error(raw);
+    io::Error::new(base.kind(), format!("{call} failed: {base}"))
 }
 
 /// Per-op state: (sends only) the staging slot pinned until the
@@ -235,7 +241,7 @@ impl RioBackend {
         let cq_size = cq_size.clamp(256, CQ_MAX);
         let cq = unsafe { (t.RIOCreateCompletionQueue.unwrap())(cq_size, &notify) };
         if cq == RIO_INVALID_CQ {
-            return Err(wsa_error());
+            return Err(wsa_named("RIOCreateCompletionQueue(IOCP-notify)"));
         }
         let mut backend = RioBackend {
             inner,
@@ -263,11 +269,12 @@ impl RioBackend {
             VirtualAlloc(std::ptr::null(), STAGING_REGION, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
         };
         if ptr.is_null() {
-            return Err(io::Error::last_os_error());
+            let base = io::Error::last_os_error();
+            return Err(io::Error::new(base.kind(), format!("VirtualAlloc(staging) failed: {base}")));
         }
         let id = unsafe { (self.t.RIORegisterBuffer.unwrap())(ptr.cast(), STAGING_REGION as u32) };
         if id == RIO_INVALID_BUFFERID {
-            let err = wsa_error();
+            let err = wsa_named("RIORegisterBuffer(staging)");
             unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
             return Err(err);
         }
@@ -295,10 +302,7 @@ impl RioBackend {
                 )
             };
             if n == RIO_CORRUPT_CQ {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "RIO completion queue corrupt (RIO_CORRUPT_CQ)",
-                ));
+                return Err(io::Error::other("RIO completion queue corrupt (RIO_CORRUPT_CQ)"));
             }
             if n == 0 {
                 return Ok(());
@@ -366,7 +370,7 @@ impl IoBackend for RioBackend {
         if let Some(new_size) = grow {
             let ok = unsafe { (self.t.RIOResizeCompletionQueue.unwrap())(self.cq, new_size) };
             if ok == 0 {
-                return Err(wsa_error());
+                return Err(wsa_named("RIOResizeCompletionQueue"));
             }
         }
         let rq = unsafe {
@@ -422,7 +426,7 @@ impl IoBackend for RioBackend {
             (self.t.RIOReceive.unwrap())(rq, &rbuf, 1, 0, ctx_of(id) as *const core::ffi::c_void)
         };
         if ok == 0 {
-            let err = wsa_error();
+            let err = wsa_named("RIOReceive");
             self.slab.complete(id);
             self.slab.release(id);
             return Err(err);
@@ -462,7 +466,7 @@ impl IoBackend for RioBackend {
             (self.t.RIOSend.unwrap())(rq, &rbuf, 1, 0, ctx_of(id) as *const core::ffi::c_void)
         };
         if ok == 0 {
-            let err = wsa_error();
+            let err = wsa_named("RIOSend");
             self.staging.free(slot);
             self.slab.complete(id);
             self.slab.release(id);
@@ -519,7 +523,7 @@ impl IoBackend for RioBackend {
             }
             let id = unsafe { (self.t.RIORegisterBuffer.unwrap())((*ptr).cast(), *len as u32) };
             if id == RIO_INVALID_BUFFERID {
-                return Err(wsa_error());
+                return Err(wsa_named("RIORegisterBuffer(slab)"));
             }
             **cookie = Some(id as u64);
             if !self.regions.insert(*ptr as usize, *len, id as u64) {
