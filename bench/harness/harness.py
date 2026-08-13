@@ -54,8 +54,15 @@ SCHED_BENCHES = [
 ]
 
 
+RUN_TIMEOUT = 90  # hard cap per run: a hung contender records as FAILED
+
+
 def run_json(cmd: list[str]) -> dict | None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("TIMEOUT (>" + str(RUN_TIMEOUT) + "s): " + " ".join(cmd) + "\n")
+        return None
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-2000:] + "\n")
         return None
