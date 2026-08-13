@@ -224,7 +224,7 @@ def chart_two_panel(title, entries, left_metric, right_metric, mode):
     entity, value labels on every bar (few bars)."""
     ink = INK[mode]
     names = [n for n, _ in entries]
-    panel_w, lab_w, val_w = 300, 150, 96
+    panel_w, lab_w, val_w = 300, 200, 96
     top = 64
     h = top + len(names) * (BAR + 10) + 46
     w = 2 * (lab_w + panel_w + val_w) + 40
