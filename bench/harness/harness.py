@@ -112,7 +112,11 @@ class ServerProc:
 
     def stop(self):
         if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.send_signal(signal.SIGINT)
+            except (ValueError, OSError):
+                # Windows: SIGINT is not deliverable to a plain subprocess.
+                self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:

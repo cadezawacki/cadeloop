@@ -47,6 +47,7 @@ def main():
             "hypercorn",
             "socketify",
             "cadeloop-native",
+            "cadeloop-native-rio",
             "cadeloop-native-w2",
             "cadeloop-native-w4",
         ],
@@ -59,10 +60,13 @@ def main():
         import cadeloop
 
         workers = 1
-        if "-w" in args.server:
+        backend = "auto"
+        if args.server.endswith("-rio"):
+            backend = "rio"
+        elif "-w" in args.server:
             workers = int(args.server.rsplit("-w", 1)[1])
         print(f"READY {args.port}", flush=True)
-        cadeloop.serve(app, "127.0.0.1", args.port, workers=workers)
+        cadeloop.serve(app, "127.0.0.1", args.port, workers=workers, backend=backend)
     elif args.server == "uvicorn":
         import uvicorn
 

@@ -37,7 +37,12 @@ def make_loop(kind: str):
         import rsloop
 
         return rsloop.new_event_loop()
-    raise SystemExit(f"unknown loop kind: {kind}")
+    # Generic: any module exposing new_event_loop (winloop on Windows).
+    try:
+        module = __import__(kind)
+        return module.new_event_loop()
+    except (ImportError, AttributeError):
+        raise SystemExit(f"unknown loop kind: {kind}") from None
 
 
 # --------------------------------------------------------------------- #

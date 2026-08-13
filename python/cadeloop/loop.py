@@ -69,7 +69,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     def __init__(
         self,
         *,
-        backend: str = "auto",
+        backend: str | None = None,
         spin_us: int = 20,
         high_water: int = 64 * 1024,
         low_water: int = 16 * 1024,
@@ -78,6 +78,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         rio_rq_recv: int = 32,
         rio_rq_send: int = 32,
     ):
+        # Backend resolution: explicit arg > CADELOOP_BACKEND env (lets the
+        # whole test/bench suite run against a chosen backend, e.g. "rio"
+        # on Windows) > "auto".
+        if backend is None:
+            backend = os.environ.get("CADELOOP_BACKEND", "auto")
         core = _core.CoreLoop(
             backend=backend,
             spin_us=spin_us,
