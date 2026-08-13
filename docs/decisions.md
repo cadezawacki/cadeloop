@@ -63,3 +63,40 @@ Only the L1 scheduling layer is benchmarkable off-Windows. The README's
 Linux report is labeled as such: it compares scheduling primitives against
 stdlib/uvloop/rloop on the portable backend and makes no claim about the
 R-003 acceptance targets, which are Windows two-machine runs (R-131).
+
+## ADR-11: Linux is a first-class dev/test target (epoll backend)
+Owner directives — drop-in coverage of the full asyncio surface, Linux
+benchmarking — override the spec's "no Linux support" non-goal (§15). The
+epoll backend emulates the IOCP completion-style op API (proactor-over-
+epoll), so ONE Rust transport layer serves both platforms and every
+transport test runs in this repo's Linux CI. Production wheels remain
+cp311-win_amd64; Linux perf headroom (EPOLLET, io_uring) is documented,
+not chased.
+
+## ADR-12: Transports live in Rust
+A Python transport layer over sock_* futures would concede uvloop's whole
+advantage. Transports are Rust state driven during completion translation;
+protocol callbacks are cached bound methods; events cross the state-cell
+boundary as pre-built payloads (see ADR-5's graveyard rule, now extended
+to buffers).
+
+## ADR-13: pause_reading never cancels the in-flight recv
+Cancelling creates completion/slot-reuse races (a cancelled op's completion
+may already be queued carrying data) and costs syscalls. Pausing merely
+stops re-posting; the in-flight result is delivered (asyncio's pause is
+advisory) and reading resumes for free. Belt-and-braces: kernel ops hold a
+buffer-slot refcount released only when their completion is reaped, so no
+teardown ordering can recycle a slot the kernel may still write (R-073).
+
+## ADR-14: The GIL is released only for polls that can block
+R-021 mandates GIL-released polling; a zero-timeout reap cannot block, and
+the save/restore costs ~100ns/tick. Ticks with pending ready work poll
+non-blocking WITH the GIL held. This plus the epoll no-op-poll fast path
+and single-clock-read rule keeps the M1 tick at M0's scheduling cost
+(verified: call_soon_chain 3.26M ops/s before/after).
+
+## ADR-15: TLS ships now via stdlib sslproto
+R-059 explicitly allows "a compatibility path built on ssl.MemoryBIO in
+Python (correctness first)" — that is asyncio.sslproto.SSLProtocol over
+our transports, exactly uvloop's approach. HTTPS works today; the native
+OpenSSL-BIO engine remains the M4 performance item.

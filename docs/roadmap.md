@@ -14,18 +14,24 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [x] Facade: policy/install/run (R-100), Config (R-102), serve()/CLI
       signatures (R-101), stats() (R-103)
 
-## M1 — IOCP transports; echo ≥1.15x winloop (two-machine)
+## M1 — TCP transports (Linux-verified; Windows echo gate pending)
 
-- [x] L0 IOCP backend primitives (R-030..R-038) — this tree, cross-checked
-- [ ] TCP transports: server (AcceptEx pool w/ replenish, R-032) + client
-      (ConnectEx), corking/gather writes (R-035), backpressure water marks,
-      buffered-protocol zero-copy receive (R-072), write-retention rule
-      (R-074)
-- [ ] `loop.sendfile` via TransmitFile (R-036)
-- [ ] add_reader/add_writer emulation (R-057)
-- [ ] Edge-case matrix automation (R-122): cancel-in-flight × ops,
-      half-close, RST, drip-feed, backpressure, close-with-pending-ops
-- [ ] bench/echo client + two-machine methodology (R-131)
+- [x] L0 IOCP backend primitives (R-030..R-038) — cross-checked
+- [x] L0 epoll dev backend (same completion API; Linux drop-in, ADR-11)
+- [x] TCP transports in Rust: cached protocol callbacks (R-054), pipelined
+      recv, corked gather writes (R-035), water-mark backpressure,
+      BufferedProtocol, write-retention rule for bytes (R-074),
+      per-op buffer refcounts (R-073)
+- [x] add_reader/add_writer + sock_* + POSIX signals (R-057 emulation on
+      IOCP is compile-verified; Windows CI exercises it)
+- [x] TLS via stdlib sslproto MemoryBIO path (R-059 fallback; native M4)
+- [x] Drop-in proof: uvicorn (HTTP/1.1) + aiohttp run unmodified
+- [x] bench/echo + bench/http suites (loopback; R-130 methodology)
+- [ ] `loop.sendfile` via TransmitFile (R-036) — sock_sendfile fallback ✅
+- [ ] Windows behavioral verification + edge-case matrix completion
+      (R-122: RST paths, drip-feed, slowloris timing) on Windows CI
+- [ ] Echo ≥1.15x winloop on two-machine Windows hardware (the M1 gate,
+      R-131 — cannot be measured from this Linux environment)
 
 ## M2 — HTTP/ASGI engine; plaintext ≥2.0x uvicorn+winloop
 
