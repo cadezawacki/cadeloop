@@ -1,11 +1,13 @@
-﻿# cadeloop Windows validation -- one-shot orchestrator (v3).
+﻿# cadeloop Windows validation -- one-shot orchestrator (v4).
 #
-# v3: pins Python to the REPO'S .venv (creating it with Python 3.11 if
-# missing) so a stray system interpreter can never hijack the run (the
-# 2nd hardware run picked up an AppData Python 3.14 and pyo3 refused to
-# build); clears windows-results\ at start so logs are single-run;
-# adds the rio_probe diagnosis step. All long steps remain wrapped in the
-# process-level watchdog (nothing can stall).
+# v4: RIO availability gate -- one 2s construct check (rio_check.py)
+# decides whether the RIO-dependent steps (06, rio smoke, 11, 13, 15,
+# the rio HTTP contender) run or get SKIP(rio) summary rows, so a
+# machine where RIO cannot initialize loses zero time to repeated
+# failures. Bench harness timeouts tightened (12s per run, 10s server
+# start). v3: pins Python to the repo .venv (hard-stop unless 3.11),
+# clears windows-results\ at start, rio_probe diagnosis step, and the
+# process-level watchdog around all long steps (nothing can stall).
 #
 # Usage (repo root): powershell -ExecutionPolicy Bypass -File tools\windows\validate.ps1
 
@@ -80,8 +82,8 @@ Step "04-build-ext" {
     cargo build --release -p cadeloop-pyshim
     Copy-Item target\release\_core.dll python\cadeloop\_core.pyd -Force
     $env:PYTHONPATH = "$repo\python"
+    & $PY tools\windows\rio_check.py
     & $PY -c "import cadeloop; lp = cadeloop.new_event_loop(); print('backend:', lp.stats()['backend']); lp.close()"
-    & $PY -c "from cadeloop.loop import Loop; lp = Loop(backend='rio'); print('rio backend:', lp.stats()['backend']); lp.close()"
 }
 
 Step "04b-rio-probe" {
@@ -89,6 +91,24 @@ Step "04b-rio-probe" {
 }
 
 $env:PYTHONPATH = "$repo\python"
+
+# ---- RIO availability gate --------------------------------------------
+# One 2-second construct check decides whether the RIO-dependent steps
+# run at all. On machines where RIO cannot initialize (see
+# 04b-rio-probe.log) they are SKIPPED instantly instead of each failing
+# slowly with the same construction error.
+& $PY tools\windows\rio_check.py
+$rioOK = ($LASTEXITCODE -eq 0)
+if ($rioOK) {
+    Write-Host "RIO gate: available -- running full RIO steps" -ForegroundColor Green
+} else {
+    Write-Host "RIO gate: unavailable on this machine -- RIO steps SKIPPED (diagnosis: 04b-rio-probe.log)" -ForegroundColor Yellow
+}
+
+function SkipStep($name) {
+    Write-Host "==== [$name] SKIPPED (rio unavailable) ====" -ForegroundColor Yellow
+    $script:summary += "{0,-28} {1,-10} {2,6}s" -f $name, "SKIP(rio)", 0
+}
 
 function PytestSweep($label) {
     $fail = 0
@@ -108,16 +128,22 @@ Step "05-pytest-iocp" {
     PytestSweep "iocp"
 }
 
-Step "06-pytest-rio" {
-    $env:CADELOOP_BACKEND = "rio"
-    PytestSweep "rio"
-    $code = $LASTEXITCODE
-    Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
-    cmd /c exit $code
-}
-
-Step "07-backend-smoke" {
-    & $PY $WD 900 -- $PY tools\windows\rio_smoke.py iocp rio --out (Join-Path $R "backend-smoke.json")
+if ($rioOK) {
+    Step "06-pytest-rio" {
+        $env:CADELOOP_BACKEND = "rio"
+        PytestSweep "rio"
+        $code = $LASTEXITCODE
+        Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
+        cmd /c exit $code
+    }
+    Step "07-backend-smoke" {
+        & $PY $WD 900 -- $PY tools\windows\rio_smoke.py iocp rio --out (Join-Path $R "backend-smoke.json")
+    }
+} else {
+    SkipStep "06-pytest-rio"
+    Step "07-backend-smoke" {
+        & $PY $WD 900 -- $PY tools\windows\rio_smoke.py iocp --out (Join-Path $R "backend-smoke.json")
+    }
 }
 
 Step "08-cpython-conformance" {
@@ -137,12 +163,16 @@ Step "10-bench-echo-rtt-iocp" {
     Set-Location $repo
 }
 
-Step "11-bench-echo-rtt-rio" {
-    Set-Location bench
-    $env:CADELOOP_BACKEND = "rio"
-    & $PY ..\$WD 900 -- $PY harness\harness.py --suite echo --loops cadeloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-rio.json")
-    Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
-    Set-Location $repo
+if ($rioOK) {
+    Step "11-bench-echo-rtt-rio" {
+        Set-Location bench
+        $env:CADELOOP_BACKEND = "rio"
+        & $PY ..\$WD 900 -- $PY harness\harness.py --suite echo --loops cadeloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-rio.json")
+        Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
+        Set-Location $repo
+    }
+} else {
+    SkipStep "11-bench-echo-rtt-rio"
 }
 
 Step "12-bench-echo-64-iocp" {
@@ -151,26 +181,36 @@ Step "12-bench-echo-64-iocp" {
     Set-Location $repo
 }
 
-Step "13-bench-echo-64-rio" {
-    Set-Location bench
-    $env:CADELOOP_BACKEND = "rio"
-    & $PY ..\$WD 900 -- $PY harness\harness.py --suite echo --loops cadeloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-rio.json")
-    Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
-    Set-Location $repo
+if ($rioOK) {
+    Step "13-bench-echo-64-rio" {
+        Set-Location bench
+        $env:CADELOOP_BACKEND = "rio"
+        & $PY ..\$WD 900 -- $PY harness\harness.py --suite echo --loops cadeloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-rio.json")
+        Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
+        Set-Location $repo
+    }
+} else {
+    SkipStep "13-bench-echo-64-rio"
 }
 
+$httpContenders = "cadeloop-native,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,uvicorn+rsloop,hypercorn"
+if ($rioOK) { $httpContenders = "cadeloop-native,cadeloop-native-rio,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,uvicorn+rsloop,hypercorn" }
 Step "14-bench-http" {
     Set-Location bench
-    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite http --contenders cadeloop-native,cadeloop-native-rio,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,uvicorn+rsloop,hypercorn --conns 64 --seconds 3 --out (Join-Path $R "win-http.json")
+    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite http --contenders $httpContenders --conns 64 --seconds 3 --out (Join-Path $R "win-http.json")
     Set-Location $repo
 }
 
-Step "15-bench-http-uvicorn-on-rio" {
-    Set-Location bench
-    $env:CADELOOP_BACKEND = "rio"
-    & $PY ..\$WD 900 -- $PY harness\harness.py --suite http --contenders uvicorn+cadeloop --conns 64 --seconds 3 --out (Join-Path $R "win-http-uvicorn-rio.json")
-    Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
-    Set-Location $repo
+if ($rioOK) {
+    Step "15-bench-http-uvicorn-on-rio" {
+        Set-Location bench
+        $env:CADELOOP_BACKEND = "rio"
+        & $PY ..\$WD 900 -- $PY harness\harness.py --suite http --contenders uvicorn+cadeloop --conns 64 --seconds 3 --out (Join-Path $R "win-http-uvicorn-rio.json")
+        Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
+        Set-Location $repo
+    }
+} else {
+    SkipStep "15-bench-http-uvicorn-on-rio"
 }
 
 Step "16-wheel" {

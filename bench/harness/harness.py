@@ -54,7 +54,11 @@ SCHED_BENCHES = [
 ]
 
 
-RUN_TIMEOUT = 90  # hard cap per run: a hung contender records as FAILED
+# Hard cap per run: a hung contender records as FAILED. The slowest
+# legitimate run observed anywhere (asyncio threadsafe_throughput, 50k ops
+# at ~36k ops/s on Windows) finishes in under 3s including startup, so 12s
+# is 4x headroom while a hang costs seconds, not minutes.
+RUN_TIMEOUT = 12
 
 
 def run_json(cmd: list[str]) -> dict | None:
@@ -89,7 +93,7 @@ class ServerProc:
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, cwd=cwd
         )
         self.port = port
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 10
         ready = False
         while time.monotonic() < deadline:
             line = self.proc.stdout.readline()
@@ -102,6 +106,11 @@ class ServerProc:
             self.stop()
             raise RuntimeError(f"server failed to start: {cmd}")
         while time.monotonic() < deadline:
+            # A server that printed READY and then died (e.g. backend
+            # construction failed inside serve()) must fail instantly, not
+            # after the full connect deadline.
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"server exited with {self.proc.returncode} before accepting")
             try:
                 socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
                 return
