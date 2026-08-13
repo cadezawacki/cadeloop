@@ -1,56 +1,74 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1132 240" width="1132" height="240" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
-<rect width="1132" height="240" fill="#1a1a19" rx="8"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1232 318" width="1232" height="318" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<rect width="1232" height="318" fill="#1a1a19" rx="8"/>
 <text x="20" y="28" font-size="15" font-weight="600" fill="#ffffff">HTTP/1.1 plaintext — 64 keep-alive connections (loopback)</text>
-<text x="150" y="50" font-size="12" fill="#c3c2b7">requests/s, K <tspan fill="#898781" font-size="10.5">(higher is better)</tspan></text>
-<line x1="150.0" y1="64" x2="150.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="150.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">0</text>
-<line x1="225.0" y1="64" x2="225.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="225.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">2</text>
-<line x1="300.0" y1="64" x2="300.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="300.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">4</text>
-<line x1="375.0" y1="64" x2="375.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="375.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">6</text>
-<line x1="450.0" y1="64" x2="450.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="450.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">8</text>
-<text x="140" y="82" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+cadeloop</text>
-<path d="M150.0,70.0 h259.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-259.8 z" fill="#3987e5"/><rect x="150.0" y="69.0" width="0" height="0" fill="#1a1a19"/>
-<text x="419.8" y="82" font-size="11" font-weight="600" fill="#ffffff">7.03 K/s</text>
-<text x="140" y="108" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+rsloop</text>
-<path d="M150.0,96.0 h256.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-256.7 z" fill="#d55181"/><rect x="150.0" y="95.0" width="0" height="0" fill="#1a1a19"/>
-<text x="416.7" y="108" font-size="11" font-weight="600" fill="#ffffff">6.95 K/s</text>
-<text x="140" y="134" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+asyncio</text>
-<path d="M150.0,122.0 h255.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-255.5 z" fill="#d95926"/><rect x="150.0" y="121.0" width="0" height="0" fill="#1a1a19"/>
-<text x="415.5" y="134" font-size="11" font-weight="600" fill="#ffffff">6.92 K/s</text>
-<text x="140" y="160" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+uvloop</text>
-<path d="M150.0,148.0 h254.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-254.7 z" fill="#199e70"/><rect x="150.0" y="147.0" width="0" height="0" fill="#1a1a19"/>
-<text x="414.7" y="160" font-size="11" font-weight="600" fill="#ffffff">6.90 K/s</text>
-<text x="140" y="186" font-size="12" fill="#c3c2b7" text-anchor="end">hypercorn</text>
-<path d="M150.0,174.0 h145.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-145.3 z" fill="#9085e9"/><rect x="150.0" y="173.0" width="0" height="0" fill="#1a1a19"/>
-<text x="305.3" y="186" font-size="11" font-weight="600" fill="#ffffff">3.98 K/s</text>
-<line x1="150" y1="64" x2="150" y2="202" stroke="#383835" stroke-width="1"/>
-<text x="736" y="50" font-size="12" fill="#c3c2b7">p99 latency <tspan fill="#898781" font-size="10.5">(lower is better)</tspan></text>
-<line x1="736.0" y1="64" x2="736.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="736.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">0</text>
-<line x1="836.0" y1="64" x2="836.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="836.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">10</text>
-<line x1="936.0" y1="64" x2="936.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="936.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">20</text>
-<line x1="1036.0" y1="64" x2="1036.0" y2="202" stroke="#2c2c2a" stroke-width="1"/>
-<text x="1036.0" y="218" font-size="10.5" fill="#898781" text-anchor="middle">30</text>
-<text x="726" y="82" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+cadeloop</text>
-<path d="M736.0,70.0 h105.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-105.8 z" fill="#3987e5"/><rect x="736.0" y="69.0" width="0" height="0" fill="#1a1a19"/>
-<text x="851.8" y="82" font-size="11" font-weight="600" fill="#ffffff">11.0 ms</text>
-<text x="726" y="108" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+rsloop</text>
-<path d="M736.0,96.0 h106.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-106.6 z" fill="#d55181"/><rect x="736.0" y="95.0" width="0" height="0" fill="#1a1a19"/>
-<text x="852.6" y="108" font-size="11" font-weight="600" fill="#ffffff">11.1 ms</text>
-<text x="726" y="134" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+asyncio</text>
-<path d="M736.0,122.0 h107.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-107.1 z" fill="#d95926"/><rect x="736.0" y="121.0" width="0" height="0" fill="#1a1a19"/>
-<text x="853.1" y="134" font-size="11" font-weight="600" fill="#ffffff">11.1 ms</text>
-<text x="726" y="160" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+uvloop</text>
-<path d="M736.0,148.0 h113.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-113.4 z" fill="#199e70"/><rect x="736.0" y="147.0" width="0" height="0" fill="#1a1a19"/>
-<text x="859.4" y="160" font-size="11" font-weight="600" fill="#ffffff">11.7 ms</text>
-<text x="726" y="186" font-size="12" fill="#c3c2b7" text-anchor="end">hypercorn</text>
-<path d="M736.0,174.0 h215.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-215.3 z" fill="#9085e9"/><rect x="736.0" y="173.0" width="0" height="0" fill="#1a1a19"/>
-<text x="961.3" y="186" font-size="11" font-weight="600" fill="#ffffff">21.9 ms</text>
-<line x1="736" y1="64" x2="736" y2="202" stroke="#383835" stroke-width="1"/>
+<text x="200" y="50" font-size="12" fill="#c3c2b7">requests/s, K <tspan fill="#898781" font-size="10.5">(higher is better)</tspan></text>
+<line x1="200.0" y1="64" x2="200.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="200.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">0</text>
+<line x1="275.0" y1="64" x2="275.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="275.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">10</text>
+<line x1="350.0" y1="64" x2="350.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="350.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">20</text>
+<line x1="425.0" y1="64" x2="425.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="425.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">30</text>
+<line x1="500.0" y1="64" x2="500.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="500.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">40</text>
+<text x="190" y="82" font-size="12" fill="#c3c2b7" text-anchor="end">cadeloop-native</text>
+<path d="M200.0,70.0 h259.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-259.6 z" fill="#6fa9ef"/><rect x="200.0" y="69.0" width="0" height="0" fill="#1a1a19"/>
+<text x="469.6" y="82" font-size="11" font-weight="600" fill="#ffffff">35.1 K/s</text>
+<text x="190" y="108" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+rsloop</text>
+<path d="M200.0,96.0 h47.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-47.2 z" fill="#d55181"/><rect x="200.0" y="95.0" width="0" height="0" fill="#1a1a19"/>
+<text x="257.2" y="108" font-size="11" font-weight="600" fill="#ffffff">6.83 K/s</text>
+<text x="190" y="134" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+asyncio</text>
+<path d="M200.0,122.0 h46.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-46.3 z" fill="#d95926"/><rect x="200.0" y="121.0" width="0" height="0" fill="#1a1a19"/>
+<text x="256.3" y="134" font-size="11" font-weight="600" fill="#ffffff">6.71 K/s</text>
+<text x="190" y="160" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+aiofastnet-cadeloop</text>
+<path d="M200.0,148.0 h46.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-46.1 z" fill="#5e93c9"/><rect x="200.0" y="147.0" width="0" height="0" fill="#1a1a19"/>
+<text x="256.1" y="160" font-size="11" font-weight="600" fill="#ffffff">6.68 K/s</text>
+<text x="190" y="186" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+uvloop</text>
+<path d="M200.0,174.0 h45.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-45.8 z" fill="#199e70"/><rect x="200.0" y="173.0" width="0" height="0" fill="#1a1a19"/>
+<text x="255.8" y="186" font-size="11" font-weight="600" fill="#ffffff">6.64 K/s</text>
+<text x="190" y="212" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+aiofastnet</text>
+<path d="M200.0,200.0 h45.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-45.5 z" fill="#1fa2b8"/><rect x="200.0" y="199.0" width="0" height="0" fill="#1a1a19"/>
+<text x="255.5" y="212" font-size="11" font-weight="600" fill="#ffffff">6.60 K/s</text>
+<text x="190" y="238" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+cadeloop</text>
+<path d="M200.0,226.0 h45.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-45.3 z" fill="#3987e5"/><rect x="200.0" y="225.0" width="0" height="0" fill="#1a1a19"/>
+<text x="255.3" y="238" font-size="11" font-weight="600" fill="#ffffff">6.57 K/s</text>
+<text x="190" y="264" font-size="12" fill="#c3c2b7" text-anchor="end">hypercorn</text>
+<path d="M200.0,252.0 h25.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-25.8 z" fill="#9085e9"/><rect x="200.0" y="251.0" width="0" height="0" fill="#1a1a19"/>
+<text x="235.8" y="264" font-size="11" font-weight="600" fill="#ffffff">3.98 K/s</text>
+<line x1="200" y1="64" x2="200" y2="280" stroke="#383835" stroke-width="1"/>
+<text x="836" y="50" font-size="12" fill="#c3c2b7">p99 latency <tspan fill="#898781" font-size="10.5">(lower is better)</tspan></text>
+<line x1="836.0" y1="64" x2="836.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="836.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">0</text>
+<line x1="936.0" y1="64" x2="936.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="936.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">10</text>
+<line x1="1036.0" y1="64" x2="1036.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="1036.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">20</text>
+<line x1="1136.0" y1="64" x2="1136.0" y2="280" stroke="#2c2c2a" stroke-width="1"/>
+<text x="1136.0" y="296" font-size="10.5" fill="#898781" text-anchor="middle">30</text>
+<text x="826" y="82" font-size="12" fill="#c3c2b7" text-anchor="end">cadeloop-native</text>
+<path d="M836.0,70.0 h74.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-74.2 z" fill="#6fa9ef"/><rect x="836.0" y="69.0" width="0" height="0" fill="#1a1a19"/>
+<text x="920.2" y="82" font-size="11" font-weight="600" fill="#ffffff">7.82 ms</text>
+<text x="826" y="108" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+rsloop</text>
+<path d="M836.0,96.0 h106.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-106.6 z" fill="#d55181"/><rect x="836.0" y="95.0" width="0" height="0" fill="#1a1a19"/>
+<text x="952.6" y="108" font-size="11" font-weight="600" fill="#ffffff">11.1 ms</text>
+<text x="826" y="134" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+asyncio</text>
+<path d="M836.0,122.0 h121.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-121.2 z" fill="#d95926"/><rect x="836.0" y="121.0" width="0" height="0" fill="#1a1a19"/>
+<text x="967.2" y="134" font-size="11" font-weight="600" fill="#ffffff">12.5 ms</text>
+<text x="826" y="160" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+aiofastnet-cadeloop</text>
+<path d="M836.0,148.0 h116.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-116.4 z" fill="#5e93c9"/><rect x="836.0" y="147.0" width="0" height="0" fill="#1a1a19"/>
+<text x="962.4" y="160" font-size="11" font-weight="600" fill="#ffffff">12.0 ms</text>
+<text x="826" y="186" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+uvloop</text>
+<path d="M836.0,174.0 h119.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-119.2 z" fill="#199e70"/><rect x="836.0" y="173.0" width="0" height="0" fill="#1a1a19"/>
+<text x="965.2" y="186" font-size="11" font-weight="600" fill="#ffffff">12.3 ms</text>
+<text x="826" y="212" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+aiofastnet</text>
+<path d="M836.0,200.0 h127.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-127.3 z" fill="#1fa2b8"/><rect x="836.0" y="199.0" width="0" height="0" fill="#1a1a19"/>
+<text x="973.3" y="212" font-size="11" font-weight="600" fill="#ffffff">13.1 ms</text>
+<text x="826" y="238" font-size="12" fill="#c3c2b7" text-anchor="end">uvicorn+cadeloop</text>
+<path d="M836.0,226.0 h119.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-119.5 z" fill="#3987e5"/><rect x="836.0" y="225.0" width="0" height="0" fill="#1a1a19"/>
+<text x="965.5" y="238" font-size="11" font-weight="600" fill="#ffffff">12.3 ms</text>
+<text x="826" y="264" font-size="12" fill="#c3c2b7" text-anchor="end">hypercorn</text>
+<path d="M836.0,252.0 h244.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-244.1 z" fill="#9085e9"/><rect x="836.0" y="251.0" width="0" height="0" fill="#1a1a19"/>
+<text x="1090.1" y="264" font-size="11" font-weight="600" fill="#ffffff">24.8 ms</text>
+<line x1="836" y1="64" x2="836" y2="280" stroke="#383835" stroke-width="1"/>
 </svg>
