@@ -54,7 +54,7 @@ jobs:
         run: |
           cargo build -p cadeloop-pyshim --release
           cp target/release/lib_core.so python/cadeloop/_core.so
-          pip install pytest pytest-timeout uvicorn aiohttp trustme
+          pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi
           PYTHONPATH=python python -m pytest tests/unit tests/conformance -q --timeout=90
 
   build-windows:
@@ -76,7 +76,7 @@ jobs:
           pip install maturin pytest
           maturin build --release --out dist
           pip install --no-index --find-links dist cadeloop
-          pip install pytest-timeout uvicorn aiohttp trustme
+          pip install pytest-timeout uvicorn aiohttp trustme starlette fastapi
       - name: unit + conformance subset
         run: python -m pytest tests/unit tests/conformance -q --timeout=120
       - name: CPython asyncio conformance suite (R-120)

@@ -4,7 +4,9 @@ A maximum-performance asyncio event loop + ASGI stack with a Rust core.
 Windows (IOCP, Registered I/O planned) is the production performance
 target; Linux runs the same transport layer over epoll, making cadeloop a
 **working drop-in `asyncio.AbstractEventLoop` replacement on both** —
-uvicorn and aiohttp run on it unmodified.
+uvicorn and aiohttp run on it unmodified — plus a **native HTTP/1.1 +
+ASGI 3.0 server** (`cadeloop.serve`) whose parsing, scope construction,
+and response serialization all happen in Rust.
 
 ```python
 import asyncio, cadeloop
@@ -17,13 +19,19 @@ reader, writer = await asyncio.open_connection("example.org", 443, ssl=ctx)
 loop.add_reader(fd, callback)      # readiness, sock_*, signals — all live
 ```
 
+```bash
+# the native ASGI server (llhttp in Rust, ~5x uvicorn on loopback):
+python -m cadeloop myapp:app --port 8000
+```
+
 ## Status
 
-**M0 + M1 complete on Linux** (scheduling core, Rust TCP transports, full
-drop-in surface, TLS via the stdlib `sslproto` path); the Windows IOCP
-backend is implemented and compile-verified, with behavioral verification
-and the winloop echo gate riding on Windows CI/hardware. The native
-HTTP/ASGI engine (`cadeloop.serve`) is milestone M2. Full R-xxx map:
+**M0 + M1 + M2 complete on Linux** (scheduling core, Rust TCP
+transports, full drop-in surface, TLS via the stdlib `sslproto` path,
+native HTTP/ASGI engine with Starlette/FastAPI verified); the Windows
+IOCP backend is implemented and compile-verified, with behavioral
+verification and the winloop gates riding on Windows CI/hardware. Full
+R-xxx map:
 [docs/requirements-traceability.md](docs/requirements-traceability.md).
 
 | Surface | State |
@@ -33,8 +41,9 @@ HTTP/ASGI engine (`cadeloop.serve`) is milestone M2. Full R-xxx map:
 | TLS (`ssl=` / `start_tls`) | ✅ via stdlib sslproto (native engine M4) |
 | `sock_*`, `add_reader`/`add_writer`, POSIX signals | ✅ tested |
 | Drop-in: uvicorn (HTTP/1.1), aiohttp | ✅ interop-tested |
+| Native HTTP/1.1 + ASGI engine (`cadeloop.serve`, CLI, lifespan) | ✅ tested (Starlette/FastAPI, keep-alive/pipelining, chunked, limits) |
 | UDP · subprocess/pipes · native `loop.sendfile` | M4 · M5 · M1-Windows |
-| Native HTTP/1.1 + ASGI engine, `cadeloop.serve`, multi-worker | M2 · M3 |
+| Multi-worker (§8) · WebSockets · native TLS | M3 · M4 · M4 |
 
 ## Benchmarks (Linux, loopback)
 
@@ -182,13 +191,13 @@ decisions in [docs/decisions.md](docs/decisions.md)):
 ## Development
 
 ```bash
-cargo test --workspace                                    # Rust core (44 tests)
+cargo test --workspace                                    # Rust core (53 tests)
 cargo check -p cadeloop-core --target x86_64-pc-windows-msvc
 
 cargo build -p cadeloop-pyshim --release                  # extension
 cp target/release/lib_core.so python/cadeloop/_core.so    # Linux dev shortcut
-pip install pytest pytest-timeout uvicorn aiohttp trustme
-PYTHONPATH=python pytest tests/unit tests/conformance     # 87 tests
+pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi
+PYTHONPATH=python pytest tests/unit tests/conformance     # 110 tests
 
 pip install maturin && maturin build --release            # the real wheel
 python tests/conformance/run_cpython_suite.py             # CPython asyncio suite
