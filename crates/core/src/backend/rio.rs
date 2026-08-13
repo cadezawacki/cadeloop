@@ -547,6 +547,25 @@ impl IoBackend for RioBackend {
         self.inner.post_connect(socket, addr)
     }
 
+    // R-058: datagrams ride the inner IOCP surface in the hybrid (RIO
+    // datagram RQs are a possible later refinement).
+    fn post_recv_from(&mut self, socket: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
+        self.inner.post_recv_from(socket, buf, len)
+    }
+
+    fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
+        self.inner.take_recv_from_addr(op)
+    }
+
+    fn post_send_to(
+        &mut self,
+        socket: RawSocket,
+        data: &[u8],
+        addr: Option<&std::net::SocketAddr>,
+    ) -> io::Result<OpId> {
+        self.inner.post_send_to(socket, data, addr)
+    }
+
     fn post_disconnect_reuse(&mut self, socket: RawSocket) -> io::Result<OpId> {
         // Recycled sockets keep their RQ association wrongly; simplest
         // correct behavior on RIO is close-don't-recycle.

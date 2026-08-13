@@ -39,7 +39,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockopt, setsockopt, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv,
-    WSASend, WSASocketW, WSAStartup, AF_INET, AF_INET6, IPPROTO_TCP, LPFN_ACCEPTEX, LPFN_CONNECTEX,
+    WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup, AF_INET, AF_INET6, IPPROTO_TCP,
+    LPFN_ACCEPTEX, LPFN_CONNECTEX,
     LPFN_DISCONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_LOOPBACK_FAST_PATH, SOCKADDR, SOCKADDR_IN,
     SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_PROTOCOL_INFOW,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TCP_FASTOPEN, TCP_NODELAY, TF_REUSE_SOCKET, WSABUF,
@@ -53,6 +54,7 @@ use windows_sys::Win32::System::IO::{
 };
 
 use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup, MAX_GATHER};
+use crate::netsys;
 use crate::opslab::{OpId, OpKind, OpSlab};
 
 // FILE_SKIP_* constants live in FileSystem in some windows-sys revisions and
@@ -194,6 +196,11 @@ pub struct IocpOp {
     socket: SOCKET,
     /// Accept only: the pre-created accept socket.
     accept_socket: SOCKET,
+    /// RecvFrom only: length the kernel wrote into `addr_buf` (R-058).
+    from_len: i32,
+    /// SendTo only: the copied-in datagram (kernel reads it until the
+    /// completion is reaped).
+    dgram: Vec<u8>,
     /// Send only: gather list (R-035). Kernel reads these until completion;
     /// pinned because slab slots never move (R-037).
     wsabufs: [WSABUF; MAX_GATHER],
@@ -202,8 +209,18 @@ pub struct IocpOp {
 }
 
 fn empty_op() -> IocpOp {
-    // SAFETY: all-zero is a valid representation for these C structs.
-    unsafe { zeroed() }
+    IocpOp {
+        // SAFETY: all-zero is a valid representation for these C structs
+        // (the Vec below is NOT zeroable and is constructed normally).
+        overlapped: unsafe { zeroed() },
+        id: OpId { index: 0, generation: 0 },
+        socket: 0,
+        accept_socket: 0,
+        from_len: 0,
+        dgram: Vec::new(),
+        wsabufs: unsafe { zeroed() },
+        addr_buf: [0; ACCEPT_BUF_LEN],
+    }
 }
 
 struct PortHandle(HANDLE);
@@ -561,6 +578,18 @@ impl IocpBackend {
                 }
                 self.slab.release(id);
             }
+            OpKind::RecvFrom => {
+                // Keep the slot on success: the peer address in addr_buf is
+                // consumed via take_recv_from_addr (R-058).
+                if os_error != 0 {
+                    self.slab.release(id);
+                }
+            }
+            OpKind::SendTo => {
+                // Free the copied-in datagram with the slot.
+                unsafe { (*op_ptr).dgram = Vec::new() };
+                self.slab.release(id);
+            }
             _ => {
                 self.slab.release(id);
             }
@@ -658,6 +687,83 @@ impl IoBackend for IocpBackend {
                 self.complete_inline(id, bytes);
             }
             // Skip-modes off (LSP socket): completion arrives via the port.
+            return Ok(id);
+        }
+        let err = unsafe { WSAGetLastError() };
+        if err == WSA_IO_PENDING {
+            return Ok(id);
+        }
+        Err(self.fail_post(id, io::Error::from_raw_os_error(err)))
+    }
+
+    fn post_recv_from(&mut self, socket: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
+        let id = self.new_op(OpKind::RecvFrom, socket);
+        let op = &mut self.slab.get_mut(id).unwrap().data;
+        op.wsabufs[0] = WSABUF { len, buf };
+        op.from_len = ACCEPT_BUF_LEN as i32;
+        let wsabuf_ptr = &mut op.wsabufs[0] as *mut WSABUF;
+        let from_ptr = op.addr_buf.as_mut_ptr().cast();
+        let from_len_ptr = &mut op.from_len as *mut i32;
+        let ov = &mut op.overlapped as *mut OVERLAPPED;
+        let mut bytes: u32 = 0;
+        let mut flags: u32 = 0;
+        let rc = unsafe {
+            WSARecvFrom(socket, wsabuf_ptr, 1, &mut bytes, &mut flags, from_ptr, from_len_ptr, ov, None)
+        };
+        if rc == 0 {
+            if self.inline_ok(socket) {
+                // Inline success KEEPS the slot (addr consumed via
+                // take_recv_from_addr) — complete_inline would release it.
+                self.slab.complete(id);
+                self.syscalls_saved_inline += 1;
+                self.inline_completions.push(Completion::Io { op: id, bytes, os_error: 0 });
+            }
+            return Ok(id);
+        }
+        let err = unsafe { WSAGetLastError() };
+        if err == WSA_IO_PENDING {
+            return Ok(id);
+        }
+        Err(self.fail_post(id, io::Error::from_raw_os_error(err)))
+    }
+
+    fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
+        let addr = self.slab.get(op).and_then(|s| {
+            let n = s.data.from_len.clamp(0, ACCEPT_BUF_LEN as i32) as usize;
+            netsys::parse_sockaddr(&s.data.addr_buf[..n])
+        });
+        if self.slab.get(op).is_some() {
+            self.slab.release(op);
+        }
+        addr
+    }
+
+    fn post_send_to(
+        &mut self,
+        socket: RawSocket,
+        data: &[u8],
+        addr: Option<&std::net::SocketAddr>,
+    ) -> io::Result<OpId> {
+        let id = self.new_op(OpKind::SendTo, socket);
+        let op = &mut self.slab.get_mut(id).unwrap().data;
+        op.dgram = data.to_vec();
+        let (to_ptr, to_len): (*const _, i32) = match addr {
+            Some(a) => {
+                let sa = netsys::build_sockaddr(*a);
+                op.addr_buf[..sa.len].copy_from_slice(&sa.buf[..sa.len]);
+                (op.addr_buf.as_ptr().cast(), sa.len as i32)
+            }
+            None => (std::ptr::null(), 0), // connected-mode send()
+        };
+        op.wsabufs[0] = WSABUF { len: op.dgram.len() as u32, buf: op.dgram.as_mut_ptr() };
+        let wsabuf_ptr = &mut op.wsabufs[0] as *mut WSABUF;
+        let ov = &mut op.overlapped as *mut OVERLAPPED;
+        let mut bytes: u32 = 0;
+        let rc = unsafe { WSASendTo(socket, wsabuf_ptr, 1, &mut bytes, 0, to_ptr, to_len, ov, None) };
+        if rc == 0 {
+            if self.inline_ok(socket) {
+                self.complete_inline(id, bytes);
+            }
             return Ok(id);
         }
         let err = unsafe { WSAGetLastError() };

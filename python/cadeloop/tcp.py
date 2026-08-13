@@ -7,6 +7,7 @@ replaces it in M4). Mixed into ``cadeloop.Loop``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import sys
@@ -566,3 +567,78 @@ class TcpSurface:
             await self.sock_sendall(sock, data)
             total += len(data)
         return total
+
+
+class _DatagramTransport(asyncio.DatagramTransport):
+    """R-058 datagram transport over the native endpoint (core `udp_*`).
+
+    The socket is detached into the engine at `_open`; sends are copied
+    into the core (fire-and-forget, serialized per endpoint), receives
+    arrive via protocol.datagram_received from the event dispatch.
+    """
+
+    def __init__(self, loop, sock, protocol, remote_addr):
+        self._loop = loop
+        self._sock_obj = sock
+        self._protocol = protocol
+        self._remote_addr = remote_addr
+        self._did = None
+        self._closing = False
+        self._extra = {}
+
+    def _open(self):
+        self._extra["sockname"] = self._sock_obj.getsockname()
+        try:
+            self._extra["peername"] = self._sock_obj.getpeername()
+        except OSError:
+            self._extra["peername"] = None
+        fd = self._sock_obj.detach()
+        self._did = self._loop._core.udp_open(
+            fd,
+            self._protocol.datagram_received,
+            self._protocol.error_received,
+            self._connection_lost,
+        )
+        # Synchronous: guarantees connection_made precedes any
+        # datagram_received (those dispatch only from future loop ticks).
+        self._protocol.connection_made(self)
+
+    def _connection_lost(self, exc):
+        self._closing = True
+        self._protocol.connection_lost(exc)
+
+    # ---- asyncio.DatagramTransport surface ----------------------------
+
+    def sendto(self, data, addr=None):
+        if self._closing:
+            return
+        if self._remote_addr is not None and addr not in (None, self._remote_addr):
+            raise ValueError(f"Invalid address: must be None or {self._remote_addr}")
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__}")
+        self._loop._core.udp_sendto(self._did, bytes(data), addr)
+
+    def close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._loop._core.udp_close(self._did, abort=False)
+
+    def abort(self):
+        self._closing = True
+        self._loop._core.udp_close(self._did, abort=True)
+
+    def is_closing(self):
+        return self._closing
+
+    def get_extra_info(self, name, default=None):
+        return self._extra.get(name, default)
+
+    def get_protocol(self):
+        return self._protocol
+
+    def set_protocol(self, protocol):
+        self._protocol = protocol
+
+    def get_write_buffer_size(self):
+        return 0  # sends are copied into the engine immediately

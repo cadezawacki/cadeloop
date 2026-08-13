@@ -495,6 +495,12 @@ impl CoreLoop {
             for lid in lids {
                 net::listener_teardown(&mut st.net, st.reactor.backend_mut(), lid);
             }
+            // R-058 datagram endpoints: cancel ops, close sockets, release
+            // slots; Python refs drop outside the cell with the rest.
+            let dids: Vec<u64> = st.net.datagrams.keys().copied().collect();
+            for did in dids {
+                net::udp_teardown_at_close(&mut st.net, st.reactor.backend_mut(), did);
+            }
             let mut dropped: Vec<Py<PyAny>> = st.reactor.clear_pending();
             dropped.extend(std::mem::take(&mut st.net.ready_scratch));
             for (_, h) in st.net.readers.drain() {
@@ -699,6 +705,64 @@ impl CoreLoop {
             },
         };
         self.listen_socket(py, fd as RawSocket, kind, accept_pool, true)
+    }
+
+    /// R-058: adopt a bound (optionally connected) UDP socket as a
+    /// datagram endpoint. Callbacks are the protocol's datagram_received /
+    /// error_received / connection_lost bound methods. Returns the did.
+    fn udp_open(
+        &self,
+        fd: u64,
+        datagram_received: Bound<'_, PyAny>,
+        error_received: Bound<'_, PyAny>,
+        connection_lost: Bound<'_, PyAny>,
+    ) -> PyResult<u64> {
+        self.check_closed()?;
+        let did = self.with_net(|net, reactor| {
+            net::udp_wire(
+                net,
+                reactor.backend_mut(),
+                fd as cadeloop_core::backend::RawSocket,
+                datagram_received.clone().unbind(),
+                error_received.clone().unbind(),
+                connection_lost.clone().unbind(),
+            )
+        })??;
+        Ok(did)
+    }
+
+    /// R-058 sendto. `addr` None = connected-mode send().
+    #[pyo3(signature = (did, data, addr=None))]
+    fn udp_sendto(
+        &self,
+        py: Python<'_>,
+        did: u64,
+        data: &[u8],
+        addr: Option<(String, u16)>,
+    ) -> PyResult<()> {
+        self.check_closed()?;
+        let addr = match addr {
+            Some((ip, port)) => {
+                let ip: std::net::IpAddr = ip
+                    .parse()
+                    .map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
+                Some(std::net::SocketAddr::new(ip, port))
+            }
+            None => None,
+        };
+        self.with_net(|net, reactor| {
+            net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr)
+        })??;
+        self.drain_graveyards(py)
+    }
+
+    /// R-058 close/abort. close flushes queued sends; abort drops them.
+    #[pyo3(signature = (did, abort=false))]
+    fn udp_close(&self, py: Python<'_>, did: u64, abort: bool) -> PyResult<()> {
+        self.with_net(|net, reactor| {
+            net::udp_close(py, net, reactor.backend_mut(), did, abort);
+        })?;
+        self.drain_graveyards(py)
     }
 
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the

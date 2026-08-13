@@ -25,7 +25,7 @@ import weakref
 from asyncio import events, futures, tasks
 
 from . import _core
-from .tcp import TcpSurface
+from .tcp import TcpSurface, _DatagramTransport
 
 __all__ = ["Loop"]
 
@@ -492,8 +492,72 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
 
 
-    async def create_datagram_endpoint(self, protocol_factory, **kwargs):
-        _not_yet("create_datagram_endpoint()", "udp")
+    async def create_datagram_endpoint(
+        self,
+        protocol_factory,
+        local_addr=None,
+        remote_addr=None,
+        *,
+        family=0,
+        proto=0,
+        flags=0,
+        reuse_port=None,
+        allow_broadcast=None,
+        sock=None,
+    ):
+        """R-058: native datagram endpoint (WSARecvFrom/WSASendTo on IOCP,
+        recvfrom/sendto on epoll — no readiness probes, which would
+        truncate datagrams on Windows)."""
+        import socket as socket_module
+
+        if sock is not None:
+            if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
+                raise ValueError("sock is mutually exclusive with address/options")
+            udp_sock = sock
+        else:
+            fam = family or socket_module.AF_INET
+            if local_addr or remote_addr:
+                probe = local_addr or remote_addr
+                infos = await self.getaddrinfo(
+                    probe[0],
+                    probe[1],
+                    family=family,
+                    type=socket_module.SOCK_DGRAM,
+                    proto=proto,
+                    flags=flags,
+                )
+                if not infos:
+                    raise OSError(f"getaddrinfo({probe!r}) returned empty list")
+                fam = infos[0][0]
+            udp_sock = socket_module.socket(fam, socket_module.SOCK_DGRAM, proto)
+            try:
+                if reuse_port:
+                    if not hasattr(socket_module, "SO_REUSEPORT"):
+                        raise ValueError("reuse_port not supported on this platform")
+                    udp_sock.setsockopt(
+                        socket_module.SOL_SOCKET, socket_module.SO_REUSEPORT, 1
+                    )
+                if allow_broadcast:
+                    udp_sock.setsockopt(
+                        socket_module.SOL_SOCKET, socket_module.SO_BROADCAST, 1
+                    )
+                if local_addr:
+                    udp_sock.bind(local_addr)
+                if remote_addr:
+                    udp_sock.connect(remote_addr)
+            except BaseException:
+                udp_sock.close()
+                raise
+        udp_sock.setblocking(False)
+        protocol = protocol_factory()
+        transport = _DatagramTransport(self, udp_sock, protocol, remote_addr)
+        try:
+            transport._open()
+        except BaseException:
+            if sock is None:
+                udp_sock.close()
+            raise
+        return transport, protocol
 
     async def sendfile(self, transport, file, offset=0, count=None, *, fallback=True):
         _not_yet("sendfile()", "sendfile")

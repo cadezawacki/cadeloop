@@ -58,6 +58,9 @@ pub(crate) enum OpTarget {
     Send(u64),
     Connect { fut: Py<PyAny>, sock: RawSocket },
     Accept(u64),
+    /// R-058 datagram endpoint ops (did keys `NetState.datagrams`).
+    DgramRecv(u64),
+    DgramSend(u64),
 }
 
 pub(crate) enum WriteBuf {
@@ -170,6 +173,23 @@ pub(crate) struct ListenerEntry {
     closing: bool,
 }
 
+/// R-058 datagram endpoint state (cached protocol callbacks, one
+/// outstanding recv, serialized sends).
+pub(crate) struct DatagramEntry {
+    pub socket: RawSocket,
+    pub datagram_received: Py<PyAny>,
+    pub error_received: Py<PyAny>,
+    pub connection_lost: Py<PyAny>,
+    pub recv_op: Option<OpId>,
+    pub recv_slot: Option<SlotId>,
+    pub send_op: Option<OpId>,
+    /// Sends beyond the in-flight one (the backend allows one parked
+    /// write-side op per fd).
+    pub send_queue: VecDeque<(Vec<u8>, Option<std::net::SocketAddr>)>,
+    pub closing: bool,
+    pub conn_lost: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct NetState {
     pub ops: HashMap<OpId, OpTarget>,
@@ -189,6 +209,9 @@ pub(crate) struct NetState {
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
     pub graveyard_protos: Vec<ProtoKind>,
+    /// R-058 datagram endpoints (separate from stream transports: no
+    /// write-queue/backpressure machinery, per-packet semantics).
+    pub datagrams: HashMap<u64, DatagramEntry>,
     /// R-140 access-log sink (a Python callable) — None disables logging
     /// with a single branch on the request-completion path.
     pub access_sink: Option<Py<PyAny>>,
@@ -260,6 +283,22 @@ pub(crate) enum NetEvent {
     Data {
         data_received: Py<PyAny>,
         payload: Py<PyAny>,
+    },
+    /// R-058: one received datagram (payload prebuilt, recv re-posted).
+    DgramData {
+        datagram_received: Py<PyAny>,
+        payload: Py<PyAny>,
+        addr: Option<std::net::SocketAddr>,
+    },
+    /// R-058: per-packet error surfaced to protocol.error_received.
+    DgramError {
+        error_received: Py<PyAny>,
+        err: u32,
+    },
+    /// R-058: datagram endpoint torn down.
+    DgramLost {
+        connection_lost: Py<PyAny>,
+        err: Option<u32>,
     },
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
@@ -446,8 +485,249 @@ pub(crate) fn http_enqueue(
     }
 }
 
-/// Mark a native HTTP connection to close once its write queue drains
-/// (`connection: close`, parse errors, app failures). In-cell.
+// --------------------------------------------------------------------- //
+// datagram endpoints (R-058)                                            //
+// --------------------------------------------------------------------- //
+
+/// Wire a bound (and possibly connected) UDP socket as a datagram
+/// endpoint. The engine owns the socket from here.
+pub(crate) fn udp_wire(
+    net: &mut NetState,
+    backend: Backend<'_>,
+    sock: RawSocket,
+    datagram_received: Py<PyAny>,
+    error_received: Py<PyAny>,
+    connection_lost: Py<PyAny>,
+) -> io::Result<u64> {
+    backend.register_socket(sock)?;
+    let did = net.next_id();
+    net.datagrams.insert(
+        did,
+        DatagramEntry {
+            socket: sock,
+            datagram_received,
+            error_received,
+            connection_lost,
+            recv_op: None,
+            recv_slot: None,
+            send_op: None,
+            send_queue: VecDeque::new(),
+            closing: false,
+            conn_lost: false,
+        },
+    );
+    dgram_post_recv(net, backend, did)?;
+    Ok(did)
+}
+
+/// One outstanding 64 KiB recv per endpoint (max UDP datagram).
+fn dgram_post_recv(net: &mut NetState, backend: Backend<'_>, did: u64) -> io::Result<()> {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return Ok(()) };
+    if entry.closing || entry.conn_lost || entry.recv_op.is_some() {
+        return Ok(());
+    }
+    let slot = entry.recv_slot.unwrap_or_else(|| net.buffers.acquire(SizeClass::S64K));
+    let sock = entry.socket;
+    let (ptr, len) = (net.buffers.slot_ptr(slot), SizeClass::S64K.size() as u32);
+    ensure_buffers_registered(net, backend);
+    match backend.post_recv_from(sock, ptr, len) {
+        Ok(op) => {
+            let entry = net.datagrams.get_mut(&did).unwrap();
+            entry.recv_slot = Some(slot);
+            entry.recv_op = Some(op);
+            net.ops.insert(op, OpTarget::DgramRecv(did));
+            Ok(())
+        }
+        Err(e) => {
+            net.buffers.release(slot);
+            if let Some(entry) = net.datagrams.get_mut(&did) {
+                entry.recv_slot = None;
+            }
+            Err(e)
+        }
+    }
+}
+
+fn on_dgram_recv_done(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    did: u64,
+    op: OpId,
+    bytes: u32,
+    os_error: u32,
+) {
+    let addr = if os_error == 0 { backend.take_recv_from_addr(op) } else { None };
+    let Some(entry) = net.datagrams.get_mut(&did) else { return };
+    entry.recv_op = None;
+    if entry.closing || entry.conn_lost {
+        return;
+    }
+    if os_error == 0 {
+        let slot = entry.recv_slot.expect("recv op had a slot");
+        let datagram_received = entry.datagram_received.clone_ref(py);
+        let ptr = net.buffers.slot_ptr(slot);
+        let payload = unsafe {
+            let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
+            Py::from_owned_ptr(py, obj)
+        };
+        net.events.push(NetEvent::DgramData { datagram_received, payload, addr });
+    } else if !is_cancelled_error(os_error) {
+        // Per-packet errors (e.g. ECONNREFUSED surfaced by a connected
+        // socket after an ICMP unreachable): report and KEEP receiving —
+        // asyncio semantics.
+        let error_received = entry.error_received.clone_ref(py);
+        net.events.push(NetEvent::DgramError { error_received, err: os_error });
+    } else {
+        return; // cancelled: teardown owns the endpoint
+    }
+    let _ = dgram_post_recv(net, backend, did);
+}
+
+fn on_dgram_send_done(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    did: u64,
+    _op: OpId,
+    os_error: u32,
+) {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return };
+    entry.send_op = None;
+    if os_error != 0 && !is_cancelled_error(os_error) {
+        let error_received = entry.error_received.clone_ref(py);
+        net.events.push(NetEvent::DgramError { error_received, err: os_error });
+    }
+    // Drain the queue (one in-flight send per endpoint).
+    if let Some((data, addr)) = net.datagrams.get_mut(&did).and_then(|e| e.send_queue.pop_front()) {
+        let _ = dgram_send_now(py, net, backend, did, &data, addr.as_ref());
+        return;
+    }
+    // Deferred close: the queue is empty now.
+    let entry = net.datagrams.get_mut(&did).unwrap();
+    if entry.closing && !entry.conn_lost {
+        udp_teardown(py, net, backend, did, None);
+    }
+}
+
+fn dgram_send_now(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    did: u64,
+    data: &[u8],
+    addr: Option<&std::net::SocketAddr>,
+) -> io::Result<()> {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return Ok(()) };
+    let sock = entry.socket;
+    match backend.post_send_to(sock, data, addr) {
+        Ok(op) => {
+            net.datagrams.get_mut(&did).unwrap().send_op = Some(op);
+            net.ops.insert(op, OpTarget::DgramSend(did));
+            Ok(())
+        }
+        Err(e) => {
+            // Synchronous refusal: per-packet error, endpoint stays up.
+            if let Some(entry) = net.datagrams.get_mut(&did) {
+                let error_received = entry.error_received.clone_ref(py);
+                net.events.push(NetEvent::DgramError {
+                    error_received,
+                    err: e.raw_os_error().unwrap_or(0) as u32,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// asyncio DatagramTransport.sendto: fire-and-forget; sends serialize
+/// through one in-flight op with a queue behind it.
+pub(crate) fn udp_sendto(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    did: u64,
+    data: &[u8],
+    addr: Option<std::net::SocketAddr>,
+) -> io::Result<()> {
+    let Some(entry) = net.datagrams.get_mut(&did) else {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "datagram endpoint closed"));
+    };
+    if entry.closing || entry.conn_lost {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "datagram endpoint closing"));
+    }
+    if entry.send_op.is_some() {
+        entry.send_queue.push_back((data.to_vec(), addr));
+        return Ok(());
+    }
+    dgram_send_now(py, net, backend, did, data, addr.as_ref())
+}
+
+/// close() flushes queued sends first; abort() drops them (asyncio
+/// semantics). connection_lost fires exactly once via the event queue.
+pub(crate) fn udp_close(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    did: u64,
+    abort: bool,
+) {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return };
+    if entry.conn_lost {
+        return;
+    }
+    entry.closing = true;
+    if abort {
+        entry.send_queue.clear();
+    }
+    if entry.send_op.is_none() && entry.send_queue.is_empty() {
+        udp_teardown(py, net, backend, did, None);
+    }
+    // else: on_dgram_send_done finishes the close once the queue drains.
+}
+
+/// Loop-close variant: no Python events (they are cleared right after);
+/// refs drop via the graveyard outside the cell.
+pub(crate) fn udp_teardown_at_close(net: &mut NetState, backend: Backend<'_>, did: u64) {
+    let Some(mut entry) = net.datagrams.remove(&did) else { return };
+    for op in [entry.recv_op.take(), entry.send_op.take()].into_iter().flatten() {
+        let _ = backend.cancel(op);
+        net.ops.remove(&op);
+    }
+    backend.detach_socket(entry.socket);
+    netsys::close(entry.socket);
+    if let Some(slot) = entry.recv_slot.take() {
+        net.buffers.release(slot);
+    }
+    net.graveyard_py.push(entry.datagram_received);
+    net.graveyard_py.push(entry.error_received);
+    net.graveyard_py.push(entry.connection_lost);
+}
+
+fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u64, err: Option<u32>) {
+    let Some(mut entry) = net.datagrams.remove(&did) else { return };
+    if entry.conn_lost {
+        return;
+    }
+    entry.conn_lost = true;
+    for op in [entry.recv_op.take(), entry.send_op.take()].into_iter().flatten() {
+        let _ = backend.cancel(op);
+        net.ops.remove(&op);
+    }
+    backend.detach_socket(entry.socket);
+    netsys::close(entry.socket);
+    if let Some(slot) = entry.recv_slot.take() {
+        net.buffers.release(slot);
+    }
+    net.events.push(NetEvent::DgramLost {
+        connection_lost: entry.connection_lost.clone_ref(py),
+        err,
+    });
+    net.graveyard_py.push(entry.datagram_received);
+    net.graveyard_py.push(entry.error_received);
+    net.graveyard_py.push(entry.connection_lost);
+}
+
 /// R-080 connection-timeout sweep. Called periodically (the facade arms a
 /// coarse repeating timer); walks HTTP connections and enforces the two
 /// windows: request-head receipt (anchored at head START, so drip-fed
@@ -517,6 +797,8 @@ pub(crate) fn http_sweep(
     (expire_head.len() as u32, expire_idle.len() as u32)
 }
 
+/// Mark a native HTTP connection to close once its write queue drains
+/// (`connection: close`, parse errors, app failures). In-cell.
 pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.conn_lost || entry.closing {
@@ -667,6 +949,12 @@ pub(crate) fn translate(
                     OpTarget::Accept(lid) => on_accept_done(net, backend, lid, op, os_error),
                     OpTarget::Connect { fut, sock } => {
                         net.events.push(NetEvent::ConnectDone { fut, sock, err: os_error });
+                    }
+                    OpTarget::DgramRecv(did) => {
+                        on_dgram_recv_done(py, net, backend, did, op, bytes, os_error);
+                    }
+                    OpTarget::DgramSend(did) => {
+                        on_dgram_send_done(py, net, backend, did, op, os_error);
                     }
                 }
             }
@@ -888,6 +1176,21 @@ pub(crate) fn dispatch_events(
                 Err(e) => core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?,
             },
             NetEvent::ConnLost { connection_lost, err } => {
+                let exc_obj = match err {
+                    Some(code) => os_err(py, code),
+                    None => py.None(),
+                };
+                core.guard_protocol_call(py, connection_lost.call1(py, (exc_obj,)))?;
+            }
+            NetEvent::DgramData { datagram_received, payload, addr } => {
+                let addr_obj = addr_tuple(py, addr).unwrap_or_else(|| py.None());
+                core.guard_protocol_call(py, datagram_received.call1(py, (payload, addr_obj)))?;
+            }
+            NetEvent::DgramError { error_received, err } => {
+                let exc_obj = os_err(py, err);
+                core.guard_protocol_call(py, error_received.call1(py, (exc_obj,)))?;
+            }
+            NetEvent::DgramLost { connection_lost, err } => {
                 let exc_obj = match err {
                     Some(code) => os_err(py, code),
                     None => py.None(),

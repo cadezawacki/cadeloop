@@ -100,6 +100,29 @@ pub trait IoBackend {
     fn post_connect(&mut self, socket: RawSocket, addr: &[u8]) -> io::Result<OpId>;
     fn post_disconnect_reuse(&mut self, socket: RawSocket) -> io::Result<OpId>;
 
+    // ---- datagrams (R-058) — Unsupported by default (portable) --------
+
+    fn post_recv_from(&mut self, _socket: RawSocket, _buf: *mut u8, _len: u32) -> io::Result<OpId> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "datagrams unsupported on this backend"))
+    }
+
+    /// Consume the peer address of a completed recv_from op — releases
+    /// the op slot (the accept-socket lifecycle, applied to datagrams).
+    fn take_recv_from_addr(&mut self, _op: OpId) -> Option<std::net::SocketAddr> {
+        None
+    }
+
+    /// The datagram is COPIED into the op (small payloads; no caller
+    /// buffer pinning). `addr` None = connected-mode send().
+    fn post_send_to(
+        &mut self,
+        _socket: RawSocket,
+        _data: &[u8],
+        _addr: Option<&std::net::SocketAddr>,
+    ) -> io::Result<OpId> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "datagrams unsupported on this backend"))
+    }
+
     /// Request cancellation of an in-flight op. MUST tolerate the op having
     /// already completed (ERROR_NOT_FOUND) — the completion is still
     /// delivered via `poll` either way (R-037).

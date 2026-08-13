@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup, MAX_GATHER};
+use crate::netsys;
 use crate::opslab::{OpId, OpKind, OpSlab};
 
 fn errno() -> i32 {
@@ -60,6 +61,12 @@ enum Pending {
     Recv { buf: *mut u8, len: u32 },
     Send { bufs: [IoSlice; MAX_GATHER], n: u8, done: u32 },
     Connect,
+    /// R-058: peer address captured into the op; the slot lives until
+    /// `take_recv_from_addr` (accept-socket lifecycle).
+    RecvFrom { buf: *mut u8, len: u32, from: [u8; 128], from_len: u32 },
+    /// R-058: the datagram is copied in (no caller pinning); UDP sendto
+    /// either sends whole or fails — no partial resumption.
+    SendTo { data: Box<[u8]>, to: [u8; 128], to_len: u32 },
 }
 
 struct EpollOp {
@@ -300,6 +307,42 @@ impl EpollBackend {
                     Some((0, err as u32))
                 }
             }
+            Pending::RecvFrom { buf, len, from, from_len } => {
+                let mut sl: libc::socklen_t = from.len() as libc::socklen_t;
+                let rc = unsafe {
+                    libc::recvfrom(
+                        fd,
+                        (*buf).cast(),
+                        *len as usize,
+                        0,
+                        from.as_mut_ptr().cast(),
+                        &mut sl,
+                    )
+                };
+                if rc >= 0 {
+                    *from_len = sl as u32;
+                    Some((rc as u32, 0))
+                } else if errno() == libc::EAGAIN {
+                    None
+                } else {
+                    Some((0, errno() as u32))
+                }
+            }
+            Pending::SendTo { data, to, to_len } => {
+                let (to_ptr, sl): (*const libc::sockaddr, libc::socklen_t) = if *to_len == 0 {
+                    (std::ptr::null(), 0) // connected-mode send()
+                } else {
+                    (to.as_ptr().cast(), *to_len as libc::socklen_t)
+                };
+                let rc = unsafe { libc::sendto(fd, data.as_ptr().cast(), data.len(), 0, to_ptr, sl) };
+                if rc >= 0 {
+                    Some((rc as u32, 0))
+                } else if errno() == libc::EAGAIN {
+                    None
+                } else {
+                    Some((0, errno() as u32))
+                }
+            }
         }
     }
 
@@ -333,7 +376,8 @@ impl EpollBackend {
             let kind = self.slab.get(id).map(|s| s.kind);
             self.slab.complete(id);
             match kind {
-                Some(OpKind::Accept) if os_error == 0 => {} // slot lives until take_accept_socket
+                // Slot lives until take_accept_socket / take_recv_from_addr.
+                Some(OpKind::Accept | OpKind::RecvFrom) if os_error == 0 => {}
                 _ => self.slab.release(id),
             }
             out.push(Completion::Io { op: id, bytes, os_error });
@@ -459,6 +503,77 @@ impl IoBackend for EpollBackend {
         }
     }
 
+    fn post_recv_from(&mut self, socket: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
+        let fd = socket as RawFd;
+        let id = self.slab.post(OpKind::RecvFrom);
+        {
+            let s = self.slab.get_mut(id).unwrap();
+            s.data = EpollOp {
+                fd,
+                pending: Pending::RecvFrom { buf, len, from: [0; 128], from_len: 0 },
+                accepted: -1,
+            };
+        }
+        match self.attempt(id) {
+            Some((bytes, err)) => {
+                self.slab.complete(id);
+                if err != 0 {
+                    self.slab.release(id);
+                }
+                self.inline_completions.push(Completion::Io { op: id, bytes, os_error: err });
+                Ok(id)
+            }
+            None => self.park(id, fd, false),
+        }
+    }
+
+    fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
+        let addr = self.slab.get(op).and_then(|s| match &s.data.pending {
+            Pending::RecvFrom { from, from_len, .. } => {
+                netsys::parse_sockaddr(&from[..*from_len as usize])
+            }
+            _ => None,
+        });
+        if self.slab.get(op).is_some() {
+            self.slab.release(op);
+        }
+        addr
+    }
+
+    fn post_send_to(
+        &mut self,
+        socket: RawSocket,
+        data: &[u8],
+        addr: Option<&std::net::SocketAddr>,
+    ) -> io::Result<OpId> {
+        let fd = socket as RawFd;
+        let id = self.slab.post(OpKind::SendTo);
+        {
+            let mut to = [0u8; 128];
+            let mut to_len = 0u32;
+            if let Some(a) = addr {
+                let sa = netsys::build_sockaddr(*a);
+                to[..sa.len].copy_from_slice(&sa.buf[..sa.len]);
+                to_len = sa.len as u32;
+            }
+            let s = self.slab.get_mut(id).unwrap();
+            s.data = EpollOp {
+                fd,
+                pending: Pending::SendTo { data: data.to_vec().into_boxed_slice(), to, to_len },
+                accepted: -1,
+            };
+        }
+        match self.attempt(id) {
+            Some((bytes, err)) => {
+                self.slab.complete(id);
+                self.slab.release(id);
+                self.inline_completions.push(Completion::Io { op: id, bytes, os_error: err });
+                Ok(id)
+            }
+            None => self.park(id, fd, true),
+        }
+    }
+
     fn post_connect(&mut self, socket: RawSocket, addr: &[u8]) -> io::Result<OpId> {
         let fd = socket as RawFd;
         let rc = unsafe { libc::connect(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t) };
@@ -501,7 +616,10 @@ impl IoBackend for EpollBackend {
             let slot = self.slab.get(op).expect("cancelled op is live");
             (
                 slot.data.fd,
-                matches!(slot.data.pending, Pending::Send { .. } | Pending::Connect),
+                matches!(
+                    slot.data.pending,
+                    Pending::Send { .. } | Pending::Connect | Pending::SendTo { .. }
+                ),
                 matches!(slot.data.pending, Pending::Accept),
                 slot.data.accepted,
             )

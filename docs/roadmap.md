@@ -126,8 +126,17 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [ ] Native OpenSSL memory-BIO TLS engine, stdlib SSLContext extraction +
       MemoryBIO fallback (R-059)
 - [ ] RFC 6455 WebSockets + permessage-deflate (R-087)
-- [ ] UDP endpoints incl. RIO datagrams (R-058); asyncpg green via R-057
-- [ ] SIGINT/SIGBREAK handlers (R-052)
+- [x] UDP endpoints (R-058): create_datagram_endpoint over native
+      recv_from/send_to ops on both backends (WSARecvFrom/WSASendTo on
+      IOCP — readiness probes would truncate datagrams there; recvfrom/
+      sendto completion emulation on epoll); one outstanding recv +
+      serialized sends per endpoint, per-packet error_received,
+      close-flushes/abort-drops semantics. RIO datagram RQs remain a
+      possible later refinement; asyncpg via R-057 readiness unaffected
+- [x] SIGINT/SIGBREAK handlers (R-052): run_forever wakeup fd makes
+      signals interrupt idle parks immediately (proactor CTRL+C fix;
+      also closes the POSIX check-then-park race); add_signal_handler
+      works on Windows for SIGINT/SIGBREAK (+SIGTERM artificial)
 
 ## M5 — 1.0
 
