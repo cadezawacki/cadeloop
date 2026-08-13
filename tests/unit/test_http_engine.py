@@ -615,10 +615,18 @@ def test_serve_end_to_end_with_lifespan(tmp_path):
             proc.kill()
             raise AssertionError(f"server never came up: {last_err}; out={proc.stdout.read()}")
         assert resp.read() == b"yes"  # lifespan state reached the scope
-        proc.send_signal(_import_signal().SIGTERM)
-        out, _ = proc.communicate(timeout=10)
-        assert "LIFESPAN_SHUTDOWN" in out
-        assert proc.returncode == 0
+        if sys.platform == "win32":
+            # send_signal(SIGTERM) is TerminateProcess on Windows — no
+            # graceful path exists to assert until the R-052
+            # SetConsoleCtrlHandler work (M4). Serving + state above is
+            # the Windows contract for this test.
+            proc.kill()
+            proc.communicate(timeout=10)
+        else:
+            proc.send_signal(_import_signal().SIGTERM)
+            out, _ = proc.communicate(timeout=10)
+            assert "LIFESPAN_SHUTDOWN" in out
+            assert proc.returncode == 0
     finally:
         if proc.poll() is None:
             proc.kill()

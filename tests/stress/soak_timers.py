@@ -35,9 +35,16 @@ def rss_bytes() -> int:
 
         pmc = PMC()
         pmc.cb = ctypes.sizeof(PMC)
-        ctypes.windll.psapi.GetProcessMemoryInfo(
-            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb
-        )
+        # Modern Windows exports this from kernel32 (K32 prefix); psapi.dll
+        # is a forwarding shim that returned 0 silently on the first
+        # hardware run — check the BOOL and prefer kernel32.
+        k32 = ctypes.windll.kernel32
+        fn = getattr(k32, "K32GetProcessMemoryInfo", None)
+        if fn is None:
+            fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        ok = fn(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+        if not ok or pmc.WorkingSetSize == 0:
+            raise OSError("GetProcessMemoryInfo failed")
         return pmc.WorkingSetSize
     # Current (not peak) RSS: ru_maxrss is a high-water mark and would
     # count any transient burst as permanent "growth".

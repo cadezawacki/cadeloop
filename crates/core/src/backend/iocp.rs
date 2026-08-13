@@ -261,6 +261,13 @@ pub struct IocpBackend {
     /// WSASocketW flags for accept sockets. The RIO hybrid adds
     /// WSA_FLAG_REGISTERED_IO so accepted connections are RQ-capable.
     accept_socket_flags: u32,
+    /// Sockets already associated with the port. A second
+    /// CreateIoCompletionPort on the same (socket, port) pair fails with
+    /// ERROR_INVALID_PARAMETER (found by the first Windows run: connect
+    /// registers, then attach_stream registered AGAIN). Recycled sockets
+    /// (R-033) keep their association across DisconnectEx, so this set +
+    /// the 87-fallback below make register_socket idempotent.
+    associated: std::collections::HashSet<SOCKET>,
 }
 
 // SAFETY: thread-affine by loop contract; raw handles are moved with it.
@@ -286,6 +293,7 @@ impl IocpBackend {
             probe_ops: HashMap::new(),
             skip_ok: std::collections::HashSet::new(),
             accept_socket_flags: WSA_FLAG_OVERLAPPED,
+            associated: std::collections::HashSet::new(),
         })
     }
 
@@ -446,6 +454,37 @@ impl IocpBackend {
         }
     }
 
+    /// R-031: skip completion-port posts for synchronous successes —
+    /// guarded against non-IFS (LSP) providers. Idempotent.
+    fn apply_skip_modes(&mut self, socket: RawSocket) {
+        if self.skip_ok.contains(&socket) {
+            return;
+        }
+        let mut info: WSAPROTOCOL_INFOW = unsafe { zeroed() };
+        let mut len = size_of::<WSAPROTOCOL_INFOW>() as i32;
+        let rc = unsafe {
+            getsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_PROTOCOL_INFOW,
+                (&mut info as *mut WSAPROTOCOL_INFOW).cast(),
+                &mut len,
+            )
+        };
+        let ifs = rc == 0 && (info.dwServiceFlags1 & XP1_IFS_HANDLES) != 0;
+        if ifs {
+            let ok = unsafe {
+                SetFileCompletionNotificationModes(
+                    socket as HANDLE,
+                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+                )
+            };
+            if ok != 0 {
+                self.skip_ok.insert(socket);
+            }
+        }
+    }
+
     pub(crate) fn translate_entry(&mut self, entry: &OVERLAPPED_ENTRY, out: &mut Vec<Completion>) {
         if entry.lpCompletionKey == KEY_WAKEUP {
             out.push(Completion::Wakeup);
@@ -527,36 +566,32 @@ impl IocpBackend {
 
 impl IoBackend for IocpBackend {
     fn register_socket(&mut self, socket: RawSocket) -> io::Result<()> {
+        if self.associated.contains(&socket) {
+            return Ok(()); // idempotent: association survives until closesocket
+        }
         let handle = socket as HANDLE;
         let rc = unsafe { CreateIoCompletionPort(handle, self.port.0, KEY_IO, 0) };
         if rc.is_null() {
-            return Err(win_error());
-        }
-        // R-031: skip completion-port posts for synchronous successes —
-        // guarded against non-IFS (LSP) providers.
-        let mut info: WSAPROTOCOL_INFOW = unsafe { zeroed() };
-        let mut len = size_of::<WSAPROTOCOL_INFOW>() as i32;
-        let rc = unsafe {
-            getsockopt(
-                socket,
-                SOL_SOCKET,
-                SO_PROTOCOL_INFOW,
-                (&mut info as *mut WSAPROTOCOL_INFOW).cast(),
-                &mut len,
-            )
-        };
-        let ifs = rc == 0 && (info.dwServiceFlags1 & XP1_IFS_HANDLES) != 0;
-        if ifs {
-            let ok = unsafe {
-                SetFileCompletionNotificationModes(
-                    handle,
-                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
-                )
-            };
-            if ok != 0 {
-                self.skip_ok.insert(socket);
+            let err = win_error();
+            // ERROR_INVALID_PARAMETER on a VALID socket means "already
+            // associated" (e.g. an R-033 recycled socket whose association
+            // outlived our bookkeeping): treat as success.
+            if err.raw_os_error() == Some(87) {
+                let mut t: i32 = 0;
+                let mut len = size_of::<i32>() as i32;
+                let ok = unsafe {
+                    getsockopt(socket, SOL_SOCKET, 0x1008 /* SO_TYPE */, (&mut t as *mut i32).cast(), &mut len)
+                };
+                if ok == 0 {
+                    self.associated.insert(socket);
+                    self.apply_skip_modes(socket);
+                    return Ok(());
+                }
             }
+            return Err(err);
         }
+        self.associated.insert(socket);
+        self.apply_skip_modes(socket);
         Ok(())
     }
 
@@ -740,6 +775,8 @@ impl IoBackend for IocpBackend {
     }
 
     fn detach_socket(&mut self, socket: RawSocket) {
+        self.associated.remove(&socket);
+        self.skip_ok.remove(&socket); // fd-number reuse must not inherit skip modes
         self.watches.remove(&socket);
         self.listener_info.remove(&socket);
         // In-flight ops on the socket deliver ABORTED completions via the

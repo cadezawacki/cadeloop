@@ -47,9 +47,19 @@ class Server:
         if self._sockets is None:
             socks = []
             for _lid, _name, fd in self._entries:
-                # dup so the reporting socket's lifetime is independent of
-                # the native listener.
-                socks.append(socket.socket(fileno=os.dup(fd)))
+                # Duplicate so the reporting socket's lifetime is
+                # independent of the native listener. On Windows a SOCKET
+                # is a kernel handle, not a CRT fd — os.dup() raises EBADF
+                # there (found by the first Windows run); WSADuplicateSocket
+                # via share/fromshare is the documented dup.
+                if sys.platform == "win32":
+                    tmp = socket.socket(fileno=fd)
+                    try:
+                        socks.append(socket.fromshare(tmp.share(os.getpid())))
+                    finally:
+                        tmp.detach()  # never close the native listener
+                else:
+                    socks.append(socket.socket(fileno=os.dup(fd)))
             self._sockets = socks
         return tuple(self._sockets)
 

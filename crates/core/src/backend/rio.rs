@@ -193,6 +193,12 @@ pub struct RioBackend {
     /// Stable OVERLAPPED for the CQ's IOCP notification.
     _notify_overlapped: Box<OVERLAPPED>,
     notify_armed: bool,
+    /// IOCP-notify CQ creation failed; running on a notification-less CQ.
+    /// Parked polls clamp to 1ms while RIO ops are in flight so the drain
+    /// stays prompt. Visible via name() == "rio-polling".
+    polling_only: bool,
+    /// Outstanding RIO requests (drives the polling-only park clamp).
+    inflight: u32,
     slab: OpSlab<RioOp>,
     results: Box<[RIORESULT; DEQUEUE_BATCH]>,
     entries: Box<[OVERLAPPED_ENTRY; POLL_BATCH]>,
@@ -239,9 +245,19 @@ impl RioBackend {
             },
         };
         let cq_size = cq_size.clamp(256, CQ_MAX);
-        let cq = unsafe { (t.RIOCreateCompletionQueue.unwrap())(cq_size, &notify) };
+        let mut polling_only = false;
+        let mut cq = unsafe { (t.RIOCreateCompletionQueue.unwrap())(cq_size, &notify) };
         if cq == RIO_INVALID_CQ {
-            return Err(wsa_named("RIOCreateCompletionQueue(IOCP-notify)"));
+            let notify_err = wsa_named("RIOCreateCompletionQueue(IOCP-notify)");
+            // Fallback: a notification-less CQ (valid per the API — pure
+            // RIODequeueCompletion polling). Keeps RIO usable for
+            // validation while the notify path is diagnosed
+            // (tools/windows: cargo run --example rio_probe).
+            cq = unsafe { (t.RIOCreateCompletionQueue.unwrap())(cq_size, std::ptr::null()) };
+            if cq == RIO_INVALID_CQ {
+                return Err(notify_err);
+            }
+            polling_only = true;
         }
         let mut backend = RioBackend {
             inner,
@@ -256,6 +272,8 @@ impl RioBackend {
             staging: StagingLedger::new(STAGING_SLOTS_PER_REGION),
             _notify_overlapped: notify_overlapped,
             notify_armed: false,
+            polling_only,
+            inflight: 0,
             slab: OpSlab::new(empty_op),
             results: Box::new(unsafe { zeroed() }),
             entries: Box::new(unsafe { zeroed() }),
@@ -313,6 +331,7 @@ impl RioBackend {
                 let Some((_kind, was_cancelled)) = self.slab.complete(id) else {
                     continue; // stale (generation-checked) — cannot happen absent kernel bugs
                 };
+                self.inflight = self.inflight.saturating_sub(1);
                 if let Some(slot) = self.slab.get(id).and_then(|s| s.data.staging) {
                     self.staging.free(slot);
                 }
@@ -431,6 +450,7 @@ impl IoBackend for RioBackend {
             self.slab.release(id);
             return Err(err);
         }
+        self.inflight += 1;
         Ok(tag(id))
     }
 
@@ -472,6 +492,7 @@ impl IoBackend for RioBackend {
             self.slab.release(id);
             return Err(err);
         }
+        self.inflight += 1;
         Ok(tag(id))
     }
 
@@ -549,12 +570,17 @@ impl IoBackend for RioBackend {
         self.inner.pre_poll(out);
         // Spin path (R-060/R-041): drain the CQ directly, no notification.
         self.drain_cq(out)?;
-        let timeout_ms: u32 = match timeout {
+        let mut timeout_ms: u32 = match timeout {
             _ if out.len() > before => 0,
             Some(t) => t.as_millis().min(u32::MAX as u128) as u32,
             None => 0,
         };
-        if timeout_ms > 0 && !self.notify_armed {
+        if self.polling_only && self.inflight > 0 {
+            // No CQ notification: keep parks short so completions are
+            // drained promptly (degraded mode, see `polling_only`).
+            timeout_ms = timeout_ms.min(1);
+        }
+        if timeout_ms > 0 && !self.polling_only && !self.notify_armed {
             // Arm exactly when we might park; RIONotify posts to the inner
             // port under KEY_RIO when completions arrive (R-041).
             let rc = unsafe { (self.t.RIONotify.unwrap())(self.cq) };
@@ -597,6 +623,10 @@ impl IoBackend for RioBackend {
     }
 
     fn name(&self) -> &'static str {
-        "rio"
+        if self.polling_only {
+            "rio-polling"
+        } else {
+            "rio"
+        }
     }
 }

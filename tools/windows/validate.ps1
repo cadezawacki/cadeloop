@@ -1,30 +1,42 @@
-# cadeloop Windows validation — one-shot orchestrator (v2).
+# cadeloop Windows validation — one-shot orchestrator (v3).
 #
-# v2 changes after the first hardware run:
-#  * every long-running step goes through tools\windows\run_with_timeout.py,
-#    a PROCESS-level watchdog — a native wedge holding the GIL can no
-#    longer stall the run (in-process pytest timeouts need the GIL)
-#  * pytest runs per test FILE so one wedged file is killed, named, and
-#    the rest still runs
-#  * logs are UTF-8 and stderr lines are plain text (no ErrorRecord noise)
+# v3: pins Python to the REPO'S .venv (creating it with Python 3.11 if
+# missing) so a stray system interpreter can never hijack the run (the
+# 2nd hardware run picked up an AppData Python 3.14 and pyo3 refused to
+# build); clears windows-results\ at start so logs are single-run;
+# adds the rio_probe diagnosis step. All long steps remain wrapped in the
+# process-level watchdog (nothing can stall).
 #
 # Usage (repo root): powershell -ExecutionPolicy Bypass -File tools\windows\validate.ps1
-# Expected total runtime: 60-100 minutes. Red steps are findings; it
-# always runs to the end and zips everything.
 
 $ErrorActionPreference = "Continue"
 $repo = (Get-Location).Path
 $R = Join-Path $repo "windows-results"
 New-Item -ItemType Directory -Force -Path $R | Out-Null
+Remove-Item "$R\*" -Recurse -Force -ErrorAction SilentlyContinue
 $summary = @()
 $WD = "tools\windows\run_with_timeout.py"
+
+# ---- python pinning: the repo venv or bust ----------------------------
+$PY = Join-Path $repo ".venv\Scripts\python.exe"
+if (-not (Test-Path $PY)) {
+    Write-Host "creating .venv with Python 3.11..." -ForegroundColor Cyan
+    if (Get-Command py -ErrorAction SilentlyContinue) { py -3.11 -m venv "$repo\.venv" }
+    else { python -m venv "$repo\.venv" }
+}
+$ver = & $PY -c "import sys; print('%d.%d' % sys.version_info[:2])"
+if ($ver -ne "3.11") {
+    Write-Host "FATAL: .venv python reports $ver — need 3.11 (delete .venv and install Python 3.11)" -ForegroundColor Red
+    exit 1
+}
+Write-Host "using $PY (Python $ver)" -ForegroundColor Green
 
 function Step($name, [scriptblock]$body) {
     $log = Join-Path $R "$name.log"
     $t0 = Get-Date
     Write-Host "==== [$name] ====" -ForegroundColor Cyan
-    Set-Location $repo          # steps never inherit a failed step's cwd
-    cmd /c exit 0               # reset stale $LASTEXITCODE
+    Set-Location $repo
+    cmd /c exit 0
     try {
         & $body 2>&1 | ForEach-Object {
             $line = "$_"
@@ -42,53 +54,51 @@ function Step($name, [scriptblock]$body) {
     $script:summary += "{0,-28} {1,-10} {2,6}s" -f $name, $status, $secs
 }
 
-# ---- 00: environment fingerprint -------------------------------------
 Step "00-env" {
     cmd /c ver
     Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture | Format-List
     Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-List
-    Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory | Format-List
-    python --version
+    & $PY --version
+    & $PY -c "import sys; print('exe:', sys.executable)"
     rustc -V
     cargo -V
     git rev-parse HEAD
     git status --short
 }
 
-# ---- 01: python deps --------------------------------------------------
 Step "01-pip-deps" {
-    python -m pip install --upgrade pip
-    python -m pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi hypercorn winloop maturin
-    python -m pip list
+    & $PY -m pip install --upgrade pip
+    & $PY -m pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi hypercorn winloop maturin
+    & $PY -m pip list
 }
 
-# ---- 02: rust unit tests (real Windows: exercises IOCP paths) ---------
-Step "02-cargo-test" { python $WD 1200 -- cargo test --workspace }
+Step "02-cargo-test" { & $PY $WD 1200 -- cargo test --workspace }
 
-# ---- 03: clippy -------------------------------------------------------
-Step "03-clippy" { python $WD 900 -- cargo clippy --workspace --all-targets }
+Step "03-clippy" { & $PY $WD 900 -- cargo clippy --workspace --all-targets }
 
-# ---- 04: build the extension (dev mode) -------------------------------
 Step "04-build-ext" {
     cargo build --release -p cadeloop-pyshim
     Copy-Item target\release\_core.dll python\cadeloop\_core.pyd -Force
     $env:PYTHONPATH = "$repo\python"
-    python -c "import cadeloop; lp = cadeloop.new_event_loop(); print('backend:', lp.stats()['backend']); lp.close()"
-    python -c "from cadeloop.loop import Loop; lp = Loop(backend='rio'); print('rio backend:', lp.stats()['backend']); lp.close()"
+    & $PY -c "import cadeloop; lp = cadeloop.new_event_loop(); print('backend:', lp.stats()['backend']); lp.close()"
+    & $PY -c "from cadeloop.loop import Loop; lp = Loop(backend='rio'); print('rio backend:', lp.stats()['backend']); lp.close()"
+}
+
+Step "04b-rio-probe" {
+    & $PY $WD 600 -- cargo run --release --example rio_probe -p cadeloop-core
 }
 
 $env:PYTHONPATH = "$repo\python"
 
-# ---- 05/06: full python suite, per-FILE with watchdog, both backends --
 function PytestSweep($label) {
     $fail = 0
     Get-ChildItem tests\unit\test_*.py | ForEach-Object {
         Write-Host "--- $label $($_.Name) ---"
-        python $WD 300 -- python -m pytest $_.FullName -v -rA --timeout 120 --timeout-method=thread
+        & $PY $WD 300 -- $PY -m pytest $_.FullName -v -rA --timeout 120 --timeout-method=thread
         if ($LASTEXITCODE -ne 0) { $fail = 1 }
     }
     Write-Host "--- $label tests\conformance ---"
-    python $WD 600 -- python -m pytest tests\conformance -v -rA --timeout 120 --timeout-method=thread
+    & $PY $WD 600 -- $PY -m pytest tests\conformance -v -rA --timeout 120 --timeout-method=thread
     if ($LASTEXITCODE -ne 0) { $fail = 1 }
     cmd /c exit $fail
 }
@@ -106,72 +116,68 @@ Step "06-pytest-rio" {
     cmd /c exit $code
 }
 
-# ---- 07: targeted backend smoke (both backends) -----------------------
 Step "07-backend-smoke" {
-    python $WD 900 -- python tools\windows\rio_smoke.py iocp rio --out (Join-Path $R "backend-smoke.json")
+    & $PY $WD 900 -- $PY tools\windows\rio_smoke.py iocp rio --out (Join-Path $R "backend-smoke.json")
 }
 
-# ---- 08: CPython asyncio conformance suite ----------------------------
 Step "08-cpython-conformance" {
-    python $WD 1200 -- python tests\conformance\run_cpython_suite.py
+    & $PY $WD 1200 -- $PY tests\conformance\run_cpython_suite.py
 }
 
-# ---- 09-15: benchmarks ------------------------------------------------
 Step "09-bench-sched" {
     Set-Location bench
-    python ..\$WD 1800 -- python harness\harness.py --suite sched --loops cadeloop,asyncio,winloop --out (Join-Path $R "win-sched.json")
+    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite sched --loops cadeloop,asyncio,winloop --out (Join-Path $R "win-sched.json")
     Set-Location $repo
 }
 
 Step "10-bench-echo-rtt-iocp" {
     Set-Location bench
     Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
-    python ..\$WD 1200 -- python harness\harness.py --suite echo --loops cadeloop,asyncio,winloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-iocp.json")
+    & $PY ..\$WD 1200 -- $PY harness\harness.py --suite echo --loops cadeloop,asyncio,winloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-iocp.json")
     Set-Location $repo
 }
 
 Step "11-bench-echo-rtt-rio" {
     Set-Location bench
     $env:CADELOOP_BACKEND = "rio"
-    python ..\$WD 900 -- python harness\harness.py --suite echo --loops cadeloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-rio.json")
+    & $PY ..\$WD 900 -- $PY harness\harness.py --suite echo --loops cadeloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-rio.json")
     Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
     Set-Location $repo
 }
 
 Step "12-bench-echo-64-iocp" {
     Set-Location bench
-    python ..\$WD 1200 -- python harness\harness.py --suite echo --loops cadeloop,asyncio,winloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-iocp.json")
+    & $PY ..\$WD 1200 -- $PY harness\harness.py --suite echo --loops cadeloop,asyncio,winloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-iocp.json")
     Set-Location $repo
 }
 
 Step "13-bench-echo-64-rio" {
     Set-Location bench
     $env:CADELOOP_BACKEND = "rio"
-    python ..\$WD 900 -- python harness\harness.py --suite echo --loops cadeloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-rio.json")
+    & $PY ..\$WD 900 -- $PY harness\harness.py --suite echo --loops cadeloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-rio.json")
     Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
     Set-Location $repo
 }
 
 Step "14-bench-http" {
     Set-Location bench
-    python ..\$WD 1800 -- python harness\harness.py --suite http --contenders cadeloop-native,cadeloop-native-rio,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,hypercorn --conns 64 --seconds 3 --out (Join-Path $R "win-http.json")
+    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite http --contenders cadeloop-native,cadeloop-native-rio,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,hypercorn --conns 64 --seconds 3 --out (Join-Path $R "win-http.json")
     Set-Location $repo
 }
 
 Step "15-bench-http-uvicorn-on-rio" {
     Set-Location bench
     $env:CADELOOP_BACKEND = "rio"
-    python ..\$WD 900 -- python harness\harness.py --suite http --contenders uvicorn+cadeloop --conns 64 --seconds 3 --out (Join-Path $R "win-http-uvicorn-rio.json")
+    & $PY ..\$WD 900 -- $PY harness\harness.py --suite http --contenders uvicorn+cadeloop --conns 64 --seconds 3 --out (Join-Path $R "win-http-uvicorn-rio.json")
     Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
     Set-Location $repo
 }
 
-# ---- 16: wheel build + clean-venv install test (R-110) ----------------
 Step "16-wheel" {
-    python $WD 1200 -- python -m maturin build --release
+    & $PY $WD 1200 -- $PY -m maturin build --release
     $wheel = Get-ChildItem target\wheels\*.whl | Select-Object -First 1
     Copy-Item $wheel.FullName $R -Force
-    python -m venv (Join-Path $R "wheelvenv")
+    & $PY -m venv (Join-Path $R "wheelvenv")
     & (Join-Path $R "wheelvenv\Scripts\python.exe") -m pip install $wheel.FullName
     Push-Location $env:TEMP
     & (Join-Path $R "wheelvenv\Scripts\python.exe") -c @"
@@ -197,14 +203,12 @@ lp.close()
     Pop-Location
 }
 
-# ---- 17: scheduling soak (RSS growth gate, R-113) ---------------------
 Step "17-soak" {
-    python $WD 300 -- python tests\stress\soak_timers.py --seconds 120
+    & $PY $WD 300 -- $PY tests\stress\soak_timers.py --seconds 120
 }
 
-# ---- 18: multiworker degradation notice (no fork on Windows) ----------
 Step "18-workers-degrade" {
-    python $WD 120 -- python -c @"
+    & $PY $WD 120 -- $PY -c @"
 import logging, threading, urllib.request, time, sys
 sys.path.insert(0, r'$repo\python')
 logging.basicConfig(level=logging.INFO)
@@ -223,7 +227,6 @@ print(urllib.request.urlopen('http://127.0.0.1:8971/', timeout=5).read())
 "@
 }
 
-# ---- summary + zip ----------------------------------------------------
 $summaryPath = Join-Path $R "SUMMARY.txt"
 $summary | Out-File -Encoding utf8 $summaryPath
 Get-Content $summaryPath | Write-Host
