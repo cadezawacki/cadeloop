@@ -821,13 +821,16 @@ impl Transport {
 
         let tid = self.tid;
         let mut pause: Option<Py<PyAny>> = None;
+        let mut dirty = false;
         core.with_net(|net, reactor| {
             let Some(entry) = net.transports.get_mut(&tid) else {
                 net.graveyard_bufs.push(buf);
+                dirty = true;
                 return; // write after connection_lost: silently dropped
             };
             if entry.closing || entry.eof_wanted || entry.conn_lost {
                 net.graveyard_bufs.push(buf);
+                dirty = true;
                 return;
             }
             entry.queued_bytes += buf.remaining();
@@ -852,8 +855,12 @@ impl Transport {
                     pause = Some(entry.proto.pause_writing.clone_ref(py));
                 }
             }
+            dirty |= !net.graveyard_bufs.is_empty() || !net.graveyard_entries.is_empty();
         })?;
-        core.drain_graveyards(py)?;
+        if dirty {
+            // Rare paths only (dropped write, >=64KiB flush that tore down).
+            core.drain_graveyards(py)?;
+        }
         if let Some(pause_writing) = pause {
             core.guard_protocol_call(py, pause_writing.call0(py))?;
         }
