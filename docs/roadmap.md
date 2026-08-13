@@ -63,8 +63,13 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       Linux; 34.7K vs uvicorn+winloop 7.85K (4.4x) on Windows hardware —
       the ≥2.0x gate cleared on both; the authoritative number remains a
       two-machine run (R-131)
-- [ ] Request-line/keep-alive idle timeouts (R-080 timers; config wired)
-- [ ] Access log (R-140) on the native engine
+- [x] Request-line/keep-alive idle timeouts (R-080): coarse-sweep design
+      (no per-request timer churn), head window anchored at head start
+      (slowloris-proof, tested with a drip client), 408 on head expiry,
+      clean close on idle expiry; per-listener config
+- [x] Access log (R-140) on the native engine: per-request sink
+      (peer, method, target, status, duration) installed by serve()
+      behind `cadeloop.access`; zero-cost when disabled (one branch)
 
 ## M2.5 — transport-layer follow-ups (from competitive analysis) ✅
 

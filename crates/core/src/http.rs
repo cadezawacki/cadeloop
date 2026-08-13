@@ -134,6 +134,12 @@ struct Acc {
     body: Vec<u8>,
     completed: VecDeque<Request>,
     error: Option<ParseError>,
+    /// A request head (request line + headers) is mid-receipt — drives
+    /// the R-080 request-line/header timeout, which anchors at head
+    /// start so drip-fed bytes (slowloris) cannot extend it. Body
+    /// receipt is NOT head time (a slow upload falls under keep-alive
+    /// idle policy instead).
+    in_head: bool,
 }
 
 impl Acc {
@@ -191,9 +197,15 @@ unsafe extern "C" fn on_header_value(p: *mut Llhttp, at: *const c_char, len: usi
     0
 }
 
+unsafe extern "C" fn on_message_begin(p: *mut Llhttp) -> c_int {
+    unsafe { acc(p) }.in_head = true;
+    0
+}
+
 unsafe extern "C" fn on_headers_complete(p: *mut Llhttp) -> c_int {
     let a = unsafe { acc(p) };
     a.commit_header();
+    a.in_head = false;
     0
 }
 
@@ -240,7 +252,7 @@ fn errno_str(e: c_int) -> &'static str {
 }
 
 const SETTINGS: Settings = Settings {
-    on_message_begin: None,
+    on_message_begin: Some(on_message_begin),
     on_url: Some(on_url),
     on_status: None,
     on_method: None,
@@ -289,6 +301,7 @@ impl HttpParser {
             body: Vec::new(),
             completed: VecDeque::new(),
             error: None,
+            in_head: false,
         });
         unsafe {
             llhttp_init(&mut *raw, HTTP_REQUEST, &SETTINGS);
@@ -316,6 +329,11 @@ impl HttpParser {
 
     pub fn has_request(&self) -> bool {
         !self.acc.completed.is_empty()
+    }
+
+    /// A request head is currently mid-receipt (R-080 timeout phase).
+    pub fn in_head(&self) -> bool {
+        self.acc.in_head
     }
 }
 

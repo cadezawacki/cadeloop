@@ -636,3 +636,125 @@ def _import_signal():
     import signal
 
     return signal
+
+
+# --------------------------------------------------------------------- #
+# R-080 connection timeouts + R-140 access log (M2 close-out)           #
+# --------------------------------------------------------------------- #
+
+
+def _arm_sweep(loop, interval=0.05):
+    """Test-sized version of the facade's timeout sweep timer."""
+    stop = {"flag": False}
+
+    def sweep():
+        if stop["flag"] or loop.is_closed():
+            return
+        loop._core.http_sweep()
+        loop.call_later(interval, sweep)
+
+    loop.call_later(interval, sweep)
+    return lambda: stop.__setitem__("flag", True)
+
+
+def test_keepalive_idle_timeout_closes(loop):
+    lid, port = listen(loop, echo_scope_app, keepalive_idle=0.3, request_line_timeout=5.0)
+    cancel = _arm_sweep(loop)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        await writer.drain()
+        await _read_one_response(reader)
+        # Keep-alive honored, then the idle window expires -> clean close
+        # (EOF, no 408: the client sent nothing wrong).
+        t0 = loop.time()
+        rest = await asyncio.wait_for(reader.read(), 3.0)
+        assert rest == b""
+        assert loop.time() - t0 < 2.5
+        writer.close()
+
+    loop.run_until_complete(main())
+    cancel()
+    loop._core.listener_close(lid)
+
+
+def test_request_head_timeout_408(loop):
+    lid, port = listen(loop, echo_scope_app, request_line_timeout=0.3, keepalive_idle=10.0)
+    cancel = _arm_sweep(loop)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTT")  # head never completes
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(), 3.0)
+        assert b"408" in data.split(b"\r\n", 1)[0]
+        writer.close()
+        # The listener stays healthy for the next connection.
+        resp = await _request(port, b"GET /ok HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+        assert b"200" in resp.split(b"\r\n", 1)[0]
+
+    loop.run_until_complete(main())
+    cancel()
+    loop._core.listener_close(lid)
+
+
+def test_slowloris_drip_still_times_out(loop):
+    # R-080: the head window anchors at head START; drip-fed bytes must
+    # not extend it (the classic slowloris hold-open).
+    lid, port = listen(loop, echo_scope_app, request_line_timeout=0.4, keepalive_idle=10.0)
+    cancel = _arm_sweep(loop)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\n")
+        await writer.drain()
+        t0 = loop.time()
+
+        async def read_resp():
+            return await asyncio.wait_for(reader.read(), 5.0)
+
+        read_task = loop.create_task(read_resp())
+        for _ in range(25):  # drip a header byte every 100ms, forever-ish
+            if read_task.done():
+                break
+            try:
+                writer.write(b"a")
+                await writer.drain()
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                break
+            await asyncio.sleep(0.1)
+        data = await read_task
+        elapsed = loop.time() - t0
+        assert b"408" in data.split(b"\r\n", 1)[0]
+        assert elapsed < 1.5, f"drip extended the head window to {elapsed:.2f}s"
+        writer.close()
+
+    loop.run_until_complete(main())
+    cancel()
+    loop._core.listener_close(lid)
+
+
+def test_access_log_sink(loop):
+    records = []
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.set_access_log(
+        lambda peer, method, target, status, dur: records.append(
+            (peer, method, target, status, dur)
+        )
+    )
+
+    async def main():
+        resp = await _request(port, b"GET /hello?x=1 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+        assert b"200" in resp.split(b"\r\n", 1)[0]
+
+    loop.run_until_complete(main())
+    loop._core.set_access_log(None)
+    assert len(records) == 1
+    peer, method, target, status, dur = records[0]
+    assert method == "GET"
+    assert target == b"/hello?x=1"
+    assert status == 200
+    assert peer is not None and peer[0] == "127.0.0.1"
+    assert dur >= 0.0
+    loop._core.listener_close(lid)

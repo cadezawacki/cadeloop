@@ -28,7 +28,7 @@ use std::io;
 
 use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
-use cadeloop_core::http::Limits;
+use cadeloop_core::http::{Limits, ParseError};
 use cadeloop_core::netsys;
 use cadeloop_core::opslab::OpId;
 use pyo3::exceptions::PyRuntimeError;
@@ -139,13 +139,27 @@ pub(crate) struct TransportEntry {
 }
 
 /// What an accepted connection turns into.
+/// R-080 connection-timeout tuning, fixed per listener (0 = disabled).
+#[derive(Clone, Copy)]
+pub(crate) struct HttpTuning {
+    pub head_timeout_ns: u64,
+    pub idle_timeout_ns: u64,
+}
+
 pub(crate) enum ListenerKind {
     /// asyncio create_server: `protocol_factory()` per accept.
     Factory(Py<PyAny>),
     /// Native HTTP engine (M2): every accept becomes an [`HttpConn`].
     /// `pyloop` is the facade loop (receive() waiter futures need it);
     /// `state` is the lifespan state dict, shallow-copied per scope.
-    Http { app: Py<PyAny>, pyloop: Py<PyAny>, state: Py<PyAny>, limits: Limits, eager: bool },
+    Http {
+        app: Py<PyAny>,
+        pyloop: Py<PyAny>,
+        state: Py<PyAny>,
+        limits: Limits,
+        eager: bool,
+        tuning: HttpTuning,
+    },
 }
 
 pub(crate) struct ListenerEntry {
@@ -175,6 +189,9 @@ pub(crate) struct NetState {
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
     pub graveyard_protos: Vec<ProtoKind>,
+    /// R-140 access-log sink (a Python callable) — None disables logging
+    /// with a single branch on the request-completion path.
+    pub access_sink: Option<Py<PyAny>>,
     pub stats_bytes_rx: u64,
     pub stats_bytes_tx: u64,
     pub stats_conns_accepted: u64,
@@ -431,6 +448,75 @@ pub(crate) fn http_enqueue(
 
 /// Mark a native HTTP connection to close once its write queue drains
 /// (`connection: close`, parse errors, app failures). In-cell.
+/// R-080 connection-timeout sweep. Called periodically (the facade arms a
+/// coarse repeating timer); walks HTTP connections and enforces the two
+/// windows: request-head receipt (anchored at head START, so drip-fed
+/// bytes cannot extend it — slowloris) and keep-alive idle (re-anchored
+/// whenever activity moved between sweeps). Busy connections (app
+/// running, queued pipeline, response streaming) are never timed out
+/// here. Returns (head_timeouts, idle_closes).
+pub(crate) fn http_sweep(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    now_ns: u64,
+) -> (u32, u32) {
+    let mut expire_head: Vec<u64> = Vec::new();
+    let mut expire_idle: Vec<u64> = Vec::new();
+    for (&tid, entry) in net.transports.iter_mut() {
+        if entry.conn_lost || entry.closing {
+            continue;
+        }
+        let ProtoKind::Http(conn) = &mut entry.proto else { continue };
+        // Done/Idle are between-requests states; only a live app, queued
+        // pipeline, or a mid-flight response counts as busy.
+        let mid_response = matches!(
+            conn.resp,
+            crate::http::RespPhase::Started | crate::http::RespPhase::Streaming
+        );
+        let busy = conn.active || !conn.pending.is_empty() || mid_response;
+        let phase: u8 = if busy {
+            2
+        } else if conn.parser.in_head() {
+            1
+        } else {
+            0
+        };
+        let moved = conn.activity != conn.sweep_seen;
+        conn.sweep_seen = conn.activity;
+        if phase != conn.sweep_phase || conn.sweep_anchor_ns == 0 || phase == 2 || (phase == 0 && moved)
+        {
+            // New phase, first sighting, busy, or fresh idle activity:
+            // (re)anchor. A head in progress deliberately does NOT
+            // re-anchor on activity — that is the slowloris rule.
+            conn.sweep_phase = phase;
+            conn.sweep_anchor_ns = now_ns;
+            continue;
+        }
+        let elapsed = now_ns.saturating_sub(conn.sweep_anchor_ns);
+        match phase {
+            1 if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => {
+                expire_head.push(tid)
+            }
+            0 if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => {
+                expire_idle.push(tid)
+            }
+            _ => {}
+        }
+    }
+    for &tid in &expire_head {
+        // 408 then close: the head never completed inside the window.
+        let resp = crate::http::error_response(ParseError { status: 408, reason: "Request Timeout" });
+        http_enqueue(py, net, backend, tid, resp);
+        http_close_after_write(py, net, backend, tid);
+    }
+    for &tid in &expire_idle {
+        // Idle keep-alive expiry closes silently (uvicorn-compatible).
+        teardown_with(py, net, backend, tid, None);
+    }
+    (expire_head.len() as u32, expire_idle.len() as u32)
+}
+
 pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.conn_lost || entry.closing {
@@ -820,18 +906,22 @@ pub(crate) fn dispatch_events(
                         state: Py<PyAny>,
                         limits: Limits,
                         eager: bool,
+                        tuning: HttpTuning,
                     },
                 }
                 let action = core.with_net(|net, _| {
                     net.listeners.get(&lid).map(|l| match &l.kind {
                         ListenerKind::Factory(f) => Action::Factory(f.clone_ref(py)),
-                        ListenerKind::Http { app, pyloop, state, limits, eager } => Action::Http {
-                            app: app.clone_ref(py),
-                            pyloop: pyloop.clone_ref(py),
-                            state: state.clone_ref(py),
-                            limits: *limits,
-                            eager: *eager,
-                        },
+                        ListenerKind::Http { app, pyloop, state, limits, eager, tuning } => {
+                            Action::Http {
+                                app: app.clone_ref(py),
+                                pyloop: pyloop.clone_ref(py),
+                                state: state.clone_ref(py),
+                                limits: *limits,
+                                eager: *eager,
+                                tuning: *tuning,
+                            }
+                        }
                     })
                 })?;
                 match action {
@@ -847,8 +937,10 @@ pub(crate) fn dispatch_events(
                             core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                         }
                     },
-                    Some(Action::Http { app, pyloop, state, limits, eager }) => {
-                        if let Err(e) = wire_http(py, slf, sock, app, pyloop, state, limits, eager) {
+                    Some(Action::Http { app, pyloop, state, limits, eager, tuning }) => {
+                        if let Err(e) =
+                            wire_http(py, slf, sock, app, pyloop, state, limits, eager, tuning)
+                        {
                             core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                         }
                     }
@@ -1021,6 +1113,7 @@ pub(crate) fn wire_http(
     state: Py<PyAny>,
     limits: Limits,
     eager: bool,
+    tuning: HttpTuning,
 ) -> PyResult<()> {
     let core = slf.get();
     let _ = netsys::set_nodelay(sock, true); // R-038
@@ -1038,7 +1131,15 @@ pub(crate) fn wire_http(
             tid,
             TransportEntry {
                 socket: sock,
-                proto: ProtoKind::Http(Box::new(HttpConn::new(app, pyloop, state, limits, eager))),
+                proto: ProtoKind::Http(Box::new(HttpConn::new(
+                    app,
+                    pyloop,
+                    state,
+                    limits,
+                    eager,
+                    tuning.head_timeout_ns,
+                    tuning.idle_timeout_ns,
+                ))),
                 pyobj: None,
                 recv_slot: None,
                 recv_op: None,

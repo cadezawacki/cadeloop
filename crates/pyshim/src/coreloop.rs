@@ -607,7 +607,8 @@ impl CoreLoop {
     /// the facade loop (receive() waiters / non-eager tasks need it).
     #[pyo3(signature = (ip, port, app, pyloop, state=None, backlog=1024, reuse_addr=true,
                         reuse_port=false, accept_pool=64, eager=true, max_header_bytes=65536,
-                        max_headers=100, max_url=8192, max_body=None))]
+                        max_headers=100, max_url=8192, max_body=None,
+                        request_line_timeout=5.0, keepalive_idle=75.0))]
     #[allow(clippy::too_many_arguments)]
     fn http_listen(
         &self,
@@ -626,6 +627,8 @@ impl CoreLoop {
         max_headers: usize,
         max_url: usize,
         max_body: Option<usize>,
+        request_line_timeout: f64,
+        keepalive_idle: f64,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
         if !app.is_callable() {
@@ -635,6 +638,7 @@ impl CoreLoop {
             Some(s) if !s.is_none() => s.unbind(),
             _ => PyDict::new(py).into_any().unbind(),
         };
+        let secs_to_ns = |s: f64| if s > 0.0 { (s * 1e9) as u64 } else { 0 };
         let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port)?;
         let kind = net::ListenerKind::Http {
             app: app.unbind(),
@@ -642,8 +646,33 @@ impl CoreLoop {
             state,
             limits: Limits { max_header_bytes, max_headers, max_url, max_body },
             eager,
+            tuning: net::HttpTuning {
+                head_timeout_ns: secs_to_ns(request_line_timeout),
+                idle_timeout_ns: secs_to_ns(keepalive_idle),
+            },
         };
         self.listen_socket(py, sock, kind, accept_pool, true)
+    }
+
+    /// R-080 timeout sweep tick (armed as a coarse repeating timer by the
+    /// facade server). Returns (head_timeouts, idle_closes) this pass.
+    fn http_sweep(&self, py: Python<'_>) -> PyResult<(u32, u32)> {
+        let counts = self.with_net(|net, reactor| {
+            let now_ns = reactor.time_cached();
+            let backend = reactor.backend_mut();
+            net::http_sweep(py, net, backend, now_ns)
+        })?;
+        self.drain_graveyards(py)?;
+        Ok(counts)
+    }
+
+    /// R-140: install (or clear) the access-log sink — a callable
+    /// receiving (peername, method, target_bytes, status, duration_ms).
+    #[pyo3(signature = (sink=None))]
+    fn set_access_log(&self, sink: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        self.with_net(|net, _| {
+            net.access_sink = sink.map(|s| s.unbind());
+        })
     }
 
     /// Adopt an existing listening socket fd (create_server(sock=...)).

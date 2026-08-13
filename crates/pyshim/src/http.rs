@@ -88,6 +88,23 @@ pub(crate) struct HttpConn {
     /// Suspended continuation (eager path) — kept alive here.
     pub(crate) driver: Option<Py<AppTask>>,
     pub(crate) eager: bool,
+    // --- R-080 idle/head timeouts (0 = disabled), driven by http_sweep --
+    pub(crate) head_timeout_ns: u64,
+    pub(crate) idle_timeout_ns: u64,
+    /// Bumped on every recv and request completion; the sweep re-anchors
+    /// an Idle connection whose activity moved between sweeps (a fast
+    /// request served wholly between two sweeps must not look idle).
+    pub(crate) activity: u32,
+    /// Sweep bookkeeping: last observed phase (0 idle / 1 head / 2 busy),
+    /// activity snapshot, and the anchor timestamp for the current phase.
+    pub(crate) sweep_phase: u8,
+    pub(crate) sweep_seen: u32,
+    pub(crate) sweep_anchor_ns: u64,
+    // --- R-140 access log (populated only while a sink is installed) ---
+    pub(crate) log_method: &'static str,
+    pub(crate) log_target: Vec<u8>,
+    pub(crate) log_status: u16,
+    pub(crate) log_start_ns: u64,
 }
 
 impl HttpConn {
@@ -97,6 +114,8 @@ impl HttpConn {
         state: Py<PyAny>,
         limits: Limits,
         eager: bool,
+        head_timeout_ns: u64,
+        idle_timeout_ns: u64,
     ) -> Self {
         HttpConn {
             app,
@@ -119,6 +138,16 @@ impl HttpConn {
             send_obj: None,
             driver: None,
             eager,
+            head_timeout_ns,
+            idle_timeout_ns,
+            activity: 0,
+            sweep_phase: 0,
+            sweep_seen: 0,
+            sweep_anchor_ns: 0,
+            log_method: "",
+            log_target: Vec::new(),
+            log_status: 0,
+            log_start_ns: 0,
         }
     }
 
@@ -131,6 +160,7 @@ impl HttpConn {
 /// must run the request pump; parse errors are answered entirely in-cell
 /// by the caller (R-086).
 pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<bool, ParseError> {
+    conn.activity = conn.activity.wrapping_add(1);
     conn.parser.feed(data)?;
     while let Some(req) = conn.parser.next_request() {
         conn.pending.push_back(req);
@@ -573,6 +603,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 conn.keep_alive = false;
             }
             conn.resp = RespPhase::Started;
+            conn.log_status = status;
             Ok(())
         })?
         .map_err(send_err)?;
@@ -681,7 +712,9 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
     let core = slf.get();
     loop {
         // Pop the next request only when no request is active.
-        let next = core.with_net(|net, _| {
+        let next = core.with_net(|net, reactor| {
+            let logging = net.access_sink.is_some();
+            let now_ns = reactor.time_cached();
             let conn = net.http_conn_mut(tid)?;
             if conn.active {
                 return None;
@@ -695,6 +728,13 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 conn.raw_stream = false;
                 conn.active_head = req.method == "HEAD";
                 conn.active_minor = req.http_minor;
+                if logging {
+                    // R-140: retained only while a sink is installed.
+                    conn.log_method = req.method;
+                    conn.log_target = req.url.clone();
+                    conn.log_status = 0;
+                    conn.log_start_ns = now_ns;
+                }
                 conn.req_body = Some(std::mem::take(&mut req.body));
                 (
                     req,
@@ -818,17 +858,22 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
             finish_request(py, core, tid)
         }
         Some(RespPhase::Idle) => {
-            core.with_net(|net, reactor| {
+            let log = core.with_net(|net, reactor| {
+                let now_ns = reactor.time_cached();
                 let backend = reactor.backend_mut();
                 if let Some(c) = net.http_conn_mut(tid) {
                     c.resp = RespPhase::Done;
                     c.keep_alive = false;
+                    c.log_status = 500;
                 }
+                let log = take_access_record(py, net, tid, now_ns);
                 let body =
                     error_response(ParseError { status: 500, reason: "internal server error" });
                 net::http_enqueue(py, net, backend, tid, body);
                 net::http_close_after_write(py, net, backend, tid);
+                log
             })?;
+            emit_access_record(py, log);
             core.drain_graveyards(py)
         }
         Some(_) => {
@@ -843,13 +888,51 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
 
 /// Reset per-request state; close (`connection: close` / disconnect) or
 /// continue keep-alive. The caller pumps pipelined requests (R-085).
+/// R-140: pull the completed request's access record + sink out of the
+/// state cell (None while logging is disabled). Must be called BEFORE
+/// the record fields are reset for the next request.
+type AccessRecord = (Py<PyAny>, Option<Py<PyAny>>, &'static str, Vec<u8>, u16, f64);
+
+fn take_access_record(
+    py: Python<'_>,
+    net: &mut crate::net::NetState,
+    tid: u64,
+    now_ns: u64,
+) -> Option<AccessRecord> {
+    net.access_sink.as_ref()?;
+    let conn = net.http_conn_mut(tid)?;
+    if conn.log_method.is_empty() {
+        return None;
+    }
+    let method = conn.log_method;
+    conn.log_method = "";
+    let target = std::mem::take(&mut conn.log_target);
+    let status = conn.log_status;
+    let dur_ms = now_ns.saturating_sub(conn.log_start_ns) as f64 / 1e6;
+    let (peer, _local) = net.peer_local(py, tid);
+    Some((net.access_sink.as_ref().unwrap().clone_ref(py), peer, method, target, status, dur_ms))
+}
+
+/// Emit outside the state cell: the sink is arbitrary Python (R-140).
+fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
+    if let Some((sink, peer, method, target, status, dur_ms)) = rec {
+        let target = pyo3::types::PyBytes::new(py, &target);
+        if let Err(e) = sink.call1(py, (peer, method, target, status, dur_ms)) {
+            e.write_unraisable(py, None);
+        }
+    }
+}
+
 pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let waiter = core.with_net(|net, reactor| {
+    let (waiter, log) = core.with_net(|net, reactor| {
+        let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
+        let log = take_access_record(py, net, tid, now_ns);
         let (waiter, driver, close) = {
-            let conn = net.http_conn_mut(tid)?;
+            let Some(conn) = net.http_conn_mut(tid) else { return (None, None) };
             conn.active = false;
             conn.req_body = None;
+            conn.activity = conn.activity.wrapping_add(1);
             (
                 conn.take_recv_waiter(),
                 conn.driver.take(),
@@ -862,8 +945,9 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
         if close {
             net::http_close_after_write(py, net, backend, tid);
         }
-        waiter
+        (waiter, log)
     })?;
+    emit_access_record(py, log);
     core.drain_graveyards(py)?;
     if let Some(fut) = waiter {
         let fut = fut.bind(py);

@@ -200,7 +200,12 @@ def _serve_single(app, host, port, config: Config, *, reuse_port: bool = False, 
             max_headers=config.max_headers,
             max_url=config.max_url,
             max_body=config.max_body,
+            request_line_timeout=config.request_line_timeout,
+            keepalive_idle=config.keepalive_idle,
         )
+        if config.access_log:
+            loop._core.set_access_log(_access_sink(logging.getLogger("cadeloop.access")))
+        _arm_timeout_sweep(loop, config)
         # R-075: freeze the post-startup heap out of the cyclic collector.
         if config.gc_mode == "freeze":
             gc.collect()
@@ -234,6 +239,40 @@ def _serve_single(app, host, port, config: Config, *, reuse_port: bool = False, 
         lifespan.shutdown()
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def _access_sink(access_logger):
+    """R-140 access-log sink: called from the engine per completed request
+    with (peername, method, target_bytes, status, duration_ms)."""
+
+    def sink(peer, method, target, status, dur_ms):
+        client = f"{peer[0]}:{peer[1]}" if peer else "-"
+        access_logger.info(
+            '%s "%s %s" %d %.2fms',
+            client,
+            method,
+            target.decode("latin-1"),
+            status,
+            dur_ms,
+        )
+
+    return sink
+
+
+def _arm_timeout_sweep(loop, config: Config):
+    """R-080: arm the coarse repeating timer driving the head/idle
+    timeout sweep. Interval adapts so short (test-sized) timeouts still
+    fire promptly; 0/negative timeouts disable their window natively."""
+    windows = [t for t in (config.request_line_timeout, config.keepalive_idle) if t and t > 0]
+    if not windows:
+        return
+    interval = max(0.05, min(1.0, min(windows) / 4))
+
+    def sweep():
+        loop._core.http_sweep()
+        loop.call_later(interval, sweep)
+
+    loop.call_later(interval, sweep)
 
 
 # --------------------------------------------------------------------- #
