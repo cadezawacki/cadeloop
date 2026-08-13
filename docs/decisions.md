@@ -149,3 +149,34 @@ epoll backend is queued as M2.5 — it does not affect Windows/IOCP, where
 completions are the native kernel interface, and it validates that
 cadeloop's scheduler core composes: aiofastnet-on-cadeloop was the
 fastest non-native stack measured.
+
+## ADR-21: The aiofastnet mirror — lazy epoll interest + drained-recv
+ADR-20 identified the gap; this closes it. Per ping-pong message the old
+proactor emulation paid recv(success) + epoll_ctl(DEL) + recv(EAGAIN) +
+epoll_ctl(ADD). Now: op completions leave the kernel mask armed (the
+same-tick re-post finds desired == kernel and issues nothing), and a
+short read marks the fd drained so the next post parks without the
+speculative recv. An event with no consumer is the single disarm point,
+so LT epoll cannot storm. Two hazards this created and their fixes, both
+regression-tested: (1) fd-number reuse after close and (2) same-socket
+re-register (connect → attach) could leave a stale mask that either
+silently skips a needed epoll_ctl (hang) or EEXISTs — register_socket
+now resets entry AND kernel registration, and watches sync eagerly
+(their removal path is the one that races user-space close). Result:
+one recv syscall per message; echo-rtt +28% (35.1K → 45.0K msg/s),
+matching the aiofastnet-stacked configuration that exposed the gap.
+
+## ADR-22: The rloop mirror — one state-cell entry per tick
+rloop's call_soon_chain lead was tick anatomy, not call_soon itself
+(their schedule path is nearly identical, context copy included). Our
+tick entered the state cell three times (poll phase, translate phase,
+batch take); a queue-depth-1 chain pays full tick overhead per callback.
+Pure-scheduling ticks now do flush + prepare + poll + translate + batch
+take under ONE claim. Interrupt safety: reactor.unpop_ready returns an
+undispatched batch tail to the queue front, so KeyboardInterrupt (from
+the throttled signal check or a callback) loses nothing and preserves
+FIFO. call_soon_chain 3.15 → 3.64 M ops/s; threadsafe 2.58 → 3.55.
+rloop's remaining threadsafe edge comes from reusing a loop-init context
+snapshot instead of copying the caller's context per call — declined:
+call_soon_threadsafe capturing the calling thread's context is
+observable drop-in behavior (R-013).

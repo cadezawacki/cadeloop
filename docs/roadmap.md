@@ -61,22 +61,32 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [ ] Request-line/keep-alive idle timeouts (R-080 timers; config wired)
 - [ ] Access log (R-140) on the native engine
 
-## M2.5 — transport-layer follow-ups (from competitive analysis)
+## M2.5 — transport-layer follow-ups (from competitive analysis) ✅
 
-- [ ] Inline-recv-on-readable for the epoll dev backend: aiofastnet's
-      reader-callback transports stacked ON cadeloop beat our
-      proactor-emulation recv path by ~12% on echo-rtt — recv directly in
-      the poll tick when a parked completion fires, skipping the
-      slot-repost hop (Windows IOCP is unaffected; completions are native
-      there)
+- [x] epoll lazy interest disarm: op completions keep the kernel mask
+      armed (the same-tick re-post then needs no epoll_ctl); unconsumed
+      events disarm — the steady-state DEL/ADD pair per message is gone
+- [x] Drained-socket heuristic: a short recv parks the next post directly
+      (no speculative recv that would EAGAIN); a full-buffer read keeps
+      the inline attempt for streaming
+- [x] Result: one recv syscall per echo message; echo-rtt 35.1K → 45.0K
+      msg/s (+28%), p99 67 → 50µs — native transports now match the
+      aiofastnet-on-cadeloop stack that exposed the gap (ADR-20/21)
+- [x] Single-cell tick (rloop tick-anatomy): pure-scheduling ticks enter
+      the state cell once; call_soon_chain 3.15 → 3.64 M ops/s,
+      threadsafe 2.58 → 3.55; lossless batch unwind on interrupts
 
 ## M3 — RIO backend; latency targets; multi-worker
 
+- [x] Worker model, Linux flavor (§8): SO_REUSEPORT pool (kernel accept
+      balancing), supervisor restart with fast-crash cutoff, SIGTERM
+      forward + grace drain, round-robin CPU pinning (R-090..R-093);
+      end-to-end tested via the CLI (balancing, SIGKILL restart, drain)
+- [ ] Windows worker model: WSADuplicateSocketW handle passing (fork-free)
 - [ ] RIO CQ/RQ machinery (R-040..R-044) on the existing probe + buffer
       registration hooks
-- [ ] p99 ≤ 0.6x uvicorn+winloop at 80% saturation (R-003)
-- [ ] Worker model: WSADuplicateSocketW handle passing, affinity pinning,
-      supervisor restart/drain (R-090..R-093)
+- [ ] p99 ≤ 0.6x uvicorn+winloop at 80% saturation (R-003 — Windows
+      two-machine measurement)
 
 ## M4 — TLS, WebSockets, UDP, readiness hardening
 

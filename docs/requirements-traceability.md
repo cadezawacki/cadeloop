@@ -53,7 +53,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-086 | Error paths: in-cell 4xx, 500-or-abort, disconnect futures | ✅ | core/http.rs, http.rs (pyshim) |
 | R-087 | WebSockets | 📅 M4 | — |
 | R-088 | Fallback to pure-Python h11 path | ➖ not planned (native engine + uvicorn interop cover it) | — |
-| R-090..093 | Worker model, affinity, supervision | 📅 M3 (config ✅) | config.py |
+| R-090..093 | Worker model, affinity, supervision | 🔶 Linux ✅: SO_REUSEPORT pool, supervisor restart + fast-crash cutoff, grace drain, sched_setaffinity pinning; Windows (WSADuplicateSocketW) 📅 M3 | server.py, tests/unit/test_multiworker.py |
 | R-100 | new_event_loop/EventLoopPolicy/install/run | ✅ | policy.py |
 | R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy; workers>1 📅 M3 | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
