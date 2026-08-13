@@ -245,6 +245,17 @@ pub struct IocpBackend {
     free_sockets: Vec<SOCKET>,
     /// Listener -> protocol info (for creating matching accept sockets).
     listener_info: HashMap<SOCKET, WSAPROTOCOL_INFOW>,
+    /// R-057 watches: fd -> (readable, writable); probes re-armed per poll.
+    watches: HashMap<SOCKET, (bool, bool)>,
+    /// Sockets whose probes need (re)posting at the next poll.
+    watch_rearm: Vec<SOCKET>,
+    /// Live probe ops -> socket, so completions translate to Ready events.
+    probe_ops: HashMap<OpId, (SOCKET, bool /*write probe*/)>,
+    /// Sockets where FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is active.
+    /// Synchronous returns may ONLY be handled inline for these (R-031);
+    /// for LSP/non-IFS sockets the port still queues a completion even on
+    /// immediate success, and treating it inline would double-complete.
+    skip_ok: std::collections::HashSet<SOCKET>,
 }
 
 // SAFETY: thread-affine by loop contract; raw handles are moved with it.
@@ -265,7 +276,74 @@ impl IocpBackend {
             syscalls_saved_inline: 0,
             free_sockets: Vec::new(),
             listener_info: HashMap::new(),
+            watches: HashMap::new(),
+            watch_rearm: Vec::new(),
+            probe_ops: HashMap::new(),
+            skip_ok: std::collections::HashSet::new(),
         })
+    }
+
+    /// May a synchronous success on this socket be handled inline (R-031)?
+    fn inline_ok(&self, socket: SOCKET) -> bool {
+        self.skip_ok.contains(&socket)
+    }
+
+    fn rearm_watch_probes(&mut self) {
+        if self.watch_rearm.is_empty() {
+            return;
+        }
+        let sockets: Vec<SOCKET> = self.watch_rearm.drain(..).collect();
+        for s in sockets {
+            let Some(&(r, w)) = self.watches.get(&s) else { continue };
+            let has_r = self.probe_ops.values().any(|&(ps, pw)| ps == s && !pw);
+            let has_w = self.probe_ops.values().any(|&(ps, pw)| ps == s && pw);
+            if r && !has_r {
+                let _ = self.post_probe(s, false);
+            }
+            if w && !has_w {
+                let _ = self.post_probe(s, true);
+            }
+        }
+    }
+
+    /// Zero-byte recv/send probe (R-057 readiness emulation).
+    fn post_probe(&mut self, socket: SOCKET, write: bool) -> io::Result<()> {
+        let id = self.new_op(if write { OpKind::Send } else { OpKind::Recv }, socket);
+        let op = &mut self.slab.get_mut(id).unwrap().data;
+        op.wsabufs[0] = WSABUF { len: 0, buf: op.addr_buf.as_mut_ptr() };
+        let wsabuf_ptr = &mut op.wsabufs[0] as *mut WSABUF;
+        let ov = &mut op.overlapped as *mut OVERLAPPED;
+        let mut bytes: u32 = 0;
+        let mut flags: u32 = 0;
+        let rc = if write {
+            unsafe { WSASend(socket, wsabuf_ptr, 1, &mut bytes, 0, ov, None) }
+        } else {
+            unsafe { WSARecv(socket, wsabuf_ptr, 1, &mut bytes, &mut flags, ov, None) }
+        };
+        if rc == 0 && self.inline_ok(socket) {
+            self.slab.complete(id);
+            self.slab.release(id);
+            self.inline_completions.push(Completion::Ready { socket, readable: !write, writable: write });
+            // Next poll re-arms (level-trigger cadence).
+            self.watch_rearm.push(socket);
+            return Ok(());
+        }
+        if rc == 0 {
+            // Skip-modes off: the completion still arrives via the port.
+            self.probe_ops.insert(id, (socket, write));
+            return Ok(());
+        }
+        let err = unsafe { WSAGetLastError() };
+        if err == WSA_IO_PENDING {
+            self.probe_ops.insert(id, (socket, write));
+            return Ok(());
+        }
+        // Probe failed outright (e.g. connection reset): report readiness so
+        // the callback runs and observes the error from its own syscall.
+        self.slab.complete(id);
+        self.slab.release(id);
+        self.inline_completions.push(Completion::Ready { socket, readable: !write, writable: write });
+        Ok(())
     }
 
     /// Allocate + initialize an op slot; returns (id, overlapped ptr).
@@ -354,6 +432,13 @@ impl IocpBackend {
         // slots are pinned until their completion is reaped (R-037).
         let op_ptr = entry.lpOverlapped.cast::<IocpOp>();
         let id = unsafe { (*op_ptr).id };
+        if let Some((socket, write_probe)) = self.probe_ops.remove(&id) {
+            self.slab.complete(id);
+            self.slab.release(id);
+            out.push(Completion::Ready { socket, readable: !write_probe, writable: write_probe });
+            self.watch_rearm.push(socket); // next poll re-arms if still watched
+            return;
+        }
         let Some((kind, _was_cancelled)) = self.slab.complete(id) else {
             return; // stale/duplicate completion; debug_assert'ed in slab
         };
@@ -436,11 +521,14 @@ impl IoBackend for IocpBackend {
         };
         let ifs = rc == 0 && (info.dwServiceFlags1 & XP1_IFS_HANDLES) != 0;
         if ifs {
-            unsafe {
+            let ok = unsafe {
                 SetFileCompletionNotificationModes(
                     handle,
                     FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
-                );
+                )
+            };
+            if ok != 0 {
+                self.skip_ok.insert(socket);
             }
         }
         Ok(())
@@ -472,10 +560,12 @@ impl IoBackend for IocpBackend {
         if ok != 0 {
             // Synchronous accept (rare): with skip-modes the completion is
             // NOT queued; surface inline but keep the slot for
-            // take_accept_socket.
-            self.slab.complete(id);
-            self.syscalls_saved_inline += 1;
-            self.inline_completions.push(Completion::Io { op: id, bytes: 0, os_error: 0 });
+            // take_accept_socket. LSP sockets get it via the port instead.
+            if self.inline_ok(listener) {
+                self.slab.complete(id);
+                self.syscalls_saved_inline += 1;
+                self.inline_completions.push(Completion::Io { op: id, bytes: 0, os_error: 0 });
+            }
             return Ok(id);
         }
         let err = unsafe { WSAGetLastError() };
@@ -496,9 +586,12 @@ impl IoBackend for IocpBackend {
         let mut flags: u32 = 0;
         let rc = unsafe { WSARecv(socket, wsabuf_ptr, 1, &mut bytes, &mut flags, ov, None) };
         if rc == 0 {
-            // R-031: synchronous success handled inline, no queued
-            // completion expected.
-            self.complete_inline(id, bytes);
+            if self.inline_ok(socket) {
+                // R-031: synchronous success handled inline, no queued
+                // completion expected.
+                self.complete_inline(id, bytes);
+            }
+            // Skip-modes off (LSP socket): completion arrives via the port.
             return Ok(id);
         }
         let err = unsafe { WSAGetLastError() };
@@ -521,7 +614,9 @@ impl IoBackend for IocpBackend {
         let mut bytes: u32 = 0;
         let rc = unsafe { WSASend(socket, wsabuf_ptr, n as u32, &mut bytes, 0, ov, None) };
         if rc == 0 {
-            self.complete_inline(id, bytes);
+            if self.inline_ok(socket) {
+                self.complete_inline(id, bytes);
+            }
             return Ok(id);
         }
         let err = unsafe { WSAGetLastError() };
@@ -565,7 +660,9 @@ impl IoBackend for IocpBackend {
             unsafe {
                 setsockopt(socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0);
             }
-            self.complete_inline(id, 0);
+            if self.inline_ok(socket) {
+                self.complete_inline(id, 0);
+            }
             return Ok(id);
         }
         let err = unsafe { WSAGetLastError() };
@@ -580,7 +677,7 @@ impl IoBackend for IocpBackend {
         let id = self.new_op(OpKind::Disconnect, socket);
         let ov = self.overlapped_ptr(id);
         let ok = unsafe { (fns.disconnect_ex.unwrap())(socket, ov, TF_REUSE_SOCKET, 0) };
-        if ok != 0 {
+        if ok != 0 && self.inline_ok(socket) {
             // Synchronous: recycle immediately (R-033).
             self.slab.complete(id);
             self.slab.release(id);
@@ -598,6 +695,29 @@ impl IoBackend for IocpBackend {
             return Ok(id);
         }
         Err(self.fail_post(id, io::Error::from_raw_os_error(err)))
+    }
+
+    /// R-057 readiness emulation: readable = pending zero-byte WSARecv
+    /// probe (completes when data or EOF arrives); writable = zero-byte
+    /// WSASend probe (documented level-trigger approximation — a connected
+    /// socket with sndbuf space completes immediately, so writable watches
+    /// fire once per poll cycle like epoll level-triggering). Probes are
+    /// re-armed at the top of each poll for fds still watched.
+    fn set_watch(&mut self, socket: RawSocket, readable: bool, writable: bool) -> io::Result<()> {
+        if readable || writable {
+            self.watches.insert(socket, (readable, writable));
+        } else {
+            self.watches.remove(&socket);
+        }
+        self.watch_rearm.push(socket);
+        Ok(())
+    }
+
+    fn detach_socket(&mut self, socket: RawSocket) {
+        self.watches.remove(&socket);
+        self.listener_info.remove(&socket);
+        // In-flight ops on the socket deliver ABORTED completions via the
+        // port after closesocket; the slab reaps them there (R-037).
     }
 
     fn cancel(&mut self, op: OpId) -> io::Result<()> {
@@ -650,6 +770,7 @@ impl IoBackend for IocpBackend {
 
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {
         let before = out.len();
+        self.rearm_watch_probes();
         // R-031: inline completions first — they were never queued.
         if !self.inline_completions.is_empty() {
             out.append(&mut self.inline_completions);

@@ -19,9 +19,11 @@ use std::time::Duration;
 
 use crate::opslab::OpId;
 
+#[cfg(target_os = "linux")]
+pub mod epoll;
 #[cfg(windows)]
 pub mod iocp;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub mod portable;
 #[cfg(windows)]
 pub mod rio;
@@ -33,14 +35,32 @@ pub enum Completion {
     /// payload — the reactor drains the cross-thread queue after any poll.
     Wakeup,
     /// A kernel I/O op finished. `bytes` is the transfer count;
-    /// `os_error` is the WSA/Win32 error code when the op failed
-    /// (0 == success). Errno mapping to Python OSError happens in pyshim.
+    /// `os_error` is the WSA/Win32 (or errno on the epoll backend) error
+    /// code when the op failed (0 == success). Errno mapping to Python
+    /// OSError happens in pyshim.
     Io { op: OpId, bytes: u32, os_error: u32 },
+    /// Level-triggered readiness for a watched fd (R-057:
+    /// add_reader/add_writer and the sock_* surface). Delivered every poll
+    /// while the condition holds and the watch is armed.
+    Ready { socket: RawSocket, readable: bool, writable: bool },
 }
 
 /// Socket handle abstraction: SOCKET (usize) on Windows; unused by the
 /// portable backend.
 pub type RawSocket = usize;
+
+/// Does this `Completion::Io::os_error` mean "op cancelled by us"
+/// (CancelIoEx / ECANCELED), as opposed to a real transport error?
+pub fn is_cancelled_error(code: u32) -> bool {
+    #[cfg(windows)]
+    {
+        code == 995 // ERROR_OPERATION_ABORTED / WSA_OPERATION_ABORTED
+    }
+    #[cfg(not(windows))]
+    {
+        code == 125 // ECANCELED
+    }
+}
 
 /// Gather list entry for scatter/gather sends (R-035: up to 16 per send).
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +102,20 @@ pub trait IoBackend {
     /// already completed (ERROR_NOT_FOUND) — the completion is still
     /// delivered via `poll` either way (R-037).
     fn cancel(&mut self, op: OpId) -> io::Result<()>;
+
+    /// Arm/disarm level-triggered readiness watches for a raw fd (R-057).
+    /// `readable`/`writable` express the DESIRED watch set (both false =
+    /// fully unwatched). On IOCP this is emulated with zero-byte probe ops;
+    /// on epoll it is native interest.
+    fn set_watch(&mut self, _socket: RawSocket, _readable: bool, _writable: bool) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "set_watch"))
+    }
+
+    /// Forget all backend state for a socket (pending-op bookkeeping,
+    /// watches, interest registrations) ahead of `closesocket`/`close`.
+    /// In-flight ops on the socket still deliver their (failed/aborted)
+    /// completions where the OS queues them.
+    fn detach_socket(&mut self, _socket: RawSocket) {}
 
     /// Reap up to `out.capacity()` completions, blocking up to `timeout`
     /// (None = non-blocking). Returns the number appended to `out`.
@@ -155,7 +189,12 @@ pub fn create(kind: BackendKind) -> io::Result<Box<dyn IoBackend + Send>> {
             },
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let _ = kind;
+        Ok(Box::new(epoll::EpollBackend::new()?))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = kind;
         Ok(Box::new(portable::PortableBackend::new()))

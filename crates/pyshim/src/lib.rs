@@ -3,6 +3,7 @@
 mod coreloop;
 mod gil_boundary;
 mod handles;
+mod net;
 
 use pyo3::prelude::*;
 
@@ -17,6 +18,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<coreloop::CoreLoop>()?;
     m.add_class::<handles::Handle>()?;
     m.add_class::<handles::TimerHandle>()?;
+    m.add_class::<net::Transport>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

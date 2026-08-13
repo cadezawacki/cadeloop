@@ -25,6 +25,7 @@ import weakref
 from asyncio import events, futures, tasks
 
 from . import _core
+from .tcp import TcpSurface
 
 __all__ = ["Loop"]
 
@@ -61,14 +62,27 @@ def _run_until_complete_cb(fut):
     futures._get_loop(fut).stop()
 
 
-class Loop(asyncio.AbstractEventLoop):
+class Loop(TcpSurface, asyncio.AbstractEventLoop):
     """A cadeloop event loop (portable dev backend off-Windows; IOCP/RIO on
     Windows). Drop-in compatible with ``asyncio.run()`` and stdlib tasks."""
 
-    def __init__(self, *, backend: str = "auto", spin_us: int = 20):
-        core = _core.CoreLoop(backend=backend, spin_us=spin_us)
+    def __init__(
+        self,
+        *,
+        backend: str = "auto",
+        spin_us: int = 20,
+        high_water: int = 64 * 1024,
+        low_water: int = 16 * 1024,
+        accept_pool: int = 64,
+    ):
+        core = _core.CoreLoop(
+            backend=backend, spin_us=spin_us, high_water=high_water, low_water=low_water
+        )
         self._core = core
+        self._accept_pool = accept_pool  # R-032
+        self._signal_handlers = {}
         core.set_error_hook(self._on_callback_error)
+        core.set_net_error_hook(self._on_net_error)
         core.set_slow_callback_hook(self._on_slow_callback)
 
         # R-050: native fast paths bound straight onto the instance —
@@ -397,6 +411,9 @@ class Loop(asyncio.AbstractEventLoop):
             }
         )
 
+    def _on_net_error(self, message, exc):
+        self.call_exception_handler({"message": message, "exception": exc})
+
     def _on_slow_callback(self, handle, seconds):
         # R-142: slow-callback warnings in debug mode (>100ms).
         logger.warning(
@@ -407,11 +424,7 @@ class Loop(asyncio.AbstractEventLoop):
     # I/O surface — milestone-gated (see docs/roadmap.md)                #
     # ------------------------------------------------------------------ #
 
-    async def create_connection(self, protocol_factory, host=None, port=None, **kwargs):
-        _not_yet("create_connection()", "tcp")
 
-    async def create_server(self, protocol_factory, host=None, port=None, **kwargs):
-        _not_yet("create_server()", "tcp")
 
     async def create_datagram_endpoint(self, protocol_factory, **kwargs):
         _not_yet("create_datagram_endpoint()", "udp")
@@ -419,44 +432,58 @@ class Loop(asyncio.AbstractEventLoop):
     async def sendfile(self, transport, file, offset=0, count=None, *, fallback=True):
         _not_yet("sendfile()", "sendfile")
 
-    async def start_tls(self, transport, protocol, sslcontext, **kwargs):
-        _not_yet("start_tls()", "tls")
 
-    async def sock_recv(self, sock, nbytes):
-        _not_yet("sock_recv()", "tcp")
 
-    async def sock_recv_into(self, sock, buf):
-        _not_yet("sock_recv_into()", "tcp")
 
-    async def sock_sendall(self, sock, data):
-        _not_yet("sock_sendall()", "tcp")
 
-    async def sock_connect(self, sock, address):
-        _not_yet("sock_connect()", "tcp")
 
-    async def sock_accept(self, sock):
-        _not_yet("sock_accept()", "tcp")
 
-    async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=None):
-        _not_yet("sock_sendfile()", "sendfile")
 
-    def add_reader(self, fd, callback, *args):
-        _not_yet("add_reader()", "readiness")
 
-    def remove_reader(self, fd):
-        _not_yet("remove_reader()", "readiness")
 
-    def add_writer(self, fd, callback, *args):
-        _not_yet("add_writer()", "readiness")
 
-    def remove_writer(self, fd):
-        _not_yet("remove_writer()", "readiness")
+
+
 
     def add_signal_handler(self, sig, callback, *args):
-        _not_yet("add_signal_handler()", "signals")
+        """POSIX implementation. The signal interrupts the kernel poll
+        (EINTR); the tick's PyErr_CheckSignals runs this Python-level
+        handler, which enqueues the callback thread-safely. Windows
+        (SetConsoleCtrlHandler, R-052) arrives with M4."""
+        if sys.platform == "win32":
+            _not_yet("add_signal_handler()", "signals")
+        import signal as signal_module
+
+        if (
+            asyncio.iscoroutine(callback)
+            or asyncio.iscoroutinefunction(callback)
+        ):
+            raise TypeError("coroutines cannot be used with add_signal_handler()")
+        self._check_closed()
+        self._signal_handlers[sig] = (callback, args)
+
+        def _dispatch(signum, frame):
+            entry = self._signal_handlers.get(signum)
+            if entry is None or self.is_closed():
+                return
+            cb, cb_args = entry
+            self.call_soon_threadsafe(cb, *cb_args)
+
+        signal_module.signal(sig, _dispatch)
 
     def remove_signal_handler(self, sig):
-        _not_yet("remove_signal_handler()", "signals")
+        if sys.platform == "win32":
+            _not_yet("remove_signal_handler()", "signals")
+        import signal as signal_module
+
+        if sig not in self._signal_handlers:
+            return False
+        del self._signal_handlers[sig]
+        if sig == signal_module.SIGINT:
+            signal_module.signal(sig, signal_module.default_int_handler)
+        else:
+            signal_module.signal(sig, signal_module.SIG_DFL)
+        return True
 
     async def subprocess_shell(self, protocol_factory, cmd, **kwargs):
         _not_yet("subprocess_shell()", "subprocess")

@@ -107,6 +107,12 @@ impl<T> Reactor<T> {
         self.backend.name()
     }
 
+    /// Direct backend access for the transport layer (post ops, watches,
+    /// accept-socket retrieval). Loop-thread only, like all `&mut self`.
+    pub fn backend_mut(&mut self) -> &mut (dyn IoBackend + Send) {
+        &mut *self.backend
+    }
+
     // ---- time -----------------------------------------------------------
 
     /// Cached tick timestamp (R-061). Refreshed by `prepare_tick`; callers
@@ -248,6 +254,13 @@ impl<T> Reactor<T> {
         self.ready_snapshot = self.ready.len();
         self.batch_left = batch;
         &self.completions
+    }
+
+    /// Copy this tick's completions out (transport translation happens in
+    /// the binding layer, which also owns the op->target mapping).
+    pub fn drain_completions(&mut self, out: &mut Vec<Completion>) {
+        out.extend_from_slice(&self.completions);
+        self.completions.clear();
     }
 
     /// Pop the next token of the current dispatch batch (R-054: max 128 per
