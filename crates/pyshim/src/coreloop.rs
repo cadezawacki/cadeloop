@@ -57,6 +57,8 @@ pub struct CoreLoop {
     /// `loop.time()` cache, updated once per tick (R-061), readable from
     /// any thread without touching loop state.
     cached_time_ns: AtomicU64,
+    /// Tick counter for the throttled signal check.
+    tick_no: AtomicU64,
     /// Facade hook: `(handle, exception) -> None` for callback errors.
     error_hook: OnceLock<Py<PyAny>>,
     /// Facade hook: `(message, exception) -> None` for protocol/net errors.
@@ -191,12 +193,6 @@ impl CoreLoop {
 
     /// One full tick — see module docs for the phase ordering.
     fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>) -> PyResult<()> {
-        unsafe {
-            if ffi::PyErr_CheckSignals() != 0 {
-                return Err(PyErr::fetch(py));
-            }
-        }
-
         let stopping = self.stopping.load(Ordering::Acquire);
         // Phase 1: flush corked writes from last tick's callbacks, then poll.
         let (poll_result, parked): (std::io::Result<()>, bool) = self.state.with(|st| {
@@ -225,6 +221,18 @@ impl CoreLoop {
             }
         })?;
         poll_result?;
+
+        // Ctrl-C responsiveness: a parked poll returns promptly on EINTR, so
+        // check right after it; busy (non-parked) ticks check every 64th
+        // tick (~tens of microseconds) instead of paying the call per tick.
+        let tick_no = self.tick_no.fetch_add(1, Ordering::Relaxed);
+        if parked || tick_no & 63 == 0 {
+            unsafe {
+                if ffi::PyErr_CheckSignals() != 0 {
+                    return Err(PyErr::fetch(py));
+                }
+            }
+        }
 
         // Phase 2: translate completions in-cell; collect events/graveyards
         // in ONE cell entry (`graveyard` items must drop out-of-cell).
@@ -265,29 +273,43 @@ impl CoreLoop {
             }
         }
 
-        // Phase 6: ready-callback batch (R-054).
-        loop {
-            let token = self.state.with(|st| st.reactor.pop_ready_batched())?;
-            let Some(token) = token else { break };
+        // Phase 6: ready-callback batch (R-054) — taken from the cell in
+        // ONE entry (rloop/rsloop batch-swap pattern); the buffer lives in
+        // loop-thread TLS and is always drained before being parked again.
+        DISPATCH_BUF.with_borrow_mut(|batch| -> PyResult<()> {
+            debug_assert!(batch.is_empty());
+            self.state.with(|st| {
+                while let Some(token) = st.reactor.pop_ready_batched() {
+                    batch.push(token);
+                }
+            })?;
             let debug = self.debug.load(Ordering::Relaxed);
-            let started = debug.then(std::time::Instant::now);
-            match run_handle(py, token.bind(py))? {
-                DispatchOutcome::Done => {}
-                DispatchOutcome::Failed(err) => self.report_failure(py, &token, err),
-            }
-            if let Some(started) = started {
-                let elapsed = started.elapsed();
-                if elapsed > Duration::from_millis(100) {
-                    if let Some(hook) = self.slow_callback_hook.get() {
-                        if let Err(e) = hook.call1(py, (&token, elapsed.as_secs_f64())) {
-                            e.write_unraisable(py, Some(token.bind(py)));
+            for token in batch.drain(..) {
+                let started = debug.then(std::time::Instant::now);
+                match run_handle(py, token.bind(py))? {
+                    DispatchOutcome::Done => {}
+                    DispatchOutcome::Failed(err) => self.report_failure(py, &token, err),
+                }
+                if let Some(started) = started {
+                    let elapsed = started.elapsed();
+                    if elapsed > Duration::from_millis(100) {
+                        if let Some(hook) = self.slow_callback_hook.get() {
+                            if let Err(e) = hook.call1(py, (&token, elapsed.as_secs_f64())) {
+                                e.write_unraisable(py, Some(token.bind(py)));
+                            }
                         }
                     }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
+}
+
+thread_local! {
+    /// Reusable dispatch buffer (loop thread only; empty between ticks).
+    static DISPATCH_BUF: std::cell::RefCell<Vec<Py<PyAny>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 type Graveyards =
@@ -338,6 +360,7 @@ impl CoreLoop {
             stopping: AtomicBool::new(false),
             debug: AtomicBool::new(false),
             cached_time_ns: AtomicU64::new(0),
+            tick_no: AtomicU64::new(0),
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
             slow_callback_hook: OnceLock::new(),

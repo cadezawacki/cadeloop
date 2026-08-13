@@ -78,6 +78,8 @@ pub struct Reactor<T> {
     cfg: ReactorConfig,
     /// Remaining items allowed in the current dispatch batch (R-054).
     batch_left: usize,
+    /// Timestamp of the last REAL backend poll (see `poll`'s skip window).
+    last_poll_ns: Ticks,
     /// Ready-queue length snapshot at tick start: callbacks scheduled during
     /// dispatch never run in the same tick (asyncio `_run_once` semantics).
     ready_snapshot: usize,
@@ -99,6 +101,7 @@ impl<T> Reactor<T> {
             stats: Stats::default(),
             cfg,
             batch_left: 0,
+            last_poll_ns: 0,
             ready_snapshot: 0,
         })
     }
@@ -217,12 +220,24 @@ impl<T> Reactor<T> {
     /// Spin-then-park (R-060): busy-poll with zero timeout for `spin_us`
     /// before parking, unless the timeout is already zero.
     pub fn poll(&mut self, timeout: Duration) -> io::Result<()> {
-        self.stats.polls += 1;
         self.completions.clear();
         if timeout.is_zero() {
+            // Poll-skip window (adopted from rloop): with ready callbacks
+            // pending, an actual kernel poll is only taken every 250us —
+            // bounded I/O-discovery staleness under CPU saturation in
+            // exchange for skipping the epoll_wait/GQCSEx syscall on the
+            // vast majority of busy ticks. Parked polls (timeout > 0) are
+            // never skipped, so idle latency is unaffected.
+            let now = self.clock.cached();
+            if now.saturating_sub(self.last_poll_ns) < 250_000 {
+                return Ok(());
+            }
+            self.stats.polls += 1;
             self.backend.try_poll(&mut self.completions)?;
+            self.last_poll_ns = now;
             return Ok(());
         }
+        self.stats.polls += 1;
         if self.cfg.spin_us > 0 {
             let spin_budget = Duration::from_micros(self.cfg.spin_us).min(timeout);
             let spin_start = std::time::Instant::now();
@@ -235,6 +250,7 @@ impl<T> Reactor<T> {
             }
         }
         self.backend.poll(&mut self.completions, Some(timeout))?;
+        self.last_poll_ns = self.clock.cached();
         Ok(())
     }
 

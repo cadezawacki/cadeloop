@@ -11,7 +11,6 @@ use std::sync::Arc;
 use cadeloop_core::timer::TimerToken;
 use pyo3::exceptions::{PyKeyboardInterrupt, PySystemExit};
 use pyo3::ffi;
-use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -93,9 +92,13 @@ pub enum DispatchOutcome {
     Failed(PyErr),
 }
 
-/// Invoke `handle.context.run(handle.callback, *handle.args)` via
-/// vectorcall (R-054: `PyObject_VectorcallMethod`, zero intermediate
-/// tuples/allocations for <= 6 positional args).
+/// Invoke `handle.callback(*handle.args)` inside `handle.context`.
+///
+/// Fast path adopted after profiling rloop/rsloop (R-054): enter/exit the
+/// context directly via the C-API (no `context.run` attribute lookup or
+/// method object) and vectorcall the callback using the argument tuple's
+/// OWN item array (contiguous in a PyTupleObject) — zero copies, zero
+/// intermediate objects for any arity.
 ///
 /// Fatal exceptions (KeyboardInterrupt / SystemExit) propagate as `Err` to
 /// unwind `run_forever`, matching asyncio's `Handle._run` contract.
@@ -106,31 +109,32 @@ pub fn run_handle(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DispatchOu
         return Ok(DispatchOutcome::Done);
     }
 
-    const INLINE: usize = 8;
-    let args = handle.args.bind(py);
-    let nargs = args.len();
-    let total = 2 + nargs; // context (receiver), callback, *args
+    let ctx = handle.context.as_ptr();
+    let cb = handle.callback.as_ptr();
+    let args = handle.args.as_ptr();
 
-    let mut inline: [*mut ffi::PyObject; INLINE] = [std::ptr::null_mut(); INLINE];
-    let mut heap: Vec<*mut ffi::PyObject>;
-    let stack: &mut [*mut ffi::PyObject] = if total <= INLINE {
-        &mut inline[..total]
-    } else {
-        heap = vec![std::ptr::null_mut(); total];
-        &mut heap[..]
+    let result = unsafe {
+        if ffi::PyContext_Enter(ctx) != 0 {
+            return Err(PyErr::fetch(py));
+        }
+        let n = ffi::PyTuple_GET_SIZE(args);
+        let res = if n == 0 {
+            ffi::compat::PyObject_CallNoArgs(cb)
+        } else {
+            // SAFETY: the tuple is owned by the frozen handle and outlives
+            // the call; its ob_item array is the vectorcall args in place.
+            let items =
+                std::ptr::addr_of!((*args.cast::<ffi::PyTupleObject>()).ob_item).cast::<*mut ffi::PyObject>();
+            ffi::PyObject_Vectorcall(cb, items, n as usize, std::ptr::null_mut())
+        };
+        // Always restore the previous context, success or not.
+        let exit_rc = ffi::PyContext_Exit(ctx);
+        if exit_rc != 0 && !res.is_null() {
+            ffi::Py_DECREF(res);
+            return Err(PyErr::fetch(py));
+        }
+        res
     };
-
-    stack[0] = handle.context.as_ptr();
-    stack[1] = handle.callback.as_ptr();
-    for i in 0..nargs {
-        // Borrowed reference out of the owned tuple; the tuple outlives the
-        // call because `handle` (frozen, refcounted) holds it.
-        stack[2 + i] = unsafe { ffi::PyTuple_GET_ITEM(args.as_ptr(), i as ffi::Py_ssize_t) };
-    }
-
-    let name = intern!(py, "run");
-    let result =
-        unsafe { ffi::PyObject_VectorcallMethod(name.as_ptr(), stack.as_ptr(), total, std::ptr::null_mut()) };
     if result.is_null() {
         let err = PyErr::fetch(py);
         if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
