@@ -188,7 +188,7 @@ cargo check -p cadeloop-core --target x86_64-pc-windows-msvc
 cargo build -p cadeloop-pyshim --release                  # extension
 cp target/release/lib_core.so python/cadeloop/_core.so    # Linux dev shortcut
 pip install pytest pytest-timeout uvicorn aiohttp trustme
-PYTHONPATH=python pytest tests/unit tests/conformance     # 90 tests
+PYTHONPATH=python pytest tests/unit tests/conformance     # 87 tests
 
 pip install maturin && maturin build --release            # the real wheel
 python tests/conformance/run_cpython_suite.py             # CPython asyncio suite
