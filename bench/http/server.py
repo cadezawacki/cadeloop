@@ -42,17 +42,27 @@ def main():
     parser.add_argument(
         "--server",
         required=True,
-        choices=["uvicorn", "hypercorn", "socketify", "cadeloop-native"],
+        choices=[
+            "uvicorn",
+            "hypercorn",
+            "socketify",
+            "cadeloop-native",
+            "cadeloop-native-w2",
+            "cadeloop-native-w4",
+        ],
     )
     parser.add_argument("--loop", default="asyncio")
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
 
-    if args.server == "cadeloop-native":
+    if args.server.startswith("cadeloop-native"):
         import cadeloop
 
+        workers = 1
+        if "-w" in args.server:
+            workers = int(args.server.rsplit("-w", 1)[1])
         print(f"READY {args.port}", flush=True)
-        cadeloop.serve(app, "127.0.0.1", args.port)
+        cadeloop.serve(app, "127.0.0.1", args.port, workers=workers)
     elif args.server == "uvicorn":
         import uvicorn
 

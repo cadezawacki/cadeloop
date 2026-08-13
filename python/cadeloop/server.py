@@ -13,7 +13,9 @@ import asyncio
 import gc
 import importlib
 import logging
+import os
 import signal as _signal
+import time
 
 from .config import Config
 from .loop import Loop
@@ -140,6 +142,8 @@ def serve(
 
     Blocks until stopped (SIGINT/SIGTERM or ``loop.stop()`` from a
     handler). ``app`` may be a callable or a ``"module:attribute"`` spec.
+    ``workers`` > 1 forks a supervised worker pool (§8, R-090..R-093);
+    ``workers=0`` means one worker per CPU.
     """
     config = Config(
         workers=workers,
@@ -153,14 +157,20 @@ def serve(
         app = load_app(app)
     if not callable(app):
         raise TypeError(f"ASGI app must be callable, got {app!r}")
-    if config.workers not in (0, 1):
-        # §8/R-090 multi-process supervisor arrives in M3.
-        logger.warning(
-            "workers=%d requested; multi-process serving arrives in M3 — "
-            "running a single worker",
-            config.workers,
-        )
 
+    n = config.workers if config.workers > 0 else (os.cpu_count() or 1)
+    if n > 1:
+        if not hasattr(os, "fork"):
+            # Windows worker model (WSADuplicateSocketW handle passing) is
+            # the M3-Windows item; until then run a single worker there.
+            logger.warning("workers=%d requires fork; running a single worker", n)
+        else:
+            return _serve_multi(app, host, port, config, n)
+    return _serve_single(app, host, port, config)
+
+
+def _serve_single(app, host, port, config: Config, *, reuse_port: bool = False, worker_id=None):
+    """One worker: loop + lifespan + native listener (the M2 path)."""
     loop = Loop(
         backend=config.backend,
         spin_us=config.spin_us,
@@ -180,6 +190,7 @@ def serve(
             app,
             loop,
             state=lifespan.state,
+            reuse_port=reuse_port,
             accept_pool=config.accept_pool,
             eager=config.eager_tasks,
             max_header_bytes=config.max_header_bytes,
@@ -201,7 +212,8 @@ def serve(
             except (NotImplementedError, RuntimeError, ValueError):
                 pass
         shown = bound if bound else (host, port)
-        logger.info("cadeloop serving on http://%s:%s", shown[0], shown[1])
+        who = f"worker {worker_id} " if worker_id is not None else ""
+        logger.info("cadeloop %sserving on http://%s:%s", who, shown[0], shown[1])
         try:
             loop.run_forever()
         except KeyboardInterrupt:
@@ -219,3 +231,130 @@ def serve(
         lifespan.shutdown()
         loop.close()
         asyncio.set_event_loop(None)
+
+
+# --------------------------------------------------------------------- #
+# multi-process worker model (§8, R-090..R-093)                          #
+# --------------------------------------------------------------------- #
+
+# Give up when a worker keeps dying immediately (R-092 supervision):
+_CRASH_STREAK_LIMIT = 5
+_CRASH_FAST_SECS = 1.0
+
+
+def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int) -> int:
+    pid = os.fork()
+    if pid != 0:
+        return pid
+    # ---- child ----
+    status = 1
+    try:
+        # A worker owns its own signal handling (installed by
+        # _serve_single via the loop); drop the supervisor's handlers.
+        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+        _signal.signal(_signal.SIGINT, _signal.SIG_IGN)  # supervisor forwards TERM
+        if config.pin and hasattr(os, "sched_setaffinity"):
+            # R-091: pin each worker to one CPU (accept balancing is the
+            # kernel's job via SO_REUSEPORT).
+            try:
+                os.sched_setaffinity(0, {idx % ncpu})
+            except OSError:
+                pass
+        _serve_single(app, host, port, config, reuse_port=True, worker_id=idx)
+        status = 0
+    except BaseException:  # noqa: BLE001 — worker death is the supervisor's signal
+        logger.exception("worker %d crashed", idx)
+    finally:
+        os._exit(status)
+    return 0  # unreachable
+
+
+def _serve_multi(app, host, port, config: Config, n: int):
+    """Supervisor: fork N workers each binding with SO_REUSEPORT (the
+    kernel load-balances accepts), restart crashed ones (R-092), forward
+    SIGTERM/SIGINT, and drain within ``config.grace`` seconds."""
+    if port == 0:
+        raise ValueError(
+            "workers > 1 requires an explicit port (each worker binds it "
+            "with SO_REUSEPORT; port 0 would scatter workers across ports)"
+        )
+    ncpu = os.cpu_count() or 1
+    logger.info("cadeloop supervisor: %d workers on http://%s:%s", n, host, port)
+    children: dict[int, tuple[int, float]] = {}  # pid -> (idx, spawn_time)
+    for idx in range(n):
+        pid = _spawn_worker(app, host, port, config, idx, ncpu)
+        children[pid] = (idx, time.monotonic())
+
+    stopping = False
+    exit_code = 0
+
+    def _forward(signum, _frame):
+        nonlocal stopping
+        stopping = True
+        for pid in list(children):
+            try:
+                os.kill(pid, _signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    old_term = _signal.signal(_signal.SIGTERM, _forward)
+    old_int = _signal.signal(_signal.SIGINT, _forward)
+    crash_streak = 0
+    try:
+        while children:
+            try:
+                pid, status = os.waitpid(-1, 0)
+            except ChildProcessError:
+                break
+            except InterruptedError:
+                continue
+            if pid not in children:
+                continue
+            idx, spawned = children.pop(pid)
+            if stopping:
+                continue
+            clean = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+            if clean:
+                # A worker exiting cleanly on its own means stop was
+                # requested inside it — treat as a shutdown signal.
+                _forward(None, None)
+                continue
+            fast = time.monotonic() - spawned < _CRASH_FAST_SECS
+            crash_streak = crash_streak + 1 if fast else 1
+            if crash_streak >= _CRASH_STREAK_LIMIT:
+                logger.error(
+                    "worker %d died %d times in under %.0fs — giving up",
+                    idx,
+                    crash_streak,
+                    _CRASH_FAST_SECS,
+                )
+                exit_code = 1
+                _forward(None, None)
+                continue
+            logger.warning("worker %d died (status %d) — restarting", idx, status)
+            npid = _spawn_worker(app, host, port, config, idx, ncpu)
+            children[npid] = (idx, time.monotonic())
+        # Drain: give survivors `grace` seconds, then SIGKILL (R-092).
+        deadline = time.monotonic() + config.grace
+        while children and time.monotonic() < deadline:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                children.clear()
+                break
+            if pid == 0:
+                time.sleep(0.05)
+                continue
+            children.pop(pid, None)
+        for pid in children:
+            logger.warning("worker pid %d exceeded grace=%ss — SIGKILL", pid, config.grace)
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+    finally:
+        _signal.signal(_signal.SIGTERM, old_term)
+        _signal.signal(_signal.SIGINT, old_int)
+    if exit_code:
+        raise SystemExit(exit_code)
