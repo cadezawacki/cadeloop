@@ -28,6 +28,7 @@ LIGHT = {
     "aiofastnet": "#00879e",
     "aiofastnet-cadeloop": "#79aede",
     "hypercorn": "#4a3aa7",
+    "winloop": "#6f6e69",
 }
 DARK = {
     "cadeloop": "#3987e5",
@@ -40,6 +41,7 @@ DARK = {
     "aiofastnet": "#1fa2b8",
     "aiofastnet-cadeloop": "#5e93c9",
     "hypercorn": "#9085e9",
+    "winloop": "#a3a29c",
 }
 
 INK = {
@@ -133,7 +135,11 @@ def chart_speedup(sched, mode, story="cadeloop"):
     ink = INK[mode]
     results = sched["results"]
     benches = [b for b in results if results[b].get("asyncio")]
-    loops = [l for l in ("cadeloop", "uvloop", "rloop", "rsloop") if any(results[b].get(l) for b in benches)]
+    loops = [
+        l
+        for l in ("cadeloop", "uvloop", "winloop", "rloop", "rsloop")
+        if any(results[b].get(l) for b in benches)
+    ]
 
     left, right, top = 190, 70, 66
     plot_w = 560
@@ -305,6 +311,10 @@ def main():
     parser.add_argument("--echo")
     parser.add_argument("--echo-title", default="TCP echo — 1 KiB messages, 64 connections (loopback)")
     parser.add_argument("--http")
+    parser.add_argument(
+        "--http-title", default="HTTP/1.1 plaintext — 64 keep-alive connections (loopback)"
+    )
+    parser.add_argument("--prefix", default="bench", help="output filename prefix")
     parser.add_argument("--outdir", default="docs/assets")
     args = parser.parse_args()
     outdir = pathlib.Path(args.outdir)
@@ -314,17 +324,17 @@ def main():
         for mode in ("light", "dark"):
             svg, _w, _h = builder(mode)
             suffix = "" if mode == "light" else "-dark"
-            path = outdir / f"{name}{suffix}.svg"
+            path = outdir / f"{args.prefix}-{name}{suffix}.svg"
             path.write_text(svg)
             print(f"wrote {path}")
 
     if args.sched:
         sched = json.loads(pathlib.Path(args.sched).read_text())
-        emit("bench-sched", lambda m: chart_speedup(sched, m))
+        emit("sched", lambda m: chart_speedup(sched, m))
     if args.echo:
         echo = json.loads(pathlib.Path(args.echo).read_text())
         emit(
-            "bench-echo",
+            "echo",
             lambda m: build_two_panel(
                 echo,
                 "median_msgs_per_sec",
@@ -338,12 +348,12 @@ def main():
     if args.http:
         http = json.loads(pathlib.Path(args.http).read_text())
         emit(
-            "bench-http",
+            "http",
             lambda m: build_two_panel(
                 http,
                 "median_rps",
                 1e3,
-                "HTTP/1.1 plaintext — 64 keep-alive connections (loopback)",
+                args.http_title,
                 "requests/s, K",
                 "K/s",
                 m,

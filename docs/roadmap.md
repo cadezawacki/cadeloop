@@ -27,11 +27,15 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [x] TLS via stdlib sslproto MemoryBIO path (R-059 fallback; native M4)
 - [x] Drop-in proof: uvicorn (HTTP/1.1) + aiohttp run unmodified
 - [x] bench/echo + bench/http suites (loopback; R-130 methodology)
+- [x] Windows behavioral verification on hardware: full unit +
+      conformance sweep green on IOCP (117 tests), backend smoke
+      battery, 2-minute soak, wheel install+serve (validation run 5,
+      Win11 26200 / Core Ultra 7 265K)
 - [ ] `loop.sendfile` via TransmitFile (R-036) — sock_sendfile fallback ✅
-- [ ] Windows behavioral verification + edge-case matrix completion
-      (R-122: RST paths, drip-feed, slowloris timing) on Windows CI
+- [ ] Edge-case matrix completion (R-122: RST paths, drip-feed,
+      slowloris timing) on Windows CI
 - [ ] Echo ≥1.15x winloop on two-machine Windows hardware (the M1 gate,
-      R-131 — cannot be measured from this Linux environment)
+      R-131) — loopback preview: 1.31x single-stream, 1.21x at 64 conns
 
 ## M2 — HTTP/ASGI engine (Linux-verified; ≥2.0x gate beaten at 5x)
 
@@ -55,9 +59,10 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [x] receive() disconnect futures (no busy-wait disconnect listeners)
 - [x] gc.freeze at post-startup (R-075; per-request warmup counter TBD)
 - [x] Starlette/FastAPI real-socket suites green (R-123)
-- [x] Loopback plaintext: 35.1K req/s vs uvicorn+uvloop 6.7K (~5x) — the
-      authoritative ≥2.0x uvicorn+winloop gate still needs Windows
-      hardware (R-131)
+- [x] Loopback plaintext: 35.1K req/s vs uvicorn+uvloop 6.7K (~5x) on
+      Linux; 34.7K vs uvicorn+winloop 7.85K (4.4x) on Windows hardware —
+      the ≥2.0x gate cleared on both; the authoritative number remains a
+      two-machine run (R-131)
 - [ ] Request-line/keep-alive idle timeouts (R-080 timers; config wired)
 - [ ] Access log (R-140) on the native engine
 
@@ -93,7 +98,11 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       msvc cross-check. `backend="rio"` selects it; `auto` stays IOCP
       until the item below
 - [ ] RIO behavioral validation + benchmarks on Windows hardware (the
-      gate for flipping `auto` to probe-RIO-first)
+      gate for flipping `auto` to probe-RIO-first) — BLOCKED on the
+      available machine: its Win11 Insider build (26200.9168) fails to
+      initialize the OS RIO subsystem itself (rio_probe.rs has the full
+      diagnosis; validate.ps1 gates RIO steps in 2s). Needs a stable
+      x64 build (23H2/24H2 or Server)
 - [ ] Windows worker model: WSADuplicateSocketW handle passing (fork-free)
 - [ ] p99 ≤ 0.6x uvicorn+winloop at 80% saturation (R-003 — Windows
       two-machine measurement)
