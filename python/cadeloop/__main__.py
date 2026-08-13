@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", "-p", type=int, default=8000)
     parser.add_argument("--workers", "-w", type=int, default=1)
-    parser.add_argument("--backend", choices=("auto", "iocp", "rio"), default="auto")
+    backends = ("auto", "iocp", "rio") if sys.platform == "win32" else ("auto", "epoll")
+    parser.add_argument("--backend", choices=backends, default="auto")
     parser.add_argument(
         "--latency-mode", choices=("throughput", "balanced", "spin"), default="balanced"
     )

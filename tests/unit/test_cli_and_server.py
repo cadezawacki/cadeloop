@@ -1,6 +1,8 @@
 """CLI (R-101) and serve() validation. End-to-end serving is covered in
 test_http_engine.py; here we check config validation and flag mapping."""
 
+import sys
+
 import pytest
 
 import cadeloop
@@ -52,4 +54,15 @@ def test_cli_maps_flags_to_serve(monkeypatch):
 
 def test_cli_rejects_bad_backend():
     with pytest.raises(SystemExit):
-        cli.main(["os.path:join", "--backend", "epoll"])
+        cli.main(["os.path:join", "--backend", "not-a-backend"])
+
+
+def test_cli_accepts_platform_backend(monkeypatch):
+    # The platform's own explicit backend name must be a valid choice
+    # (epoll on Linux, iocp on Windows) — regression: epoll was missing
+    # from the CLI entirely.
+    calls = {}
+    monkeypatch.setattr(cli, "serve", lambda app, host, port, **kw: calls.update(kw))
+    name = "iocp" if sys.platform == "win32" else "epoll"
+    assert cli.main(["os.path:join", "--backend", name]) == 0
+    assert calls["backend"] == name

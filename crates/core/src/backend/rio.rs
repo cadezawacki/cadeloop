@@ -255,7 +255,13 @@ impl RioBackend {
             // (tools/windows: cargo run --example rio_probe).
             cq = unsafe { (t.RIOCreateCompletionQueue.unwrap())(cq_size, std::ptr::null()) };
             if cq == RIO_INVALID_CQ {
-                return Err(notify_err);
+                // Name BOTH failures: a null-notify CQ rejecting too means
+                // the problem is not the notification struct at all.
+                let poll_err = wsa_named("RIOCreateCompletionQueue(null-notify)");
+                return Err(io::Error::new(
+                    notify_err.kind(),
+                    format!("{notify_err}; fallback {poll_err}"),
+                ));
             }
             polling_only = true;
         }

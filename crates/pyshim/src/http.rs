@@ -1015,6 +1015,20 @@ impl AppTask {
         0
     }
 
+    /// asyncio.Task private surface read directly (not called) by anyio's
+    /// `CancelScope._deliver_cancellation` and
+    /// `TaskInfo.has_pending_cancellation` — without these, any Starlette/
+    /// FastAPI cancel scope raises AttributeError mid-cancellation.
+    #[getter(_must_cancel)]
+    fn must_cancel_attr(&self) -> bool {
+        self.must_cancel
+    }
+
+    #[getter(_fut_waiter)]
+    fn fut_waiter_attr(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.waiting_on.as_ref().map(|f| f.clone_ref(py))
+    }
+
     fn get_loop(&self, py: Python<'_>) -> Py<PyAny> {
         self.pyloop.clone_ref(py)
     }

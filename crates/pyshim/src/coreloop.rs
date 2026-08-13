@@ -401,7 +401,9 @@ impl CoreLoop {
         rio_rq_send: u32,
     ) -> PyResult<Self> {
         let kind = BackendKind::parse(backend).ok_or_else(|| {
-            PyValueError::new_err(format!("invalid backend {backend:?}: expected 'auto', 'iocp' or 'rio'"))
+            PyValueError::new_err(format!(
+                "invalid backend {backend:?}: expected 'auto', 'iocp', 'rio' or 'epoll'"
+            ))
         })?;
         let cfg = ReactorConfig {
             backend: kind,

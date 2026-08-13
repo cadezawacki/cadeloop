@@ -11,8 +11,9 @@
 //!   conformance-tested anywhere. It implements no socket ops and is never
 //!   published in wheels (wheels are cp311-win_amd64 only, R-110).
 //!
-//! Backend selection at loop creation (R-020): `"auto" | "iocp" | "rio"`,
-//! where auto probes RIO availability and falls back to IOCP.
+//! Backend selection at loop creation (R-020): `"auto" | "iocp" | "rio" |
+//! "epoll"`, where auto probes RIO availability and falls back to IOCP.
+//! `"epoll"` is the Linux dev backend's explicit name (Linux-only).
 
 use std::io;
 use std::time::Duration;
@@ -150,12 +151,13 @@ pub trait Wakeup: Send + Sync {
     fn wake(&self);
 }
 
-/// Requested backend kind (R-020 `backend="auto"|"iocp"|"rio"`).
+/// Requested backend kind (R-020 `backend="auto"|"iocp"|"rio"|"epoll"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Auto,
     Iocp,
     Rio,
+    Epoll,
 }
 
 impl BackendKind {
@@ -164,6 +166,7 @@ impl BackendKind {
             "auto" => Some(BackendKind::Auto),
             "iocp" => Some(BackendKind::Iocp),
             "rio" => Some(BackendKind::Rio),
+            "epoll" => Some(BackendKind::Epoll),
             _ => None,
         }
     }
@@ -202,10 +205,16 @@ pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn Io
                 opts.rio_rq_recv,
                 opts.rio_rq_send,
             )?)),
+            BackendKind::Epoll => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "epoll backend is Linux-only (use 'auto', 'iocp' or 'rio')",
+            )),
         }
     }
     #[cfg(target_os = "linux")]
     {
+        // Iocp/Rio deliberately resolve to the dev backend too, so
+        // backend-parameterized test sweeps run unmodified everywhere.
         let _ = (kind, opts);
         Ok(Box::new(epoll::EpollBackend::new()?))
     }
