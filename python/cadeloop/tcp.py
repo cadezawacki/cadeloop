@@ -500,6 +500,15 @@ class TcpSurface:
                 return
             e = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             if e == 0:
+                if sys.platform == "win32":
+                    # IOCP writable watches are zero-byte-send probes, which
+                    # can fire while the connect is still in flight (SO_ERROR
+                    # is 0 until the handshake resolves). Only resolve once
+                    # actually connected; the level-triggered watch re-fires.
+                    try:
+                        sock.getpeername()
+                    except OSError:
+                        return
                 fut.set_result(None)
             else:
                 fut.set_exception(OSError(e, f"Connect call failed {address}"))

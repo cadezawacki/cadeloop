@@ -352,11 +352,16 @@ impl IocpBackend {
             self.probe_ops.insert(id, (socket, write));
             return Ok(());
         }
-        // Probe failed outright (e.g. connection reset): report readiness so
-        // the callback runs and observes the error from its own syscall.
+        // Probe failed outright (e.g. connection reset, or WSAENOTCONN on
+        // a still-connecting socket): report readiness so the callback
+        // runs and observes the error from its own syscall — and re-arm,
+        // preserving level-trigger semantics for callbacks that decide
+        // the fd is not actually actionable yet (sock_connect's
+        // in-progress guard relies on the watch firing again).
         self.slab.complete(id);
         self.slab.release(id);
         self.inline_completions.push(Completion::Ready { socket, readable: !write, writable: write });
+        self.watch_rearm.push(socket);
         Ok(())
     }
 
@@ -766,6 +771,12 @@ impl IoBackend for IocpBackend {
     /// re-armed at the top of each poll for fds still watched.
     fn set_watch(&mut self, socket: RawSocket, readable: bool, writable: bool) -> io::Result<()> {
         if readable || writable {
+            // Watched sockets usually arrive via add_reader/add_writer on
+            // fds Python created itself (never wired through us), so they
+            // are not yet associated with the port — and a probe posted on
+            // an unassociated socket completes into the void, hanging the
+            // watch forever (run-4: aiohttp sock_connect timeout).
+            self.register_socket(socket)?;
             self.watches.insert(socket, (readable, writable));
         } else {
             self.watches.remove(&socket);

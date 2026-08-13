@@ -42,7 +42,14 @@ def rss_bytes() -> int:
         fn = getattr(k32, "K32GetProcessMemoryInfo", None)
         if fn is None:
             fn = ctypes.windll.psapi.GetProcessMemoryInfo
-        ok = fn(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+        # Explicit signatures are load-bearing: ctypes' default conversion
+        # passes Python ints as 32-bit C ints, truncating the 64-bit
+        # GetCurrentProcess() pseudo handle (-1) — the call then fails with
+        # an invalid handle on 64-bit Windows (run-4 soak failure).
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(PMC), wt.DWORD]
+        fn.restype = wt.BOOL
+        current_process = ctypes.c_void_p(-1)  # GetCurrentProcess() pseudo handle
+        ok = fn(current_process, ctypes.byref(pmc), pmc.cb)
         if not ok or pmc.WorkingSetSize == 0:
             raise OSError("GetProcessMemoryInfo failed")
         return pmc.WorkingSetSize

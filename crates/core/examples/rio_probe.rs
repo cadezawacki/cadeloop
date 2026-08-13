@@ -119,7 +119,30 @@ mod win {
             return;
         };
 
-        println!("== CQ variants ==");
+        // Run 4 showed EVERY variant below failing WSAEFAULT when no
+        // REGISTERED_IO socket was alive (both table sockets were closed
+        // by then), with a perfectly valid table. Hypothesis: mswsock's
+        // per-process RIO state is torn down with the last RIO socket.
+        // Prove it by trying CQ creation in both worlds.
+        println!("== CQ variants (no RIO socket alive; run-4 repro, expect WSAEFAULT) ==");
+        let cq_dead = try_cq(&t, "null-notify/no-rio-socket", std::ptr::null());
+        if cq_dead != 0 {
+            unsafe { (t.RIOCloseCompletionQueue.unwrap())(cq_dead) };
+        }
+
+        println!("== CQ variants (RIO socket held open) ==");
+        let anchor = unsafe {
+            WSASocketW(
+                AF_INET as i32,
+                1,
+                IPPROTO_TCP,
+                std::ptr::null(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
+            )
+        };
+        println!("  anchor rio socket: {anchor:#x}");
+
         // 1. no notification (pure polling)
         let cq_poll = try_cq(&t, "null-notify", std::ptr::null());
 

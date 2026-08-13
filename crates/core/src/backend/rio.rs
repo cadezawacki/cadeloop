@@ -111,14 +111,31 @@ fn id_of(ctx: u64) -> OpId {
 
 /// R-020 auto-probe: is the RIO function table resolvable?
 pub fn probe_available() -> bool {
-    resolve_table().is_ok()
+    resolve_table_anchored().is_ok() // AnchorSocket drop closes the probe
 }
 
-fn resolve_table() -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
+/// A `WSA_FLAG_REGISTERED_IO` socket held open on purpose. mswsock
+/// initializes its per-process RIO state when the first REGISTERED_IO
+/// socket is created and tears it down when the last one closes; run 4's
+/// hardware probe showed EVERY `RIOCreateCompletionQueue` variant (null,
+/// event, and IOCP notification) failing WSAEFAULT once no RIO socket was
+/// alive — with a fully valid, correctly-sized function table. The
+/// backend therefore keeps the table-resolution socket open ("anchor")
+/// for its entire lifetime.
+struct AnchorSocket(SOCKET);
+
+impl Drop for AnchorSocket {
+    fn drop(&mut self) {
+        unsafe { closesocket(self.0) };
+    }
+}
+
+fn resolve_table_anchored() -> io::Result<(RIO_EXTENSION_FUNCTION_TABLE, AnchorSocket)> {
     super::iocp::ensure_winsock();
     unsafe {
         // The canonical RIO pattern (per the SDK samples) resolves the
-        // table from a socket created WITH the REGISTERED_IO flag.
+        // table from a socket created WITH the REGISTERED_IO flag — and
+        // keeps that socket open (see AnchorSocket).
         let probe = WSASocketW(
             AF_INET as i32,
             1, // SOCK_STREAM
@@ -130,6 +147,7 @@ fn resolve_table() -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
         if probe == !0usize {
             return Err(io::Error::from_raw_os_error(WSAGetLastError()));
         }
+        let anchor = AnchorSocket(probe);
         let guid: GUID = WSAID_MULTIPLE_RIO;
         let mut table: RIO_EXTENSION_FUNCTION_TABLE = zeroed();
         let mut bytes: u32 = 0;
@@ -144,11 +162,10 @@ fn resolve_table() -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
             std::ptr::null_mut(),
             None,
         );
-        closesocket(probe);
         if rc == SOCKET_ERROR {
             return Err(io::Error::from_raw_os_error(WSAGetLastError()));
         }
-        Ok(table)
+        Ok((table, anchor))
     }
 }
 
@@ -202,6 +219,10 @@ pub struct RioBackend {
     slab: OpSlab<RioOp>,
     results: Box<[RIORESULT; DEQUEUE_BATCH]>,
     entries: Box<[OVERLAPPED_ENTRY; POLL_BATCH]>,
+    /// Keeps mswsock's per-process RIO state alive (see AnchorSocket).
+    /// Field drop runs after the explicit `Drop` impl closes the CQ, so
+    /// RIO state outlives every RIO handle owned by this backend.
+    _anchor: AnchorSocket,
 }
 
 // SAFETY: thread-affine by the loop contract (see gil_boundary); raw
@@ -210,7 +231,7 @@ unsafe impl Send for RioBackend {}
 
 impl RioBackend {
     pub fn new(cq_size: u32, rq_recv: u32, rq_send: u32) -> io::Result<Self> {
-        let t = resolve_table()
+        let (t, anchor) = resolve_table_anchored()
             .map_err(|e| io::Error::new(e.kind(), format!("RIO unavailable on this system: {e}")))?;
         // Every entry point we rely on must have resolved.
         if t.RIOReceive.is_none()
@@ -283,6 +304,7 @@ impl RioBackend {
             slab: OpSlab::new(empty_op),
             results: Box::new(unsafe { zeroed() }),
             entries: Box::new(unsafe { zeroed() }),
+            _anchor: anchor,
         };
         backend.grow_staging()?;
         Ok(backend)

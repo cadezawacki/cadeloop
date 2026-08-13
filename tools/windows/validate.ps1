@@ -68,7 +68,7 @@ Step "00-env" {
 
 Step "01-pip-deps" {
     & $PY -m pip install --upgrade pip
-    & $PY -m pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi hypercorn winloop maturin
+    & $PY -m pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi hypercorn winloop rsloop maturin
     & $PY -m pip list
 }
 
@@ -126,14 +126,14 @@ Step "08-cpython-conformance" {
 
 Step "09-bench-sched" {
     Set-Location bench
-    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite sched --loops cadeloop,asyncio,winloop --out (Join-Path $R "win-sched.json")
+    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite sched --loops cadeloop,asyncio,winloop,rsloop --out (Join-Path $R "win-sched.json")
     Set-Location $repo
 }
 
 Step "10-bench-echo-rtt-iocp" {
     Set-Location bench
     Remove-Item Env:\CADELOOP_BACKEND -ErrorAction SilentlyContinue
-    & $PY ..\$WD 1200 -- $PY harness\harness.py --suite echo --loops cadeloop,asyncio,winloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-iocp.json")
+    & $PY ..\$WD 1200 -- $PY harness\harness.py --suite echo --loops cadeloop,asyncio,winloop,rsloop --conns 1 --msgs 5000 --out (Join-Path $R "win-echo-rtt-iocp.json")
     Set-Location $repo
 }
 
@@ -147,7 +147,7 @@ Step "11-bench-echo-rtt-rio" {
 
 Step "12-bench-echo-64-iocp" {
     Set-Location bench
-    & $PY ..\$WD 1200 -- $PY harness\harness.py --suite echo --loops cadeloop,asyncio,winloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-iocp.json")
+    & $PY ..\$WD 1200 -- $PY harness\harness.py --suite echo --loops cadeloop,asyncio,winloop,rsloop --conns 64 --msgs 2000 --out (Join-Path $R "win-echo-64-iocp.json")
     Set-Location $repo
 }
 
@@ -161,7 +161,7 @@ Step "13-bench-echo-64-rio" {
 
 Step "14-bench-http" {
     Set-Location bench
-    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite http --contenders cadeloop-native,cadeloop-native-rio,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,hypercorn --conns 64 --seconds 3 --out (Join-Path $R "win-http.json")
+    & $PY ..\$WD 1800 -- $PY harness\harness.py --suite http --contenders cadeloop-native,cadeloop-native-rio,uvicorn+cadeloop,uvicorn+asyncio,uvicorn+winloop,uvicorn+rsloop,hypercorn --conns 64 --seconds 3 --out (Join-Path $R "win-http.json")
     Set-Location $repo
 }
 

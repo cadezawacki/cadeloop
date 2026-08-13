@@ -71,7 +71,11 @@ def check_construct(backend):
     try:
         name = lp.stats()["backend"]
         if backend != "auto":
-            assert name == backend, f"stats backend {name!r} != {backend!r}"
+            # Degraded-mode names are suffixed (e.g. "rio-polling" when the
+            # CQ runs without IOCP notification) — still the right backend.
+            assert name == backend or name.startswith(backend + "-"), (
+                f"stats backend {name!r} != {backend!r}"
+            )
         return {"backend_name": name}
     finally:
         lp.close()

@@ -1,6 +1,8 @@
 """CLI (R-101) and serve() validation. End-to-end serving is covered in
 test_http_engine.py; here we check config validation and flag mapping."""
 
+import contextlib
+import io
 import sys
 
 import pytest
@@ -53,7 +55,10 @@ def test_cli_maps_flags_to_serve(monkeypatch):
 
 
 def test_cli_rejects_bad_backend():
-    with pytest.raises(SystemExit):
+    # Swallow argparse's usage/error output: it goes to real stderr, and a
+    # "python -m cadeloop: error: invalid choice" line in a green sweep log
+    # reads like a failure (this test PASSES by rejecting the name).
+    with pytest.raises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
         cli.main(["os.path:join", "--backend", "not-a-backend"])
 
 
