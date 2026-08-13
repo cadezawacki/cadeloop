@@ -32,3 +32,20 @@ cadeloop does not configure NICs programmatically (spec §8).
 `latency_mode`: `throughput` (spin 0µs) / `balanced` (20µs, default) /
 `spin` (200µs). Spinning trades CPU for tail latency; use `spin` only on
 dedicated cores.
+
+
+## Release wheels (R-110/R-111)
+
+`release.yml` builds three artifacts on tag push (or dispatch):
+
+- `wheel-win-pgo-baseline` — the production cp311-win_amd64 wheel,
+  PGO-optimized: an instrumented build runs the repo's own scheduling +
+  native-HTTP workload, profiles merge via llvm-profdata, and the final
+  build compiles with `-Cprofile-use`.
+- `wheel-win-pgo-v3` — same, plus `-C target-cpu=x86-64-v3` (AVX2/BMI2/
+  FMA baseline). Wheel tags cannot express micro-arch levels, so this
+  ships as a release artifact installed by direct URL, not via PyPI:
+  `pip install https://github.com/<org>/cadeloop/releases/download/vX.Y.Z/<wheel>`.
+  It refuses nothing at runtime — on a pre-v3 CPU it dies with SIGILL —
+  so only deploy it to fleets known to be Haswell/Zen1 or newer.
+- `wheel-linux` — the plain Linux dev/test wheel.

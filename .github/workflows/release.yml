@@ -1,0 +1,110 @@
+# Release wheels (R-110/R-111): PGO-optimized cp311-win_amd64 (the
+# production wheel), a -v3 variant (x86-64-v3: AVX2/BMI2/FMA baseline),
+# and the plain Linux dev wheel. PGO profiles are gathered by running the
+# repo's own benchmark workload against an instrumented build — the same
+# hot paths the loop serves in production (scheduling, echo, native HTTP).
+#
+# The -v3 wheel is published as a separately-named RELEASE ARTIFACT (not a
+# PyPI upload): wheel tags cannot express micro-arch levels, so it installs
+# via direct URL (documented in docs/ops.md).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wheel-windows-pgo:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        variant: [baseline, v3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install maturin pytest uvicorn
+      - name: variant flags
+        shell: bash
+        run: |
+          if [ "${{ matrix.variant }}" = "v3" ]; then
+            echo "ARCH_FLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
+          else
+            echo "ARCH_FLAGS=" >> "$GITHUB_ENV"
+          fi
+      - name: build instrumented (profile-generate)
+        shell: bash
+        run: |
+          export RUSTFLAGS="$ARCH_FLAGS -Cprofile-generate=$PWD/pgo-data"
+          cargo build --release -p cadeloop-pyshim
+          cp target/release/_core.dll python/cadeloop/_core.pyd
+      - name: run the profiling workload (R-111)
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+        run: |
+          # Scheduling + timer hot paths.
+          for b in call_soon_chain timer_fire threadsafe_throughput future_chain; do
+            python bench/sched/bench_sched.py --loop cadeloop --bench "$b" --scale 200000
+          done
+          # Native HTTP engine hot path: serve + hammer briefly.
+          python - <<'EOF'
+          import threading, time, urllib.request, cadeloop
+          async def app(scope, receive, send):
+              if scope["type"] != "http":
+                  return
+              await receive()
+              await send({"type": "http.response.start", "status": 200, "headers": []})
+              await send({"type": "http.response.body", "body": b"pgo"})
+          lp = cadeloop.new_event_loop()
+          lid, bound, _ = lp._core.http_listen("127.0.0.1", 0, app, lp)
+          def hammer():
+              time.sleep(0.3)
+              for _ in range(3000):
+                  urllib.request.urlopen(f"http://127.0.0.1:{bound[1]}/", timeout=5).read()
+              lp.call_soon_threadsafe(lp.stop)
+          threading.Thread(target=hammer).start()
+          lp.run_forever(); lp.close()
+          EOF
+      - name: merge profiles
+        shell: bash
+        run: |
+          PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata.exe | head -1)
+          "$PROFDATA" merge -o pgo-data/merged.profdata pgo-data
+      - name: build optimized (profile-use) wheel
+        shell: bash
+        run: |
+          export RUSTFLAGS="$ARCH_FLAGS -Cprofile-use=$PWD/pgo-data/merged.profdata"
+          maturin build --release --out dist
+      - name: smoke the wheel
+        shell: bash
+        run: |
+          pip install --force-reinstall dist/*.whl
+          python -c "import cadeloop; lp = cadeloop.new_event_loop(); print(lp.stats()['backend']); lp.close()"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-win-pgo-${{ matrix.variant }}
+          path: dist/*.whl
+
+  wheel-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install maturin
+      - run: maturin build --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: dist/*.whl

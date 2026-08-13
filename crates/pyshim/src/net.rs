@@ -1864,6 +1864,18 @@ impl Transport {
         })
     }
 
+    /// The transport's raw socket handle, BORROWED (the transport still
+    /// owns and closes it). Powers loop.sendfile's native path (R-036).
+    fn fileno(&self, py: Python<'_>) -> PyResult<u64> {
+        let core = self.core_ref(py);
+        core.with_net(|net, _| {
+            net.transports
+                .get(&self.tid)
+                .map(|e| e.socket as u64)
+                .ok_or_else(|| PyRuntimeError::new_err("transport is closed"))
+        })?
+    }
+
     #[pyo3(signature = (name, default=None))]
     fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         let core = self.core_ref(py);

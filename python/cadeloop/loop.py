@@ -560,7 +560,86 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return transport, protocol
 
     async def sendfile(self, transport, file, offset=0, count=None, *, fallback=True):
-        _not_yet("sendfile()", "sendfile")
+        """R-036. Native path: drain the transport's corked writes, then
+        os.sendfile straight on the borrowed socket fd (zero-copy).
+        TransmitFile on Windows is the remaining native refinement; there
+        (and for SSL transports, which have no raw fd) the chunked
+        transport-write fallback applies."""
+        if transport.is_closing():
+            raise RuntimeError("Transport is closing")
+        fileno = getattr(transport, "fileno", None)
+        can_native = (
+            fileno is not None and hasattr(os, "sendfile") and hasattr(file, "fileno")
+        )
+        if can_native:
+            try:
+                file.fileno()
+            except (OSError, AttributeError, ValueError):
+                can_native = False
+        if not can_native:
+            if not fallback:
+                raise asyncio.SendfileNotAvailableError(
+                    "sendfile is not available for this transport/file"
+                )
+            return await self._sendfile_fallback(transport, file, offset, count)
+        # No byte may interleave: wait out writes already queued in the
+        # engine before bypassing it (concurrent app writes during a
+        # sendfile are user error, as in stdlib asyncio).
+        while transport.get_write_buffer_size() > 0:
+            await tasks.sleep(0.001)
+        return await self._sendfile_native_fd(transport.fileno(), file, offset, count)
+
+    async def _sendfile_native_fd(self, fd, file, offset, count):
+        in_fd = file.fileno()
+        total = 0
+        while True:
+            blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
+            if blocksize <= 0:
+                break
+            try:
+                sent = os.sendfile(fd, in_fd, offset + total, blocksize)
+            except BlockingIOError:
+                sent = None
+            except InterruptedError:
+                continue
+            if sent == 0:
+                break  # end of file
+            if sent is not None:
+                total += sent
+                continue
+            # Socket buffer full: wait for writability.
+            fut = self.create_future()
+
+            def on_writable():
+                if not fut.done():
+                    fut.set_result(None)
+
+            self._core.add_writer(fd, on_writable)
+            try:
+                await fut
+            finally:
+                self._core.remove_writer(fd)
+        # stdlib convention: leave the file object positioned after the
+        # bytes sent.
+        file.seek(offset + total)
+        return total
+
+    async def _sendfile_fallback(self, transport, file, offset, count):
+        if offset:
+            file.seek(offset)
+        total = 0
+        while True:
+            blocksize = 16384 if count is None else min(count - total, 16384)
+            if blocksize <= 0:
+                break
+            data = file.read(blocksize)
+            if not data:
+                break
+            transport.write(data)
+            total += len(data)
+            while transport.get_write_buffer_size() > 64 * 1024:
+                await tasks.sleep(0.001)
+        return total
 
 
 

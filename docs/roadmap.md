@@ -31,9 +31,15 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       conformance sweep green on IOCP (117 tests), backend smoke
       battery, 2-minute soak, wheel install+serve (validation run 5,
       Win11 26200 / Core Ultra 7 265K)
-- [ ] `loop.sendfile` via TransmitFile (R-036) — sock_sendfile fallback ✅
-- [ ] Edge-case matrix completion (R-122: RST paths, drip-feed,
-      slowloris timing) on Windows CI
+- [x] `loop.sendfile` (R-036): native zero-copy path — drain the
+      transport's corked writes, then os.sendfile on the borrowed fd
+      (Transport.fileno()); chunked transport-write fallback for SSL
+      transports and Windows. TransmitFile as the Windows native path
+      remains the M1-Windows refinement
+- [x] Edge-case matrix (R-122): RST-during-write surfaces
+      connection_lost (SO_LINGER-0 peer), drip-fed request heads parse
+      across recv boundaries, slowloris anchoring (M2 tests), abrupt
+      close storms (backend smoke); the same tests run on Windows CI
 - [ ] Echo ≥1.15x winloop on two-machine Windows hardware (the M1 gate,
       R-131) — loopback preview: 1.31x single-stream, 1.21x at 64 conns
 
@@ -164,7 +170,11 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       asyncio.create_subprocess_exec/shell work unmodified. Windows
       needs IOCP named-pipe ops (overlapped ReadFile/WriteFile):
       M5-Windows remainder
-- [ ] PGO-published wheels (R-111), -v3 wheel variant (R-110)
+- [x] PGO wheel pipeline (R-111) + -v3 variant (R-110): release.yml
+      builds instrumented, runs the repo's scheduling + native-HTTP
+      workload, merges via llvm-profdata, rebuilds with profile-use;
+      the x86-64-v3 build ships as a direct-URL release artifact
+      (docs/ops.md). Runs on tag push — first publish validates it
 - [ ] Docs complete; conformance skip-list at its floor
 
 ## Explicit non-goals (v1, §15)

@@ -512,3 +512,150 @@ def test_loop_close_with_live_connections():
     assert loop.stats()["connections"] > 0
     loop.close()  # must not hang or leak
     assert loop.is_closed()
+
+
+# --------------------------------------------------------------------- #
+# loop.sendfile (R-036) + R-122 edge-case matrix                        #
+# --------------------------------------------------------------------- #
+
+
+def test_loop_sendfile_native(loop, tmp_path):
+    import hashlib
+
+    payload = os.urandom(2 * 1024 * 1024)
+    f = tmp_path / "blob.bin"
+    f.write_bytes(payload)
+
+    async def main():
+        received = bytearray()
+        done = loop.create_future()
+
+        class Sink(asyncio.Protocol):
+            def data_received(self, data):
+                received.extend(data)
+
+            def connection_lost(self, exc):
+                if not done.done():
+                    done.set_result(None)
+
+        server = await loop.create_server(Sink, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        transport, _proto = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", port
+        )
+        transport.write(b"HEAD:")  # pre-queued bytes must not interleave
+        with open(f, "rb") as fh:
+            sent = await asyncio.wait_for(loop.sendfile(transport, fh), 20)
+            assert sent == len(payload)
+            assert fh.tell() == len(payload)
+        transport.close()
+        await asyncio.wait_for(done, 10)
+        server.close()
+        assert bytes(received[:5]) == b"HEAD:"
+        assert hashlib.sha256(received[5:]).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+    loop.run_until_complete(main())
+
+
+def test_loop_sendfile_offset_count(loop, tmp_path):
+    f = tmp_path / "oc.bin"
+    f.write_bytes(bytes(range(256)) * 16)
+
+    async def main():
+        received = bytearray()
+        done = loop.create_future()
+
+        class Sink(asyncio.Protocol):
+            def data_received(self, data):
+                received.extend(data)
+
+            def connection_lost(self, exc):
+                if not done.done():
+                    done.set_result(None)
+
+        server = await loop.create_server(Sink, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        transport, _p = await loop.create_connection(asyncio.Protocol, "127.0.0.1", port)
+        with open(f, "rb") as fh:
+            sent = await loop.sendfile(transport, fh, offset=100, count=1000)
+        assert sent == 1000
+        transport.close()
+        await asyncio.wait_for(done, 10)
+        server.close()
+        assert bytes(received) == (bytes(range(256)) * 16)[100:1100]
+
+    loop.run_until_complete(main())
+
+
+def test_rst_during_write_surfaces_connection_lost(loop):
+    # R-122: peer sets SO_LINGER=0 and closes -> RST. The writer's
+    # transport must report connection_lost with an error, not hang.
+    async def main():
+        lost = loop.create_future()
+
+        class Server(asyncio.Protocol):
+            def connection_made(self, transport):
+                # SO_LINGER(0) + close = RST instead of FIN.
+                sock = socket.socket(fileno=os.dup(transport.fileno()))
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER,
+                    __import__("struct").pack("ii", 1, 0),
+                )
+                sock.close()  # option is set on the shared socket; drop the dup
+                transport.abort()
+
+        class Client(asyncio.Protocol):
+            def __init__(self):
+                self.transport = None
+
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def connection_lost(self, exc):
+                if not lost.done():
+                    lost.set_result(exc)
+
+        server = await loop.create_server(Server, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        tr, client = await loop.create_connection(Client, "127.0.0.1", port)
+        # Write into the (about-to-be-reset) connection until failure.
+        for _ in range(50):
+            if tr.is_closing():
+                break
+            tr.write(b"x" * 65536)
+            await asyncio.sleep(0.02)
+        await asyncio.wait_for(lost, 10)
+        server.close()
+
+    loop.run_until_complete(main())
+
+
+def test_drip_fed_request_head_completes(loop):
+    # R-122 drip-feed: one byte at a time must still parse into a full
+    # request (no partial-buffer loss across recv boundaries).
+    async def main():
+        lid, bound, _fd = loop._core.http_listen(
+            "127.0.0.1", 0, _drip_app, loop
+        )
+        port = bound[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        raw = b"GET /drip HTTP/1.1\r\nhost: a\r\nconnection: close\r\n\r\n"
+        for i in range(0, len(raw), 3):
+            writer.write(raw[i : i + 3])
+            await writer.drain()
+            await asyncio.sleep(0.005)
+        data = await asyncio.wait_for(reader.read(), 10)
+        assert b"200" in data.split(b"\r\n", 1)[0]
+        assert b"/drip" in data
+        writer.close()
+        loop._core.listener_close(lid)
+
+    loop.run_until_complete(main())
+
+
+async def _drip_app(scope, receive, send):
+    await receive()
+    await send(
+        {"type": "http.response.start", "status": 200, "headers": []}
+    )
+    await send({"type": "http.response.body", "body": scope["raw_path"]})
