@@ -108,7 +108,16 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       initialize the OS RIO subsystem itself (rio_probe.rs has the full
       diagnosis; validate.ps1 gates RIO steps in 2s). Needs a stable
       x64 build (23H2/24H2 or Server)
-- [ ] Windows worker model: WSADuplicateSocketW handle passing (fork-free)
+- [x] Fork-free worker model (Windows flavor, §8): supervisor binds one
+      listener and hands it to spawned workers — WSADuplicateSocketW
+      (socket.share over stdin) on win32, fd inheritance on POSIX so the
+      identical supervisor/worker/control-pipe path is end-to-end tested
+      on Linux; graceful drain via control pipe (EOF = dead supervisor
+      cascades to worker shutdown), same crash-streak cutoff as the fork
+      model, SetProcessAffinityMask pinning; engine adopt path
+      (`http_listen_fd`) tested everywhere. Windows-hardware run covers
+      it via validate.ps1 step 18 (spec app, workers=2, PID-stamped
+      responses)
 - [ ] p99 ≤ 0.6x uvicorn+winloop at 80% saturation (R-003 — Windows
       two-machine measurement)
 

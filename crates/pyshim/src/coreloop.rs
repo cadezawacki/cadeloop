@@ -654,6 +654,53 @@ impl CoreLoop {
         self.listen_socket(py, sock, kind, accept_pool, true)
     }
 
+    /// Adopt an EXISTING listening socket for the native HTTP engine —
+    /// the Windows worker model hands each spawned worker a
+    /// WSADuplicateSocketW-shared listener (R-090); also usable anywhere
+    /// a pre-bound socket exists. The engine owns the socket from here.
+    #[pyo3(signature = (fd, app, pyloop, state=None, accept_pool=64, eager=true,
+                        max_header_bytes=65536, max_headers=100, max_url=8192, max_body=None,
+                        request_line_timeout=5.0, keepalive_idle=75.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn http_listen_fd(
+        &self,
+        py: Python<'_>,
+        fd: u64,
+        app: Bound<'_, PyAny>,
+        pyloop: Bound<'_, PyAny>,
+        state: Option<Bound<'_, PyAny>>,
+        accept_pool: usize,
+        eager: bool,
+        max_header_bytes: usize,
+        max_headers: usize,
+        max_url: usize,
+        max_body: Option<usize>,
+        request_line_timeout: f64,
+        keepalive_idle: f64,
+    ) -> PyResult<(u64, Py<PyAny>, u64)> {
+        self.check_closed()?;
+        if !app.is_callable() {
+            return Err(PyTypeError::new_err("ASGI app must be callable"));
+        }
+        let state: Py<PyAny> = match state {
+            Some(s) if !s.is_none() => s.unbind(),
+            _ => PyDict::new(py).into_any().unbind(),
+        };
+        let secs_to_ns = |s: f64| if s > 0.0 { (s * 1e9) as u64 } else { 0 };
+        let kind = net::ListenerKind::Http {
+            app: app.unbind(),
+            pyloop: pyloop.unbind(),
+            state,
+            limits: Limits { max_header_bytes, max_headers, max_url, max_body },
+            eager,
+            tuning: net::HttpTuning {
+                head_timeout_ns: secs_to_ns(request_line_timeout),
+                idle_timeout_ns: secs_to_ns(keepalive_idle),
+            },
+        };
+        self.listen_socket(py, fd as RawSocket, kind, accept_pool, true)
+    }
+
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the
     /// facade server). Returns (head_timeouts, idle_closes) this pass.
     fn http_sweep(&self, py: Python<'_>) -> PyResult<(u32, u32)> {

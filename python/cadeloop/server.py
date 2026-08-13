@@ -10,11 +10,17 @@ tuning (R-075), and signal wiring.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gc
 import importlib
+import json
 import logging
 import os
 import signal as _signal
+import socket as _socket
+import subprocess
+import sys
+import threading
 import time
 
 from .config import Config
@@ -153,6 +159,7 @@ def serve(
         **cfg,
     )
     del ssl  # accepted (stable signature); native TLS engine lands in M4
+    app_spec = app if isinstance(app, str) else None
     if isinstance(app, str):
         app = load_app(app)
     if not callable(app):
@@ -160,17 +167,40 @@ def serve(
 
     n = config.workers if config.workers > 0 else (os.cpu_count() or 1)
     if n > 1:
-        if not hasattr(os, "fork"):
-            # Windows worker model (WSADuplicateSocketW handle passing) is
-            # the M3-Windows item; until then run a single worker there.
-            logger.warning("workers=%d requires fork; running a single worker", n)
-        else:
+        if hasattr(os, "fork"):
             return _serve_multi(app, host, port, config, n)
+        if app_spec is not None:
+            # Windows spawn model (R-090): one shared listener duplicated
+            # into each worker via WSADuplicateSocketW (socket.share).
+            return _serve_multi_spawn(app_spec, host, port, config, n)
+        # Spawned workers re-import the app, so a bare callable cannot
+        # cross the process boundary (uvicorn has the same rule).
+        logger.warning(
+            "workers=%d on this platform requires an app import string "
+            '("module:attribute"); running a single worker',
+            n,
+        )
     return _serve_single(app, host, port, config)
 
 
-def _serve_single(app, host, port, config: Config, *, reuse_port: bool = False, worker_id=None):
-    """One worker: loop + lifespan + native listener (the M2 path)."""
+def _serve_single(
+    app,
+    host,
+    port,
+    config: Config,
+    *,
+    reuse_port: bool = False,
+    worker_id=None,
+    listen_sock=None,
+    control_reader=None,
+):
+    """One worker: loop + lifespan + native listener (the M2 path).
+
+    ``listen_sock``: an already-listening socket to adopt instead of
+    binding (the Windows spawn model shares the supervisor's listener).
+    ``control_reader``: a pipe the supervisor writes b"STOP" to for a
+    graceful drain (EOF — a dead supervisor — also stops the worker).
+    """
     loop = Loop(
         backend=config.backend,
         spin_us=config.spin_us,
@@ -187,22 +217,45 @@ def _serve_single(app, host, port, config: Config, *, reuse_port: bool = False, 
     installed_signals = []
     try:
         lifespan.startup()
-        lid, bound, _fd = loop._core.http_listen(
-            host,
-            port,
-            app,
-            loop,
-            state=lifespan.state,
-            reuse_port=reuse_port,
-            accept_pool=config.accept_pool,
-            eager=config.eager_tasks,
-            max_header_bytes=config.max_header_bytes,
-            max_headers=config.max_headers,
-            max_url=config.max_url,
-            max_body=config.max_body,
-            request_line_timeout=config.request_line_timeout,
-            keepalive_idle=config.keepalive_idle,
-        )
+        if listen_sock is not None:
+            # Adopt the shared listener; the engine owns the handle now.
+            listen_sock.setblocking(False)
+            fd = listen_sock.detach()
+            lid, bound, _fd = loop._core.http_listen_fd(
+                fd,
+                app,
+                loop,
+                state=lifespan.state,
+                accept_pool=config.accept_pool,
+                eager=config.eager_tasks,
+                max_header_bytes=config.max_header_bytes,
+                max_headers=config.max_headers,
+                max_url=config.max_url,
+                max_body=config.max_body,
+                request_line_timeout=config.request_line_timeout,
+                keepalive_idle=config.keepalive_idle,
+            )
+        else:
+            lid, bound, _fd = loop._core.http_listen(
+                host,
+                port,
+                app,
+                loop,
+                state=lifespan.state,
+                reuse_port=reuse_port,
+                accept_pool=config.accept_pool,
+                eager=config.eager_tasks,
+                max_header_bytes=config.max_header_bytes,
+                max_headers=config.max_headers,
+                max_url=config.max_url,
+                max_body=config.max_body,
+                request_line_timeout=config.request_line_timeout,
+                keepalive_idle=config.keepalive_idle,
+            )
+        if control_reader is not None:
+            threading.Thread(
+                target=_watch_control, args=(control_reader, loop), daemon=True
+            ).start()
         if config.access_log:
             loop._core.set_access_log(_access_sink(logging.getLogger("cadeloop.access")))
         _arm_timeout_sweep(loop, config)
@@ -273,6 +326,22 @@ def _arm_timeout_sweep(loop, config: Config):
         loop.call_later(interval, sweep)
 
     loop.call_later(interval, sweep)
+
+
+def _watch_control(reader, loop):
+    """Worker side of the spawn model's control pipe: b"STOP" (or EOF —
+    the supervisor died) requests a graceful stop."""
+    try:
+        while True:
+            line = reader.readline()
+            if not line or line.strip() == b"STOP":
+                break
+    except OSError:
+        pass
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        pass  # loop already closed
 
 
 # --------------------------------------------------------------------- #
@@ -398,5 +467,135 @@ def _serve_multi(app, host, port, config: Config, n: int):
     finally:
         _signal.signal(_signal.SIGTERM, old_term)
         _signal.signal(_signal.SIGINT, old_int)
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+# --------------------------------------------------------------------- #
+# spawn worker model — fork-free platforms (Windows), R-090..R-093       #
+# --------------------------------------------------------------------- #
+
+
+def _spawn_shared_worker(spec, lsock, config: Config, idx: int, ncpu: int):
+    """Spawn one worker process and hand it the shared listener: on
+    Windows via WSADuplicateSocketW (socket.share) bytes after the JSON
+    header on stdin; on POSIX via fd inheritance (pass_fds), which keeps
+    the spawn model testable on the dev platform. Returns the Popen."""
+    win = sys.platform == "win32"
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if win else 0
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "cadeloop._winworker"],
+        stdin=subprocess.PIPE,
+        creationflags=creationflags,
+        pass_fds=() if win else (lsock.fileno(),),
+    )
+    try:
+        share = lsock.share(proc.pid) if win else b""
+        header = {
+            "spec": spec,
+            "config": dataclasses.asdict(config) | {"workers": 1},
+            "worker_id": idx,
+            "pin": (idx % ncpu) if config.pin else None,
+            "share_len": len(share),
+            "listen_fd": None if win else lsock.fileno(),
+        }
+        proc.stdin.write(json.dumps(header).encode() + b"\n")
+        if share:
+            proc.stdin.write(share)
+        proc.stdin.flush()
+    except (OSError, ValueError):
+        proc.kill()
+        raise
+    return proc
+
+
+def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
+    """Fork-free supervisor (Windows): bind ONE listener here, duplicate
+    it into every worker (all post accepts on the same socket — the
+    kernel distributes them), restart crashed workers with the same
+    fast-crash cutoff as the fork model, and drain via the control pipe
+    within ``config.grace`` seconds (R-090..R-093)."""
+    if port == 0:
+        raise ValueError(
+            "workers > 1 requires an explicit port (the supervisor binds "
+            "one listener; port 0 would be unknowable to callers)"
+        )
+    lsock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        lsock.bind((host, port))
+        lsock.listen(1024)
+    except OSError:
+        lsock.close()
+        raise
+    ncpu = os.cpu_count() or 1
+    logger.info("cadeloop supervisor: %d workers on http://%s:%s (shared listener)", n, host, port)
+    children: dict = {}  # Popen -> (idx, spawn_time)
+    for idx in range(n):
+        children[_spawn_shared_worker(spec, lsock, config, idx, ncpu)] = (idx, time.monotonic())
+
+    stopping = False
+    exit_code = 0
+
+    def _stop_all():
+        nonlocal stopping
+        stopping = True
+        for proc in list(children):
+            try:
+                proc.stdin.write(b"STOP\n")
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    crash_streak = 0
+    try:
+        while children:
+            time.sleep(0.2)
+            done = [p for p in children if p.poll() is not None]
+            for proc in done:
+                idx, spawned = children.pop(proc)
+                if stopping:
+                    continue
+                if proc.returncode == 0:
+                    # Clean self-exit means stop was requested inside the
+                    # worker — treat as a shutdown signal (fork parity).
+                    _stop_all()
+                    continue
+                fast = time.monotonic() - spawned < _CRASH_FAST_SECS
+                crash_streak = crash_streak + 1 if fast else 1
+                if crash_streak >= _CRASH_STREAK_LIMIT:
+                    logger.error(
+                        "worker %d died %d times in under %.0fs — giving up",
+                        idx,
+                        crash_streak,
+                        _CRASH_FAST_SECS,
+                    )
+                    exit_code = 1
+                    _stop_all()
+                    continue
+                logger.warning(
+                    "worker %d died (status %d) — restarting", idx, proc.returncode
+                )
+                children[_spawn_shared_worker(spec, lsock, config, idx, ncpu)] = (
+                    idx,
+                    time.monotonic(),
+                )
+    except KeyboardInterrupt:
+        _stop_all()
+    finally:
+        # Drain: give survivors `grace` seconds, then terminate (R-092).
+        if not stopping:
+            _stop_all()
+        deadline = time.monotonic() + config.grace
+        for proc in list(children):
+            budget = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=budget)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "worker pid %d exceeded grace=%ss — terminating", proc.pid, config.grace
+                )
+                proc.kill()
+                proc.wait()
+        lsock.close()
     if exit_code:
         raise SystemExit(exit_code)

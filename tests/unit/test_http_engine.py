@@ -758,3 +758,27 @@ def test_access_log_sink(loop):
     assert peer is not None and peer[0] == "127.0.0.1"
     assert dur >= 0.0
     loop._core.listener_close(lid)
+
+
+def test_http_listen_fd_adopts_existing_listener(loop):
+    # The spawn worker model's adopt path (R-090): the engine takes over
+    # an already-bound, already-listening socket. Platform-neutral half
+    # of the WSADuplicateSocketW handoff.
+    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ls.bind(("127.0.0.1", 0))
+    ls.listen(64)
+    port = ls.getsockname()[1]
+    ls.setblocking(False)
+    fd = ls.detach()
+    lid, bound, _fd = loop._core.http_listen_fd(fd, echo_scope_app, loop)
+    assert bound[1] == port
+
+    async def main():
+        resp = await _request(
+            port, b"GET /adopted HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+        )
+        assert b"200" in resp.split(b"\r\n", 1)[0]
+        assert b"/adopted" in resp
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)

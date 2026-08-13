@@ -248,7 +248,29 @@ Step "17-soak" {
     & $PY $WD 300 -- $PY tests\stress\soak_timers.py --seconds 120
 }
 
-Step "18-workers-degrade" {
+Step "18-workers-spawn" {
+    # Real fork-free worker model (R-090..R-093): supervisor binds one
+    # listener, WSADuplicateSocketW-shares it into 2 spawned workers.
+    # Response bodies carry worker PIDs, so the log shows distribution.
+    $env:PYTHONPATH = "$repo\python;$repo\tools\windows"
+    $srv = Start-Process -FilePath $PY -ArgumentList "-m","cadeloop","wapp:app","--workers","2","--port","8972" -PassThru -NoNewWindow
+    Start-Sleep -Seconds 4
+    $ok = 0
+    foreach ($i in 1..8) {
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8972/" -TimeoutSec 5
+            if ($r.StatusCode -eq 200) { $ok++; Write-Host "req $i -> $($r.Content)" }
+        } catch { Write-Host "req $i FAILED: $_" }
+    }
+    Write-Host "spawn-model requests OK: $ok/8"
+    taskkill /PID $($srv.Id) /T /F | Out-Null
+    $env:PYTHONPATH = "$repo\python"
+    cmd /c exit $(if ($ok -eq 8) { 0 } else { 1 })
+}
+
+Step "19-workers-degrade" {
+    # Bare-callable app + workers>1 cannot cross a spawn boundary: must
+    # WARN and serve on a single worker.
     & $PY $WD 120 -- $PY -c @"
 import logging, threading, urllib.request, time, sys
 sys.path.insert(0, r'$repo\python')

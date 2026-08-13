@@ -113,3 +113,54 @@ def test_multiworker_rejects_port_zero():
 
     with pytest.raises(ValueError, match="explicit port"):
         cadeloop.serve(app, "127.0.0.1", 0, workers=2)
+
+
+def test_spawn_worker_pool_serves_and_stops(tmp_path):
+    """The fork-free spawn model (R-090, Windows worker model): one
+    supervisor-bound listener handed to spawned workers. On POSIX the
+    handoff is fd inheritance instead of WSADuplicateSocketW, so the
+    whole supervisor/worker/control-pipe path runs here too."""
+    (tmp_path / "mwapp.py").write_text(APP)
+    port = _free_port()
+    env = dict(os.environ)
+    pkg = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), pkg, env.get("PYTHONPATH", "")])
+    driver = (
+        "from cadeloop.server import _serve_multi_spawn\n"
+        "from cadeloop.config import Config\n"
+        f"_serve_multi_spawn('mwapp:app', '127.0.0.1', {port}, "
+        "Config(workers=2, grace=5.0), 2)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", driver], env=env)
+    try:
+        deadline = time.monotonic() + 10
+        pids = set()
+        while time.monotonic() < deadline:
+            try:
+                pids.add(_get(port))
+                break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            raise AssertionError("spawn worker pool never started serving")
+        for _ in range(7):
+            pids.add(_get(port))
+        assert len(pids) >= 1  # accept distribution is the kernel's call
+        assert all(p.isdigit() for p in (b.decode() for b in pids))
+        # Supervisor death must cascade: workers see control-pipe EOF and
+        # drain out; the port must stop answering.
+        proc.terminate()
+        proc.wait(timeout=10)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                _get(port, timeout=0.5)
+                time.sleep(0.2)
+            except OSError:
+                break
+        else:
+            raise AssertionError("workers kept serving after supervisor death")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
