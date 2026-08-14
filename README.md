@@ -11,9 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Server | Shutdown truncated in-flight responses; `grace` was never applied inside a worker | `HEAD` |
-> | Server | Failed *replacement* fork left every surviving worker running unsupervised | `HEAD` |
-> | WebSocket | Shutdown now sends a 1012 close frame instead of dropping the TCP connection | `HEAD` |
+> | Server | Shutdown truncated in-flight responses; `grace` was never applied inside a worker | `65fe5c8` |
+> | Server | Failed *replacement* fork left every surviving worker running unsupervised | `65fe5c8` |
+> | WebSocket | Shutdown now sends a 1012 close frame instead of dropping the TCP connection | `65fe5c8` |
 > | Loop | Every closed `Loop` leaked: the loop/core cycle had no `tp_traverse` | `8a11392` |
 > | Perf | Native vectorcall `create_task` (-25%) / `create_future` (-11%) | `8a11392` |
 > | Perf | `call_soon` validation gated behind debug, as CPython gates it (~+11%) | `4ee108e` |
