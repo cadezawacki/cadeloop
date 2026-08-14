@@ -84,6 +84,14 @@ pub fn parse_unix_sockaddr(buf: &[u8]) -> Option<Vec<u8>> {
     Some(path[..end].to_vec())
 }
 
+/// Any-family sockaddr parse: Internet families first, AF_UNIX second.
+pub fn parse_any_sockaddr(buf: &[u8]) -> Option<Addr> {
+    if let Some(a) = parse_sockaddr(buf) {
+        return Some(Addr::Inet(a));
+    }
+    parse_unix_sockaddr(buf).map(Addr::Unix)
+}
+
 pub fn parse_sockaddr(buf: &[u8]) -> Option<SocketAddr> {
     if buf.len() < 8 {
         return None;
@@ -206,14 +214,8 @@ mod imp {
         let mut buf = [0u8; 128];
         let mut len = buf.len() as libc::socklen_t;
         cvt(unsafe { f(sock as i32, buf.as_mut_ptr().cast(), &mut len) })?;
-        let raw = &buf[..len as usize];
-        if let Some(a) = parse_sockaddr(raw) {
-            return Ok(Addr::Inet(a));
-        }
-        if let Some(p) = parse_unix_sockaddr(raw) {
-            return Ok(Addr::Unix(p));
-        }
-        Err(io::Error::new(io::ErrorKind::InvalidData, "unparseable sockaddr"))
+        parse_any_sockaddr(&buf[..len as usize])
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unparseable sockaddr"))
     }
 
     pub fn peername_any(sock: RawSocket) -> io::Result<Addr> {

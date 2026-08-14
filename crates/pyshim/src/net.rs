@@ -409,7 +409,7 @@ pub(crate) enum NetEvent {
     DgramData {
         datagram_received: Py<PyAny>,
         payload: Py<PyAny>,
-        addr: Option<std::net::SocketAddr>,
+        addr: Option<netsys::Addr>,
     },
     /// R-058: per-packet error surfaced to protocol.error_received.
     DgramError {
@@ -2093,7 +2093,7 @@ pub(crate) fn dispatch_events(
                 core.guard_protocol_call(py, connection_lost.call1(py, (exc_obj,)))?;
             }
             NetEvent::DgramData { datagram_received, payload, addr } => {
-                let addr_obj = addr_tuple(py, addr).unwrap_or_else(|| py.None());
+                let addr_obj = any_addr_tuple(py, addr).unwrap_or_else(|| py.None());
                 core.guard_protocol_call(py, datagram_received.call1(py, (payload, addr_obj)))?;
             }
             NetEvent::DgramError { error_received, err } => {

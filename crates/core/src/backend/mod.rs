@@ -108,7 +108,7 @@ pub trait IoBackend {
 
     /// Consume the peer address of a completed recv_from op — releases
     /// the op slot (the accept-socket lifecycle, applied to datagrams).
-    fn take_recv_from_addr(&mut self, _op: OpId) -> Option<std::net::SocketAddr> {
+    fn take_recv_from_addr(&mut self, _op: OpId) -> Option<crate::netsys::Addr> {
         None
     }
 

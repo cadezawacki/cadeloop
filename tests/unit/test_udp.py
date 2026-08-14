@@ -3,6 +3,7 @@ native recv_from/send_to ops (no readiness probes — those would truncate
 datagrams on IOCP)."""
 
 import asyncio
+import socket
 
 import cadeloop
 import pytest
@@ -87,6 +88,59 @@ def test_udp_echo_roundtrip(loop):
         await asyncio.sleep(0.05)
         assert client.lost_called and client.lost is None
         assert server.lost_called and server.lost is None
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX only")
+def test_unix_datagram_endpoint(loop, tmp_path):
+    """AF_UNIX datagram addresses are filesystem paths: they must reach
+    bind()/connect() untouched, not be fed to the Internet resolver as
+    (addr[0], addr[1]) -- which indexes characters out of the path.
+    Reported on PR #1."""
+    server_path = str(tmp_path / "srv.sock")
+    client_path = str(tmp_path / "cli.sock")
+
+    async def main():
+        server_tr, server = await loop.create_datagram_endpoint(
+            Client, local_addr=server_path, family=socket.AF_UNIX
+        )
+        assert server_tr.get_extra_info("sockname") == server_path
+        client_tr, client = await loop.create_datagram_endpoint(
+            Client,
+            local_addr=client_path,
+            remote_addr=server_path,
+            family=socket.AF_UNIX,
+        )
+        assert client_tr.get_extra_info("peername") == server_path
+        server.got = loop.create_future()
+        client_tr.sendto(b"ping")  # connected-mode send
+        await asyncio.wait_for(server.got, 5)
+        data, addr = server.received[0]
+        assert data == b"ping"
+        # The sender's path, as parsed from the native recvfrom's
+        # sockaddr_un -- not dropped, not an Internet tuple.
+        assert addr == client_path
+        client_tr.close()
+        server_tr.close()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX only")
+def test_unix_datagram_stale_socket_file_is_replaced(loop, tmp_path):
+    """CPython parity: a leftover socket file at local_addr is removed
+    before bind, instead of failing with EADDRINUSE."""
+    path = str(tmp_path / "stale.sock")
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    stale.bind(path)
+    stale.close()  # leaves the filesystem entry behind
+
+    async def main():
+        tr, _p = await loop.create_datagram_endpoint(
+            Echo, local_addr=path, family=socket.AF_UNIX
+        )
+        tr.close()
 
     loop.run_until_complete(main())
 

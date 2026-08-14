@@ -903,10 +903,10 @@ impl IoBackend for IocpBackend {
         Err(self.fail_post(id, io::Error::from_raw_os_error(err)))
     }
 
-    fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
+    fn take_recv_from_addr(&mut self, op: OpId) -> Option<netsys::Addr> {
         let addr = self.slab.get(op).and_then(|s| {
             let n = s.data.from_len.clamp(0, ACCEPT_BUF_LEN as i32) as usize;
-            netsys::parse_sockaddr(&s.data.addr_buf[..n])
+            netsys::parse_any_sockaddr(&s.data.addr_buf[..n])
         });
         if self.slab.get(op).is_some() {
             self.slab.release(op);

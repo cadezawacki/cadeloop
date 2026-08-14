@@ -546,9 +546,13 @@ impl IoBackend for EpollBackend {
         }
     }
 
-    fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
+    fn take_recv_from_addr(&mut self, op: OpId) -> Option<netsys::Addr> {
         let addr = self.slab.get(op).and_then(|s| match &s.data.pending {
-            Pending::RecvFrom { from, from_len, .. } => netsys::parse_sockaddr(&from[..*from_len as usize]),
+            // Any family: a unix-datagram sender's path must not be
+            // dropped just because it is not an Internet address.
+            Pending::RecvFrom { from, from_len, .. } => {
+                netsys::parse_any_sockaddr(&from[..*from_len as usize])
+            }
             _ => None,
         });
         if self.slab.get(op).is_some() {

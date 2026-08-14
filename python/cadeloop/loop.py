@@ -17,6 +17,7 @@ import concurrent.futures
 import os
 import reprlib
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -667,7 +668,33 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             # slow resolver stalls every other connection this worker is
             # serving -- and the second lookup can return a different
             # family than the socket was created with.
-            if local_addr or remote_addr:
+            if (
+                hasattr(socket_module, "AF_UNIX")
+                and fam == socket_module.AF_UNIX
+                and (local_addr or remote_addr)
+            ):
+                # AF_UNIX datagram addresses are filesystem paths, not
+                # (host, port) pairs: the resolver either refuses them or
+                # addr[0]/addr[1] below indexes characters out of the
+                # path. CPython parity: type-check, clear a stale socket
+                # file at local_addr, and hand the raw paths to
+                # bind()/connect() via pseudo-addrinfo entries.
+                for addr in (local_addr, remote_addr):
+                    if addr is not None and not isinstance(addr, str):
+                        raise TypeError(f"string is expected, got {addr!r}")
+                if local_addr and local_addr[0] not in (0, "\x00"):
+                    # Not the abstract namespace: remove a leftover
+                    # socket file so bind() does not fail EADDRINUSE.
+                    try:
+                        if stat.S_ISSOCK(os.stat(local_addr).st_mode):
+                            os.remove(local_addr)
+                    except FileNotFoundError:
+                        pass
+                if local_addr:
+                    local_res = (fam, socket_module.SOCK_DGRAM, proto, "", local_addr)
+                if remote_addr:
+                    remote_res = (fam, socket_module.SOCK_DGRAM, proto, "", remote_addr)
+            elif local_addr or remote_addr:
                 candidates = {}
                 for key, addr in (("local", local_addr), ("remote", remote_addr)):
                     if not addr:

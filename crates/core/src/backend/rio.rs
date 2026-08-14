@@ -78,6 +78,7 @@ use windows_sys::Win32::System::IO::{GetQueuedCompletionStatusEx, OVERLAPPED, OV
 use super::iocp::{IocpBackend, KEY_RIO, POLL_BATCH};
 use super::rio_util::{CqLedger, RegionMap, StagingLedger};
 use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup};
+use crate::netsys;
 use crate::opslab::{OpId, OpKind, OpSlab};
 
 /// Sentinels per MSWSock headers (not exported by windows-sys).
@@ -565,7 +566,7 @@ impl IoBackend for RioBackend {
         self.inner.post_recv_from(socket, buf, len)
     }
 
-    fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
+    fn take_recv_from_addr(&mut self, op: OpId) -> Option<netsys::Addr> {
         self.inner.take_recv_from_addr(op)
     }
 
