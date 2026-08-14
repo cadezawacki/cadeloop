@@ -218,6 +218,15 @@ def _serve_single(
     ``control_reader``: a pipe the supervisor writes b"STOP" to for a
     graceful drain (EOF — a dead supervisor — also stops the worker).
     """
+    # TEMPORARY (ADR-24): bisecting a Windows-only STATUS_ACCESS_VIOLATION
+    # in the spawned worker model. worker_id is only set from
+    # _winworker.main(), so this stays silent for every other caller.
+    _trace = (
+        (lambda stage: print(f"cadeloop._serve_single: {stage}", file=sys.stderr, flush=True))
+        if worker_id is not None
+        else (lambda stage: None)
+    )
+    _trace("start")
     loop = Loop(
         backend=config.backend,
         spin_us=config.spin_us,
@@ -230,16 +239,20 @@ def _serve_single(
         dns_cache=config.dns_cache,
         dns_cache_ttl=config.dns_cache_ttl,
     )
+    _trace("loop constructed")
     asyncio.set_event_loop(loop)
     lifespan = _Lifespan(app, loop)
     lid = None
     installed_signals = []
     try:
+        _trace("about to run lifespan.startup")
         lifespan.startup()
+        _trace("lifespan.startup returned")
         if listen_sock is not None:
             # Adopt the shared listener; the engine owns the handle now.
             listen_sock.setblocking(False)
             fd = listen_sock.detach()
+            _trace(f"about to call http_listen_fd (fd={fd})")
             lid, bound, _fd = loop._core.http_listen_fd(
                 fd,
                 app,
@@ -255,6 +268,7 @@ def _serve_single(
                 keepalive_idle=config.keepalive_idle,
                 tls=ssl_ctx,
             )
+            _trace("http_listen_fd returned")
         else:
             lid, bound, _fd = loop._core.http_listen(
                 host,
@@ -277,6 +291,7 @@ def _serve_single(
             threading.Thread(
                 target=_watch_control, args=(control_reader, loop), daemon=True
             ).start()
+            _trace("control thread started")
         if config.access_log:
             loop._core.set_access_log(_access_sink(logging.getLogger("cadeloop.access")))
         _arm_timeout_sweep(loop, config)
@@ -287,6 +302,7 @@ def _serve_single(
         elif config.gc_mode == "disable":
             gc.collect()
             gc.disable()
+        _trace("about to install signal handlers")
         stop_signals = [_signal.SIGINT, _signal.SIGTERM]
         if hasattr(_signal, "SIGBREAK"):
             stop_signals.append(_signal.SIGBREAK)  # CTRL+BREAK (R-052)
@@ -299,6 +315,7 @@ def _serve_single(
         shown = bound if bound else (host, port)
         who = f"worker {worker_id} " if worker_id is not None else ""
         logger.info("cadeloop %sserving on http://%s:%s", who, shown[0], shown[1])
+        _trace("about to call run_forever")
         try:
             loop.run_forever()
         except KeyboardInterrupt:
