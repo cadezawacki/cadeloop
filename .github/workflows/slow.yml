@@ -1,0 +1,78 @@
+# R-113 slow validation: the 10-minute soak and the benchmark regression
+# gate. Split out of ci.yml because that workflow uses
+# `cancel-in-progress: true` -- correct for the fast jobs, since a
+# superseded run burns Windows minutes on a revision nobody will look at
+# again, but these two are the LAST to start, so during any active work
+# session they were cancelled every single time and validated nothing.
+#
+# Here they queue instead: at most one run in flight and one pending per
+# ref, so the soak and the regression gate always complete for a recent
+# commit even while commits keep landing.
+name: slow
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *" # nightly: full soak + benchmark regression
+  workflow_dispatch:
+
+concurrency:
+  group: slow-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stress:
+    # R-113/R-122: soak. Short on PRs; the nightly schedule runs the full
+    # 10-minute soak with RSS-growth assertion (<5%).
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install maturin
+          maturin build --release --out dist
+          pip install --no-index --find-links dist cadeloop
+      - name: soak
+        run: python tests/stress/soak_timers.py --seconds ${{ github.event_name == 'schedule' && '600' || '30' }}
+
+  benchmark-regression:
+    # R-113: fail on >5% regression vs stored baseline JSON. Until a
+    # Windows baseline is recorded under bench/baselines/, the check
+    # records results as artifacts and passes.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install maturin
+          maturin build --release --out dist
+          pip install --no-index --find-links dist cadeloop
+      - name: scheduling benchmark
+        run: python bench/harness/harness.py --suite sched --loops cadeloop --out bench-results.json
+      - name: regression gate (>5%)
+        # Gates against a CI-RECORDED baseline, deliberately not
+        # bench/baselines/windows-sched.json: that one was recorded on the
+        # owner's own Windows machine, and a dedicated box vs. a shared
+        # GitHub-hosted runner differs by far more than this 5% threshold
+        # permanently, so gating on it can never pass regardless of code
+        # quality (it read as a 25-69% "regression" across every scheduling
+        # benchmark the first time this job ever ran). The local baseline
+        # stays as-is for the README/docs comparisons it was made for.
+        # Until this file is seeded from a green run's uploaded artifact,
+        # check_regression.py passes with a notice, per its own contract.
+        run: python bench/harness/check_regression.py bench-results.json bench/baselines/windows-sched-ci.json --threshold 0.05
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json

@@ -1,5 +1,7 @@
-# CI per R-113: build, unit, asyncio-conformance, stress soak,
-# benchmark-regression, clippy/fmt/deny/audit.
+# CI per R-113: build, unit, asyncio-conformance, clippy/fmt/deny/audit.
+# The soak and benchmark-regression gates live in slow.yml -- see the
+# note there for why they cannot share this workflow's concurrency
+# policy.
 #
 # Spec asks for windows-2022 + windows-11 runners; GitHub-hosted labels
 # provide windows-2022 and windows-2025 (Windows Server 2025). A windows-11
@@ -14,8 +16,6 @@ on:
   push:
     branches: ["main"]
   pull_request:
-  schedule:
-    - cron: "0 4 * * *" # nightly: full soak + benchmark regression
   workflow_dispatch:
 
 # Superseded runs are wasted runs: pushing a follow-up commit while a run
@@ -111,56 +111,3 @@ jobs:
         with:
           name: wheel-${{ matrix.os }}
           path: dist/*.whl
-
-  stress:
-    # R-113/R-122: soak. Short on PRs; the nightly schedule runs the full
-    # 10-minute soak with RSS-growth assertion (<5%).
-    runs-on: windows-2022
-    needs: build-windows
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: |
-          pip install maturin
-          maturin build --release --out dist
-          pip install --no-index --find-links dist cadeloop
-      - name: soak
-        run: python tests/stress/soak_timers.py --seconds ${{ github.event_name == 'schedule' && '600' || '30' }}
-
-  benchmark-regression:
-    # R-113: fail on >5% regression vs stored baseline JSON. Until a
-    # Windows baseline is recorded under bench/baselines/, the check
-    # records results as artifacts and passes.
-    runs-on: windows-2022
-    needs: build-windows
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: |
-          pip install maturin
-          maturin build --release --out dist
-          pip install --no-index --find-links dist cadeloop
-      - name: scheduling benchmark
-        run: python bench/harness/harness.py --suite sched --loops cadeloop --out bench-results.json
-      - name: regression gate (>5%)
-        # Gates against a CI-RECORDED baseline, deliberately not
-        # bench/baselines/windows-sched.json: that one was recorded on the
-        # owner's own Windows machine, and a dedicated box vs. a shared
-        # GitHub-hosted runner differs by far more than this 5% threshold
-        # permanently, so gating on it can never pass regardless of code
-        # quality (it read as a 25-69% "regression" across every scheduling
-        # benchmark the first time this job ever ran). The local baseline
-        # stays as-is for the README/docs comparisons it was made for.
-        # Until this file is seeded from a green run's uploaded artifact,
-        # check_regression.py passes with a notice, per its own contract.
-        run: python bench/harness/check_regression.py bench-results.json bench/baselines/windows-sched-ci.json --threshold 0.05
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bench-results
-          path: bench-results.json
