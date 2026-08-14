@@ -103,7 +103,7 @@ pub enum DispatchOutcome {
 /// Fatal exceptions (KeyboardInterrupt / SystemExit) propagate as `Err` to
 /// unwind `run_forever`, matching asyncio's `Handle._run` contract.
 pub fn run_handle(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DispatchOutcome> {
-    let bound = obj.downcast::<Handle>().map_err(PyErr::from)?;
+    let bound = obj.cast::<Handle>().map_err(PyErr::from)?;
     let handle: &Handle = bound.get();
     if handle.is_cancelled() {
         return Ok(DispatchOutcome::Done);

@@ -88,7 +88,7 @@ impl<S> StateCell<S> {
     /// CONTRACT (upheld by all callers in this crate): `f` must not invoke
     /// arbitrary Python code — no user callbacks, no `Py::new`, nothing
     /// that can trigger GC or release/acquire the GIL — EXCEPT the single
-    /// sanctioned `allow_threads(poll)` inside `run_forever`'s tick, which
+    /// sanctioned `detach(poll)` inside `run_forever`'s tick, which
     /// is sound because the claiming thread has exclusive access.
     pub fn with<R>(&self, f: impl FnOnce(&mut S) -> R) -> PyResult<R> {
         let owner = self.owner.load(Ordering::Acquire);

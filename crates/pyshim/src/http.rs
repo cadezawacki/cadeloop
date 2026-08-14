@@ -30,7 +30,7 @@ use pyo3::exceptions::{
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 
 use crate::coreloop::CoreLoop;
@@ -323,9 +323,9 @@ pub(crate) fn date_line(net: &mut NetState, unix_secs: u64) -> &[u8] {
 // scope construction (R-081, R-082)                                     //
 // --------------------------------------------------------------------- //
 
-static ASGI_INFO: GILOnceCell<Py<PyDict>> = GILOnceCell::new();
-static EMPTY_BYTES: GILOnceCell<Py<PyBytes>> = GILOnceCell::new();
-static COMPLETED: GILOnceCell<Py<CompletedAwaitable>> = GILOnceCell::new();
+static ASGI_INFO: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+static EMPTY_BYTES: PyOnceLock<Py<PyBytes>> = PyOnceLock::new();
+static COMPLETED: PyOnceLock<Py<CompletedAwaitable>> = PyOnceLock::new();
 
 fn method_obj<'py>(py: Python<'py>, m: &'static str) -> Bound<'py, PyString> {
     // R-082: common method strings are interned once.
@@ -447,7 +447,7 @@ fn build_scope<'py>(
         None => scope.set_item(intern!(py, "server"), py.None())?,
     }
     // R-081: lifespan state, shallow-copied per request (ASGI spec).
-    let state_copy = match state.bind(py).downcast::<PyDict>() {
+    let state_copy = match state.bind(py).cast::<PyDict>() {
         Ok(d) if !d.is_empty() => d.copy()?,
         _ => PyDict::new(py),
     };
@@ -662,7 +662,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
     let mtype: Bound<'_, PyAny> = message
         .get_item(intern!(py, "type"))?
         .ok_or_else(|| PyRuntimeError::new_err("ASGI message missing 'type'"))?;
-    let mtype = mtype.downcast::<PyString>().map_err(PyErr::from)?;
+    let mtype = mtype.cast::<PyString>().map_err(PyErr::from)?;
     let kind = mtype.to_str()?;
 
     let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
@@ -830,12 +830,12 @@ fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
 // native TLS termination (R-059)                                        //
 // --------------------------------------------------------------------- //
 
-static SSL_WANT_READ: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
-static SSL_WANT_WRITE: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+static SSL_WANT_READ: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SSL_WANT_WRITE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 fn ssl_exc<'py>(
     py: Python<'py>,
-    cell: &'static GILOnceCell<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'py Py<PyAny>> {
     cell.get_or_try_init(py, || Ok(py.import("ssl")?.getattr(name)?.unbind()))
@@ -1637,9 +1637,9 @@ pub(crate) enum StepOutcome {
 /// available): registers the AppTask as `asyncio.current_task()` while it
 /// steps, which anyio/Starlette task groups rely on (they weakref and
 /// interrogate the host task).
-static ENTER_TASK: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
-static LEAVE_TASK: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
-static CANCELLED_ERROR: GILOnceCell<Py<PyAny>> = GILOnceCell::new();
+static ENTER_TASK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static LEAVE_TASK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static CANCELLED_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 fn cancelled_error(py: Python<'_>) -> PyErr {
     let cls = CANCELLED_ERROR.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
@@ -1656,7 +1656,7 @@ fn cancelled_error(py: Python<'_>) -> PyErr {
 
 fn task_hook<'py>(
     py: Python<'py>,
-    cell: &'static GILOnceCell<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'py Py<PyAny>> {
     cell.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
@@ -1975,7 +1975,7 @@ impl AppTask {
                             }
                             Ok(None)
                         }
-                        ffi::PySendResult::PYGEN_NEXT => Ok(Some(Py::from_owned_ptr(py, result))),
+                        ffi::PySendResult::PYGEN_NEXT => Ok(Some(Bound::from_owned_ptr(py, result).unbind())),
                         ffi::PySendResult::PYGEN_ERROR => Err(PyErr::fetch(py)),
                     }
                 }

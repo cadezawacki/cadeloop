@@ -22,7 +22,7 @@ mimalloc-allocator = ["dep:mimalloc"]
 [dependencies]
 cadeloop-core = { path = "../core" }
 # R-012: PyO3 >= 0.21. Pinned minor for reproducible builds.
-pyo3 = { version = "0.24", features = ["extension-module", "generate-import-lib"] }
+pyo3 = { version = "0.29", features = ["extension-module", "generate-import-lib"] }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [lints.rust]

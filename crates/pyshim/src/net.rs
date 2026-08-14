@@ -642,7 +642,7 @@ fn on_dgram_recv_done(
         let ptr = net.buffers.slot_ptr(slot);
         let payload = unsafe {
             let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
-            Py::from_owned_ptr(py, obj)
+            Bound::from_owned_ptr(py, obj).unbind()
         };
         net.events.push(NetEvent::DgramData { datagram_received, payload, addr });
     } else if !is_cancelled_error(os_error) {
@@ -1098,7 +1098,7 @@ fn on_recv_done(
                 let ptr = net.buffers.slot_ptr(slot);
                 let payload = unsafe {
                     let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
-                    Py::from_owned_ptr(py, obj)
+                    Bound::from_owned_ptr(py, obj).unbind()
                 };
                 net.events.push(NetEvent::Data { data_received, payload });
             } else {
@@ -1647,7 +1647,7 @@ impl Transport {
         let core = self.core_ref(py);
         // R-074 retention: exact bytes -> zero-copy retain; any other
         // buffer exporter -> copy now.
-        let buf: WriteBuf = if let Ok(b) = data.downcast::<PyBytes>() {
+        let buf: WriteBuf = if let Ok(b) = data.cast::<PyBytes>() {
             let len = b.as_bytes().len();
             if len == 0 {
                 return Ok(());

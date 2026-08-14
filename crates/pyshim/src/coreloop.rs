@@ -231,7 +231,7 @@ impl CoreLoop {
                 } else {
                     // R-021: the only GIL release point; sound because
                     // `claim` guarantees no other thread enters this state.
-                    (py.allow_threads(move || reactor.poll(timeout)), true)
+                    (py.detach(move || reactor.poll(timeout)), true)
                 };
                 if poll_result.is_err() {
                     return (
@@ -406,7 +406,7 @@ pub(crate) fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
         if ptr.is_null() {
             return Err(PyErr::fetch(py));
         }
-        Ok(Py::from_owned_ptr(py, ptr))
+        Ok(Bound::from_owned_ptr(py, ptr).unbind())
     }
 }
 
