@@ -352,7 +352,7 @@ def test_reserved_close_codes_are_rejected(loop, code):
         try:
             while True:
                 frames.append(await asyncio.wait_for(read_server_frame(reader), 5))
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
             pass
         writer.close()
         return frames
@@ -418,8 +418,10 @@ def test_pre_accept_flood_is_bounded(loop):
                 writer.write(blob)
                 await writer.drain()
                 await asyncio.sleep(0)
-        except (ConnectionResetError, BrokenPipeError):
-            pass
+        except OSError:
+            pass  # the server dropping us mid-flood IS the cap working
+            # (Windows reports it as ConnectionAbortedError, POSIX as
+            # ConnectionResetError/BrokenPipeError)
         # The cap must have closed the connection rather than buffering on.
         try:
             rest = await asyncio.wait_for(reader.read(), 5)

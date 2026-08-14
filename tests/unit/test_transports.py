@@ -1084,8 +1084,8 @@ def test_graceful_close_leaves_no_pool_slots_behind(loop):
             writer.close()
             try:
                 await writer.wait_closed()
-            except (ConnectionResetError, BrokenPipeError):
-                pass
+            except OSError:
+                pass  # peer-reset flavours differ across platforms
         server.close()
         await server.wait_closed()
         for _ in range(20):
