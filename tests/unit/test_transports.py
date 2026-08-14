@@ -1383,12 +1383,16 @@ def test_get_extra_info_socket_is_live_and_non_owning(loop):
             assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
             # Stable across calls -- not a fresh dup each time.
             assert transport.get_extra_info("socket") is sock
-            # Non-owning: after the engine closes its descriptor this one
-            # is still usable. Were it the same number, the engine's close
-            # would have invalidated it and getsockopt would raise EBADF.
+            # The transport's close must be final even though this
+            # object holds a duplicate. A duplicate is another OWNER of the
+            # connection: leaving it open would deny the peer its EOF and
+            # keep the connection allocated for as long as the application
+            # happened to hold the object.
             transport.close()
             await asyncio.sleep(0.05)
-            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+            assert sock.fileno() == -1, "the transport's close left its socket open"
+            with pytest.raises(OSError):
+                sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
         finally:
             server.close()
             await server.wait_closed()
@@ -1484,3 +1488,21 @@ def test_sendto_rejects_a_malformed_address_tuple(loop):
             await asyncio.sleep(0.05)
 
     loop.run_until_complete(main())
+
+
+def test_create_server_rejects_a_datagram_socket(loop):
+    """A SOCK_DGRAM sock= was detached and registered as a listener;
+    accept() then failed forever while the listener rearmed after each
+    failure, so the caller got an apparently serving Server that only
+    logged accept errors."""
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", 0))
+    try:
+        with pytest.raises(ValueError, match="stream socket"):
+            loop.run_until_complete(
+                loop.create_server(asyncio.Protocol, sock=udp)
+            )
+        # Rejected before ownership transferred, so it is still ours.
+        assert udp.fileno() != -1
+    finally:
+        udp.close()

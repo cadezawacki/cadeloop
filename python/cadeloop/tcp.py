@@ -422,6 +422,13 @@ class TcpSurface:
             raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
         if sock is not None:
             _check_ssl_socket(sock)
+            # Checked before ownership transfers. A SOCK_DGRAM socket got
+            # detached and registered as a listener, and then accept() on
+            # it failed forever -- the listener rearms after each failure,
+            # so the caller was handed an apparently serving Server that
+            # only logged accept errors, instead of a ValueError here.
+            if sock.type != socket.SOCK_STREAM:
+                raise ValueError(f"a stream socket was expected, got {sock!r}")
         if reuse_port and not hasattr(socket, "SO_REUSEPORT"):
             raise ValueError("reuse_port not supported by socket module")
 

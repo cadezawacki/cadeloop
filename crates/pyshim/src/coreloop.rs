@@ -148,17 +148,27 @@ impl CoreLoop {
     }
 
     /// Drop graveyarded Python refs / buffers outside the state cell.
-    pub(crate) fn drain_graveyards(&self, _py: Python<'_>) -> PyResult<()> {
-        let (entries, bufs, pys, protos, timers) = self.state.with(|st| {
+    pub(crate) fn drain_graveyards(&self, py: Python<'_>) -> PyResult<()> {
+        let (entries, bufs, pys, protos, timers, socks) = self.state.with(|st| {
             (
                 std::mem::take(&mut st.net.graveyard_entries),
                 std::mem::take(&mut st.net.graveyard_bufs),
                 std::mem::take(&mut st.net.graveyard_py),
                 std::mem::take(&mut st.net.graveyard_protos),
                 st.reactor.take_graveyard(),
+                std::mem::take(&mut st.net.graveyard_sockets),
             )
         })?;
-        drop((entries, bufs, pys, protos, timers));
+        // Sockets handed out by `get_extra_info("socket")` are CLOSED, not
+        // merely dropped. Each holds its own duplicate of the connection,
+        // and a duplicate is another owner: if the application kept the
+        // object, dropping our reference leaves the peer without an EOF
+        // and the connection allocated until that object happens to be
+        // collected. Closing is what makes the transport's close final.
+        for sock in &socks {
+            let _ = sock.call_method0(py, intern!(py, "close"));
+        }
+        drop((entries, bufs, pys, protos, timers, socks));
         Ok(())
     }
 

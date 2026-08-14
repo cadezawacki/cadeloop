@@ -87,6 +87,9 @@ pub(crate) struct HttpConn {
     /// Like `active_head` this suppresses body bytes, and additionally
     /// suppresses the framing headers themselves.
     pub(crate) resp_bodyless: bool,
+    /// 205 Reset Content: body bytes suppressed like `resp_bodyless`, but
+    /// the empty payload still has to be framed (RFC 7231 6.3.6).
+    pub(crate) resp_empty: bool,
     /// Active request's HTTP minor version (0 => chunked is unavailable).
     pub(crate) active_minor: u8,
     /// Body of the ACTIVE request, taken by the first `receive()`.
@@ -222,6 +225,7 @@ impl HttpConn {
             raw_stream: false,
             active_head: false,
             resp_bodyless: false,
+            resp_empty: false,
             active_minor: 1,
             req_body: None,
             disconnected: false,
@@ -283,6 +287,9 @@ pub(crate) struct FeedOutcome {
     pub pump: bool,
     /// The pipeline budget is spent: stop reading until it drains.
     pub pause_reading: bool,
+    /// A head carried `Expect: 100-continue` and the interim response is
+    /// owed to the client (RFC 7231 5.1.1).
+    pub owes_continue: bool,
 }
 
 pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome, ParseError> {
@@ -296,8 +303,19 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
         conn.pending_bytes += req.queued_size();
         conn.pending.push_back(req);
     }
-    Ok(FeedOutcome { pump: !conn.pending.is_empty() && !conn.active, pause_reading: conn.pipeline_full() })
+    Ok(FeedOutcome {
+        pump: !conn.pending.is_empty() && !conn.active,
+        pause_reading: conn.pipeline_full(),
+        owes_continue: conn.parser.take_owes_continue(),
+    })
 }
+
+/// RFC 7231 5.1.1 interim response. Sent as soon as a head asking for it
+/// is parsed, before the body: that is the whole point of the
+/// expectation, and a client that does not get it waits out its own
+/// continue timeout before sending -- a fixed stall on every upload for
+/// the clients that use it, and an indefinite one for the strict ones.
+pub(crate) const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 /// In-cell: serialized minimal error response (400/413/414/431/500).
 pub(crate) fn error_response(err: ParseError) -> Vec<u8> {
@@ -851,15 +869,35 @@ fn origin_form(url: &[u8]) -> &[u8] {
 /// RFC 7230 3.3.2 / RFC 7231: responses with these statuses are defined
 /// to carry no message body, and no `Content-Length`/`Transfer-Encoding`
 /// framing of one.
+/// Statuses whose response is terminated by the end of the headers no
+/// matter what the headers say (RFC 7230 3.3.3 rule 1): they carry no
+/// body *and* need no framing header, so emitting one desynchronises a
+/// keep-alive stream.
+///
+/// 205 is deliberately absent. It also carries no content, but it is not
+/// in rule 1's self-framing set -- RFC 7231 6.3.6 requires the server to
+/// frame the empty payload explicitly, so it takes the ordinary
+/// `content-length: 0` path with its body bytes suppressed.
 fn status_forbids_body(status: u16) -> bool {
     (100..200).contains(&status) || status == 204 || status == 304
+}
+
+/// 205 Reset Content: no content, but explicitly framed. Without the
+/// suppression an application that sends a body on a 205 puts bytes on
+/// the wire the client will read as the next response.
+fn status_requires_empty_body(status: u16) -> bool {
+    status == 205
 }
 
 /// Narrower than `status_forbids_body`: 304 carries no body but MAY
 /// carry `Content-Length` describing the representation a 200 would have
 /// returned (RFC 7232 4.1), so that header is preserved there.
 fn status_forbids_content_length(status: u16) -> bool {
-    (100..200).contains(&status) || status == 204
+    // 205 is here for a different reason than 204: no body reaches the
+    // wire, so whatever length the application declared is a promise the
+    // response cannot keep. The engine emits `content-length: 0` for it
+    // instead of copying that through.
+    (100..200).contains(&status) || status == 204 || status == 205
 }
 
 /// RFC 7230 `tchar`.
@@ -1020,6 +1058,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             conn.resp_declared_length = declared_length;
             conn.resp_body_sent = 0;
             conn.resp_bodyless = status_forbids_body(status);
+            conn.resp_empty = status_requires_empty_body(status);
             if saw_close {
                 conn.keep_alive = false;
             }
@@ -1056,23 +1095,34 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // content-length/chunked header (or body) desynchronises
                     // the keep-alive stream.
                     let bodyless = conn.resp_bodyless;
-                    let head_req = conn.active_head || bodyless;
+                    let empty = conn.resp_empty;
+                    let head_req = conn.active_head || bodyless || empty;
                     let minor = conn.active_minor;
-                    if !more {
+                    // A 205 frames up front even when the application
+                    // means to stream: it is not in rule 1's self-framing
+                    // set, so the client needs an explicit length, and no
+                    // body byte will ever follow to justify chunked.
+                    if !more || empty {
                         if !saw_length && !bodyless {
                             out.extend_from_slice(b"content-length: ");
-                            out.extend_from_slice(body.len().to_string().as_bytes());
+                            let framed = if empty { 0 } else { body.len() };
+                            out.extend_from_slice(framed.to_string().as_bytes());
                             out.extend_from_slice(b"\r\n");
                         }
                         out.extend_from_slice(b"\r\n");
                         if !head_req {
                             out.extend_from_slice(&body);
                         }
-                        conn.resp_body_sent = body.len() as u64;
-                        if let Some(e) = length_mismatch(conn, true) {
+                        conn.resp_body_sent = if head_req { 0 } else { body.len() as u64 };
+                        if let Some(e) = length_mismatch(conn, !more) {
                             return Err(e);
                         }
-                        conn.resp = RespPhase::Done;
+                        if more {
+                            conn.raw_stream = true;
+                            conn.resp = RespPhase::Streaming;
+                        } else {
+                            conn.resp = RespPhase::Done;
+                        }
                     } else if saw_length || head_req || minor == 0 {
                         // Raw streaming: caller-framed (their CL), a HEAD
                         // response (no body bytes at all), or HTTP/1.0
@@ -1106,7 +1156,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 }
                 RespPhase::Streaming => {
                     let raw = conn.raw_stream;
-                    let head_req = conn.active_head || conn.resp_bodyless;
+                    let head_req = conn.active_head || conn.resp_bodyless || conn.resp_empty;
                     let mut out = Vec::with_capacity(body.len() + 16);
                     if head_req {
                         // body bytes suppressed
@@ -1143,7 +1193,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
 /// long one makes the surplus look like a new response. Either way the
 /// stream is desynchronised, which is the request-smuggling shape.
 fn length_mismatch(conn: &HttpConn, final_message: bool) -> Option<SendErr> {
-    if conn.active_head || conn.resp_bodyless {
+    if conn.active_head || conn.resp_bodyless || conn.resp_empty {
         // No body goes on the wire, and for these the declared length
         // legitimately describes a body that is not being sent: a HEAD
         // response carries the would-be GET length (RFC 7231 4.3.2) and a
@@ -1371,6 +1421,11 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
                     // something to release when the queue drains.
                     if outcome.pause_reading {
                         conn.pipeline_paused = true;
+                    }
+                    if outcome.owes_continue {
+                        // Staged as plaintext like any other response
+                        // byte; the TlsFlush below encrypts it.
+                        net::http_enqueue(py, net, backend, tid, CONTINUE_RESPONSE.to_vec());
                     }
                     outcome.pump
                 }
@@ -1905,6 +1960,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 conn.raw_stream = false;
                 conn.active_head = req.method == "HEAD";
                 conn.resp_bodyless = false;
+                conn.resp_empty = false;
                 conn.active_minor = req.http_minor;
                 if logging {
                     // R-140: retained only while a sink is installed.

@@ -175,9 +175,9 @@ pub(crate) struct TransportEntry {
     flush_scheduled: bool,
     pub peername: Option<Py<PyAny>>,
     pub sockname: Option<Py<PyAny>>,
-    /// `get_extra_info("socket")`, built on first ask and kept. Dropped
-    /// with the entry (outside the state cell, like every other Py ref
-    /// an entry holds).
+    /// `get_extra_info("socket")`, built on first ask and kept. Moved to
+    /// `graveyard_sockets` at teardown to be closed, not merely dropped
+    /// -- see the note there.
     pub extra_sock: Option<Py<PyAny>>,
 }
 
@@ -281,6 +281,9 @@ pub(crate) struct NetState {
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
+    /// Sockets handed out by `get_extra_info("socket")`, awaiting an
+    /// explicit `close()` outside the state cell (see drain_graveyards).
+    pub graveyard_sockets: Vec<Py<PyAny>>,
     pub graveyard_protos: Vec<ProtoKind>,
     /// R-058 datagram endpoints (separate from stream transports: no
     /// write-queue/backpressure machinery, per-packet semantics).
@@ -588,6 +591,9 @@ pub(crate) fn teardown_with(
     err: Option<u32>,
 ) {
     let Some(mut entry) = net.transports.remove(&tid) else { return };
+    if let Some(sock) = entry.extra_sock.take() {
+        net.graveyard_sockets.push(sock);
+    }
     if entry.conn_lost {
         net.graveyard_entries.push(entry);
         return;
@@ -618,6 +624,9 @@ pub(crate) fn teardown_with(
             }
         }
     }
+    if let Some(sock) = entry.extra_sock.take() {
+        net.graveyard_sockets.push(sock);
+    }
     net.graveyard_entries.push(entry);
 }
 
@@ -631,6 +640,9 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     netsys::close(entry.socket);
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
+    }
+    if let Some(sock) = entry.extra_sock.take() {
+        net.graveyard_sockets.push(sock);
     }
     net.graveyard_entries.push(entry);
 }
@@ -1557,6 +1569,7 @@ fn on_recv_done(
     net.stats_bytes_rx += bytes as u64;
     debug_assert_eq!(entry.recv_slot, Some(slot), "op slot / transport slot mismatch");
     let mut parse_err = None;
+    let mut continue_owed = false;
     match &mut entry.proto {
         ProtoKind::Py(p) => {
             if let Some(data_received) = &p.data_received {
@@ -1610,6 +1623,9 @@ fn on_recv_done(
                         if outcome.pump {
                             net.events.push(NetEvent::HttpPump { tid });
                         }
+                        if outcome.owes_continue {
+                            continue_owed = true;
+                        }
                     }
                     Err(e) => parse_err = Some(e),
                 }
@@ -1622,6 +1638,14 @@ fn on_recv_done(
         http_enqueue(py, net, backend, tid, resp);
         http_close_after_write(py, net, backend, tid);
         return; // no recv re-post
+    }
+    if continue_owed {
+        // Before the body, not after: the client is holding it back until
+        // this arrives. A request whose declared length already exceeds
+        // max_body never gets here -- the parser answers 413 at
+        // headers-complete instead, which is the other half of what the
+        // expectation is for.
+        http_enqueue(py, net, backend, tid, crate::http::CONTINUE_RESPONSE.to_vec());
     }
     if paused_now {
         net.stats_pipeline_pauses += 1;
@@ -2279,12 +2303,17 @@ impl Transport {
     /// Protocols and libraries reach for this through the standard
     /// transport API to read the address family, inspect socket options,
     /// or set one such as keepalive. Returning `None` for a live
-    /// connection made them either fail or silently skip that setup, so
-    /// the key is answered -- but with a socket object owning its own
-    /// `dup()` of the descriptor, never the engine's. The engine's
-    /// descriptor is closed by teardown; a second Python owner of the
-    /// same number would close it again, and by then the OS may have
-    /// handed that number to an unrelated connection.
+    /// connection made them either fail or silently skip that setup.
+    ///
+    /// The object owns a `dup()` rather than the engine's descriptor,
+    /// because two Python-visible owners of one descriptor means a double
+    /// close, and by the second one the OS may have handed that number to
+    /// an unrelated connection (ADR-25's hazard, reached from the other
+    /// side). But a duplicate is still an *owner* of the connection: if
+    /// the application keeps the object, the peer gets no EOF when the
+    /// transport closes. So teardown closes it explicitly -- see
+    /// `graveyard_sockets` -- which makes the transport's close final
+    /// whether or not anyone kept a reference.
     ///
     /// Built on first ask (nothing pays for it otherwise) and kept on the
     /// entry, so repeated calls return the same object rather than
@@ -2310,10 +2339,14 @@ impl Transport {
     }
 }
 
-/// A `socket` object over a duplicate of `raw`, wrapped in asyncio's own
-/// `TransportSocket` -- the type callers expect back from
-/// `get_extra_info("socket")`, and the one that refuses the mutating
-/// operations that would desynchronise the transport.
+/// A plain `socket.socket` over a duplicate of `raw`.
+///
+/// Not wrapped in `asyncio.trsock.TransportSocket`: that wrapper's whole
+/// job is to stop callers closing a descriptor the transport owns, and
+/// here the descriptor is a duplicate the *engine* must be able to close
+/// at teardown. A real socket object is also the more useful thing to
+/// hand back -- `.family`, `.getsockopt`, `.setsockopt` and the rest are
+/// what libraries actually reach for, and they work on it directly.
 fn build_transport_socket(py: Python<'_>, raw: RawSocket) -> PyResult<Py<PyAny>> {
     let socket_mod = py.import("socket")?;
     // socket.dup(), not os.dup(): on Windows a SOCKET is not a file
@@ -2321,11 +2354,7 @@ fn build_transport_socket(py: Python<'_>, raw: RawSocket) -> PyResult<Py<PyAny>>
     let dup = socket_mod.call_method1(intern!(py, "dup"), (raw as u64,))?;
     let kwargs = PyDict::new(py);
     kwargs.set_item(intern!(py, "fileno"), dup)?;
-    let sock = socket_mod.getattr(intern!(py, "socket"))?.call((), Some(&kwargs))?;
-    match py.import("asyncio.trsock") {
-        Ok(m) => Ok(m.getattr(intern!(py, "TransportSocket"))?.call1((sock,))?.unbind()),
-        Err(_) => Ok(sock.unbind()),
-    }
+    Ok(socket_mod.getattr(intern!(py, "socket"))?.call((), Some(&kwargs))?.unbind())
 }
 
 #[pymethods]

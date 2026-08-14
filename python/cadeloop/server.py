@@ -586,19 +586,28 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
     try:
         while children:
             if stopping:
-                # Leave the blocking reap the moment shutdown begins. The
-                # bounded drain below (config.grace, then SIGKILL) is what
-                # enforces the deadline, and waitpid(-1, 0) never returns
-                # for a worker stuck in synchronous application code that
-                # cannot run its Python signal handler -- so staying here
-                # meant the deadline was reached only after every child had
-                # already exited, i.e. never when it mattered.
+                # The bounded drain below (config.grace, then SIGKILL) is
+                # what enforces the shutdown deadline, so leave the reap
+                # loop the moment shutdown begins.
                 break
             try:
-                pid, status = os.waitpid(-1, 0)
+                # WNOHANG, not a blocking wait. A blocking waitpid() is
+                # restarted by CPython after a signal handler that does not
+                # raise -- and _forward does not raise -- so the `stopping`
+                # check above was unreachable until some child happened to
+                # exit. A worker wedged in synchronous application code
+                # never exits, so shutdown hung indefinitely instead of
+                # killing it after `grace`. That is the bug the comment
+                # here previously claimed to have fixed.
+                pid, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 break
             except InterruptedError:
+                continue
+            if pid == 0:
+                # Nothing exited. Sleep briefly rather than spinning; the
+                # signal handler runs between iterations either way.
+                time.sleep(0.05)
                 continue
             if pid not in children:
                 continue

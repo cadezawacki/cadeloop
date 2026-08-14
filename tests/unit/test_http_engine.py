@@ -1828,3 +1828,152 @@ def test_latency_mode_spin_selects_immediate_flush():
     # An explicit setting always wins over the preset.
     assert cadeloop.Config(latency_mode="spin", immediate_flush=False).immediate_flush is False
     assert cadeloop.Config(latency_mode="balanced", immediate_flush=True).immediate_flush is True
+
+
+# --------------------------------------------------------------------- #
+# Expect: 100-continue (RFC 7231 5.1.1) and 205 framing (6.3.6)         #
+# --------------------------------------------------------------------- #
+
+
+def test_expect_100_continue_gets_an_interim_response(loop):
+    """A client that sends `Expect: 100-continue` holds the body back
+    until the interim response arrives. Ignoring the expectation made
+    every such upload wait out the client's own continue timeout -- and
+    the strict clients that never give up wait forever."""
+
+    async def app(scope, receive, send):
+        msg = await receive()
+        body = msg["body"]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"got:" + body})
+
+    lid, port = listen(loop, app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n"
+            b"Expect: 100-continue\r\n\r\n"
+        )
+        await w.drain()
+        # The interim response must arrive BEFORE any body is sent.
+        interim = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5.0)
+        w.write(b"hello")
+        await w.drain()
+        rest = await asyncio.wait_for(_read_one_response(r), 5.0)
+        w.close()
+        return interim, rest
+
+    interim, rest = loop.run_until_complete(client())
+    assert interim == b"HTTP/1.1 100 Continue\r\n\r\n", interim
+    assert b"got:hello" in rest, rest
+    loop._core.listener_close(lid)
+
+
+def test_expect_100_continue_is_case_insensitive_and_listed(loop):
+    """The expectation is a comma-separated list and the token is
+    case-insensitive (RFC 7231 5.1.1)."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\n"
+            b"Expect: 100-Continue\r\n\r\n"
+        )
+        await w.drain()
+        interim = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5.0)
+        w.write(b"x")
+        await w.drain()
+        await asyncio.wait_for(_read_one_response(r), 5.0)
+        w.close()
+        return interim
+
+    assert loop.run_until_complete(client()).startswith(b"HTTP/1.1 100"), "case-sensitive match"
+    loop._core.listener_close(lid)
+
+
+def test_oversized_declared_body_is_refused_before_it_is_sent(loop):
+    """The other half of what the expectation is for: a Content-Length
+    already over the cap is known at headers-complete, so the upload is
+    refused before a byte of it is buffered."""
+
+    async def app(scope, receive, send):  # pragma: no cover - never reached
+        raise AssertionError("the app must not see an over-cap request")
+
+    lid, port = listen(loop, app, max_body=16)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4096\r\n"
+            b"Expect: 100-continue\r\n\r\n"
+        )
+        await w.drain()
+        data = await asyncio.wait_for(r.read(), 5.0)
+        w.close()
+        return data
+
+    resp = loop.run_until_complete(client())
+    assert resp.startswith(b"HTTP/1.1 413"), resp[:60]
+    assert b"100 Continue" not in resp, "sent Continue for a request already refused"
+    loop._core.listener_close(lid)
+
+
+def test_205_frames_its_empty_payload(loop):
+    """205 carries no content, but unlike 204/304 it is not self-framing
+    (RFC 7230 3.3.3 rule 1 does not list it), so RFC 7231 6.3.6 requires
+    an explicit zero length. Without one the client reads the next
+    keep-alive response as this one's body."""
+
+    async def app(scope, receive, send):
+        await receive()
+        # An application that sends a body on a 205 is wrong; the bytes
+        # must not reach the wire either way.
+        await send({"type": "http.response.start", "status": 205, "headers": []})
+        await send({"type": "http.response.body", "body": b"should not be sent"})
+
+    lid, port = listen(loop, app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n")
+        await w.drain()
+        first = await asyncio.wait_for(_read_one_response(r), 5.0)
+        # Same connection: a mis-framed 205 desynchronises this.
+        w.write(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+        await w.drain()
+        second = await asyncio.wait_for(_read_one_response(r), 5.0)
+        w.close()
+        return first, second
+
+    first, second = loop.run_until_complete(client())
+    assert first.startswith(b"HTTP/1.1 205"), first[:40]
+    assert b"content-length: 0" in first.lower(), first
+    assert b"should not be sent" not in first, first
+    assert second.startswith(b"HTTP/1.1 205"), f"keep-alive desynchronised: {second[:60]!r}"
+    loop._core.listener_close(lid)
+
+
+def test_204_stays_self_framing(loop):
+    """The 205 change must not give 204 a content-length: rule 1 makes it
+    self-framing and a framing header there is what desynchronises."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(
+        _request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+    )
+    assert resp.startswith(b"HTTP/1.1 204"), resp[:40]
+    assert b"content-length" not in resp.lower(), resp
+    loop._core.listener_close(lid)

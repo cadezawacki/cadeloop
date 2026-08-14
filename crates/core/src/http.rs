@@ -167,12 +167,35 @@ struct Acc {
     /// receipt is NOT head time (a slow upload falls under keep-alive
     /// idle policy instead).
     in_head: bool,
+    /// The head just parsed carried `Expect: 100-continue` and the caller
+    /// still owes the client an interim response (RFC 7231 5.1.1).
+    owes_continue: bool,
 }
 
 impl Acc {
     fn fail(&mut self, status: u16, reason: &'static str) -> c_int {
         self.error = Some(ParseError { status, reason });
         -1
+    }
+
+    /// `Content-Length` as declared by the head, if it parses. llhttp has
+    /// already rejected conflicting or malformed ones by this point.
+    fn declared_content_length(&self) -> Option<u64> {
+        let (_, v) = self.headers.iter().find(|(n, _)| n.as_slice() == b"content-length")?;
+        std::str::from_utf8(v).ok()?.trim().parse::<u64>().ok()
+    }
+
+    /// `Expect: 100-continue`. The field is a comma-separated list of
+    /// expectations and the token is case-insensitive (RFC 7231 5.1.1);
+    /// any other expectation is one we do not understand, and the spec's
+    /// answer to that is 417 -- which we do not send, because refusing an
+    /// otherwise valid request over an unknown expectation is worse for
+    /// interoperability than ignoring it, and every mainstream server
+    /// ignores it too.
+    fn expects_continue(&self) -> bool {
+        self.headers.iter().filter(|(n, _)| n.as_slice() == b"expect").any(|(_, v)| {
+            v.split(|&b| b == b',').any(|tok| tok.trim_ascii().eq_ignore_ascii_case(b"100-continue"))
+        })
     }
 
     fn commit_header(&mut self) {
@@ -243,6 +266,24 @@ unsafe extern "C" fn on_headers_complete(p: *mut Llhttp) -> c_int {
         if hosts != 1 {
             return a.fail(400, "HTTP/1.1 requires exactly one Host header");
         }
+    }
+    // RFC 7230 3.3.2 / 7231 5.1.1. A declared length over the cap is
+    // known here, before a byte of the body has been read: refusing now
+    // costs one response instead of buffering an upload we have already
+    // decided to reject -- and for an `Expect: 100-continue` client it is
+    // the whole point of the expectation, since the client has not sent
+    // the body yet and never will.
+    if let Some(cap) = a.limits.max_body {
+        if let Some(declared) = a.declared_content_length() {
+            if declared > cap as u64 {
+                return a.fail(413, "body too large");
+            }
+        }
+    }
+    // Otherwise the expectation is honoured: the caller writes the
+    // interim response, because it owns the wire.
+    if minor >= 1 && a.expects_continue() {
+        a.owes_continue = true;
     }
     0
 }
@@ -342,6 +383,7 @@ impl HttpParser {
             completed: VecDeque::new(),
             error: None,
             in_head: false,
+            owes_continue: false,
         });
         unsafe {
             llhttp_init(&mut *raw, HTTP_REQUEST, &SETTINGS);
@@ -382,6 +424,18 @@ impl HttpParser {
     /// A request head is currently mid-receipt (R-080 timeout phase).
     pub fn in_head(&self) -> bool {
         self.acc.in_head
+    }
+
+    /// True once, per head that carried `Expect: 100-continue`.
+    ///
+    /// The caller owns the write queue, so it is the caller that writes
+    /// the interim response; taking the flag here makes it impossible to
+    /// send twice for one request. Without this the client waits out its
+    /// own continue timeout before sending the body -- a fixed stall on
+    /// every upload for clients that use the expectation, and an
+    /// indefinite one for the stricter clients that never give up.
+    pub fn take_owes_continue(&mut self) -> bool {
+        std::mem::take(&mut self.acc.owes_continue)
     }
 }
 
