@@ -40,6 +40,27 @@ def test_subprocess_exec_communicate(loop):
     loop.run_until_complete(main())
 
 
+def test_subprocess_exec_accepts_path_like(loop):
+    """CPython's subprocess_exec passes arguments straight to Popen,
+    which accepts os.PathLike; cadeloop's stricter str/bytes check
+    rejected a pathlib.Path program that works on the standard loop.
+    Reported on PR #1."""
+    import pathlib
+
+    async def main():
+        proc = await asyncio.create_subprocess_exec(
+            pathlib.Path(sys.executable),
+            "-c",
+            "print('ok')",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        out, _err = await asyncio.wait_for(proc.communicate(), 15)
+        assert out.strip() == b"ok"
+        assert proc.returncode == 0
+
+    loop.run_until_complete(main())
+
+
 def test_subprocess_shell_and_returncode(loop):
     async def main():
         proc = await asyncio.create_subprocess_shell(

@@ -11,7 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | Engine-generated errors (400/408/413/431/500...) carried an `HTTP/1.1` status line even for parsed HTTP/1.0 requests | `` |
+> | Loop | `subprocess_exec` rejected `os.PathLike` arguments the standard loop hands to Popen unchecked | `` |
+> | HTTP | Engine-generated errors (400/408/413/431/500...) carried an `HTTP/1.1` status line even for parsed HTTP/1.0 requests | `d70d30f` |
 > | HTTP | `OPTIONS *` was normalized to `/` in the ASGI scope, indistinguishable from an OPTIONS on the root resource | `2a97321` |
 > | Unix | Abstract-namespace socket addresses were reported as lossy strings instead of bytes; non-UTF-8 paths were mangled | `afb64a8` |
 > | Loop | Cancelling `shutdown_default_executor()` produced a spurious `InvalidStateError` when the shutdown thread finished | `5c096bb` |

@@ -1208,9 +1208,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             raise ValueError("bufsize must be 0")
         popen_args = (program,) + args
         for arg in popen_args:
-            if not isinstance(arg, (str, bytes)):
+            # os.PathLike included: CPython performs no check here at all
+            # and hands the tuple to Popen, which accepts path-likes -- a
+            # pathlib.Path program must not fail only on this loop.
+            if not isinstance(arg, (str, bytes, os.PathLike)):
                 raise TypeError(
-                    f"program arguments must be a bytes or text string, not {type(arg).__name__}"
+                    f"program arguments must be a bytes or text string "
+                    f"or os.PathLike, not {type(arg).__name__}"
                 )
         protocol = protocol_factory()
         transport = await self._make_subprocess_transport(
