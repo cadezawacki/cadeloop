@@ -484,9 +484,23 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
     ncpu = os.cpu_count() or 1
     logger.info("cadeloop supervisor: %d workers on http://%s:%s", n, host, port)
     children: dict[int, tuple[int, float]] = {}  # pid -> (idx, spawn_time)
-    for idx in range(n):
-        pid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
-        children[pid] = (idx, time.monotonic())
+    try:
+        for idx in range(n):
+            pid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+            children[pid] = (idx, time.monotonic())
+    except BaseException:
+        # A fork failing partway (a process limit, say) raised before the
+        # signal handlers were installed and before the cleanup block
+        # below, so every worker already started kept serving while the
+        # caller saw startup fail -- holding the port and the application's
+        # resources with no supervisor left to stop them.
+        for pid in children:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+        raise
 
     stopping = False
     exit_code = 0

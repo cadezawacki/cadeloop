@@ -1574,3 +1574,25 @@ def test_304_keeps_application_content_length(loop):
     assert b"content-length: 1234" in head.lower(), head
     assert b'etag: "abc"' in head.lower()
     loop._core.listener_close(lid)
+
+
+def test_http10_request_gets_an_http10_status_line(loop):
+    """The body path already used HTTP/1.0-compatible close-delimited
+    framing for a 1.0 request, but the status line said 1.1 regardless,
+    and a strict 1.0-only client may reject the higher version. Reported
+    by Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(
+        _request(port, b"GET / HTTP/1.0\r\nHost: h\r\n\r\n", read_all=True)
+    )
+    assert resp.startswith(b"HTTP/1.0 200"), resp[:40]
+    # and 1.1 still answers 1.1
+    resp11 = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert resp11.startswith(b"HTTP/1.1 200")
+    loop._core.listener_close(lid)

@@ -435,3 +435,27 @@ def test_pre_accept_flood_is_bounded(loop):
     rest = loop.run_until_complete(main())
     assert b"101 Switching Protocols" not in rest, "flood was accepted, not capped"
     loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize(
+    "header", [b"sec-websocket-accept", b"sec-websocket-protocol", b"upgrade", b"connection"]
+)
+def test_reserved_upgrade_headers_are_rejected(loop, header):
+    """The server generates the handshake fields itself; an app adding its
+    own produces a 101 with conflicting duplicates that a compliant client
+    may reject. Reported by Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept", "headers": [(header, b"x")]})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(port)
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"101" not in head.split(b"\r\n", 1)[0], head[:60]
+    loop._core.listener_close(lid)

@@ -926,8 +926,13 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         }
         // Serialize caller headers OUTSIDE the cell (arbitrary Python
         // objects), then commit in-cell.
+        // Answer in the version the client spoke. The body path already
+        // uses HTTP/1.0-compatible close-delimited framing for a 1.0
+        // request, but the status line said 1.1 regardless, and a strict
+        // 1.0-only client may reject the higher version outright.
+        let minor = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.active_minor).unwrap_or(1))?;
         let mut head: Vec<u8> = Vec::with_capacity(256);
-        head.extend_from_slice(b"HTTP/1.1 ");
+        head.extend_from_slice(if minor == 0 { b"HTTP/1.0 " } else { b"HTTP/1.1 " });
         head.extend_from_slice(status.to_string().as_bytes());
         head.push(b' ');
         head.extend_from_slice(status_text(status).as_bytes());
@@ -1469,6 +1474,20 @@ fn ws_send(
                     if let Err(why) = validate_response_header(&name, &value) {
                         return Err(PyRuntimeError::new_err(format!(
                             "websocket.accept sent an invalid response header: {why}"
+                        )));
+                    }
+                    // The server generates the handshake fields itself.
+                    // Letting an app add its own produces a 101 with
+                    // conflicting duplicates, which a compliant client may
+                    // reject and intermediaries may resolve differently.
+                    // Subprotocol selection has its own dedicated key.
+                    const RESERVED: [&[u8]; 4] =
+                        [b"sec-websocket-accept", b"sec-websocket-protocol", b"upgrade", b"connection"];
+                    if RESERVED.iter().any(|r| name.eq_ignore_ascii_case(r)) {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "websocket.accept may not set {:?}; it is part of the handshake \
+                             the server generates (use 'subprotocol' to select one)",
+                            String::from_utf8_lossy(&name)
                         )));
                     }
                     extra.push((name, value));
