@@ -11,3 +11,4 @@ build/
 .hypothesis/
 bench/results/
 proptest-regressions/
+.claude/worktrees/
