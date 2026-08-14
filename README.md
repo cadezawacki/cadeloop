@@ -11,7 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | CI | Actions ran from moving tags and a branch; now pinned to commit SHAs | `` |
+> | CI | Actions ran from moving tags and a branch; now pinned to commit SHAs | `becb220` |
 > | HTTP | Request trailers were merged into `scope["headers"]`, smuggling a second `Host` | `7249648` |
 > | WS | Empty frames cost nothing against the inbox budget, so it never bounded the queue | `7249648` |
 > | WS | `Upgrade` was compared whole instead of parsed as a token list | `7249648` |
