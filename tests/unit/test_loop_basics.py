@@ -640,3 +640,171 @@ def test_signal_handler_fires_during_idle_park():
         lp.remove_signal_handler(sig)
     finally:
         lp.close()
+
+
+# --------------------------------------------------------------------- #
+# native create_task / create_future fast paths (R-050)                 #
+# --------------------------------------------------------------------- #
+
+
+def test_create_task_fast_path_is_a_real_asyncio_task(loop):
+    """The vectorcall path must build the same objects the Python path
+    did -- a real asyncio.Task owned by the facade, not by the core."""
+
+    async def work():
+        return 7
+
+    async def main():
+        t = loop.create_task(work())
+        assert isinstance(t, asyncio.Task)
+        assert t.get_loop() is loop
+        assert await t == 7
+
+    loop.run_until_complete(main())
+    f = loop.create_future()
+    assert isinstance(f, asyncio.Future)
+    assert f.get_loop() is loop
+    f.set_result(None)
+
+
+def test_create_task_forwards_name_and_context(loop):
+    """name= / context= are only threaded into the vectorcall when
+    supplied, so both must still land."""
+    var = contextvars.ContextVar("v", default="default")
+    ctx = contextvars.copy_context()
+    ctx.run(var.set, "from-ctx")
+    seen = []
+
+    async def work():
+        seen.append(var.get())
+
+    async def main():
+        t = loop.create_task(work(), name="named", context=ctx)
+        assert t.get_name() == "named"
+        await t
+
+    loop.run_until_complete(main())
+    assert seen == ["from-ctx"]
+
+
+def test_create_task_rejects_unknown_kwarg(loop):
+    """An unmodelled keyword falls back to the facade, which forwards it
+    to asyncio.Task -- so the error is the stdlib's, not a cadeloop
+    'unexpected keyword argument create_task()' from the shim."""
+
+    async def work():
+        pass
+
+    coro = work()
+    try:
+        with pytest.raises(TypeError):
+            loop.create_task(coro, no_such_kwarg=1)
+    finally:
+        coro.close()
+
+
+def test_create_task_on_closed_loop_raises(loop):
+    async def work():
+        pass
+
+    coro = work()
+    loop.close()
+    try:
+        with pytest.raises(RuntimeError, match="closed"):
+            loop.create_task(coro)
+    finally:
+        coro.close()
+
+
+def test_task_factory_takes_back_the_fast_path(loop):
+    """Setting a factory must unbind the native fast path, and clearing
+    it must put the fast path back -- otherwise the factory is silently
+    ignored (or permanently sticky)."""
+    made = []
+
+    def factory(lp, coro, context=None):
+        t = asyncio.Task(coro, loop=lp, context=context)
+        made.append(t)
+        return t
+
+    async def one():
+        await loop.create_task(asyncio.sleep(0))
+
+    loop.set_task_factory(factory)
+    loop.run_until_complete(one())
+    # run_until_complete wraps its own coroutine in a task too, so the
+    # factory sees two -- the count matters only as a delta.
+    with_factory = len(made)
+    assert with_factory >= 1
+
+    loop.set_task_factory(None)
+    loop.run_until_complete(one())
+    assert len(made) == with_factory, "factory still used after set_task_factory(None)"
+
+
+def test_subclass_override_is_not_shadowed_by_the_fast_path():
+    """Binding a native method onto the instance would shadow a subclass
+    override. A subclass has every right to expect its own method to be
+    called, so the fast path must stand down for it."""
+    calls = []
+
+    class MyLoop(cadeloop.Loop):
+        def create_task(self, coro, *, name=None, context=None, **kw):
+            calls.append("task")
+            return super().create_task(coro, name=name, context=context, **kw)
+
+        def create_future(self):
+            calls.append("future")
+            return super().create_future()
+
+    lp = MyLoop()
+    try:
+        fut = lp.create_future()
+        fut.set_result(None)
+        lp.run_until_complete(lp.create_task(asyncio.sleep(0)))
+    finally:
+        lp.close()
+    assert calls == ["future", "task"]
+
+
+def test_debug_mode_still_trims_the_source_traceback(loop):
+    """Debug mode routes back through the facade so that the
+    `del task._source_traceback[-1]` frame trim still happens -- the
+    native path has no Python frame to trim."""
+
+    async def work():
+        pass
+
+    loop.set_debug(True)
+    try:
+        t = loop.create_task(work())
+        assert t._source_traceback
+        # The trimmed entry is the facade's own create_task line; what is
+        # left must end at this test function.
+        assert t._source_traceback[-1].name == (
+            "test_debug_mode_still_trims_the_source_traceback"
+        )
+        loop.run_until_complete(t)
+    finally:
+        loop.set_debug(False)
+
+
+def test_closed_loop_is_collectable():
+    """`Loop.__dict__` holds the core and the core holds bound methods of
+    the Loop (the error hooks, and the owner reference the native
+    create_task fast path needs). Without a tp_traverse on the core the
+    collector could not see that cycle, so every closed loop stayed
+    allocated for the life of the process."""
+    import gc
+    import weakref
+
+    refs = []
+    for _ in range(3):
+        lp = cadeloop.Loop()
+        refs.append(weakref.ref(lp))
+        lp.close()
+        del lp
+    gc.collect()
+    gc.collect()
+    alive = sum(1 for r in refs if r() is not None)
+    assert alive == 0, f"{alive}/{len(refs)} closed loops were never collected"

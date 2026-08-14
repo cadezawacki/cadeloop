@@ -128,6 +128,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self.stats = core.stats  # R-103
 
         self._task_factory = None
+        core.set_owner(self)
+        self._rebind_task_fastpath()
         self._exception_handler = None
         self._default_executor = None
         self._executor_shutdown_called = False
@@ -321,20 +323,26 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # futures & tasks                                                    #
     # ------------------------------------------------------------------ #
 
+    # Both of these are shadowed on the instance by native vectorcall fast
+    # paths (see _rebind_task_fastpath). They stay here as the general
+    # implementation: the native create_task hands anything it does not
+    # model -- debug mode, a **kwarg a newer CPython grew -- straight back
+    # to this method, and a task factory unbinds the fast path outright.
+
     def create_future(self):
         return futures.Future(loop=self)
 
-    def create_task(self, coro, *, name=None, context=None):
+    def create_task(self, coro, *, name=None, context=None, **kwargs):
         self._check_closed()
         if self._task_factory is None:
-            task = tasks.Task(coro, loop=self, name=name, context=context)
+            task = tasks.Task(coro, loop=self, name=name, context=context, **kwargs)
             if task._source_traceback:
                 del task._source_traceback[-1]
         else:
             if context is None:
-                task = self._task_factory(self, coro)
+                task = self._task_factory(self, coro, **kwargs)
             else:
-                task = self._task_factory(self, coro, context=context)
+                task = self._task_factory(self, coro, context=context, **kwargs)
             if name is not None:
                 try:
                     set_name = task.set_name
@@ -344,10 +352,32 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     set_name(name)
         return task
 
+    def _rebind_task_fastpath(self):
+        """(Re)install the native create_task/create_future fast paths.
+
+        R-050: binding the native method straight onto the instance means
+        ``loop.create_task(coro)`` resolves to it with no Python frame in
+        between. Two things take that back:
+
+        * a task factory -- the native path only builds ``asyncio.Task``;
+        * a subclass that overrides either method -- an instance attribute
+          would otherwise shadow the override, which is a silent way to
+          break a subclass that has every right to expect its method to be
+          called.
+        """
+        cls = type(self)
+        if cls.create_future is Loop.create_future:
+            self.create_future = self._core.create_future
+        if self._task_factory is None and cls.create_task is Loop.create_task:
+            self.create_task = self._core.create_task
+        else:
+            self.__dict__.pop("create_task", None)
+
     def set_task_factory(self, factory):
         if factory is not None and not callable(factory):
             raise TypeError("task factory must be a callable or None")
         self._task_factory = factory
+        self._rebind_task_fastpath()
 
     def get_task_factory(self):
         return self._task_factory

@@ -5,6 +5,7 @@ mod gil_boundary;
 mod handles;
 mod http;
 mod net;
+mod taskfast;
 
 use pyo3::prelude::*;
 

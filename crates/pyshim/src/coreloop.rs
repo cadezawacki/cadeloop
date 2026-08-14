@@ -35,10 +35,12 @@ use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::{PyTraverseError, PyVisit};
 
 use crate::gil_boundary::StateCell;
 use crate::handles::{run_handle, DispatchOutcome, Handle, TimerHandle};
 use crate::net::{self, NetEvent, NetState, Transport};
+use crate::taskfast;
 
 pub(crate) struct LoopState {
     pub reactor: Reactor<Py<PyAny>>,
@@ -69,6 +71,11 @@ pub struct CoreLoop {
     net_error_hook: OnceLock<Py<PyAny>>,
     /// Facade hook: `(handle, seconds) -> None` (R-142 slow callbacks).
     slow_callback_hook: OnceLock<Py<PyAny>>,
+    /// The `cadeloop.Loop` facade that owns this core, so the native
+    /// `create_task` / `create_future` fast paths can pass `loop=` without
+    /// a round trip through Python. Strong, like the hooks above -- the
+    /// facade and its core have the same lifetime.
+    owner: OnceLock<Py<PyAny>>,
     high_water: usize,
     low_water: usize,
 }
@@ -80,6 +87,44 @@ impl CoreLoop {
         } else {
             Ok(())
         }
+    }
+
+    fn require_owner(&self) -> PyResult<&Py<PyAny>> {
+        self.owner.get().ok_or_else(|| {
+            PyRuntimeError::new_err("cadeloop: core has no owning Loop (set_owner was never called)")
+        })
+    }
+
+    /// Hand a `create_task` call the native path does not model back to the
+    /// facade's own method. Looked up on the *type*, never the instance, so
+    /// this cannot re-enter the native binding the facade installed on the
+    /// instance -- and so a `Loop` subclass that overrides `create_task`
+    /// still gets its override (the facade only installs the fast path when
+    /// the method is unoverridden, which makes the type lookup exact).
+    fn create_task_via_facade(
+        &self,
+        py: Python<'_>,
+        owner: &Py<PyAny>,
+        coro: Bound<'_, PyAny>,
+        name: Option<Bound<'_, PyAny>>,
+        context: Option<Bound<'_, PyAny>>,
+        kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let owner = owner.bind(py);
+        let slow = owner.get_type().getattr(intern!(py, "create_task"))?;
+        let kw = PyDict::new(py);
+        if let Some(extra) = kwargs {
+            for (k, v) in extra.iter() {
+                kw.set_item(k, v)?;
+            }
+        }
+        if let Some(n) = name {
+            kw.set_item(intern!(py, "name"), n)?;
+        }
+        if let Some(c) = context {
+            kw.set_item(intern!(py, "context"), c)?;
+        }
+        slow.call((owner, coro), Some(&kw)).map(Bound::unbind)
     }
 
     fn now_ns(&self) -> PyResult<Ticks> {
@@ -531,6 +576,7 @@ impl CoreLoop {
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
             slow_callback_hook: OnceLock::new(),
+            owner: OnceLock::new(),
             high_water,
             low_water,
         })
@@ -1214,6 +1260,81 @@ impl CoreLoop {
         })??;
         self.drain_graveyards(py)?;
         Ok(removed)
+    }
+
+    // ---- tasks & futures (R-050 native fast paths) -------------------------
+
+    /// Give the core a reference to the `cadeloop.Loop` that wraps it, so
+    /// `create_task` / `create_future` can pass `loop=` themselves.
+    ///
+    /// Idempotent and set-once: the facade calls it from `__init__`.
+    fn set_owner(&self, owner: Bound<'_, PyAny>) {
+        let _ = self.owner.set(owner.unbind());
+    }
+
+    /// `asyncio.Future(loop=<facade>)`, constructed by vectorcall.
+    ///
+    /// Bound onto the facade instance as `Loop.create_future`, so the
+    /// attribute lookup lands on this native method directly -- no Python
+    /// frame, no keyword-dict marshalling.
+    fn create_future(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let owner = self.require_owner()?;
+        taskfast::create_future(py, owner)
+    }
+
+    /// `asyncio.Task(coro, loop=<facade>)`, constructed by vectorcall.
+    ///
+    /// `name` / `context` are forwarded only when supplied. Anything this
+    /// signature does not model -- a `**kwargs` a newer CPython grew, or
+    /// debug mode, which wants the `_source_traceback` trim the facade
+    /// does -- falls back to the facade's own `create_task`. The facade
+    /// unbinds this method entirely while a task factory is installed, so
+    /// the factory branch is not reachable from here.
+    #[pyo3(signature = (coro, *, name=None, context=None, **kwargs))]
+    fn create_task(
+        &self,
+        py: Python<'_>,
+        coro: Bound<'_, PyAny>,
+        name: Option<Bound<'_, PyAny>>,
+        context: Option<Bound<'_, PyAny>>,
+        kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.check_closed()?;
+        let owner = self.require_owner()?;
+        let extra = kwargs.as_ref().is_some_and(|kw| !kw.is_empty());
+        if extra || self.debug.load(Ordering::Relaxed) {
+            return self.create_task_via_facade(py, owner, coro, name, context, kwargs);
+        }
+        let name = name.filter(|n| !n.is_none());
+        let context = context.filter(|c| !c.is_none());
+        taskfast::create_task(py, owner, &coro, name.as_ref(), context.as_ref())
+    }
+
+    // ---- gc ----------------------------------------------------------------
+
+    /// Let the cycle collector see the facade the core points back at.
+    ///
+    /// `Loop.__dict__` holds the core; the core holds the facade -- both
+    /// through `owner` and through the three hooks, each of which is a
+    /// bound method of the facade. Without a `tp_traverse` the collector
+    /// cannot see that edge, so every closed loop stayed unreachable *and*
+    /// uncollectable: a process that creates and closes loops (a test
+    /// suite, a worker that restarts its loop) accumulated one dead
+    /// `Loop` per cycle forever. Being traversable is enough to fix it --
+    /// the collector breaks the cycle through the facade's own `tp_clear`,
+    /// which clears its `__dict__`.
+    ///
+    /// Only the slots reachable without borrowing the state cell are
+    /// visited. Under-reporting in `tp_traverse` costs at most a missed
+    /// collection, never a premature free -- and by the time a loop is
+    /// garbage, `close()` has already emptied the cell.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for slot in [&self.owner, &self.error_hook, &self.net_error_hook, &self.slow_callback_hook] {
+            if let Some(obj) = slot.get() {
+                visit.call(obj)?;
+            }
+        }
+        Ok(())
     }
 
     // ---- hooks / config ----------------------------------------------------
