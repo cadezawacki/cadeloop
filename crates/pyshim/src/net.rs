@@ -83,6 +83,21 @@ pub(crate) enum OpTarget {
     },
 }
 
+/// Resources a cancelled kernel operation still owns.
+///
+/// `CancelIoEx` only *requests* cancellation: IOCP may keep reading a send
+/// buffer or writing a recv buffer until that op's (ABORTED) completion is
+/// dequeued. Teardown therefore hands the op's buffers here instead of
+/// freeing them, and the reap in `dispatch_completions` releases them once
+/// the kernel is provably finished (R-037/R-073).
+pub(crate) enum ReapGuard {
+    /// A pool slot the kernel may still write into.
+    Slot(SlotId),
+    /// Write buffers the kernel may still read from. Dropped via
+    /// `graveyard_bufs`, never in-cell: `WriteBuf::Bytes` owns a `Py`.
+    Writes(Vec<WriteBuf>),
+}
+
 pub(crate) enum WriteBuf {
     /// Zero-copy retained `bytes` (R-074). `ptr` stays valid while `keep`
     /// holds the reference (bytes are immutable and pinned by refcount).
@@ -227,6 +242,8 @@ pub(crate) struct NetState {
     /// Watch-callback handles to enqueue on the reactor ready queue.
     pub ready_scratch: Vec<Py<PyAny>>,
     /// Python refs & buffers to drop outside the cell (see gil_boundary).
+    /// Buffers owned by cancelled-but-unreaped ops, keyed by op.
+    pub reap_guards: HashMap<OpId, ReapGuard>,
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
@@ -443,6 +460,50 @@ fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_
     }
 }
 
+/// Cancel a stream transport's in-flight ops and keep every buffer the
+/// kernel might still touch alive until the completions are reaped.
+///
+/// Two things must NOT happen here, and both used to:
+///   * removing the op from `net.ops` — the completion then falls through
+///     `dispatch_completions`'s `else { continue }`, so the recv slot's
+///     op-reference (R-073) is never released and the slot leaks for the
+///     life of the process;
+///   * dropping the write queue with the entry — `post_send` points WSABUFs
+///     straight at `WriteBuf` memory, so freeing it while an ABORTED
+///     completion is still outstanding is a use-after-free.
+fn cancel_transport_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut TransportEntry) {
+    if let Some(op) = entry.recv_op.take() {
+        let _ = backend.cancel(op);
+        // Mapping deliberately left in place: `on_recv_done` tolerates a
+        // dead tid, and the dispatcher releases the op's slot reference.
+    }
+    if let Some(op) = entry.send_op.take() {
+        let _ = backend.cancel(op);
+        let wq: Vec<WriteBuf> = entry.wq.drain(..).collect();
+        if !wq.is_empty() {
+            net.reap_guards.insert(op, ReapGuard::Writes(wq));
+        }
+    }
+    entry.queued_bytes = 0;
+}
+
+/// Same discipline for datagram endpoints. The recv slot has only ONE
+/// reference (the entry's — `post_recv_from` takes no op reference), so it
+/// is moved into the guard rather than released.
+fn cancel_dgram_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut DatagramEntry) {
+    if let Some(op) = entry.recv_op.take() {
+        let _ = backend.cancel(op);
+        if let Some(slot) = entry.recv_slot.take() {
+            net.reap_guards.insert(op, ReapGuard::Slot(slot));
+        }
+    }
+    if let Some(op) = entry.send_op.take() {
+        // The payload was copied into the op slot by `post_send_to`, so the
+        // slab keeps it alive; nothing of ours is still in kernel hands.
+        let _ = backend.cancel(op);
+    }
+}
+
 /// Tear a connection down: cancel ops, close the socket, emit ConnLost.
 /// `err` None = orderly close. In-cell; entry moves to the graveyard.
 pub(crate) fn teardown_with(
@@ -458,13 +519,12 @@ pub(crate) fn teardown_with(
         return;
     }
     entry.conn_lost = true;
-    for op in [entry.recv_op.take(), entry.send_op.take()].into_iter().flatten() {
-        let _ = backend.cancel(op);
-        net.ops.remove(&op);
-    }
+    cancel_transport_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
     netsys::close(entry.socket);
     if let Some(slot) = entry.recv_slot.take() {
+        // The transport's own reference. The posted op holds a second one
+        // (R-073) that only the reap releases.
         net.buffers.release(slot);
     }
     match &mut entry.proto {
@@ -487,10 +547,7 @@ pub(crate) fn teardown_with(
 pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err: Option<u32>) {
     let Some(mut entry) = net.transports.remove(&tid) else { return };
     entry.conn_lost = true;
-    for op in [entry.recv_op.take(), entry.send_op.take()].into_iter().flatten() {
-        let _ = backend.cancel(op);
-        net.ops.remove(&op);
-    }
+    cancel_transport_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
     netsys::close(entry.socket);
     if let Some(slot) = entry.recv_slot.take() {
@@ -755,10 +812,7 @@ pub(crate) fn udp_close(py: Python<'_>, net: &mut NetState, backend: Backend<'_>
 /// refs drop via the graveyard outside the cell.
 pub(crate) fn udp_teardown_at_close(net: &mut NetState, backend: Backend<'_>, did: u64) {
     let Some(mut entry) = net.datagrams.remove(&did) else { return };
-    for op in [entry.recv_op.take(), entry.send_op.take()].into_iter().flatten() {
-        let _ = backend.cancel(op);
-        net.ops.remove(&op);
-    }
+    cancel_dgram_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
     netsys::close(entry.socket);
     if let Some(slot) = entry.recv_slot.take() {
@@ -775,10 +829,7 @@ fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u
         return;
     }
     entry.conn_lost = true;
-    for op in [entry.recv_op.take(), entry.send_op.take()].into_iter().flatten() {
-        let _ = backend.cancel(op);
-        net.ops.remove(&op);
-    }
+    cancel_dgram_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
     netsys::close(entry.socket);
     if let Some(slot) = entry.recv_slot.take() {
@@ -942,7 +993,9 @@ pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u
     listener.closing = true;
     for op in listener.accept_ops.drain(..) {
         let _ = backend.cancel(op);
-        net.ops.remove(&op);
+        // Mapping kept: `on_accept_done` already knows how to reap a
+        // socket AcceptEx produced for a listener that has since closed,
+        // but only if the completion still resolves to this lid.
     }
     backend.detach_socket(listener.socket);
     netsys::close(listener.socket);
@@ -998,6 +1051,19 @@ pub(crate) fn translate(
                 }
             }
             Completion::Io { op, bytes, os_error } => {
+                // Before anything else, and before the `continue` below:
+                // the kernel is done with this op, so any buffers held
+                // back for it can finally be freed.
+                if let Some(guard) = net.reap_guards.remove(&op) {
+                    match guard {
+                        ReapGuard::Slot(slot) => {
+                            net.buffers.release(slot);
+                        }
+                        // ADR-5: a `WriteBuf::Bytes` decref must not run
+                        // inside the cell.
+                        ReapGuard::Writes(bufs) => net.graveyard_bufs.extend(bufs),
+                    }
+                }
                 let Some(target) = net.ops.remove(&op) else { continue };
                 match target {
                     OpTarget::Recv { tid, slot } => {

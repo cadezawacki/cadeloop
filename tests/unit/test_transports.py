@@ -1066,3 +1066,114 @@ async def _drip_app(scope, receive, send):
         {"type": "http.response.start", "status": 200, "headers": []}
     )
     await send({"type": "http.response.body", "body": scope["raw_path"]})
+
+
+def test_graceful_close_leaves_no_pool_slots_behind(loop):
+    """Baseline for the two below: an ordinary close must not retain pool
+    slots. Its recv has normally already completed with EOF, so this does
+    not exercise the cancellation path — it pins the steady state that the
+    cancellation tests measure against."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        for _ in range(25):
+            reader, writer = await asyncio.open_connection(*addr)
+            writer.write(b"ping")
+            await writer.drain()
+            assert await reader.readexactly(4) == b"ping"
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+        server.close()
+        await server.wait_closed()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_abort_with_ops_in_flight_releases_pool_slots(loop):
+    """R-073: `abort()` cancels a posted recv, and `CancelIoEx`/`ECANCELED`
+    only *requests* cancellation — the op's buffer reference is released
+    when the completion is finally reaped. Dropping the op mapping at
+    teardown (as the code used to) orphaned that completion, so every
+    aborted connection leaked its pool slot for the life of the process.
+
+    The queued writes matter too, though this counter cannot see them:
+    `post_send` points the kernel straight at the queued `WriteBuf` memory,
+    which teardown used to drop with the transport entry. That is a
+    use-after-free rather than a leak, so it shows up under PageHeap/ASan,
+    not here — this test at least drives the path. Both reported by Codex
+    review on PR #1.
+    """
+    import threading
+
+    payload = b"x" * (256 * 1024)  # big enough to stay queued
+
+    # A peer that accepts and never reads, deliberately NOT a cadeloop
+    # server: only the client side should own pool slots, so the assertion
+    # measures this loop and nothing else.
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(16)
+    addr = lsock.getsockname()
+    accepted = []
+    stop = threading.Event()
+
+    def acceptor():
+        while not stop.is_set():
+            try:
+                c, _ = lsock.accept()
+            except OSError:
+                return
+            accepted.append(c)
+
+    t = threading.Thread(target=acceptor, daemon=True)
+    t.start()
+
+    async def main():
+        for _ in range(10):
+            _reader, writer = await asyncio.open_connection(*addr)
+            for _ in range(8):
+                writer.write(payload)
+            writer.transport.abort()  # recv AND send cancelled in flight
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+
+    try:
+        loop.run_until_complete(main())
+        assert loop._core.stats()["buffers_in_use"] == 0
+    finally:
+        stop.set()
+        lsock.close()
+        for c in accepted:
+            c.close()
+        t.join(timeout=2)
+
+
+def test_datagram_close_releases_its_recv_slot(loop):
+    """A datagram endpoint's recv slot has a single reference, so releasing
+    it straight after `cancel()` handed a still-kernel-owned buffer back to
+    the pool. It now travels with the op and is released on reap."""
+
+    class P(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            pass
+
+    async def main():
+        for _ in range(15):
+            transport, _proto = await loop.create_datagram_endpoint(
+                P, local_addr=("127.0.0.1", 0)
+            )
+            transport.close()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
