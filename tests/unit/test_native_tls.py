@@ -142,6 +142,31 @@ def test_plaintext_to_tls_port_is_dropped(loop, certs):
     loop._core.listener_close(lid)
 
 
+def test_tls_parse_error_answered_in_pipeline_order(loop, certs):
+    """Parity with the plaintext path: a request that completed ahead of
+    malformed bytes in the same TLS record is answered before the 400,
+    not dropped in its favour. Reported on PR #1."""
+    server_ctx, client_ctx = certs
+    lid, port = listen_tls(loop, scope_echo_app, server_ctx)
+
+    async def main():
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", port, ssl=client_ctx, server_hostname="localhost"
+        )
+        writer.write(b"GET /ok HTTP/1.1\r\nhost: localhost\r\n\r\nGARBAGE\r\n\r\n")
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        return data
+
+    data = loop.run_until_complete(main())
+    assert data.startswith(b"HTTP/1.1 200 OK\r\n"), data[:64]
+    at = data.find(b"HTTP/1.1 400 ")
+    assert at > 0, data
+    assert b"path=/ok" in data[:at]
+    loop._core.listener_close(lid)
+
+
 def test_serve_rejects_non_context():
     with pytest.raises(TypeError, match="SSLContext"):
         cadeloop.serve(scope_echo_app, ssl="not-a-context")

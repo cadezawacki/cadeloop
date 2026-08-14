@@ -106,6 +106,13 @@ pub(crate) struct HttpConn {
     pub(crate) active_minor: u8,
     /// Body of the ACTIVE request, taken by the first `receive()`.
     pub(crate) req_body: Option<Vec<u8>>,
+    /// A parse error's serialized response, parked while earlier
+    /// pipelined requests are still owed theirs: the 400 has a position
+    /// in the response order like any other response, and writing it the
+    /// moment the parse failed handed it to the client as (or spliced
+    /// into) the answer to a different request. `finish_request` releases
+    /// it once everything ahead of it has been answered.
+    pub(crate) deferred_error: Option<Vec<u8>>,
     pub(crate) disconnected: bool,
     /// Pending receive() waiter, resolved with http.disconnect.
     pub(crate) recv_waiter: Option<Py<PyAny>>,
@@ -285,6 +292,7 @@ impl HttpConn {
             trailers_started: false,
             active_minor: 1,
             req_body: None,
+            deferred_error: None,
             disconnected: false,
             recv_waiter: None,
             drain_waiter: None,
@@ -353,14 +361,20 @@ pub(crate) struct FeedOutcome {
 pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome, ParseError> {
     conn.activity = conn.activity.wrapping_add(1);
     conn.saw_bytes = true;
-    if let Some(offset) = conn.parser.feed(data)? {
-        // Upgrade head complete (R-087): bytes past it are NOT HTTP —
-        // they belong to the upgraded protocol (early client WS frames).
-        conn.ws_trailing.extend_from_slice(&data[offset..]);
-    }
+    let fed = conn.parser.feed(data);
+    // Drained BEFORE the error check: the parser keeps requests that
+    // completed ahead of the malformed bytes, and each is still owed a
+    // response in its position -- before the 400. Propagating the error
+    // first dropped them, and the client read the 400 as the answer to
+    // the first request it was still waiting on.
     while let Some(req) = conn.parser.next_request() {
         conn.pending_bytes += req.queued_size();
         conn.pending.push_back(req);
+    }
+    if let Some(offset) = fed? {
+        // Upgrade head complete (R-087): bytes past it are NOT HTTP —
+        // they belong to the upgraded protocol (early client WS frames).
+        conn.ws_trailing.extend_from_slice(&data[offset..]);
     }
     Ok(FeedOutcome {
         pump: !conn.pending.is_empty() && !conn.active,
@@ -375,6 +389,39 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
 /// continue timeout before sending -- a fixed stall on every upload for
 /// the clients that use it, and an indefinite one for the strict ones.
 pub(crate) const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// R-086, shared by the plaintext and TLS ingest paths: answer a parse
+/// error in its pipeline position. An idle connection is answered (and
+/// close-marked) immediately; while earlier requests are active or
+/// queued, the response parks on the connection instead and
+/// `finish_request` releases it once the last of them has been answered.
+/// Returns whether the caller should pump -- valid requests drained from
+/// the same buffer still get served ahead of the parked 400. Reading
+/// stops either way (neither caller re-posts a recv after an error): the
+/// parser is dead, so later bytes change nothing, and a second error
+/// from them must not displace the parked response.
+pub(crate) fn conn_parse_failed(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: net::Backend<'_>,
+    tid: u64,
+    err: ParseError,
+) -> bool {
+    let Some(conn) = net.http_conn_mut(tid) else { return false };
+    if conn.deferred_error.is_some() {
+        return false;
+    }
+    let resp = error_response(err);
+    if conn.active || !conn.pending.is_empty() {
+        let pump = !conn.active;
+        conn.deferred_error = Some(resp);
+        pump
+    } else {
+        net::http_enqueue(py, net, backend, tid, resp);
+        net::http_close_after_write(py, net, backend, tid);
+        false
+    }
+}
 
 /// In-cell: serialized minimal error response (400/413/414/431/500).
 pub(crate) fn error_response(err: ParseError) -> Vec<u8> {
@@ -1685,11 +1732,9 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
                     outcome.pump
                 }
                 Err(e) => {
-                    // R-086 parity: answer in-cell (staged via TLS), close.
-                    let resp = error_response(e);
-                    net::http_enqueue(py, net, backend, tid, resp);
-                    net::http_close_after_write(py, net, backend, tid);
-                    false
+                    // R-086 parity: answered in its pipeline position
+                    // (conn_parse_failed), staged via TLS.
+                    conn_parse_failed(py, net, backend, tid, e)
                 }
             }
         }
@@ -2574,17 +2619,26 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
         let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
         let log = take_access_record(py, net, tid, now_ns);
-        let (waiter, driver, close) = {
+        let (waiter, driver, close, parked_error) = {
             let Some(conn) = net.http_conn_mut(tid) else { return (None, None) };
             conn.active = false;
             conn.req_body = None;
             conn.activity = conn.activity.wrapping_add(1);
-            (conn.take_recv_waiter(), conn.driver.take(), !conn.keep_alive || conn.disconnected)
+            // A parse error parked by conn_parse_failed goes out only
+            // once everything ahead of it in the pipeline is answered.
+            let parked_error = if conn.pending.is_empty() { conn.deferred_error.take() } else { None };
+            (conn.take_recv_waiter(), conn.driver.take(), !conn.keep_alive || conn.disconnected, parked_error)
         };
         if let Some(d) = driver {
             net.graveyard_py.push(d.into_any());
         }
         if close {
+            // The response that just finished was close-marked: the
+            // connection ends here, and a parked 400 (if any) has
+            // nowhere valid to go after a close-delimited exchange.
+            net::http_close_after_write(py, net, backend, tid);
+        } else if let Some(resp) = parked_error {
+            net::http_enqueue(py, net, backend, tid, resp);
             net::http_close_after_write(py, net, backend, tid);
         } else {
             // R-085: a request just left the pipeline queue, so the budget

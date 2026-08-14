@@ -1811,11 +1811,14 @@ fn on_recv_done(
         }
     }
     if let Some(err) = parse_err {
-        // R-086: malformed request answered entirely in-cell, then closed.
-        let resp = crate::http::error_response(err);
-        http_enqueue(py, net, backend, tid, resp);
-        http_close_after_write(py, net, backend, tid);
-        return; // no recv re-post
+        // R-086: malformed request answered entirely in-cell -- in its
+        // pipeline position (conn_parse_failed): requests already being
+        // served keep the response order, and valid ones drained from
+        // this same buffer are pumped ahead of the parked 400.
+        if crate::http::conn_parse_failed(py, net, backend, tid, err) {
+            net.events.push(NetEvent::HttpPump { tid });
+        }
+        return; // no recv re-post: the parser is dead
     }
     if continue_owed {
         // Before the body, not after: the client is holding it back until

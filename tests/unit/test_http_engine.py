@@ -328,6 +328,67 @@ def test_malformed_request_400(loop):
     loop._core.listener_close(lid)
 
 
+def test_parse_error_waits_for_inflight_response(loop):
+    """A malformed pipelined request must be answered in its pipeline
+    position. Enqueueing the 400 the moment the parse fails let the
+    client read it as the response to an earlier valid request that was
+    still being served (or spliced into that response's unfinished
+    body). Reported on PR #1."""
+    release = asyncio.Event()
+
+    async def app(scope, receive, send):
+        await release.wait()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"first"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        burst = b"GET /ok HTTP/1.1\r\nHost: h\r\n\r\nGARBAGE\r\n\r\n"
+        writer.write(burst)
+        await writer.drain()
+        # Release the app only once the server has consumed the malformed
+        # bytes too, so slow delivery cannot mask the reordering.
+        while loop._core.stats()["bytes_received"] < len(burst):
+            await asyncio.sleep(0.01)
+        release.set()
+        data = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        return data
+
+    data = loop.run_until_complete(main())
+    assert data.startswith(b"HTTP/1.1 200 OK\r\n"), data[:64]
+    at = data.find(b"HTTP/1.1 400 ")
+    assert at > 0, data
+    first = data[:at]
+    headers = _parse_headers(first.split(b"\r\n\r\n", 1)[0])
+    assert headers["content-length"] == "5"
+    assert first.endswith(b"first"), first
+    loop._core.listener_close(lid)
+
+
+def test_request_parsed_ahead_of_malformed_bytes_still_answered(loop):
+    """The parser keeps requests that completed ahead of malformed bytes
+    in the same buffer. Dropping them on the parse error made the client
+    read the 400 as the answer to the valid request. Reported on PR #1."""
+    lid, port = listen(loop, echo_scope_app)
+    data = loop.run_until_complete(
+        _request(port, b"GET /ok HTTP/1.1\r\nHost: h\r\n\r\nGARBAGE\r\n\r\n", read_all=True)
+    )
+    assert data.startswith(b"HTTP/1.1 200 OK\r\n"), data[:64]
+    at = data.find(b"HTTP/1.1 400 ")
+    assert at > 0, data
+    assert json.loads(_body(data[:at]))["path"] == "/ok"
+    loop._core.listener_close(lid)
+
+
 def test_uri_limit_414(loop):
     lid, port = listen(loop, echo_scope_app, max_url=32)
     resp = loop.run_until_complete(

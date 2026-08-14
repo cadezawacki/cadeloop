@@ -7,10 +7,11 @@
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
-> **Fixed and on `claude/new-session-bq3hp6`**
+> **Fixed and on `claude/pipelined-parse-error-desync-k6y3tp` (continues `claude/new-session-bq3hp6`)**
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | HTTP | A pipelined parse error was answered out of order: its 400 could reach the client as (or spliced into) an earlier request's response, and valid requests parsed ahead of it in the same buffer were dropped | `` |
 > | Loop | `run_until_complete` scheduled the coroutine before refusing to run it | `fc8da98` |
 > | ASGI | `scope["asgi"]` and `scope["extensions"]` were shared process-wide and mutable | `5c0e21a` |
 > | Loop | `slow_callback_duration` was absent from the facade and ignored by the core | `5c0e21a` |
