@@ -607,6 +607,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         truncate datagrams on Windows)."""
         import socket as socket_module
 
+        local_res = remote_res = None
         if sock is not None:
             if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
                 raise ValueError("sock is mutually exclusive with address/options")
@@ -618,19 +619,41 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             udp_sock = sock
         else:
             fam = family or socket_module.AF_INET
+            # Resolve BOTH addresses here and keep the sockaddrs, rather
+            # than resolving one to pick a family and throwing the result
+            # away. bind()/connect() below would otherwise resolve the
+            # hostname again -- synchronously, on the loop thread, so a
+            # slow resolver stalls every other connection this worker is
+            # serving -- and the second lookup can return a different
+            # family than the socket was created with.
             if local_addr or remote_addr:
-                probe = local_addr or remote_addr
-                infos = await self.getaddrinfo(
-                    probe[0],
-                    probe[1],
-                    family=family,
-                    type=socket_module.SOCK_DGRAM,
-                    proto=proto,
-                    flags=flags,
-                )
-                if not infos:
-                    raise OSError(f"getaddrinfo({probe!r}) returned empty list")
-                fam = infos[0][0]
+                resolved = {}
+                for key, addr in (("local", local_addr), ("remote", remote_addr)):
+                    if not addr:
+                        continue
+                    infos = await self.getaddrinfo(
+                        addr[0],
+                        addr[1],
+                        family=family,
+                        type=socket_module.SOCK_DGRAM,
+                        proto=proto,
+                        flags=flags,
+                    )
+                    if not infos:
+                        raise OSError(f"getaddrinfo({addr!r}) returned empty list")
+                    resolved[key] = infos[0]
+                first = resolved.get("local") or resolved["remote"]
+                fam = first[0]
+                # Both ends must live in the same address family; the
+                # socket has exactly one.
+                for key, info in resolved.items():
+                    if info[0] != fam:
+                        raise ValueError(
+                            "local_addr and remote_addr resolved to different "
+                            f"address families ({fam} vs {info[0]})"
+                        )
+                local_res = resolved.get("local")
+                remote_res = resolved.get("remote")
             udp_sock = socket_module.socket(fam, socket_module.SOCK_DGRAM, proto)
             try:
                 if reuse_port:
@@ -644,15 +667,20 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                         socket_module.SOL_SOCKET, socket_module.SO_BROADCAST, 1
                     )
                 if local_addr:
-                    udp_sock.bind(local_addr)
+                    # The already-resolved sockaddr, not the original
+                    # tuple: no second (blocking) lookup.
+                    udp_sock.bind(local_res[4])
                 if remote_addr:
-                    udp_sock.connect(remote_addr)
+                    udp_sock.connect(remote_res[4])
             except BaseException:
                 udp_sock.close()
                 raise
         udp_sock.setblocking(False)
         protocol = protocol_factory()
-        transport = _DatagramTransport(self, udp_sock, protocol, remote_addr)
+        # The resolved sockaddr, so a connected endpoint's peername is an
+        # address rather than whatever hostname the caller typed.
+        peer = remote_res[4] if remote_res is not None else remote_addr
+        transport = _DatagramTransport(self, udp_sock, protocol, peer)
         try:
             transport._open()
         except BaseException:

@@ -306,3 +306,43 @@ def test_set_protocol_redirects_datagrams(loop):
     loop.run_until_complete(main())
     assert first == [b"one"], f"first protocol got {first}"
     assert second == [b"two"], f"replacement protocol got {second}"
+
+
+def test_datagram_endpoint_resolves_each_address_once(loop):
+    """The awaited getaddrinfo() result used to be read for its family
+    and discarded, so bind()/connect() resolved the hostname again --
+    synchronously, on the loop thread. A slow resolver stalled every
+    other connection the worker was serving, and the second lookup could
+    disagree with the family the socket was already created with."""
+    calls = []
+    real = loop.getaddrinfo
+
+    async def counting(host, port, **kw):
+        calls.append((host, port))
+        return await real(host, port, **kw)
+
+    loop.getaddrinfo = counting
+
+    class P(asyncio.DatagramProtocol):
+        pass
+
+    async def main():
+        server, _ = await loop.create_datagram_endpoint(P, local_addr=("127.0.0.1", 0))
+        try:
+            port = server.get_extra_info("sockname")[1]
+            client, _ = await loop.create_datagram_endpoint(
+                P, remote_addr=("localhost", port)
+            )
+            try:
+                # Resolved exactly once per supplied address; bind/connect
+                # must not have gone back to the resolver.
+                assert calls == [("127.0.0.1", 0), ("localhost", port)], calls
+                peer = client.get_extra_info("peername")
+                assert peer is not None and peer[0] != "localhost", peer
+            finally:
+                client.close()
+        finally:
+            server.close()
+            await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())

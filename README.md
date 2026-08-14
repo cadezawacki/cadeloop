@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | UDP | Datagram endpoint resolved hostnames twice, the second time blocking the loop | `HEAD` |
 > | Transport | `data_received` exceptions left the connection open and reading | `2750ecc` |
 > | Ops | Access log ran on the loop thread; now a bounded queue + writer thread | `2750ecc` |
 > | Ops | `stats_endpoint` was documented since M2 but did nothing | `2750ecc` |
