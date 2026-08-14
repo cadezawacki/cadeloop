@@ -150,6 +150,45 @@ impl<D> OpSlab<D> {
         (slot.generation == id.generation && slot.state != OpState::Free).then_some(slot)
     }
 
+    /// Is `ptr` exactly the address of some live chunk slot's `data` field?
+    ///
+    /// Backends hand the kernel a pointer INTO a slot (`&mut slot.data`,
+    /// whose first field is the OVERLAPPED) and recover the op by casting
+    /// the completion's pointer back. The generation check in [`OpId`]
+    /// catches stale ids, but only AFTER that cast is dereferenced — which
+    /// is fatal if the pointer never belonged to this slab at all. A
+    /// completion can carry a foreign pointer whenever a handle is shared
+    /// across processes: the kernel delivers to the port the FILE OBJECT is
+    /// bound to, not the one the op was posted from (ADR-25). Screening the
+    /// pointer here turns that from a wild read into a dropped completion.
+    ///
+    /// Chunks are boxed and never reallocated (R-037 pinning), so their
+    /// address ranges are stable for the life of the slab.
+    pub fn contains_data_ptr(&self, ptr: *const u8) -> bool {
+        let stride = core::mem::size_of::<OpSlot<D>>();
+        if stride == 0 {
+            return false;
+        }
+        let addr = ptr as usize;
+        for chunk in &self.chunks {
+            let base = chunk.as_ptr() as usize;
+            let Some(offset) = addr.checked_sub(base) else { continue };
+            if offset >= stride * CHUNK {
+                continue;
+            }
+            // Must land exactly on a slot's `data`, not merely inside the
+            // chunk: a pointer to any other field (or mid-struct) is not
+            // something we ever handed out.
+            let idx = offset / stride;
+            let data_off =
+                (&chunk[idx].data as *const D as usize) - (&chunk[idx] as *const OpSlot<D> as usize);
+            if offset % stride == data_off {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn get_mut(&mut self, id: OpId) -> Option<&mut OpSlot<D>> {
         let slot = self.slot_mut(id.index);
         (slot.generation == id.generation && slot.state != OpState::Free).then_some(slot)
@@ -373,6 +412,57 @@ mod tests {
                     prop_assert_eq!(s.state(*id), Some(*st));
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod adr25_ptr_screen {
+    use super::*;
+
+    fn slab() -> OpSlab<u64> {
+        OpSlab::new(|| 0u64)
+    }
+
+    #[test]
+    fn accepts_pointers_it_handed_out() {
+        let mut s = slab();
+        let ids: Vec<OpId> = (0..CHUNK * 2 + 5).map(|_| s.post(OpKind::Send)).collect();
+        for id in ids {
+            let p = (&mut s.get_mut(id).unwrap().data) as *mut u64 as *const u8;
+            assert!(s.contains_data_ptr(p), "own data pointer must be recognised");
+        }
+    }
+
+    #[test]
+    fn rejects_foreign_and_misaligned_pointers() {
+        let mut s = slab();
+        let id = s.post(OpKind::Recv);
+        let good = (&mut s.get_mut(id).unwrap().data) as *mut u64 as *const u8;
+
+        // A pointer from another allocation entirely (the cross-process case).
+        let other = Box::new(0u64);
+        assert!(!s.contains_data_ptr(&*other as *const u64 as *const u8));
+
+        // Inside our chunk but not at a slot's `data` field.
+        assert!(!s.contains_data_ptr(unsafe { good.add(1) }));
+
+        // Null, and a wildly out-of-range address.
+        assert!(!s.contains_data_ptr(core::ptr::null()));
+        assert!(!s.contains_data_ptr(usize::MAX as *const u8));
+    }
+
+    #[test]
+    fn still_recognises_slots_after_growth_and_reuse() {
+        let mut s = slab();
+        let first = s.post(OpKind::Accept);
+        let p_first = (&mut s.get_mut(first).unwrap().data) as *mut u64 as *const u8;
+        // Force several new chunks; existing slots must stay valid (pinning).
+        let more: Vec<OpId> = (0..CHUNK * 3).map(|_| s.post(OpKind::Send)).collect();
+        assert!(s.contains_data_ptr(p_first), "growth must not invalidate earlier slots");
+        for id in more {
+            let p = (&mut s.get_mut(id).unwrap().data) as *mut u64 as *const u8;
+            assert!(s.contains_data_ptr(p));
         }
     }
 }

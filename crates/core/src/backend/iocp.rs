@@ -284,6 +284,21 @@ pub struct IocpBackend {
     /// (R-033) keep their association across DisconnectEx, so this set +
     /// the 87-fallback below make register_socket idempotent.
     associated: std::collections::HashSet<SOCKET>,
+    /// Every socket THIS PROCESS has ever associated with THIS port.
+    /// Never pruned: `associated` is cleared by `detach_socket` (and by
+    /// R-033 recycling), but the kernel association outlives that, so the
+    /// ERROR_INVALID_PARAMETER fallback in `register_socket` needs a record
+    /// that survives. Critically it also distinguishes "already associated
+    /// with MY port" from "already associated with ANOTHER PROCESS's port"
+    /// — a socket that arrived over a process boundary (WSADuplicateSocketW)
+    /// was never associated here, and waving it through would let its
+    /// completions be delivered to the owning process carrying an
+    /// lpOverlapped valid only in ours (ADR-25).
+    ever_associated: std::collections::HashSet<SOCKET>,
+    /// ADR-25: completions dequeued carrying an OVERLAPPED outside our slab
+    /// (another process's op on a handle bound to our port). Never expected
+    /// to be non-zero; surfaced so it is visible rather than silent.
+    pub foreign_completions: u64,
 }
 
 // SAFETY: thread-affine by loop contract; raw handles are moved with it.
@@ -303,6 +318,8 @@ impl IocpBackend {
             inline_completions: Vec::with_capacity(32),
             syscalls_saved_inline: 0,
             free_sockets: Vec::new(),
+            ever_associated: std::collections::HashSet::new(),
+            foreign_completions: 0,
             listener_info: HashMap::new(),
             watches: HashMap::new(),
             watch_rearm: Vec::new(),
@@ -514,7 +531,18 @@ impl IocpBackend {
         if entry.lpOverlapped.is_null() {
             return;
         }
-        // SAFETY: OVERLAPPED is the first field of repr(C) IocpOp, and slab
+        // ADR-25: screen the pointer before trusting it. A completion can
+        // carry an OVERLAPPED that was never ours — the kernel delivers to
+        // the port the FILE OBJECT is bound to, so a handle shared across
+        // processes routes another process's ops here, with a pointer valid
+        // only in ITS address space. The slab's generation check cannot help:
+        // it runs after the dereference that would fault. Drop and count.
+        if !self.slab.contains_data_ptr(entry.lpOverlapped.cast::<u8>()) {
+            self.foreign_completions += 1;
+            return;
+        }
+        // SAFETY: the pointer is exactly a live slot's `data` (checked
+        // above), OVERLAPPED is the first field of repr(C) IocpOp, and slab
         // slots are pinned until their completion is reaped (R-037).
         let op_ptr = entry.lpOverlapped.cast::<IocpOp>();
         let id = unsafe { (*op_ptr).id };
@@ -636,9 +664,26 @@ impl IoBackend for IocpBackend {
             // address space; translate_entry dereferences it and takes an
             // access violation. See ADR-24.
             if err.raw_os_error() == Some(87) {
+                let ours = self.ever_associated.contains(&socket);
                 if trace_assoc_enabled() {
-                    eprintln!("cadeloop-iocp: register_socket({socket}) got ERROR_INVALID_PARAMETER — already associated with SOME completion port (possibly another process's)");
+                    eprintln!(
+                        "cadeloop-iocp: register_socket({socket}) ERROR_INVALID_PARAMETER; ours={ours}"
+                    );
                     let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                if !ours {
+                    // Associated with a port we do not own — almost always a
+                    // socket that crossed a process boundary. Proceeding
+                    // would post ops whose completions land on the OWNING
+                    // process's port carrying a pointer into ours (ADR-25):
+                    // a memory-safety violation, reported as a crash far
+                    // from here. Fail loudly at setup instead.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "socket is already bound to a completion port this process does not own \
+                         (a Windows file object binds to exactly one IOCP for life; a listener \
+                         duplicated into several processes can only be driven by one of them)",
+                    ));
                 }
                 let mut t: i32 = 0;
                 let mut len = size_of::<i32>() as i32;
@@ -660,6 +705,7 @@ impl IoBackend for IocpBackend {
             return Err(err);
         }
         self.associated.insert(socket);
+        self.ever_associated.insert(socket);
         self.apply_skip_modes(socket);
         Ok(())
     }
