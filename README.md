@@ -11,9 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | HTTP/1.0 requests now get an `HTTP/1.0` status line | `HEAD` |
-> | WebSocket | `websocket.accept` rejects reserved handshake headers | `HEAD` |
-> | Server | Fork supervisor cleans up workers when a later fork fails | `HEAD` |
+> | HTTP | HTTP/1.0 requests now get an `HTTP/1.0` status line | `d0cdad0` |
+> | WebSocket | `websocket.accept` rejects reserved handshake headers | `d0cdad0` |
+> | Server | Fork supervisor cleans up workers when a later fork fails | `d0cdad0` |
 > | HTTP/TLS | Staged plaintext now counted in ASGI backpressure (was inert on HTTPS) | `ee37f02` |
 > | HTTP | 304 keeps its `Content-Length` (my 204 strip was too broad) | `ee37f02` |
 > | Worker | Failed `http_adopt` no longer double-closes the descriptor | `ee37f02` |
