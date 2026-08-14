@@ -6,9 +6,8 @@ import asyncio
 import os
 import sys
 
-import pytest
-
 import cadeloop
+import pytest
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX subprocess path (Windows: M5, IOCP pipes)"

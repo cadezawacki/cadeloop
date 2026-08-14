@@ -68,10 +68,10 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    import cadeloop
-
     # Route the suite's loop construction through cadeloop.
     import asyncio
+
+    import cadeloop
 
     asyncio.set_event_loop_policy(cadeloop.EventLoopPolicy())
 

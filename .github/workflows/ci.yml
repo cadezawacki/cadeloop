@@ -39,6 +39,14 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - run: cargo fmt --all --check
       - run: cargo clippy -p cadeloop-core --all-targets -- -D warnings
+      # pyproject.toml has carried a [tool.ruff] section since the start
+      # and nothing ever ran it. The rule set is bug-shaped (pyflakes,
+      # bugbear, the ASYNC family) rather than style-shaped -- see the
+      # comment on `select` there for what is deliberately left off.
+      - name: ruff (python lint)
+        run: |
+          pipx install ruff==0.16.3 || pip install ruff==0.16.3
+          ruff check python/ tests/
       - name: clippy (windows target)
         run: |
           # pyo3-ffi's PYO3_CROSS build script generates python3.dll's

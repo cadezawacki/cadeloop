@@ -7,9 +7,8 @@ import signal
 import socket
 import sys
 
-import pytest
-
 import cadeloop
+import pytest
 
 
 @pytest.fixture()
@@ -1329,7 +1328,6 @@ def test_failing_protocol_factory_does_not_leak_the_connected_socket(loop):
     the descriptor has no owner. A protocol_factory that raises therefore
     leaked one connected socket per failure -- invisible until the process
     ran out of them."""
-    import errno
 
     def open_fds():
         return len(os.listdir("/proc/self/fd"))
@@ -1897,7 +1895,9 @@ def test_a_failed_ssl_protocol_build_does_not_leak_the_connection(loop):
     try:
 
         async def attempt():
-            with pytest.raises(BaseException):
+            # AttributeError: _make_ssl_context hands back the non-bool
+            # unchanged, so wrap_bio is looked up on a str.
+            with pytest.raises(AttributeError):
                 await loop.create_connection(asyncio.Protocol, *srv.getsockname(), ssl="bad")
 
         before = _open_fd_count()

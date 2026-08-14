@@ -475,6 +475,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 f"loop.shutdown_asyncgens() call",
                 ResourceWarning,
                 source=self,
+                stacklevel=2,
             )
         self._asyncgens.add(agen)
 
@@ -492,7 +493,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         results = await tasks.gather(
             *[ag.aclose() for ag in closing_agens], return_exceptions=True
         )
-        for result, agen in zip(results, closing_agens):
+        for result, agen in zip(results, closing_agens, strict=True):
             if isinstance(result, Exception):
                 self.call_exception_handler(
                     {
@@ -761,7 +762,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 # Socket buffer full: wait for writability.
                 fut = self.create_future()
 
-                def on_writable():
+                # Bound as a default; see the matching note in tcp.py.
+                def on_writable(fut=fut):
                     if not fut.done():
                         fut.set_result(None)
 
@@ -882,7 +884,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     _CTRL_CLOSE_EVENT = 2
     _CTRL_LOGOFF_EVENT = 5
     _CTRL_SHUTDOWN_EVENT = 6
-    _STOP_CTRL_EVENTS = frozenset((_CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT, _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT))
+    _STOP_CTRL_EVENTS = frozenset(
+        (_CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT, _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT)
+    )
 
     def _remove_console_ctrl_handler(self):
         """R-052 (win32 only): unregister the console-control callback so a

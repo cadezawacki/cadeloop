@@ -12,9 +12,8 @@ there once wired into the suite list.
 import asyncio
 import sys
 
-import pytest
-
 import cadeloop
+import pytest
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="IOCP named-pipe path (win32 only)")
 

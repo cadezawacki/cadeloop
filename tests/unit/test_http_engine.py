@@ -10,9 +10,8 @@ import os
 import socket
 import sys
 
-import pytest
-
 import cadeloop
+import pytest
 
 
 @pytest.fixture()
@@ -498,7 +497,7 @@ def test_receive_resolves_disconnect(loop):
 
 
 def test_starlette_routes_and_streaming(loop):
-    starlette = pytest.importorskip("starlette.applications")
+    pytest.importorskip("starlette.applications")
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse, StreamingResponse
     from starlette.routing import Route
@@ -549,7 +548,7 @@ def test_starlette_base_http_middleware(loop):
     """BaseHTTPMiddleware wraps the app call in its own anyio task group
     + memory streams (a distinct code path from a plain route handler) —
     a common real-world compatibility trap per Starlette's own docs."""
-    starlette = pytest.importorskip("starlette.applications")
+    pytest.importorskip("starlette.applications")
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -579,7 +578,7 @@ def test_starlette_base_http_middleware(loop):
 
 
 def test_starlette_cors_and_gzip_middleware(loop):
-    starlette = pytest.importorskip("starlette.applications")
+    pytest.importorskip("starlette.applications")
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
@@ -630,7 +629,7 @@ def test_starlette_file_response(loop, tmp_path):
     os.stat + threaded read path) — exercises the same eager-engine/
     anyio interop as the sync-route fix, from a different Starlette
     entry point."""
-    starlette = pytest.importorskip("starlette.applications")
+    pytest.importorskip("starlette.applications")
     from starlette.applications import Starlette
     from starlette.responses import FileResponse
     from starlette.routing import Route
@@ -666,7 +665,7 @@ def test_streaming_disconnect_no_spurious_error(loop):
     report as 'ASGI application returned without completing the
     response' even though nothing went wrong — real uvicorn logs nothing
     for the identical scenario."""
-    starlette = pytest.importorskip("starlette.applications")
+    pytest.importorskip("starlette.applications")
     from starlette.applications import Starlette
     from starlette.responses import StreamingResponse
     from starlette.routing import Route
@@ -704,7 +703,7 @@ def test_streaming_disconnect_no_spurious_error(loop):
 
 
 def test_fastapi_route(loop):
-    fastapi = pytest.importorskip("fastapi")
+    pytest.importorskip("fastapi")
     from fastapi import FastAPI
 
     app = FastAPI()
@@ -728,7 +727,7 @@ def test_fastapi_sync_route(loop):
     `current_task().add_done_callback(...)` on the AppTask driving the
     request — both previously missing, crashing every sync route with
     AttributeError -> HTTP 500."""
-    fastapi = pytest.importorskip("fastapi")
+    pytest.importorskip("fastapi")
     from fastapi import Depends, FastAPI
 
     app = FastAPI()
@@ -1693,8 +1692,14 @@ def test_shutdown_drains_the_in_flight_response(loop):
     assert reached, "the request never reached the app"
     loop._core.listener_close(lid)
     _drain_connections(loop, 5.0)
-    assert task.done(), "client did not finish inside the grace window"
-    task.result()
+    # The drain returns as soon as the connection count reaches zero, and
+    # that can be the same tick that resolves the client's read -- leaving
+    # its continuation queued but not yet stepped. Sampling done() at that
+    # exact instant is a race (it lost on windows-2025, with the read
+    # future already finished). Give the task a bounded chance to run
+    # instead; a client that genuinely never finishes still fails here,
+    # and the untruncated-body assertion below is what carries the point.
+    loop.run_until_complete(asyncio.wait_for(task, 5.0))
     assert got[0].endswith(body), f"truncated response: ...{got[0][-40:]!r}"
     assert loop._core.http_connection_count() == 0
 

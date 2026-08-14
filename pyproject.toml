@@ -38,5 +38,25 @@ testpaths = ["tests/unit", "tests/conformance"]
 addopts = "-q"
 
 [tool.ruff]
-line-length = 88
+# Matches rustfmt.toml's max_width, so both halves of the codebase wrap at
+# the same column instead of each having its own idea.
+line-length = 110
 target-version = "py311"
+
+[tool.ruff.lint]
+# Deliberately bug-shaped rather than style-shaped. E/F are the pyflakes
+# core (undefined names, unused imports and variables -- the class that
+# hides a dropped assertion or a forgotten call); B is bugbear; ASYNC
+# catches blocking work on the loop thread, which for an event loop is the
+# defect that matters most; I keeps imports ordered so diffs stay small.
+# Explicitly NOT enabled: BLE001 (blind excepts are deliberate and
+# documented throughout -- a writer thread that dies on a handler's
+# exception is worse than one that logs it) and the TRY/SIM/UP families,
+# which would fight stdlib-parity choices (asyncio itself raises
+# ValueError for a non-string cmd, which TRY004 wants to be TypeError).
+select = ["E", "F", "B", "ASYNC", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests open files and poll with sleep() on purpose: they are not serving
+# traffic, and rewriting them around anyio would obscure what they check.
+"tests/**" = ["ASYNC230", "ASYNC240", "ASYNC109", "ASYNC110", "E741", "B023"]

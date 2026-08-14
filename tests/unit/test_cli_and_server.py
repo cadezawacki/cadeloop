@@ -7,10 +7,9 @@ import io
 import sys
 import threading
 
-import pytest
-
 import cadeloop
 import cadeloop.__main__ as cli
+import pytest
 from cadeloop.server import load_app
 
 
@@ -244,6 +243,7 @@ def _serve_briefly(cfg):
     the loop, then stop it -- all in this process, so the restore that
     serve()'s finally performs is observable here."""
     import gc as _gc
+
     from cadeloop.server import _serve_single
 
     started = threading.Event()

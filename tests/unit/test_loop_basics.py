@@ -6,9 +6,8 @@ import sys
 import threading
 import time as _time
 
-import pytest
-
 import cadeloop
+import pytest
 
 
 @pytest.fixture()

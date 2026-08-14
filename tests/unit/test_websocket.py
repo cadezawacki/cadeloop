@@ -10,9 +10,8 @@ import os
 import struct
 import threading
 
-import pytest
-
 import cadeloop
+import pytest
 
 
 @pytest.fixture()
@@ -202,7 +201,7 @@ def test_ws_scope_contents_and_subprotocol(loop):
 
 
 def test_starlette_websocket_route(loop):
-    starlette = pytest.importorskip("starlette")
+    pytest.importorskip("starlette")
     from starlette.applications import Starlette
     from starlette.routing import WebSocketRoute
 

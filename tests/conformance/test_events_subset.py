@@ -9,9 +9,8 @@ import asyncio
 import threading
 import time
 
-import pytest
-
 import cadeloop
+import pytest
 
 
 @pytest.fixture()

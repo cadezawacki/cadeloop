@@ -5,9 +5,8 @@ client. Skipped where the libraries aren't installed."""
 import asyncio
 import json
 
-import pytest
-
 import cadeloop
+import pytest
 
 uvicorn = pytest.importorskip("uvicorn")
 aiohttp = pytest.importorskip("aiohttp")

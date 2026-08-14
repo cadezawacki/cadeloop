@@ -6,7 +6,6 @@ implementation."""
 
 import asyncio
 import ssl
-import struct
 
 import pytest
 

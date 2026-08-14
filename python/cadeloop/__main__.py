@@ -11,10 +11,10 @@ import sys
 import typing
 
 from .config import Config
+from .server import load_app, serve
 
 # Distinguishes "flag absent" from "--flag none" for the int|None options.
 _UNSET = object()
-from .server import load_app, serve
 
 
 def _optional_int(text: str):

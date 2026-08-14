@@ -12,9 +12,8 @@ import sys
 import time
 import urllib.request
 
-import pytest
-
 import cadeloop
+import pytest
 
 APP = """\
 import os

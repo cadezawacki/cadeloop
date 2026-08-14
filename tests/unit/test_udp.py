@@ -4,9 +4,8 @@ datagrams on IOCP)."""
 
 import asyncio
 
-import pytest
-
 import cadeloop
+import pytest
 
 
 @pytest.fixture()

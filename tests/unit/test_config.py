@@ -1,7 +1,6 @@
 """Config surface (R-102)."""
 
 import pytest
-
 from cadeloop.config import LATENCY_PRESETS, Config
 
 

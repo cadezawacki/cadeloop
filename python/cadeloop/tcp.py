@@ -825,7 +825,11 @@ class TcpSurface:
                     address[0], address[1], family=sock.family, type=sock.type, proto=sock.proto
                 )
                 if not infos:
-                    raise OSError(f"getaddrinfo({address!r}) returned empty list")
+                    # `from None`: the inet_pton failure we are inside is
+                    # expected control flow ("not a numeric address"), so
+                    # chaining it onto a resolution failure buries the real
+                    # cause under an irrelevant one.
+                    raise OSError(f"getaddrinfo({address!r}) returned empty list") from None
                 address = infos[0][4]
         err = sock.connect_ex(address)
         if err == 0:
@@ -1052,7 +1056,11 @@ class TcpSurface:
                 # Socket buffer full: wait for writability.
                 fut = self.create_future()
 
-                def on_writable():
+                # fut bound as a default: the callback is registered and
+                # awaited inside this iteration, so late-binding is not a
+                # live bug here -- but the shape is one edit away from
+                # being one, and binding costs nothing.
+                def on_writable(fut=fut):
                     if not fut.done():
                         fut.set_result(None)
 
