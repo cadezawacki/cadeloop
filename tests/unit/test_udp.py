@@ -4,6 +4,7 @@ datagrams on IOCP)."""
 
 import asyncio
 import socket
+import sys
 
 import cadeloop
 import pytest
@@ -121,6 +122,40 @@ def test_unix_datagram_endpoint(loop, tmp_path):
         # The sender's path, as parsed from the native recvfrom's
         # sockaddr_un -- not dropped, not an Internet tuple.
         assert addr == client_path
+        client_tr.close()
+        server_tr.close()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX") or sys.platform != "linux",
+    reason="abstract namespace is Linux-only",
+)
+def test_abstract_unix_datagram_source_address_is_bytes(loop, tmp_path):
+    """Abstract-namespace unix addresses are bytes with a leading NUL in
+    the socket module; reporting them as lossy UTF-8 strings meant the
+    address could not be passed back to socket APIs and distinct names
+    could collide. Reported on PR #1."""
+    server_path = str(tmp_path / "abs-srv.sock")
+    abstract = "\0cadeloop-test-abs"
+
+    async def main():
+        server_tr, server = await loop.create_datagram_endpoint(
+            Client, local_addr=server_path, family=socket.AF_UNIX
+        )
+        client_tr, _client = await loop.create_datagram_endpoint(
+            Client,
+            local_addr=abstract,
+            remote_addr=server_path,
+            family=socket.AF_UNIX,
+        )
+        server.got = loop.create_future()
+        client_tr.sendto(b"ping")
+        await asyncio.wait_for(server.got, 5)
+        data, addr = server.received[0]
+        assert data == b"ping"
+        assert addr == abstract.encode()  # bytes, leading NUL preserved
         client_tr.close()
         server_tr.close()
 

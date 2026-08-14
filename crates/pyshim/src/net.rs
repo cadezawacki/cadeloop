@@ -2429,8 +2429,19 @@ fn any_addr_tuple(py: Python<'_>, addr: Option<netsys::Addr>) -> Option<Py<PyAny
     match addr {
         Some(netsys::Addr::Inet(a)) => addr_tuple(py, Some(a)),
         Some(netsys::Addr::Unix(path)) => {
-            let s = String::from_utf8_lossy(&path).into_owned();
-            Some(s.into_pyobject(py).ok()?.into_any().unbind())
+            if path.first() == Some(&0) {
+                // Abstract namespace: bytes with the leading NUL, as the
+                // socket module reports it -- a string form could not be
+                // passed back to socket APIs, and lossy decoding could
+                // collide two distinct names.
+                return Some(PyBytes::new(py, &path).into_any().unbind());
+            }
+            // Filesystem path: os.fsdecode semantics (surrogateescape),
+            // not lossy UTF-8, so a non-UTF-8 path survives a round trip.
+            let obj = unsafe {
+                ffi::PyUnicode_DecodeFSDefaultAndSize(path.as_ptr().cast(), path.len() as ffi::Py_ssize_t)
+            };
+            Some(unsafe { Bound::from_owned_ptr_or_opt(py, obj) }?.unbind())
         }
         None => None,
     }
