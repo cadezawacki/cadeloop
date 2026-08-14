@@ -873,3 +873,31 @@ def test_slow_callback_duration_is_a_real_knob(caplog):
             lp2.slow_callback_duration = 0
         finally:
             lp2.close()
+
+
+def test_run_until_complete_rejects_before_scheduling_the_coroutine():
+    """The running-loop check happened inside run_forever(), by which
+    point ensure_future() had already created and queued a Task. So a
+    coroutine the caller was told had been REJECTED went on executing as
+    an unobserved background task. base_events checks first; now so does
+    this. Reported by Codex on PR #1."""
+    lp = cadeloop.new_event_loop()
+    ran = []
+
+    async def should_not_run():
+        ran.append(1)  # pragma: no cover - the point is that it does not
+
+    async def inner():
+        # Re-entering the running loop must refuse, and must not have
+        # scheduled anything on the way to refusing.
+        with pytest.raises(RuntimeError, match="already running"):
+            lp.run_until_complete(should_not_run())
+
+    try:
+        lp.run_until_complete(inner())
+        # Give anything that was wrongly scheduled a chance to run.
+        lp.run_until_complete(asyncio.sleep(0.05))
+    finally:
+        lp.close()
+
+    assert ran == [], "the rejected coroutine ran anyway, as a background task"

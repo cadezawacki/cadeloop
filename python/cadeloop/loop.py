@@ -166,14 +166,23 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # lifecycle                                                          #
     # ------------------------------------------------------------------ #
 
-    def run_forever(self):
-        self._check_closed()
+    def _check_running(self):
+        """The two running-loop refusals, in one place.
+
+        run_until_complete needs them BEFORE it creates a Task, and
+        run_forever needs them at entry; duplicating the pair is how the
+        two come to disagree.
+        """
         if self.is_running():
             raise RuntimeError("This event loop is already running")
         if events._get_running_loop() is not None:
             raise RuntimeError(
                 "Cannot run the event loop while another loop is running"
             )
+
+    def run_forever(self):
+        self._check_closed()
+        self._check_running()
         self._set_coroutine_origin_tracking(self.get_debug())
         old_agen_hooks = sys.get_asyncgen_hooks()
         sys.set_asyncgen_hooks(
@@ -259,6 +268,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
     def run_until_complete(self, future):
         self._check_closed()
+        # BEFORE ensure_future, as base_events does. Scheduling first meant
+        # a call made while a loop was already running in this thread had
+        # already created and queued a Task by the time run_forever()
+        # raised -- so the coroutine the caller was told had been REJECTED
+        # went on executing as an unobserved background task.
+        self._check_running()
         new_task = not futures.isfuture(future)
         future = tasks.ensure_future(future, loop=self)
         if new_task:
