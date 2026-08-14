@@ -65,6 +65,17 @@ class Config:
             raise ValueError(
                 f"backend must be one of {_BACKENDS}, got {self.backend!r}"
             )
+        if self.backend == "rio" and not os.environ.get("CADELOOP_ALLOW_EXPERIMENTAL_RIO"):
+            raise ValueError(
+                "backend='rio' is experimental and unvalidated on real Windows "
+                "hardware — every machine tested so far has hit either an "
+                "OS-level RIO initialization failure or a data-path stall (see "
+                "docs/roadmap.md's M3 entry). 'auto' already avoids it and stays "
+                "on the hardware-validated IOCP backend. To opt in anyway (e.g. "
+                "for RIO diagnosis with tools/windows/rio_smoke.py or "
+                "rio_bisect.py), set CADELOOP_ALLOW_EXPERIMENTAL_RIO=1, or "
+                "construct cadeloop.Loop(backend='rio') directly."
+            )
         if self.latency_mode not in LATENCY_PRESETS:
             raise ValueError(
                 f"latency_mode must be one of {tuple(LATENCY_PRESETS)}, "

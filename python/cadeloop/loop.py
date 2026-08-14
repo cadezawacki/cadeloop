@@ -79,6 +79,22 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # on Windows) > "auto".
         if backend is None:
             backend = os.environ.get("CADELOOP_BACKEND", "auto")
+        if backend == "rio":
+            # R-020: 'auto' deliberately avoids RIO until it's validated on
+            # real hardware (docs/roadmap.md M3) — an explicit request gets
+            # a loud, dismissible warning rather than a silent footgun.
+            # cadeloop.Config/serve() additionally require
+            # CADELOOP_ALLOW_EXPERIMENTAL_RIO=1 for this exact reason; this
+            # low-level constructor stays unblocked for RIO diagnosis
+            # (tools/windows/rio_smoke.py, rio_bisect.py).
+            warnings.warn(
+                "cadeloop: backend='rio' is experimental and unvalidated on "
+                "real Windows hardware — every machine tested so far has hit "
+                "either an OS-level RIO initialization failure or a data-path "
+                "stall. 'auto' stays on the hardware-validated IOCP backend.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         core = _core.CoreLoop(
             backend=backend,
             spin_us=spin_us,
@@ -91,6 +107,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._core = core
         self._accept_pool = accept_pool  # R-032
         self._signal_handlers = {}
+        self._console_ctrl_handler_ref = None  # R-052: keeps the ctypes callback alive
         core.set_error_hook(self._on_callback_error)
         core.set_net_error_hook(self._on_net_error)
         core.set_slow_callback_hook(self._on_slow_callback)
@@ -658,7 +675,24 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         promptly) and enqueues the callback thread-safely. On Windows the
         deliverable console signals are SIGINT (CTRL+C) and SIGBREAK
         (CTRL+BREAK); SIGTERM is accepted for artificial delivery
-        (os.kill / raise_signal) like CPython itself."""
+        (os.kill / raise_signal) like CPython itself.
+
+        A genuinely external stop request — a process supervisor, Docker,
+        or ``Popen.send_signal(SIGTERM)`` — reaches none of these:
+        Windows has no real SIGTERM delivery, and ``Popen.send_signal``
+        maps SIGTERM straight to ``TerminateProcess`` (uncatchable by any
+        process, full stop — no workaround exists or ever will). What
+        *can* be caught is ``GenerateConsoleCtrlEvent`` (CTRL_BREAK_EVENT
+        et al.), which arrives through ``SetConsoleCtrlHandler``, not
+        Python's ``signal`` module — so this installs that handler
+        (idempotently, once per loop) and routes CTRL_BREAK/CLOSE/LOGOFF/
+        SHUTDOWN events into whichever of SIGTERM/SIGINT/SIGBREAK is
+        registered here, giving external supervisors a real graceful-
+        shutdown path if they send CTRL_BREAK_EVENT instead of a blind
+        kill. cadeloop's own multi-worker supervisor already gets this for
+        its spawned children via CREATE_NEW_PROCESS_GROUP + a control
+        pipe (server.py); this covers the top-level process an external
+        manager controls, which that mechanism does not reach."""
         import signal as signal_module
 
         if sys.platform == "win32":
@@ -667,6 +701,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 allowed.add(signal_module.SIGBREAK)
             if sig not in allowed:
                 raise ValueError(f"signal {sig!r} not supported on this platform")
+            self._install_console_ctrl_handler()
         if (
             asyncio.iscoroutine(callback)
             or asyncio.iscoroutinefunction(callback)
@@ -695,6 +730,59 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         else:
             signal_module.signal(sig, signal_module.SIG_DFL)
         return True
+
+    # Console control events SetConsoleCtrlHandler treats as a stop
+    # request; CTRL_C_EVENT (0) is deliberately excluded — Python's own
+    # SIGINT plumbing already owns that one.
+    _CTRL_BREAK_EVENT = 1
+    _CTRL_CLOSE_EVENT = 2
+    _CTRL_LOGOFF_EVENT = 5
+    _CTRL_SHUTDOWN_EVENT = 6
+    _STOP_CTRL_EVENTS = frozenset((_CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT, _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT))
+
+    def _install_console_ctrl_handler(self):
+        """R-052 (win32 only, idempotent). See add_signal_handler's
+        docstring for why this exists alongside the signal-module path."""
+        if self._console_ctrl_handler_ref is not None:
+            return
+        import ctypes
+        import signal as signal_module
+
+        handler_routine = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+        def handler(ctrl_type):
+            # Runs on a dedicated OS thread Windows spawns to deliver the
+            # event — never this loop's own thread (R-022 discipline).
+            if ctrl_type not in self._STOP_CTRL_EVENTS:
+                return 0  # not ours: let the next handler (or Python's
+                # own SIGINT/SIGBREAK plumbing, for CTRL_C/CTRL_BREAK) act
+            for candidate in (
+                signal_module.SIGTERM,
+                signal_module.SIGINT,
+                getattr(signal_module, "SIGBREAK", None),
+            ):
+                entry = self._signal_handlers.get(candidate) if candidate is not None else None
+                if entry is not None:
+                    cb, cb_args = entry
+                    try:
+                        self.call_soon_threadsafe(cb, *cb_args)
+                    except RuntimeError:
+                        pass  # loop already closing/closed
+                    return 1
+            return 0  # nothing registered: let Windows apply the default
+
+        self._console_ctrl_handler_ref = handler_routine(handler)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleCtrlHandler.argtypes = [handler_routine, ctypes.c_int]
+        kernel32.SetConsoleCtrlHandler.restype = ctypes.c_int
+        if not kernel32.SetConsoleCtrlHandler(self._console_ctrl_handler_ref, 1):
+            warnings.warn(
+                "cadeloop: SetConsoleCtrlHandler registration failed — "
+                "CTRL_CLOSE/LOGOFF/SHUTDOWN events won't trigger graceful "
+                "shutdown (CTRL+C/CTRL+BREAK are unaffected).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     # ---- pipes + subprocess (R-051) ----------------------------------
     # POSIX rides the stdlib 3.11 machinery (this project pins CPython

@@ -695,12 +695,18 @@ def test_serve_end_to_end_with_lifespan(tmp_path):
     root = str(tmp_path)
     pkg = os.path.join(os.path.dirname(__file__), "..", "..", "python")
     env["PYTHONPATH"] = os.pathsep.join([root, os.path.abspath(pkg), env.get("PYTHONPATH", "")])
+    popen_kwargs = {}
+    if sys.platform == "win32":
+        # CTRL_BREAK_EVENT (below) targets a process GROUP; a fresh one
+        # keeps the event from also reaching this test process.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(
         [sys.executable, "-m", "cadeloop", "smokeapp:app", "--port", str(port)],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        **popen_kwargs,
     )
     try:
         deadline = time.time() + 10
@@ -717,12 +723,16 @@ def test_serve_end_to_end_with_lifespan(tmp_path):
             raise AssertionError(f"server never came up: {last_err}; out={proc.stdout.read()}")
         assert resp.read() == b"yes"  # lifespan state reached the scope
         if sys.platform == "win32":
-            # send_signal(SIGTERM) is TerminateProcess on Windows — no
-            # graceful path exists to assert until the R-052
-            # SetConsoleCtrlHandler work (M4). Serving + state above is
-            # the Windows contract for this test.
-            proc.kill()
-            proc.communicate(timeout=10)
+            # Popen.send_signal(SIGTERM) is TerminateProcess on Windows —
+            # uncatchable by design, no graceful path exists there (see
+            # add_signal_handler's docstring in loop.py). CTRL_BREAK_EVENT
+            # IS catchable, via the R-052 SetConsoleCtrlHandler wiring;
+            # this is the realistic stand-in for an external supervisor
+            # that speaks that protocol instead of a blind kill.
+            os.kill(proc.pid, _import_signal().CTRL_BREAK_EVENT)
+            out, _ = proc.communicate(timeout=10)
+            assert "LIFESPAN_SHUTDOWN" in out
+            assert proc.returncode == 0
         else:
             proc.send_signal(_import_signal().SIGTERM)
             out, _ = proc.communicate(timeout=10)
