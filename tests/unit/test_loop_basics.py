@@ -55,8 +55,14 @@ def test_call_soon_returns_cancellable_handle(loop):
 
 
 def test_call_soon_non_callable_raises(loop):
-    with pytest.raises(TypeError):
-        loop.call_soon(42)
+    # Debug-gated, matching CPython: base_events.call_soon runs
+    # _check_callback only under `if self._debug`.
+    loop.set_debug(True)
+    try:
+        with pytest.raises(TypeError):
+            loop.call_soon(42)
+    finally:
+        loop.set_debug(False)
 
 
 def test_call_soon_rejects_coroutine_function(loop):
@@ -72,12 +78,20 @@ def test_call_soon_rejects_coroutine_function(loop):
         async def coro_method(self):
             pass
 
+    # Debug-gated, exactly as CPython gates it: base_events.call_soon runs
+    # _check_callback only under `if self._debug`. Running it on every
+    # schedule made cadeloop stricter than the stdlib it mirrors and cost
+    # two attribute lookups on the loop's busiest path.
+    loop.set_debug(True)
     with pytest.raises(TypeError, match="coroutines cannot be used with call_soon"):
         loop.call_soon(coro_fn)
     with pytest.raises(TypeError, match="coroutines cannot be used with call_soon_threadsafe"):
         loop.call_soon_threadsafe(Obj().coro_method)
+    with pytest.raises(TypeError, match="a callable object was expected"):
+        loop.call_soon(42)
     # A sync function/method must still be accepted normally.
     loop.call_soon(lambda: None)
+    loop.set_debug(False)
 
 
 def test_call_soon_after_close_raises():

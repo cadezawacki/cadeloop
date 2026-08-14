@@ -170,14 +170,25 @@ impl CoreLoop {
         context: Option<&Bound<'_, PyAny>>,
         method: &str,
     ) -> PyResult<Handle> {
-        if !callback.is_callable() {
-            return Err(PyTypeError::new_err(format!(
-                "a callable object was expected by {method}(), got {}",
-                callback.repr()?
-            )));
-        }
-        if is_coroutine_function(py, callback) {
-            return Err(PyTypeError::new_err(format!("coroutines cannot be used with {method}()")));
+        // Debug-gated, exactly as CPython does it: base_events.call_soon
+        // runs _check_callback (its callable + coroutine-function test)
+        // only under `if self._debug`. Running it unconditionally made
+        // cadeloop STRICTER than the stdlib it mirrors, and cost two
+        // PyObject_GetAttr round-trips (__code__, co_flags) on every
+        // call_soon / call_later / call_at / add_reader / add_writer --
+        // the busiest path in the loop. uvloop, rloop and rsloop skip the
+        // check entirely; matching the stdlib's own gating keeps the clear
+        // TypeError where a developer will actually see it.
+        if self.debug.load(Ordering::Relaxed) {
+            if !callback.is_callable() {
+                return Err(PyTypeError::new_err(format!(
+                    "a callable object was expected by {method}(), got {}",
+                    callback.repr()?
+                )));
+            }
+            if is_coroutine_function(py, callback) {
+                return Err(PyTypeError::new_err(format!("coroutines cannot be used with {method}()")));
+            }
         }
         let context: Py<PyAny> = match context {
             Some(c) if !c.is_none() => c.clone().unbind(),

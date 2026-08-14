@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Perf | `call_soon` validation gated behind debug, as CPython gates it (~+11%) | `HEAD` |
 > | IOCP | Recycled pipe HANDLEs skipped association (the pipe sibling of `5d96fcb`) | `5aeeb0e` |
 > | UDP | `set_protocol()` now rewires the native callbacks | `5aeeb0e` |
 > | Transport | `write()` after `write_eof()` raises; watermarks derive `high` from `low` | `5aeeb0e` |
