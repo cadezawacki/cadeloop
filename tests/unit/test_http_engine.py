@@ -6,6 +6,7 @@ are plain asyncio streams (which also exercises the M1 transport surface).
 
 import asyncio
 import json
+import os
 import socket
 import sys
 
@@ -531,6 +532,119 @@ def test_starlette_routes_and_streaming(loop):
     assert json.loads(_body(resp)) == {"ok": True}
     loop.run_until_complete(asyncio.sleep(0.05))
     assert ran_background == [True]
+    loop._core.listener_close(lid)
+
+
+def test_starlette_base_http_middleware(loop):
+    """BaseHTTPMiddleware wraps the app call in its own anyio task group
+    + memory streams (a distinct code path from a plain route handler) —
+    a common real-world compatibility trap per Starlette's own docs."""
+    starlette = pytest.importorskip("starlette.applications")
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+
+    class AddHeaderMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            response = await call_next(request)
+            response.headers["x-cadeloop"] = "yes"
+            return response
+
+    async def hello(request):
+        return PlainTextResponse("hi")
+
+    app = Starlette(
+        routes=[Route("/hi", hello)],
+        middleware=[Middleware(AddHeaderMiddleware)],
+    )
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET /hi HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert resp.startswith(b"HTTP/1.1 200 OK\r\n"), resp[:200]
+    assert b"x-cadeloop: yes" in resp.lower()
+    assert _body(resp) == b"hi"
+    loop._core.listener_close(lid)
+
+
+def test_starlette_cors_and_gzip_middleware(loop):
+    starlette = pytest.importorskip("starlette.applications")
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.middleware.gzip import GZipMiddleware
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+
+    async def big(request):
+        return PlainTextResponse("x" * 4000)  # over GZipMiddleware's min size
+
+    app = Starlette(
+        routes=[Route("/big", big)],
+        middleware=[
+            Middleware(CORSMiddleware, allow_origins=["https://example.com"]),
+            Middleware(GZipMiddleware, minimum_size=500),
+        ],
+    )
+    lid, port = listen(loop, app)
+
+    # CORS preflight
+    resp = loop.run_until_complete(
+        _request(
+            port,
+            b"OPTIONS /big HTTP/1.1\r\nHost: h\r\n"
+            b"Origin: https://example.com\r\n"
+            b"Access-Control-Request-Method: GET\r\n\r\n",
+        )
+    )
+    assert resp.startswith(b"HTTP/1.1 200 OK\r\n"), resp[:200]
+    assert b"access-control-allow-origin: https://example.com" in resp.lower()
+
+    # gzip'd response, decompressed content matches
+    resp = loop.run_until_complete(
+        _request(
+            port,
+            b"GET /big HTTP/1.1\r\nHost: h\r\nOrigin: https://example.com\r\nAccept-Encoding: gzip\r\n\r\n",
+        )
+    )
+    assert b"content-encoding: gzip" in resp.lower()
+    import gzip
+
+    assert gzip.decompress(_body(resp)) == b"x" * 4000
+    loop._core.listener_close(lid)
+
+
+def test_starlette_file_response(loop, tmp_path):
+    """FileResponse reads the file via anyio.to_thread (Starlette's own
+    os.stat + threaded read path) — exercises the same eager-engine/
+    anyio interop as the sync-route fix, from a different Starlette
+    entry point."""
+    starlette = pytest.importorskip("starlette.applications")
+    from starlette.applications import Starlette
+    from starlette.responses import FileResponse
+    from starlette.routing import Route
+
+    payload = os.urandom(200_000)
+    f = tmp_path / "blob.bin"
+    f.write_bytes(payload)
+
+    async def serve_file(request):
+        return FileResponse(str(f), media_type="application/octet-stream")
+
+    app = Starlette(routes=[Route("/file", serve_file)])
+    lid, port = listen(loop, app)
+
+    resp = loop.run_until_complete(_request(port, b"GET /file HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert resp.startswith(b"HTTP/1.1 200 OK\r\n"), resp[:200]
+    assert _body(resp) == payload
+    # The client seeing the last byte doesn't guarantee the server-side
+    # AppTask has also finished (anyio's to_thread worker-stop
+    # done-callback fires on a later tick) — give the loop one more
+    # beat so the anyio worker thread gets stopped before the fixture
+    # closes the loop, same pattern as the /bg background-task test
+    # above.
+    loop.run_until_complete(asyncio.sleep(0.05))
     loop._core.listener_close(lid)
 
 

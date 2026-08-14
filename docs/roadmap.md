@@ -60,11 +60,21 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       Tasks/Futures for non-suspending requests, singleton completed
       awaitable; suspensions get an `AppTask` registered via
       `_enter_task` so `asyncio.current_task()`/anyio task groups work
-      (Starlette StreamingResponse + BackgroundTask verified);
-      `cfg.eager_tasks=False` stdlib-Task escape hatch (§16)
+      (Starlette StreamingResponse + BackgroundTask verified); AppTask
+      also has a real `_loop` getter and Future-style
+      add_done_callback/remove_done_callback (anyio's WorkerThread
+      needs both to offload FastAPI's plain `def` routes/sync
+      Depends() — missing until the drop-in-completeness audit caught
+      it, see ADR-19's addendum) and enters a captured contextvars
+      Context per step (cross-request contextvar isolation, same
+      audit); `cfg.eager_tasks=False` stdlib-Task escape hatch (§16)
 - [x] receive() disconnect futures (no busy-wait disconnect listeners)
 - [x] gc.freeze at post-startup (R-075; per-request warmup counter TBD)
-- [x] Starlette/FastAPI real-socket suites green (R-123)
+- [x] Starlette/FastAPI real-socket suites green (R-123): routes,
+      streaming, background tasks, sync routes/dependencies (anyio
+      to_thread), contextvar isolation (sequential + concurrent),
+      BaseHTTPMiddleware/CORSMiddleware/GZipMiddleware, FileResponse,
+      mid-stream client disconnect (no spurious error log)
 - [x] Loopback plaintext: 35.1K req/s vs uvicorn+uvloop 6.7K (~5x) on
       Linux; 34.7K vs uvicorn+winloop 7.85K (4.4x) on Windows hardware —
       the ≥2.0x gate cleared on both; the authoritative number remains a
@@ -123,12 +133,15 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       listener and hands it to spawned workers — WSADuplicateSocketW
       (socket.share over stdin) on win32, fd inheritance on POSIX so the
       identical supervisor/worker/control-pipe path is end-to-end tested
-      on Linux; graceful drain via control pipe (EOF = dead supervisor
-      cascades to worker shutdown), same crash-streak cutoff as the fork
-      model, SetProcessAffinityMask pinning; engine adopt path
-      (`http_listen_fd`) tested everywhere. Windows-hardware run covers
-      it via validate.ps1 step 18 (spec app, workers=2, PID-stamped
-      responses)
+      on Linux AND in Windows CI (test_multiworker.py's spawn-model test
+      was previously module-skipped on Windows entirely — a
+      drop-in-completeness audit finding, since it needs no fork and
+      always ran fine on POSIX); graceful drain via control pipe (EOF =
+      dead supervisor cascades to worker shutdown), same crash-streak
+      cutoff as the fork model, SetProcessAffinityMask pinning; engine
+      adopt path (`http_listen_fd`) tested everywhere. Windows-hardware
+      run additionally covers it via validate.ps1 step 18 (spec app,
+      workers=2, PID-stamped responses)
 - [ ] p99 ≤ 0.6x uvicorn+winloop at 80% saturation (R-003 — Windows
       two-machine measurement)
 

@@ -25,8 +25,26 @@ SUITES_BY_MILESTONE = {
     "M1": ["test.test_asyncio.test_streams", "test.test_asyncio.test_sock_lowlevel"],
     "M2": ["test.test_asyncio.test_tasks"],
     "M4": ["test.test_asyncio.test_sslproto"],
+    "M5": ["test.test_asyncio.test_subprocess"],
 }
-CURRENT_MILESTONE = "M0"
+# Informational only (which milestone this project is at) — does NOT
+# gate which suites run below. It used to (SUITES_BY_MILESTONE[
+# CURRENT_MILESTONE] alone), which is exactly why test_streams/
+# test_sock_lowlevel/test_tasks/test_sslproto never ran in CI despite
+# M1/M2/M4 being complete: CURRENT_MILESTONE was never advanced past
+# "M0" once those suites were added. The default below now runs every
+# suite across every milestone unconditionally, so a future milestone's
+# suite addition takes effect the moment it's added to the dict above.
+CURRENT_MILESTONE = "M5"
+
+
+def all_suites() -> list[str]:
+    seen: list[str] = []
+    for suite_list in SUITES_BY_MILESTONE.values():
+        for name in suite_list:
+            if name not in seen:
+                seen.append(name)
+    return seen
 
 
 def load_skiplist(path: pathlib.Path) -> set[str]:
@@ -58,7 +76,7 @@ def main(argv: list[str]) -> int:
     asyncio.set_event_loop_policy(cadeloop.EventLoopPolicy())
 
     skiplist = load_skiplist(pathlib.Path(__file__).with_name("skiplist.txt"))
-    suites = argv or SUITES_BY_MILESTONE[CURRENT_MILESTONE]
+    suites = argv or all_suites()
 
     loader = unittest.TestLoader()
     runner = unittest.TextTestRunner(verbosity=1)

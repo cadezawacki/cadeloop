@@ -1,5 +1,8 @@
-"""M3 multi-process worker model (§8, R-090..R-093): SO_REUSEPORT pool,
-supervisor restart, graceful drain. Linux-only (fork)."""
+"""M3 multi-process worker model (§8, R-090..R-093): SO_REUSEPORT pool
+(fork, POSIX-only), supervisor restart, graceful drain, and the
+fork-free spawn model (R-090 Windows worker model — also runs on POSIX
+via fd inheritance, so it's covered here on every platform, not just
+manually via tools/windows/validate.ps1's step 18)."""
 
 import os
 import signal
@@ -10,8 +13,6 @@ import time
 import urllib.request
 
 import pytest
-
-pytestmark = pytest.mark.skipif(not hasattr(os, "fork"), reason="fork-based worker model")
 
 APP = """\
 import os
@@ -48,6 +49,7 @@ def _get(port: int, timeout: float = 3.0) -> bytes:
     return urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=timeout).read()
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork-based worker model + /proc introspection")
 def test_worker_pool_balances_restarts_and_drains(tmp_path):
     (tmp_path / "mwapp.py").write_text(APP)
     port = _free_port()

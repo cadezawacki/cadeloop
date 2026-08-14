@@ -136,6 +136,26 @@ forwarding, done/get_loop/get_name/uncancel/cancelling). Verified against
 Starlette streaming + background tasks. `eager_tasks=False` remains the
 full-fidelity escape hatch (§16).
 
+**Addendum (drop-in-completeness audit, post-M5):** the verification
+above was accurate but incomplete — it never exercised anyio's
+thread-offload path or contextvars isolation, and both were broken.
+anyio's `WorkerThread` (the target of `anyio.to_thread.run_sync`, which
+Starlette's `run_in_threadpool` and every FastAPI plain `def` route or
+sync `Depends()` go through) resolves the "root task" to
+`current_task()` and then reads `root_task._loop` and calls
+`root_task.add_done_callback(...)` — AppTask had neither, so every sync
+route crashed with AttributeError. Separately, `step_inner` drove
+coroutines with no `PyContext_Enter`/`Exit` boundary at all (unlike
+`handles.rs::run_handle`'s existing discipline for plain callbacks), so
+a contextvar set during one request stayed visible to a later or
+concurrently-interleaved request on the same worker — silent state
+corruption for Sentry/OpenTelemetry/structlog/correlation-ID patterns.
+Both fixed: AppTask now has a real `_loop` getter and Future-style
+`add_done_callback`/`remove_done_callback`, and captures+enters a
+`contextvars.Context.copy()` per step, mirroring `run_handle` exactly.
+See `test_fastapi_sync_route` and `test_contextvar_isolation_*` in
+tests/unit/test_http_engine.py.
+
 ## ADR-20: aiofastnet findings — stacked transports beat proactor emulation
 aiofastnet (Cython transports patched onto any base loop via add_reader)
 was benched standalone AND stacked on cadeloop. On echo-rtt the stack
