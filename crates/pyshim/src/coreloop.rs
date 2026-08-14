@@ -1103,7 +1103,7 @@ impl CoreLoop {
         fut: Bound<'_, PyAny>,
         local_ip: Option<&str>,
         local_port: u16,
-    ) -> PyResult<()> {
+    ) -> PyResult<(u32, u32)> {
         self.check_closed()?;
         let addr: std::net::IpAddr =
             ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
@@ -1121,13 +1121,13 @@ impl CoreLoop {
         }
         let fut: Py<PyAny> = fut.unbind();
         let sa = netsys::build_sockaddr(sockaddr);
-        let res = self.with_net(|net, reactor| -> std::io::Result<()> {
+        let res = self.with_net(|net, reactor| -> std::io::Result<(u32, u32)> {
             let backend = reactor.backend_mut();
             backend.register_socket(sock)?;
             match backend.post_connect(sock, &sa.buf[..sa.len]) {
                 Ok(op) => {
                     net.ops.insert(op, net::OpTarget::Connect { fut, sock });
-                    Ok(())
+                    Ok((op.index, op.generation))
                 }
                 Err(e) => {
                     // register_socket succeeded, so this socket IS
@@ -1138,11 +1138,32 @@ impl CoreLoop {
                 }
             }
         })?;
-        if let Err(e) = res {
-            netsys::close(sock);
-            return Err(e.into());
+        match res {
+            Err(e) => {
+                netsys::close(sock);
+                Err(e.into())
+            }
+            Ok(op) => Ok(op),
         }
-        Ok(())
+    }
+
+    /// Cancel an in-flight connect posted by `tcp_connect`.
+    ///
+    /// Without this, a caller whose `await` is cancelled -- which is
+    /// every losing Happy Eyeballs attempt, not just an unusual one --
+    /// left the operation running with its socket open until the OS gave
+    /// up on the connect, which can be minutes. The completion still
+    /// arrives (ABORTED) and `ConnectDone` closes the socket then, so
+    /// this only ever brings that forward; the op mapping deliberately
+    /// stays until the completion is dequeued (ADR-25).
+    ///
+    /// A stale or already-completed op is not an error: the race between
+    /// cancelling and completing is normal and both outcomes are fine.
+    fn cancel_connect(&self, op: (u32, u32)) -> PyResult<()> {
+        let op = cadeloop_core::opslab::OpId { index: op.0, generation: op.1 };
+        self.with_net(|_, reactor| {
+            let _ = reactor.backend_mut().cancel(op);
+        })
     }
 
     /// Close a connected socket that never reached `attach_stream`.
@@ -1256,11 +1277,27 @@ impl CoreLoop {
         let token: Py<PyAny> = handle.clone_ref(py).into_any();
         let sock = fd as RawSocket;
         self.with_net(|net, reactor| -> std::io::Result<()> {
-            if let Some(old) = net.readers.insert(sock, token) {
+            let displaced = net.readers.insert(sock, token);
+            let w = net.writers.contains_key(&sock);
+            if let Err(e) = reactor.backend_mut().set_watch(sock, true, w) {
+                // Undo the map change. Leaving it makes the loop claim a
+                // watcher the backend refused to register -- `remove_reader`
+                // returns True for an fd nothing is watching -- and silently
+                // discards the callback this call displaced, which was a
+                // working watcher until a moment ago.
+                let ours = match displaced {
+                    Some(prev) => net.readers.insert(sock, prev),
+                    None => net.readers.remove(&sock),
+                };
+                if let Some(h) = ours {
+                    net.graveyard_py.push(h);
+                }
+                return Err(e);
+            }
+            if let Some(old) = displaced {
                 net.graveyard_py.push(old);
             }
-            let w = net.writers.contains_key(&sock);
-            reactor.backend_mut().set_watch(sock, true, w)
+            Ok(())
         })??;
         self.drain_graveyards(py)?;
         Ok(handle)
@@ -1271,12 +1308,22 @@ impl CoreLoop {
         let removed = self.with_net(|net, reactor| -> std::io::Result<bool> {
             let removed = net.readers.remove(&sock);
             let had = removed.is_some();
-            if let Some(h) = removed {
-                net.graveyard_py.push(h);
-            }
             let w = net.writers.contains_key(&sock);
             if had || w {
-                reactor.backend_mut().set_watch(sock, false, w)?;
+                if let Err(e) = reactor.backend_mut().set_watch(sock, false, w) {
+                    // Put it back: the backend is still watching, so the
+                    // callback must stay reachable or its next readiness
+                    // event finds no handler.
+                    if let Some(h) = removed {
+                        if let Some(newer) = net.readers.insert(sock, h) {
+                            net.graveyard_py.push(newer);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+            if let Some(h) = removed {
+                net.graveyard_py.push(h);
             }
             Ok(had)
         })??;
@@ -1298,11 +1345,23 @@ impl CoreLoop {
         let token: Py<PyAny> = handle.clone_ref(py).into_any();
         let sock = fd as RawSocket;
         self.with_net(|net, reactor| -> std::io::Result<()> {
-            if let Some(old) = net.writers.insert(sock, token) {
+            let displaced = net.writers.insert(sock, token);
+            let r = net.readers.contains_key(&sock);
+            if let Err(e) = reactor.backend_mut().set_watch(sock, r, true) {
+                // Same rollback as add_reader: see the note there.
+                let ours = match displaced {
+                    Some(prev) => net.writers.insert(sock, prev),
+                    None => net.writers.remove(&sock),
+                };
+                if let Some(h) = ours {
+                    net.graveyard_py.push(h);
+                }
+                return Err(e);
+            }
+            if let Some(old) = displaced {
                 net.graveyard_py.push(old);
             }
-            let r = net.readers.contains_key(&sock);
-            reactor.backend_mut().set_watch(sock, r, true)
+            Ok(())
         })??;
         self.drain_graveyards(py)?;
         Ok(handle)
@@ -1313,12 +1372,20 @@ impl CoreLoop {
         let removed = self.with_net(|net, reactor| -> std::io::Result<bool> {
             let removed = net.writers.remove(&sock);
             let had = removed.is_some();
-            if let Some(h) = removed {
-                net.graveyard_py.push(h);
-            }
             let r = net.readers.contains_key(&sock);
             if had || r {
-                reactor.backend_mut().set_watch(sock, r, false)?;
+                if let Err(e) = reactor.backend_mut().set_watch(sock, r, false) {
+                    // Same restore as remove_reader: see the note there.
+                    if let Some(h) = removed {
+                        if let Some(newer) = net.writers.insert(sock, h) {
+                            net.graveyard_py.push(newer);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+            if let Some(h) = removed {
+                net.graveyard_py.push(h);
             }
             Ok(had)
         })??;

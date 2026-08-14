@@ -11,7 +11,28 @@ import sys
 import typing
 
 from .config import Config
+
+# Distinguishes "flag absent" from "--flag none" for the int|None options.
+_UNSET = object()
 from .server import load_app, serve
+
+
+def _optional_int(text: str):
+    """An int-or-None CLI value.
+
+    `max_body`, `spin_us` and `stats_endpoint` all use None to mean
+    something a number cannot say -- no body cap, derive the spin window
+    from latency_mode, no stats listener. With a plain `type=int` those
+    states were unreachable from the command line: `--max-body none`
+    failed argparse outright, so a CLI user could not turn the 16 MiB cap
+    off at all.
+    """
+    if text.strip().lower() in ("none", "null", ""):
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer or 'none', got {text!r}") from None
 
 
 def _add_config_args(parser: argparse.ArgumentParser) -> list[str]:
@@ -35,6 +56,10 @@ def _add_config_args(parser: argparse.ArgumentParser) -> list[str]:
                 action="store_false",
                 default=None,
             )
+        elif optional and hint is int:
+            # Sentinel, not None: None is a meaningful *value* for these,
+            # so "unset" has to be distinguishable from "set to none".
+            parser.add_argument(flag, dest=f.name, type=_optional_int, default=_UNSET)
         else:
             parser.add_argument(flag, dest=f.name, type=hint, default=None)
         handled.append(f.name)
@@ -62,8 +87,17 @@ def main(argv: list[str] | None = None) -> int:
     cfg = {
         name: getattr(ns, name)
         for name in cfg_fields
-        if getattr(ns, name) is not None
+        if getattr(ns, name) is not _UNSET and getattr(ns, name) is not None
     }
+    # ... except an explicit `none`, which is a value and must be passed.
+    cfg.update(
+        {
+            name: None
+            for name in cfg_fields
+            if getattr(ns, name, _UNSET) is None
+            and parser.get_default(name) is _UNSET
+        }
+    )
     # Validate the spec now so a typo fails before we bind anything, but
     # hand serve() the STRING: the fork-free (Windows) worker model needs
     # it to re-import the app in each child, and a resolved callable makes

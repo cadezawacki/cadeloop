@@ -231,8 +231,23 @@ class TcpSurface:
                     raise exc
             fut = self.create_future()
             try:
-                self._core.tcp_connect(address[0], address[1], fut, local_ip, local_port)
+                op = self._core.tcp_connect(
+                    address[0], address[1], fut, local_ip, local_port
+                )
+            except OSError as exc:
+                errors.append(exc)
+                raise
+            try:
                 return await fut
+            except asyncio.CancelledError:
+                # Cancel the native op too. Every losing Happy Eyeballs
+                # attempt lands here, so without this each connection
+                # leaves N-1 sockets in a half-open connect until the OS
+                # times them out -- which can be minutes. The completion
+                # still arrives and closes the socket; this only brings
+                # that forward.
+                self._core.cancel_connect(op)
+                raise
             except OSError as exc:
                 errors.append(exc)
                 raise

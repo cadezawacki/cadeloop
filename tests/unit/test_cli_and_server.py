@@ -166,3 +166,34 @@ def test_stats_endpoint_port_is_validated():
             cadeloop.Config(stats_endpoint=bad)
     assert cadeloop.Config(stats_endpoint=None).stats_endpoint is None
     assert cadeloop.Config(stats_endpoint=9001).stats_endpoint == 9001
+
+
+def test_cli_can_turn_off_the_body_cap(monkeypatch):
+    """`max_body=None` means "no cap", and with a plain `type=int` the CLI
+    could not say it -- `--max-body none` failed argparse outright, so a
+    CLI user had no way to turn the 16 MiB default off."""
+    seen = {}
+
+    def fake_serve(app, host, port, **kw):
+        seen.update(kw)
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    monkeypatch.setattr(cli, "load_app", lambda spec: dummy_app)
+
+    cli.main(["mod:app", "--max-body", "none"])
+    assert "max_body" in seen and seen["max_body"] is None, seen
+
+    seen.clear()
+    cli.main(["mod:app", "--max-body", "1024"])
+    assert seen["max_body"] == 1024
+
+    seen.clear()
+    cli.main(["mod:app"])
+    assert "max_body" not in seen, "an absent flag must not override the default"
+
+
+def test_cli_rejects_a_non_numeric_body_cap(monkeypatch):
+    monkeypatch.setattr(cli, "load_app", lambda spec: dummy_app)
+    with pytest.raises(SystemExit):
+        with contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["mod:app", "--max-body", "banana"])
