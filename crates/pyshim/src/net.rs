@@ -1985,20 +1985,25 @@ fn on_send_done(
             net.events.push(NetEvent::ResumeWriting { resume_writing });
         }
     }
-    // A WebSocket paused for WRITE pressure has no other way back: the
-    // inbox path only re-evaluates when the app calls receive(), and a
-    // connection paused because we owed the peer output may have no
-    // inbox message for it to consume. Without this the pause added for
-    // the ping-flood bound was permanent -- a peer that resumed reading
-    // was never read from again, turning a bounded queue into a stalled
-    // connection.
-    crate::http::ws_sync_read_pause(py, net, backend, tid);
-    let entry = net.transports.get_mut(&tid).unwrap();
+    // Not `unwrap()`. It was safe only while nothing between the lookup
+    // above and here could remove the entry, and the WebSocket read-pause
+    // re-check below breaks that: resuming a read posts a recv, and a
+    // failing post tears the transport down. An invariant that holds by
+    // accident of ordering is one edit from a panic -- and a panic here
+    // unwinds through FFI, taking the worker with it.
+    let Some(entry) = net.transports.get_mut(&tid) else { return };
     if !entry.wq.is_empty() {
         flush_pending(py, net, backend, tid);
     } else {
         maybe_finish_shutdown(py, net, backend, tid);
     }
+    // A WebSocket paused for WRITE pressure has no other way back: the
+    // inbox path only re-evaluates when the app calls receive(), and a
+    // connection paused because we owed the peer output may have no
+    // inbox message for it to consume. Without this the pause added for
+    // the ping-flood bound was permanent. Last, so nothing after it
+    // depends on the transport still existing.
+    crate::http::ws_sync_read_pause(py, net, backend, tid);
 }
 
 fn on_accept_done(net: &mut NetState, backend: Backend<'_>, lid: u64, op: OpId, os_error: u32) {

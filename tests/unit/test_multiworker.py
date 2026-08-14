@@ -291,7 +291,7 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
     spawned = []
     killed = []
 
-    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None):
+    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None, inherited=()):
         if len(spawned) >= 2:
             raise OSError(11, "Resource temporarily unavailable")
         pid = 101 + len(spawned)
@@ -343,7 +343,7 @@ def test_a_slow_failing_worker_still_trips_the_crash_loop_guard(monkeypatch):
     spawned = []
     pending = []
 
-    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None):
+    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None, inherited=()):
         pid = 200 + len(spawned)
         spawned.append(pid)
         r, w = os.pipe()

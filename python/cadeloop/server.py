@@ -832,7 +832,7 @@ def _crash_streak_next(streak: int, *, became_ready, uptime: float) -> int:
     return streak + 1
 
 
-def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=None):
+def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=None, inherited=()):
     """Fork one worker. Returns (pid, ready_fd).
 
     `ready_fd` is the read end of a pipe the child writes one byte to once
@@ -852,6 +852,17 @@ def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=
         return pid, ready_r
     # ---- child ----
     os.close(ready_r)
+    # fork (no exec) ignores close-on-exec, so this child also inherited a
+    # read end for every worker already running. They are harmless -- the
+    # signal rides the WRITE end, which only the relevant child holds --
+    # but each worker would sit on one descriptor per sibling for its
+    # whole life, which on a large pool is a leak I added along with the
+    # pipe.
+    for fd in inherited:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     status = 1
     try:
         # A worker owns its own signal handling (installed by
@@ -948,7 +959,16 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
     children: dict[int, tuple[int, float, int]] = {}
     try:
         for idx in range(n):
-            pid, ready_fd = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+            pid, ready_fd = _spawn_worker(
+                app,
+                host,
+                port,
+                config,
+                idx,
+                ncpu,
+                ssl_ctx=ssl_ctx,
+                inherited=[e[2] for e in children.values()],
+            )
             children[pid] = (idx, time.monotonic(), ready_fd)
     except BaseException:
         # A fork failing partway (a process limit, say) raised before the
@@ -1031,7 +1051,16 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
                 continue
             logger.warning("worker %d died (status %d) — restarting", idx, status)
             try:
-                npid, nready = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+                npid, nready = _spawn_worker(
+                    app,
+                    host,
+                    port,
+                    config,
+                    idx,
+                    ncpu,
+                    ssl_ctx=ssl_ctx,
+                    inherited=[e[2] for e in children.values()],
+                )
             except BaseException:
                 # A replacement fork can fail for the same reasons the
                 # initial ones can, and this one raised straight through
