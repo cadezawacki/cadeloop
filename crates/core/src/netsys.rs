@@ -240,7 +240,7 @@ mod imp {
     use windows_sys::Win32::Networking::WinSock::{
         bind as ws_bind, closesocket, getpeername, getsockname, listen as ws_listen, setsockopt, shutdown,
         WSAGetLastError, WSAIoctl, WSASocketW, IPPROTO_TCP, SD_SEND, SOCKADDR, SOCKET_ERROR, SOL_SOCKET,
-        SO_REUSEADDR, TCP_NODELAY, WSAEINVAL, WSA_FLAG_OVERLAPPED,
+        TCP_NODELAY, WSAEINVAL, WSA_FLAG_OVERLAPPED,
     };
 
     fn wsa_err() -> io::Error {
@@ -302,9 +302,27 @@ mod imp {
         Ok(())
     }
 
-    pub fn set_reuse_addr(sock: RawSocket, on: bool) -> io::Result<()> {
-        let v: u32 = on as u32;
-        let rc = unsafe { setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (&v as *const u32).cast(), 4) };
+    /// SO_EXCLUSIVEADDRUSE (winsock2.h). Not in windows-sys 0.59's
+    /// bindings; the value is `(u32::MAX - 4) as i32` per the header.
+    const SO_EXCLUSIVEADDRUSE: i32 = !4i32;
+
+    /// On Windows, "reuse the address" does not mean what it means on
+    /// POSIX.
+    ///
+    /// SO_REUSEADDR there lets a DIFFERENT process bind an address and
+    /// port that is already live, after which which socket receives a
+    /// given connection is indeterminate -- the classic Windows
+    /// port-hijacking hole. POSIX SO_REUSEADDR only relaxes TIME_WAIT,
+    /// which is what callers asking for it actually want.
+    ///
+    /// So the flag is honoured by its INTENT rather than its name:
+    /// SO_EXCLUSIVEADDRUSE, which gives the TIME_WAIT relaxation without
+    /// letting anyone else in. `reuse_addr=false` leaves Winsock's
+    /// default, which is the permissive one, so exclusivity is set on
+    /// both branches.
+    pub fn set_reuse_addr(sock: RawSocket, _on: bool) -> io::Result<()> {
+        let v: u32 = 1;
+        let rc = unsafe { setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (&v as *const u32).cast(), 4) };
         if rc == SOCKET_ERROR {
             return Err(wsa_err());
         }

@@ -379,3 +379,28 @@ def test_a_slow_failing_worker_still_trips_the_crash_loop_guard(monkeypatch):
     assert len(spawned) <= srv._CRASH_STREAK_LIMIT + 1, (
         f"respawned {len(spawned)} times; the crash-loop guard never engaged"
     )
+
+
+def test_the_restart_rule_is_one_rule_for_both_supervisors():
+    """The rule lived twice and the two copies disagreed: the fork
+    supervisor was taught to use readiness while the spawn supervisor kept
+    asking only "did this die within a second of starting", so a worker
+    failing slowly was restarted forever there. Reported by Codex on PR #1
+    as a direct follow-up to the fork-side fix.
+
+    Exercised directly, since the spawn model's own path needs a real
+    process to reach."""
+    from cadeloop import server as srv
+
+    n = srv._crash_streak_next
+    # Never served: advances however long the failure took. This is the
+    # case both supervisors used to get wrong.
+    assert n(1, became_ready=False, uptime=0.0) == 2
+    assert n(4, became_ready=False, uptime=srv._STABLE_SECS * 10) == 5
+    # No readiness signal (the spawn model): staying up is the stand-in.
+    assert n(3, became_ready=None, uptime=srv._STABLE_SECS + 1) == 1
+    assert n(3, became_ready=None, uptime=srv._STABLE_SECS - 1) == 4
+    # Served and stayed up: a genuine one-off crash resets.
+    assert n(4, became_ready=True, uptime=srv._STABLE_SECS + 1) == 1
+    # Served but died quickly, repeatedly: still a loop.
+    assert n(2, became_ready=True, uptime=0.5) == 3

@@ -699,7 +699,7 @@ impl IoBackend for EpollBackend {
             0
         } else {
             match timeout {
-                Some(t) => t.as_millis().min(i32::MAX as u128) as i32,
+                Some(t) => crate::backend::wait_millis(t).min(i32::MAX as u128) as i32,
                 None => 0,
             }
         };

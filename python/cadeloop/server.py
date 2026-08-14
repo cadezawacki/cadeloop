@@ -797,6 +797,33 @@ def _channel_pump(chan, loop, adopt):
 # Give up when a worker keeps dying immediately (R-092 supervision):
 _CRASH_STREAK_LIMIT = 5
 _CRASH_FAST_SECS = 1.0
+# How long a worker must stay up to count as stable when we cannot tell
+# whether it ever served. Well past any plausible startup: the whole point
+# is that a deterministic startup failure -- a database connection timing
+# out after five seconds -- must not read as a healthy run.
+_STABLE_SECS = 30.0
+
+
+def _crash_streak_next(streak: int, *, became_ready, uptime: float) -> int:
+    """The restart-limit rule, in ONE place for both supervisors.
+
+    It lived twice, and the two copies were not the same: the fork
+    supervisor was taught to use readiness while the spawn supervisor kept
+    asking only "did this die within a second of starting". A worker that
+    fails slowly -- which is the ordinary shape of a startup failure --
+    therefore reset the streak on every death there and was restarted
+    forever, with no worker ever serving.
+
+    `became_ready` is True/False where a supervisor has a readiness
+    signal, and None where it does not; without one, staying up for
+    `_STABLE_SECS` is the stand-in. Never serving always advances the
+    streak, however long the failure took.
+    """
+    if became_ready is False:
+        return streak + 1
+    if uptime >= _STABLE_SECS:
+        return 1
+    return streak + 1
 
 
 def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=None):
@@ -981,23 +1008,17 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
                 # requested inside it — treat as a shutdown signal.
                 _forward(None, None)
                 continue
-            # A worker that never reached the serving state counts toward
-            # the streak however long it took to fail: the old test asked
-            # only whether it died within _CRASH_FAST_SECS of being forked,
-            # so an application failing slowly -- a database connection
-            # timing out after five seconds, say -- reset the streak on
-            # every death and was restarted forever.
-            fast = time.monotonic() - spawned < _CRASH_FAST_SECS
-            if became_ready and not fast:
-                crash_streak = 1
-            else:
-                crash_streak += 1
+            crash_streak = _crash_streak_next(
+                crash_streak,
+                became_ready=became_ready,
+                uptime=time.monotonic() - spawned,
+            )
             if crash_streak >= _CRASH_STREAK_LIMIT:
                 logger.error(
                     "worker %d died %d times %s — giving up",
                     idx,
                     crash_streak,
-                    "without ever serving" if not became_ready else f"in under {_CRASH_FAST_SECS:.0f}s",
+                    "without ever serving" if not became_ready else "without staying up",
                 )
                 exit_code = 1
                 _forward(None, None)
@@ -1297,14 +1318,21 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
                     # worker — treat as a shutdown signal (fork parity).
                     _stop_all()
                     continue
-                fast = time.monotonic() - w.spawned < _CRASH_FAST_SECS
-                crash_streak = crash_streak + 1 if fast else 1
+                # became_ready=None: this model's control channel runs
+                # supervisor -> worker only on Windows, so there is no
+                # readiness frame to read. `_STABLE_SECS` stands in --
+                # which is the point of sharing the rule rather than
+                # keeping a second copy that quietly says something else.
+                crash_streak = _crash_streak_next(
+                    crash_streak,
+                    became_ready=None,
+                    uptime=time.monotonic() - w.spawned,
+                )
                 if crash_streak >= _CRASH_STREAK_LIMIT:
                     logger.error(
-                        "worker %d died %d times in under %.0fs — giving up",
+                        "worker %d died %d times without staying up — giving up",
                         w.idx,
                         crash_streak,
-                        _CRASH_FAST_SECS,
                     )
                     exit_code = 1
                     _stop_all()

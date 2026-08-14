@@ -210,8 +210,24 @@ pub trait Wakeup: Send + Sync {
     fn wake(&self);
 }
 
+/// Milliseconds to wait, rounding a nonzero duration UP.
+///
+/// `as_millis()` truncates, so any deadline under a millisecond became a
+/// zero-timeout wait: the syscall returned at once, the tick ran again,
+/// and the loop burned a full core spinning until the timer finally
+/// expired -- past the configured spin window, on every sub-millisecond
+/// timer. Zero in means zero out (a deliberate poll); anything positive
+/// waits at least 1ms.
+pub(crate) fn wait_millis(t: std::time::Duration) -> u128 {
+    if t.is_zero() {
+        return 0;
+    }
+    t.as_millis().max(1)
+}
+
 /// Requested backend kind (R-020 `backend="auto"|"iocp"|"rio"|"epoll"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
 pub enum BackendKind {
     Auto,
     Iocp,
@@ -279,5 +295,24 @@ pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn Io
     {
         let _ = (kind, opts);
         Ok(Box::new(portable::PortableBackend::new()))
+    }
+}
+
+#[cfg(test)]
+mod wait_millis_tests {
+    use super::wait_millis;
+    use std::time::Duration;
+
+    #[test]
+    fn a_sub_millisecond_wait_does_not_become_a_busy_poll() {
+        // The bug: 400us truncated to 0, so the wait returned instantly
+        // and the loop spun until the timer expired.
+        assert_eq!(wait_millis(Duration::from_micros(400)), 1);
+        assert_eq!(wait_millis(Duration::from_nanos(1)), 1);
+        // Zero stays zero: that is a deliberate non-blocking poll.
+        assert_eq!(wait_millis(Duration::ZERO), 0);
+        // Whole milliseconds are unchanged.
+        assert_eq!(wait_millis(Duration::from_millis(7)), 7);
+        assert_eq!(wait_millis(Duration::from_micros(7_400)), 7);
     }
 }

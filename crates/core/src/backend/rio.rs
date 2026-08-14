@@ -655,7 +655,7 @@ impl IoBackend for RioBackend {
         }
         let mut timeout_ms: u32 = match timeout {
             _ if out.len() > before => 0,
-            Some(t) => t.as_millis().min(u32::MAX as u128) as u32,
+            Some(t) => crate::backend::wait_millis(t).min(u32::MAX as u128) as u32,
             None => 0,
         };
         if self.polling_only && self.inflight > 0 {
