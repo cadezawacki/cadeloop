@@ -120,6 +120,17 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
+impl Request {
+    /// Bytes this parsed request retains, for the pipeline queue budget.
+    /// Approximate by design: the point is bounding memory, not exact
+    /// accounting.
+    pub fn queued_size(&self) -> usize {
+        self.url.len()
+            + self.body.len()
+            + self.headers.iter().map(|(n, v)| n.len() + v.len() + 4).sum::<usize>()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseError {
     /// Suggested response status (400 or 431/413).

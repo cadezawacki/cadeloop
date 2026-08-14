@@ -64,6 +64,10 @@ pub(crate) struct HttpConn {
     /// Parsed-but-undispatched requests (pipelined; drained sequentially,
     /// R-085).
     pub(crate) pending: VecDeque<Request>,
+    /// Bytes retained by `pending`, against MAX_PIPELINE_BYTES.
+    pub(crate) pending_bytes: usize,
+    /// Reading was stopped because the pipeline budget was spent.
+    pub(crate) pipeline_paused: bool,
     /// A request is being processed (its app coroutine has not returned).
     pub(crate) active: bool,
     pub(crate) keep_alive: bool,
@@ -177,6 +181,8 @@ impl HttpConn {
             state,
             parser: HttpParser::new(limits),
             pending: VecDeque::new(),
+            pending_bytes: 0,
+            pipeline_paused: false,
             active: false,
             keep_alive: true,
             resp: RespPhase::Idle,
@@ -214,12 +220,42 @@ impl HttpConn {
     pub(crate) fn take_recv_waiter(&mut self) -> Option<Py<PyAny>> {
         self.recv_waiter.take()
     }
+
+    /// The pipeline queue is at its depth or byte budget.
+    pub(crate) fn pipeline_full(&self) -> bool {
+        self.pending.len() >= MAX_PIPELINE_DEPTH || self.pending_bytes >= MAX_PIPELINE_BYTES
+    }
+
+    /// Drained far enough below the budget to start reading again. The
+    /// gap is deliberate: resuming exactly at the limit would toggle the
+    /// recv on and off for every single request.
+    pub(crate) fn pipeline_drained(&self) -> bool {
+        self.pending.len() * 2 < MAX_PIPELINE_DEPTH && self.pending_bytes * 2 < MAX_PIPELINE_BYTES
+    }
 }
 
-/// In-cell: feed received bytes into the parser. `Ok(true)` means phase 2
-/// must run the request pump; parse errors are answered entirely in-cell
-/// by the caller (R-086).
-pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<bool, ParseError> {
+/// R-085 pipeline budget: how many parsed-but-undispatched requests a
+/// single connection may hold, and how many bytes they may retain.
+///
+/// Without these a client can pipeline an unbounded burst behind one slow
+/// request -- the receive path keeps reposting reads and every parsed
+/// request is retained in full (URL, headers, body) -- and grow
+/// `conn.pending` until the worker dies. Reading is paused at the limit
+/// and resumed as the queue drains, so the backlog ends up in the peer's
+/// send buffer and the kernel's receive window instead of our heap.
+pub(crate) const MAX_PIPELINE_DEPTH: usize = 64;
+pub(crate) const MAX_PIPELINE_BYTES: usize = 1 << 20;
+
+/// In-cell: feed received bytes into the parser. Parse errors are
+/// answered entirely in-cell by the caller (R-086).
+pub(crate) struct FeedOutcome {
+    /// Phase 2 must run the request pump.
+    pub pump: bool,
+    /// The pipeline budget is spent: stop reading until it drains.
+    pub pause_reading: bool,
+}
+
+pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome, ParseError> {
     conn.activity = conn.activity.wrapping_add(1);
     if let Some(offset) = conn.parser.feed(data)? {
         // Upgrade head complete (R-087): bytes past it are NOT HTTP —
@@ -227,9 +263,10 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<bool, ParseE
         conn.ws_trailing.extend_from_slice(&data[offset..]);
     }
     while let Some(req) = conn.parser.next_request() {
+        conn.pending_bytes += req.queued_size();
         conn.pending.push_back(req);
     }
-    Ok(!conn.pending.is_empty() && !conn.active)
+    Ok(FeedOutcome { pump: !conn.pending.is_empty() && !conn.active, pause_reading: conn.pipeline_full() })
 }
 
 /// In-cell: serialized minimal error response (400/413/414/431/500).
@@ -1178,7 +1215,16 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
             false
         } else {
             match conn_feed(conn, &plaintext) {
-                Ok(pump) => pump,
+                Ok(outcome) => {
+                    // TLS reads are driven by the ciphertext recv, which
+                    // this path does not repost; flagging the connection
+                    // keeps the budget honest so http_resume_reading has
+                    // something to release when the queue drains.
+                    if outcome.pause_reading {
+                        conn.pipeline_paused = true;
+                    }
+                    outcome.pump
+                }
                 Err(e) => {
                     // R-086 parity: answer in-cell (staged via TLS), close.
                     let resp = error_response(e);
@@ -1609,6 +1655,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 return None;
             }
             conn.pending.pop_front().map(|mut req| {
+                conn.pending_bytes = conn.pending_bytes.saturating_sub(req.queued_size());
                 conn.active = true;
                 conn.keep_alive = req.keep_alive;
                 conn.resp = RespPhase::Idle;
@@ -1907,6 +1954,10 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
         }
         if close {
             net::http_close_after_write(py, net, backend, tid);
+        } else {
+            // R-085: a request just left the pipeline queue, so the budget
+            // that suppressed reading may have freed up.
+            net::http_resume_reading(py, net, backend, tid);
         }
         (waiter, log)
     })?;

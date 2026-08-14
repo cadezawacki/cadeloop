@@ -1315,3 +1315,58 @@ def test_matching_content_length_still_passes(loop):
     assert resp.startswith(b"HTTP/1.1 200")
     assert _body(resp) == b"hello"
     loop._core.listener_close(lid)
+
+
+def test_pipelined_burst_behind_a_slow_request_is_bounded(loop):
+    """R-085: while one request is being served, every subsequently parsed
+    pipelined request was retained in full and the receive path kept
+    reposting reads, so a client could grow conn.pending until the process
+    died. Reading is now paused at the budget and resumed as the queue
+    drains — the backlog belongs in the peer's send buffer, not our heap.
+    Reported by Codex review on PR #1 (F01).
+
+    The burst must still be served correctly and in order once released.
+    """
+    release = asyncio.Event()
+    served = []
+
+    async def app(scope, receive, send):
+        await receive()
+        if scope["path"] == "/slow":
+            await release.wait()
+        served.append(scope["path"])
+        body = scope["path"].encode()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, app)
+    n = 300  # far past the 64-deep budget
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        burst = b"GET /slow HTTP/1.1\r\nHost: h\r\n\r\n" + b"".join(
+            f"GET /n{i} HTTP/1.1\r\nHost: h\r\n\r\n".encode() for i in range(n)
+        )
+        writer.write(burst)
+        # drain() may not complete while the server is paused — that IS
+        # the backpressure, so do not await it before releasing.
+        await asyncio.sleep(0.2)
+        release.set()
+        got = []
+        for _ in range(n + 1):
+            resp = await asyncio.wait_for(_read_one_response(reader), 20)
+            got.append(_body(resp).decode())
+        writer.close()
+        return got
+
+    got = loop.run_until_complete(main())
+    assert got[0] == "/slow"
+    assert got[1:] == [f"/n{i}" for i in range(n)], "pipelined order broken"
+    # The bound actually engaged — otherwise this test would pass just as
+    # happily against an unbounded queue.
+    assert loop._core.stats()["pipeline_pauses"] > 0, "reading was never paused"
+    loop._core.listener_close(lid)

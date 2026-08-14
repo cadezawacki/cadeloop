@@ -1214,6 +1214,7 @@ impl CoreLoop {
                     st.net.stats_bytes_tx,
                     st.net.stats_conns_accepted,
                     st.net.stats_accept_starved,
+                    st.net.stats_pipeline_pauses,
                 ),
                 st.reactor.backend_mut().diag(),
                 // Live, not the construction-time cache: RIO downgrades its
@@ -1239,6 +1240,7 @@ impl CoreLoop {
         d.set_item("bytes_sent", netstats.4)?;
         d.set_item("connections_accepted", netstats.5)?;
         d.set_item("accept_starved", netstats.6)?;
+        d.set_item("pipeline_pauses", netstats.7)?;
         if let Some((notifies, reaps)) = diag {
             d.set_item("rio_notifies", notifies)?;
             d.set_item("rio_watchdog_reaps", reaps)?;

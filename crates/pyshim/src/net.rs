@@ -284,6 +284,9 @@ pub(crate) struct NetState {
     pub stats_conns_accepted: u64,
     /// Times an accept pool ran dry on a transient post failure (R-032).
     pub stats_accept_starved: u64,
+    /// Times a connection stopped reading because its pipeline budget was
+    /// spent (R-085). Non-zero means backpressure is doing its job.
+    pub stats_pipeline_pauses: u64,
     /// Cheap gate for `retry_starved_listeners` on the tick path.
     pub any_starved_listener: bool,
     /// HTTP `Date:` header cache (R-084): rebuilt when the unix second ticks.
@@ -1287,6 +1290,8 @@ fn on_recv_done(
     bytes: u32,
     os_error: u32,
 ) {
+    let mut pipeline_pause = false;
+    let mut paused_now = false;
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.recv_op == Some(op) {
         entry.recv_op = None;
@@ -1375,8 +1380,22 @@ fn on_recv_done(
                 // In-cell parse (R-080): llhttp over the recv slot; the
                 // parser copies what it keeps, so the slot re-posts below.
                 match crate::http::conn_feed(conn, data) {
-                    Ok(true) => net.events.push(NetEvent::HttpPump { tid }),
-                    Ok(false) => {}
+                    Ok(outcome) => {
+                        // R-085: stop reading while the pipeline budget is
+                        // spent. The connection is flagged here and the
+                        // recv is simply not reposted below; pump_requests
+                        // resumes it as the queue drains.
+                        if outcome.pause_reading && !conn.pipeline_paused {
+                            conn.pipeline_paused = true;
+                            pipeline_pause = true;
+                            paused_now = true;
+                        } else if outcome.pause_reading {
+                            pipeline_pause = true;
+                        }
+                        if outcome.pump {
+                            net.events.push(NetEvent::HttpPump { tid });
+                        }
+                    }
                     Err(e) => parse_err = Some(e),
                 }
             }
@@ -1389,7 +1408,28 @@ fn on_recv_done(
         http_close_after_write(py, net, backend, tid);
         return; // no recv re-post
     }
+    if paused_now {
+        net.stats_pipeline_pauses += 1;
+    }
+    if pipeline_pause {
+        return; // budget spent; http_resume_reading re-posts
+    }
     post_recv(py, net, backend, tid);
+}
+
+/// R-085: re-post the recv a spent pipeline budget suppressed, once the
+/// queue has drained far enough. In-cell.
+pub(crate) fn http_resume_reading(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
+    let resume = match net.transports.get_mut(&tid).map(|e| &mut e.proto) {
+        Some(ProtoKind::Http(conn)) if conn.pipeline_paused && conn.pipeline_drained() => {
+            conn.pipeline_paused = false;
+            true
+        }
+        _ => false,
+    };
+    if resume {
+        post_recv(py, net, backend, tid);
+    }
 }
 
 fn on_send_done(
