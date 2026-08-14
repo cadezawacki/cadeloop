@@ -11,7 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | ADR-24 | `/bg` trace markers removed; op-target breakdown kept in `stats()` | `HEAD` |
+> | ADR-24 | `/bg` trace markers removed; op-target breakdown kept in `stats()` | `d4cfe3e` |
 > | CI | Soak + benchmark gates moved to `slow.yml`, where they are not cancelled | `48e584c` |
 > | Net | A starved listener stayed deaf: the retry only ran when other I/O arrived | `999eab8` |
 > | Net | Wildcard IPv6 listeners need `IPV6_V6ONLY`; `host=None` failed `EADDRINUSE` | `999eab8` |
