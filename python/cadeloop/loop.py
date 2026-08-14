@@ -252,6 +252,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return future.result()
 
     def close(self):
+        # Check-before-teardown (base_events.close()'s own order): a
+        # close() on a running loop must fail cleanly, not leave the
+        # executors permanently shut down as a side effect of a call
+        # that itself raised.
+        if self.is_running():
+            raise RuntimeError("Cannot close a running event loop")
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None

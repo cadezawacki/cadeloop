@@ -194,6 +194,13 @@ def test_reentrant_run_forever_raises(loop):
 
 def test_close_while_running_raises(loop):
     errors = []
+    # Prime a default executor so we can prove it survives a failed
+    # close() below (R-102: close() must check is_running() before
+    # touching the executors, not after — otherwise a close() that
+    # itself raises still leaves them permanently shut down).
+    loop.run_until_complete(loop.run_in_executor(None, lambda: None))
+    executor_before = loop._default_executor
+    assert executor_before is not None
 
     def do_close():
         try:
@@ -205,6 +212,11 @@ def test_close_while_running_raises(loop):
     loop.call_soon(do_close)
     loop.run_forever()
     assert errors and "Cannot close a running event loop" in errors[0]
+    assert loop._default_executor is executor_before
+    assert (
+        loop.run_until_complete(loop.run_in_executor(None, lambda: "still works"))
+        == "still works"
+    )
 
 
 def test_close_is_idempotent():

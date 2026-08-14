@@ -583,8 +583,75 @@ class TcpSurface:
             self._core.remove_reader(fd)
 
     async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=True):
-        # Portable fallback: chunked read + sock_sendall (native
-        # TransmitFile arrives with R-036 on Windows).
+        """Native os.sendfile first (TransmitFile is the remaining R-036
+        refinement on Windows, same caveat as loop.py's sendfile()), the
+        chunked read + sock_sendall path as the fallback — mirrors
+        sendfile()'s own native-first/fallback/validation shape exactly;
+        this previously always took the chunked path regardless of
+        fallback= and skipped every one of these checks."""
+        if "b" not in getattr(file, "mode", "b"):
+            raise ValueError("file should be opened in binary mode")
+        if sock.type != socket.SOCK_STREAM:
+            raise ValueError("only SOCK_STREAM type sockets are supported")
+        if count is not None:
+            if not isinstance(count, int):
+                raise TypeError(f"count must be a positive integer (got {count!r})")
+            if count <= 0:
+                raise ValueError(f"count must be a positive integer (got {count!r})")
+        if not isinstance(offset, int):
+            raise TypeError(f"offset must be a non-negative integer (got {offset!r})")
+        if offset < 0:
+            raise ValueError(f"offset must be a non-negative integer (got {offset!r})")
+
+        can_native = hasattr(os, "sendfile") and hasattr(file, "fileno")
+        if can_native:
+            try:
+                file.fileno()
+            except (OSError, AttributeError, ValueError):
+                can_native = False
+        if not can_native:
+            if not fallback:
+                raise asyncio.SendfileNotAvailableError(
+                    "syscall sendfile is not available for this socket/file combination"
+                )
+            return await self._sock_sendfile_fallback(sock, file, offset, count)
+        return await self._sock_sendfile_native(sock, file, offset, count)
+
+    async def _sock_sendfile_native(self, sock, file, offset, count):
+        fd = sock.fileno()
+        in_fd = file.fileno()
+        total = 0
+        while True:
+            blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
+            if blocksize <= 0:
+                break
+            try:
+                sent = os.sendfile(fd, in_fd, offset + total, blocksize)
+            except BlockingIOError:
+                sent = None
+            except InterruptedError:
+                continue
+            if sent == 0:
+                break  # end of file
+            if sent is not None:
+                total += sent
+                continue
+            # Socket buffer full: wait for writability.
+            fut = self.create_future()
+
+            def on_writable():
+                if not fut.done():
+                    fut.set_result(None)
+
+            self._core.add_writer(fd, on_writable)
+            try:
+                await fut
+            finally:
+                self._core.remove_writer(fd)
+        file.seek(offset + total)  # stdlib convention
+        return total
+
+    async def _sock_sendfile_fallback(self, sock, file, offset, count):
         if offset:
             file.seek(offset)
         blocksize = min(count, 16384) if count else 16384

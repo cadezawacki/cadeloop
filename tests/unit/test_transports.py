@@ -473,21 +473,36 @@ def test_sock_functions(loop):
     loop.run_until_complete(main())
 
 
-def test_sock_sendfile_fallback(loop, tmp_path):
+def _sock_sendfile_pair(loop):
+    """listener/client/server_side triple bound + connected on 127.0.0.1."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.setblocking(False)
+    return listener
+
+
+async def _sock_sendfile_connect(loop, listener):
+    addr = listener.getsockname()
+    client = socket.socket()
+    client.setblocking(False)
+    await loop.sock_connect(client, addr)
+    server_side, _ = await loop.sock_accept(listener)
+    return client, server_side
+
+
+def test_sock_sendfile_native(loop, tmp_path):
+    """A real on-disk file has .fileno(), so this exercises the native
+    os.sendfile path added alongside the chunked fallback (previously
+    sock_sendfile always took the chunked path regardless)."""
+
     async def main():
         payload = os.urandom(150_000)
         f = tmp_path / "blob.bin"
         f.write_bytes(payload)
 
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        listener.setblocking(False)
-        addr = listener.getsockname()
-        client = socket.socket()
-        client.setblocking(False)
-        await loop.sock_connect(client, addr)
-        server_side, _ = await loop.sock_accept(listener)
+        listener = _sock_sendfile_pair(loop)
+        client, server_side = await _sock_sendfile_connect(loop, listener)
 
         with open(f, "rb") as fh:
             sent = await loop.sock_sendfile(client, fh)
@@ -498,6 +513,81 @@ def test_sock_sendfile_fallback(loop, tmp_path):
         assert bytes(received) == payload
         for s in (client, server_side, listener):
             s.close()
+
+    loop.run_until_complete(main())
+
+
+def test_sock_sendfile_fallback_no_fileno(loop):
+    """A file-like object without .fileno() (BytesIO) can't use native
+    os.sendfile — must still work via the chunked fallback."""
+    import io
+
+    async def main():
+        payload = os.urandom(50_000)
+        listener = _sock_sendfile_pair(loop)
+        client, server_side = await _sock_sendfile_connect(loop, listener)
+
+        sent = await loop.sock_sendfile(client, io.BytesIO(payload))
+        assert sent == len(payload)
+        received = bytearray()
+        while len(received) < len(payload):
+            received.extend(await loop.sock_recv(server_side, 65536))
+        assert bytes(received) == payload
+        for s in (client, server_side, listener):
+            s.close()
+
+    loop.run_until_complete(main())
+
+
+def test_sock_sendfile_fallback_false_raises_without_native(loop):
+    """fallback=False must raise SendfileNotAvailableError rather than
+    silently falling back when native sendfile isn't usable — previously
+    fallback= was accepted but never actually inspected."""
+    import io
+
+    async def main():
+        listener = _sock_sendfile_pair(loop)
+        client, server_side = await _sock_sendfile_connect(loop, listener)
+        with pytest.raises(asyncio.SendfileNotAvailableError):
+            await loop.sock_sendfile(client, io.BytesIO(b"x"), fallback=False)
+        for s in (client, server_side, listener):
+            s.close()
+
+    loop.run_until_complete(main())
+
+
+def test_sock_sendfile_validates_params(loop, tmp_path):
+    """Params previously reached os.sendfile/file.read unchecked; now
+    matches base_events._check_sendfile_params exactly."""
+    f = tmp_path / "blob.bin"
+    f.write_bytes(b"x" * 100)
+
+    async def main():
+        listener = _sock_sendfile_pair(loop)
+        client, server_side = await _sock_sendfile_connect(loop, listener)
+        try:
+            with open(f, "rb") as fh:
+                with pytest.raises(TypeError, match="count must be"):
+                    await loop.sock_sendfile(client, fh, count="not-an-int")
+                with pytest.raises(ValueError, match="count must be"):
+                    await loop.sock_sendfile(client, fh, count=0)
+                with pytest.raises(TypeError, match="offset must be"):
+                    await loop.sock_sendfile(client, fh, offset="not-an-int")
+                with pytest.raises(ValueError, match="offset must be"):
+                    await loop.sock_sendfile(client, fh, offset=-1)
+            with open(f, "r") as text_fh:  # not binary mode
+                with pytest.raises(ValueError, match="binary mode"):
+                    await loop.sock_sendfile(client, text_fh)
+            dgram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                with pytest.raises(ValueError, match="SOCK_STREAM"):
+                    with open(f, "rb") as fh:
+                        await loop.sock_sendfile(dgram, fh)
+            finally:
+                dgram.close()
+        finally:
+            for s in (client, server_side, listener):
+                s.close()
 
     loop.run_until_complete(main())
 
