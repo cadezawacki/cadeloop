@@ -291,6 +291,7 @@ def _serve_single(
     worker_id=None,
     control_channel=None,
     ssl_ctx=None,
+    ready_fd=None,
 ):
     """One worker: loop + lifespan + native listener (the M2 path).
 
@@ -420,6 +421,19 @@ def _serve_single(
         who = f"worker {worker_id} " if worker_id is not None else ""
         logger.info("cadeloop %sserving on http://%s:%s", who, shown[0], shown[1])
         served = True
+        if ready_fd is not None:
+            # Tells the supervisor this worker reached the serving state,
+            # so a death from here on is a crash rather than a failure to
+            # start. Written once, here and nowhere earlier: everything
+            # above (bind, lifespan startup, listener setup) is precisely
+            # what "not ready" has to cover.
+            try:
+                os.write(ready_fd, b"R")
+            except OSError:
+                pass
+            finally:
+                os.close(ready_fd)
+                ready_fd = None
         try:
             loop.run_forever()
         except KeyboardInterrupt:
@@ -785,11 +799,26 @@ _CRASH_STREAK_LIMIT = 5
 _CRASH_FAST_SECS = 1.0
 
 
-def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=None) -> int:
+def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=None):
+    """Fork one worker. Returns (pid, ready_fd).
+
+    `ready_fd` is the read end of a pipe the child writes one byte to once
+    it is actually serving. The supervisor needs that distinction: its
+    crash-loop guard used to ask only "did this die within
+    _CRASH_FAST_SECS of being forked", so an application that fails
+    SLOWLY -- a database connection that times out after five seconds is
+    the ordinary case -- reset the streak on every death and was restarted
+    forever. "Died without ever serving" is the signal that matters, and
+    it does not depend on how long the failure took.
+    """
+    ready_r, ready_w = os.pipe()
     pid = os.fork()
     if pid != 0:
-        return pid
+        os.close(ready_w)
+        os.set_blocking(ready_r, False)
+        return pid, ready_r
     # ---- child ----
+    os.close(ready_r)
     status = 1
     try:
         # A worker owns its own signal handling (installed by
@@ -803,13 +832,55 @@ def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=
                 os.sched_setaffinity(0, {idx % ncpu})
             except OSError:
                 pass
-        _serve_single(app, host, port, config, reuse_port=True, worker_id=idx, ssl_ctx=ssl_ctx)
+        _serve_single(
+            app,
+            host,
+            port,
+            config,
+            reuse_port=True,
+            worker_id=idx,
+            ssl_ctx=ssl_ctx,
+            ready_fd=ready_w,
+        )
         status = 0
     except BaseException:  # noqa: BLE001 — worker death is the supervisor's signal
         logger.exception("worker %d crashed", idx)
     finally:
         os._exit(status)
     return 0  # unreachable
+
+
+def _close_ready_fd(entry) -> None:
+    """Release a supervised worker's readiness pipe.
+
+    Every path that forgets a child has to come through here, or the
+    supervisor leaks one descriptor per worker per restart -- which a
+    crash-restart cycle turns into a slow exhaustion of the one process
+    that is supposed to survive it.
+    """
+    if not isinstance(entry, tuple) or len(entry) < 3:
+        return
+    try:
+        os.close(entry[2])
+    except OSError:
+        pass
+
+
+def _worker_became_ready(ready_fd) -> bool:
+    """Did this worker ever reach the serving state?
+
+    Non-blocking: the byte is either already in the pipe or the worker
+    died before writing it. Closes the descriptor either way.
+    """
+    try:
+        return bool(os.read(ready_fd, 1))
+    except (BlockingIOError, OSError):
+        return False
+    finally:
+        try:
+            os.close(ready_fd)
+        except OSError:
+            pass
 
 
 def _kill_children(children) -> None:
@@ -819,12 +890,13 @@ def _kill_children(children) -> None:
     supervisor left to signal it would otherwise keep the port bound and
     the application's resources held for the life of the machine.
     """
-    for pid in list(children):
+    for pid, entry in list(children.items()):
         try:
             os.kill(pid, _signal.SIGKILL)
             os.waitpid(pid, 0)
         except (ProcessLookupError, ChildProcessError):
             pass
+        _close_ready_fd(entry)
     children.clear()
 
 
@@ -839,11 +911,12 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
         )
     ncpu = os.cpu_count() or 1
     logger.info("cadeloop supervisor: %d workers on http://%s:%s", n, host, port)
-    children: dict[int, tuple[int, float]] = {}  # pid -> (idx, spawn_time)
+    # pid -> (idx, spawn_time, ready_fd)
+    children: dict[int, tuple[int, float, int]] = {}
     try:
         for idx in range(n):
-            pid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
-            children[pid] = (idx, time.monotonic())
+            pid, ready_fd = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+            children[pid] = (idx, time.monotonic(), ready_fd)
     except BaseException:
         # A fork failing partway (a process limit, say) raised before the
         # signal handlers were installed and before the cleanup block
@@ -896,7 +969,10 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
                 continue
             if pid not in children:
                 continue
-            idx, spawned = children.pop(pid)
+            idx, spawned, ready_fd = children.pop(pid)
+            # Consumes and closes ready_fd, so every reaped child is
+            # accounted for on this path.
+            became_ready = _worker_became_ready(ready_fd)
             if stopping:
                 continue
             clean = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
@@ -905,21 +981,30 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
                 # requested inside it — treat as a shutdown signal.
                 _forward(None, None)
                 continue
+            # A worker that never reached the serving state counts toward
+            # the streak however long it took to fail: the old test asked
+            # only whether it died within _CRASH_FAST_SECS of being forked,
+            # so an application failing slowly -- a database connection
+            # timing out after five seconds, say -- reset the streak on
+            # every death and was restarted forever.
             fast = time.monotonic() - spawned < _CRASH_FAST_SECS
-            crash_streak = crash_streak + 1 if fast else 1
+            if became_ready and not fast:
+                crash_streak = 1
+            else:
+                crash_streak += 1
             if crash_streak >= _CRASH_STREAK_LIMIT:
                 logger.error(
-                    "worker %d died %d times in under %.0fs — giving up",
+                    "worker %d died %d times %s — giving up",
                     idx,
                     crash_streak,
-                    _CRASH_FAST_SECS,
+                    "without ever serving" if not became_ready else f"in under {_CRASH_FAST_SECS:.0f}s",
                 )
                 exit_code = 1
                 _forward(None, None)
                 continue
             logger.warning("worker %d died (status %d) — restarting", idx, status)
             try:
-                npid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+                npid, nready = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
             except BaseException:
                 # A replacement fork can fail for the same reasons the
                 # initial ones can, and this one raised straight through
@@ -929,7 +1014,7 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
                 # server had failed. Same cleanup as the startup path.
                 _kill_children(children)
                 raise
-            children[npid] = (idx, time.monotonic())
+            children[npid] = (idx, time.monotonic(), nready)
         # Drain: give survivors `grace` seconds, then SIGKILL (R-092).
         deadline = time.monotonic() + config.grace
         while children and time.monotonic() < deadline:
@@ -941,7 +1026,7 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
             if pid == 0:
                 time.sleep(0.05)
                 continue
-            children.pop(pid, None)
+            _close_ready_fd(children.pop(pid, None))
         for pid in children:
             logger.warning("worker pid %d exceeded grace=%ss — SIGKILL", pid, config.grace)
             try:
@@ -950,6 +1035,8 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
             except (ProcessLookupError, ChildProcessError):
                 pass
     finally:
+        for entry in children.values():
+            _close_ready_fd(entry)
         _signal.signal(_signal.SIGTERM, old_term)
         _signal.signal(_signal.SIGINT, old_int)
     if exit_code:

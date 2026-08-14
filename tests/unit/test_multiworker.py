@@ -296,7 +296,13 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
             raise OSError(11, "Resource temporarily unavailable")
         pid = 101 + len(spawned)
         spawned.append(pid)
-        return pid
+        # (pid, ready_fd): the supervisor reads the fd to tell "died
+        # before ever serving" from "crashed while serving". A real pipe,
+        # not a placeholder, so the close paths are exercised too.
+        r, w = os.pipe()
+        os.close(w)  # never written: this worker never reaches serving
+        os.set_blocking(r, False)
+        return pid, r
 
     reaped = [False]
 
@@ -322,3 +328,54 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
 
 async def _noop_app(scope, receive, send):  # pragma: no cover - never run
     pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork worker model")
+def test_a_slow_failing_worker_still_trips_the_crash_loop_guard(monkeypatch):
+    """The guard asked only whether a worker died within _CRASH_FAST_SECS
+    of being FORKED. An application that fails slowly -- a database
+    connection timing out after five seconds is the ordinary case -- reset
+    the streak on every death, so the pool restarted it forever and never
+    gave up. "Died without ever serving" is the signal that matters, and
+    it does not depend on how long the failure took."""
+    from cadeloop import server as srv
+
+    spawned = []
+    pending = []
+
+    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None):
+        pid = 200 + len(spawned)
+        spawned.append(pid)
+        r, w = os.pipe()
+        os.close(w)  # never written: the worker dies before serving
+        os.set_blocking(r, False)
+        pending.append(pid)
+        return pid, r
+
+    def fake_waitpid(pid, flags=0):
+        if pid == -1:
+            if not pending:
+                raise ChildProcessError
+            # Each death looks SLOW: well past _CRASH_FAST_SECS since fork.
+            return (pending.pop(0), 256)
+        return (pid, 0)
+
+    # Every reap reports a death older than the fast-crash window.
+    clock = [0.0]
+
+    def fake_monotonic():
+        clock[0] += srv._CRASH_FAST_SECS * 3
+        return clock[0]
+
+    monkeypatch.setattr(srv, "_spawn_worker", fake_spawn)
+    monkeypatch.setattr(srv.os, "waitpid", fake_waitpid)
+    monkeypatch.setattr(srv.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(srv.time, "monotonic", fake_monotonic)
+
+    with pytest.raises(SystemExit):
+        srv._serve_multi(_noop_app, "127.0.0.1", 8124, cadeloop.Config(grace=0.0), 1)
+
+    # Bounded: the guard gave up instead of respawning without end.
+    assert len(spawned) <= srv._CRASH_STREAK_LIMIT + 1, (
+        f"respawned {len(spawned)} times; the crash-loop guard never engaged"
+    )
