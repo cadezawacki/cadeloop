@@ -11,7 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | ASGI | A second concurrent `receive()` displaced the first waiter, whose awaiter then stayed pending forever | `` |
+> | Loop | An exception handler raising `KeyboardInterrupt`/`SystemExit` was demoted to an unraisable warning; the loop kept running | `` |
+> | ASGI | A second concurrent `receive()` displaced the first waiter, whose awaiter then stayed pending forever | `5186907` |
 > | HTTP | A pipelined parse error was answered out of order: its 400 could reach the client as (or spliced into) an earlier request's response, and valid requests parsed ahead of it in the same buffer were dropped | `e37e9ad` |
 > | Loop | `run_until_complete` scheduled the coroutine before refusing to run it | `fc8da98` |
 > | ASGI | `scope["asgi"]` and `scope["extensions"]` were shared process-wide and mutable | `5c0e21a` |

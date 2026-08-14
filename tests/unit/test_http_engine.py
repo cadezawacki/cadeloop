@@ -374,6 +374,28 @@ def test_parse_error_waits_for_inflight_response(loop):
     loop._core.listener_close(lid)
 
 
+def test_net_error_hook_raising_fatal_stops_the_loop(loop):
+    """An exception handler that raises KeyboardInterrupt on an ASGI
+    app failure must stop the loop (CPython re-raises the two fatal
+    exceptions out of call_exception_handler), not be demoted to an
+    unraisable warning while the 500 goes out as if nothing happened.
+    Reported on PR #1."""
+
+    async def app(scope, receive, send):
+        raise ValueError("boom")
+
+    def handler(lp, ctx):
+        raise KeyboardInterrupt
+
+    loop.set_exception_handler(handler)
+    lid, port = listen(loop, app)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run_until_complete(
+            _request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", read_all=True)
+        )
+    loop._core.listener_close(lid)
+
+
 def test_concurrent_receive_waiters_all_resolve_on_disconnect(loop):
     """Two receive() calls awaiting concurrently must BOTH resolve when
     the client disconnects. Parking the second waiter used to displace

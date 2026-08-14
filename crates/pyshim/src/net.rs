@@ -2262,7 +2262,7 @@ pub(crate) fn dispatch_events(
                 crate::http::tls_flush_conn(py, slf, tid)?;
             }
             NetEvent::AcceptError { err } => {
-                core.report_net_error(py, "Accept failed", os_err(py, err));
+                core.report_net_error(py, "Accept failed", os_err(py, err))?;
             }
             NetEvent::ConnectDone { fut, sock, err } => {
                 let fut = fut.bind(py);

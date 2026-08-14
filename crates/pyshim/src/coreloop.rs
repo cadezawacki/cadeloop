@@ -188,39 +188,54 @@ impl CoreLoop {
             Err(e) if e.is_instance_of::<PyKeyboardInterrupt>(py) || e.is_instance_of::<PySystemExit>(py) => {
                 Err(e)
             }
-            Err(e) => {
-                self.report_net_error(
-                    py,
-                    "Exception in network protocol callback",
-                    e.into_value(py).into_any(),
-                );
+            Err(e) => self.report_net_error(
+                py,
+                "Exception in network protocol callback",
+                e.into_value(py).into_any(),
+            ),
+        }
+    }
+
+    /// The two hooks below route errors to the facade's
+    /// call_exception_handler, which deliberately RE-RAISES
+    /// KeyboardInterrupt/SystemExit from a custom handler (CPython
+    /// parity). Those two must keep propagating here -- demoting them to
+    /// an unraisable warning kept the loop running through a Ctrl-C the
+    /// user's own handler chose to surface. Anything else the hook call
+    /// raises stays non-fatal (the facade already fell back to the
+    /// default handler internally before letting it escape).
+    fn hook_error_verdict(&self, py: Python<'_>, e: PyErr, ctx: Option<&Py<PyAny>>) -> PyResult<()> {
+        if e.is_instance_of::<PyKeyboardInterrupt>(py) || e.is_instance_of::<PySystemExit>(py) {
+            return Err(e);
+        }
+        e.write_unraisable(py, ctx.map(|c| c.bind(py)));
+        Ok(())
+    }
+
+    pub(crate) fn report_net_error(&self, py: Python<'_>, message: &str, exc: Py<PyAny>) -> PyResult<()> {
+        match self.net_error_hook.get() {
+            Some(hook) => match hook.call1(py, (message, &exc)) {
+                Ok(_) => Ok(()),
+                Err(e) => self.hook_error_verdict(py, e, None),
+            },
+            None => {
+                let err = PyRuntimeError::new_err(message.to_string());
+                err.write_unraisable(py, Some(exc.bind(py)));
                 Ok(())
             }
         }
     }
 
-    pub(crate) fn report_net_error(&self, py: Python<'_>, message: &str, exc: Py<PyAny>) {
-        match self.net_error_hook.get() {
-            Some(hook) => {
-                if let Err(e) = hook.call1(py, (message, &exc)) {
-                    e.write_unraisable(py, None);
-                }
-            }
-            None => {
-                let err = PyRuntimeError::new_err(message.to_string());
-                err.write_unraisable(py, Some(exc.bind(py)));
-            }
-        }
-    }
-
-    fn report_failure(&self, py: Python<'_>, handle: &Py<PyAny>, err: PyErr) {
+    fn report_failure(&self, py: Python<'_>, handle: &Py<PyAny>, err: PyErr) -> PyResult<()> {
         match self.error_hook.get() {
-            Some(hook) => {
-                if let Err(hook_err) = hook.call1(py, (handle, err.value(py))) {
-                    hook_err.write_unraisable(py, Some(handle.bind(py)));
-                }
+            Some(hook) => match hook.call1(py, (handle, err.value(py))) {
+                Ok(_) => Ok(()),
+                Err(hook_err) => self.hook_error_verdict(py, hook_err, Some(handle)),
+            },
+            None => {
+                err.write_unraisable(py, Some(handle.bind(py)));
+                Ok(())
             }
-            None => err.write_unraisable(py, Some(handle.bind(py))),
         }
     }
 
@@ -417,7 +432,15 @@ impl CoreLoop {
                 let started = debug.then(std::time::Instant::now);
                 match run_handle(py, token.bind(py)) {
                     Ok(DispatchOutcome::Done) => {}
-                    Ok(DispatchOutcome::Failed(err)) => self.report_failure(py, token, err),
+                    Ok(DispatchOutcome::Failed(err)) => {
+                        // A fatal raise from the hook unwinds exactly like
+                        // one from the callback itself: the undispatched
+                        // tail goes back to the queue front below.
+                        if let Err(e) = self.report_failure(py, token, err) {
+                            fatal = Some((idx, e));
+                            break;
+                        }
+                    }
                     Err(e) => {
                         fatal = Some((idx, e));
                         break;

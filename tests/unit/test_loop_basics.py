@@ -385,6 +385,22 @@ def test_exception_handler_get_set(loop):
         loop.set_exception_handler(42)
 
 
+def test_exception_handler_raising_system_exit_stops_the_loop(loop):
+    """CPython parity: call_exception_handler deliberately re-raises
+    SystemExit/KeyboardInterrupt from a custom handler, and the loop
+    must let them unwind run_forever -- not demote them to an
+    unraisable warning and keep running. Reported on PR #1."""
+
+    def handler(lp, ctx):
+        raise SystemExit(3)
+
+    loop.set_exception_handler(handler)
+    loop.call_soon(lambda: 1 / 0)
+    loop.call_later(2, loop.stop)  # fallback so a broken loop still exits
+    with pytest.raises(SystemExit):
+        loop.run_forever()
+
+
 def test_loop_keeps_running_after_callback_exception(loop):
     loop.set_exception_handler(lambda lp, ctx: None)
     out = []

@@ -1621,7 +1621,7 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
                              set_alpn_protocols([\"http/1.1\"])."
                         ),
                         py.None(),
-                    );
+                    )?;
                     core.with_net(|net, reactor| {
                         net::teardown_with(py, net, reactor.backend_mut(), tid, None);
                     })?;
@@ -2530,7 +2530,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
     let disconnect =
         err.is_instance_of::<PyConnectionResetError>(py) || err.is_instance_of::<PyBrokenPipeError>(py);
     if !disconnect {
-        core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any());
+        core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any())?;
     }
     let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
     if is_ws {
