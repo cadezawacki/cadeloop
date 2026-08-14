@@ -1506,3 +1506,42 @@ def test_create_server_rejects_a_datagram_socket(loop):
         assert udp.fileno() != -1
     finally:
         udp.close()
+
+
+def test_data_received_exception_closes_the_transport(loop):
+    """The next receive is already posted by the time the callback runs,
+    so reporting the exception and carrying on kept feeding bytes to a
+    protocol whose state may be inconsistent. The stdlib's socket
+    transport treats this as fatal."""
+    lost = []
+    seen = []
+
+    class Boom(asyncio.Protocol):
+        def data_received(self, data):
+            seen.append(data)
+            raise RuntimeError("protocol is confused now")
+
+        def connection_lost(self, exc):
+            lost.append(exc)
+
+    reported = []
+    loop.set_exception_handler(lambda lp, ctx: reported.append(ctx.get("message", "")))
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        try:
+            transport, _ = await loop.create_connection(Boom, *addr)
+            transport.write(b"first")
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if lost:
+                    break
+            assert seen, "the protocol never received anything"
+            assert lost, "connection_lost never ran; the transport stayed open"
+            assert transport.is_closing()
+            assert any("protocol callback" in m for m in reported), reported
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())

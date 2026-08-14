@@ -77,7 +77,10 @@ class Config:
     grace: float = 10.0  # R-092 graceful drain seconds
     # --- misc ----------------------------------------------------------------
     access_log: bool = False  # R-140
-    stats_endpoint: int | None = None  # R-141 localhost port or None
+    # R-141: serve stats() as JSON on 127.0.0.1:<port>. Bound by one
+    # worker only (see server._start_stats_endpoint) -- the payload names
+    # which. None disables it.
+    stats_endpoint: int | None = None
 
     def __post_init__(self):
         if self.backend not in _BACKENDS:
@@ -137,6 +140,8 @@ class Config:
                 raise ValueError(f"{field} must be >= 0")
         if self.max_body is not None and self.max_body < 0:
             raise ValueError("max_body must be None or >= 0")
+        if self.stats_endpoint is not None and not 1 <= self.stats_endpoint <= 65535:
+            raise ValueError("stats_endpoint must be None or a port in 1..65535")
         if self.write_low_water > self.write_high_water:
             raise ValueError("write_low_water must be <= write_high_water")
 

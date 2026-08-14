@@ -2,15 +2,21 @@
 
 ## Logging (R-140)
 Logger name: `"cadeloop"` (stdlib `logging`). Default: errors + lifecycle
-only. Access log (M2): opt-in, buffered ring + background writer thread,
-drop-on-overflow counted — never blocks the loop.
+only. Access log: opt-in, bounded queue + background writer thread,
+drop-on-overflow counted and reported when the writer catches up — never
+blocks the loop. (Before this was implemented the sink called
+`logger.info()` inline on the loop thread, so a handler doing blocking
+I/O stalled every connection the worker held.)
 
 ## Introspection (R-103/R-141)
 `loop.stats()` returns counters: `ticks, polls, completions,
 callbacks_dispatched, timers_fired, xthread_items, spin_hits, ready_len,
 timers_len, backend` (M1 adds `syscalls_saved_inline, buffers_in_use`;
-M2 adds `tasks_eager_completed`). `Config(stats_endpoint=<port>)` (M2)
-serves the same dict as JSON on localhost.
+M2 adds `tasks_eager_completed`). `Config(stats_endpoint=<port>)` serves
+the same dict as JSON, bound to 127.0.0.1 only, with a `worker` key
+naming whose counters they are. One worker binds it: every worker on the
+same port would hand each scrape whichever process the kernel picked,
+which makes a counter series meaningless.
 
 ## Debug mode (R-142)
 `PYTHONASYNCIODEBUG=1` (or `-X dev`) enables slow-callback warnings

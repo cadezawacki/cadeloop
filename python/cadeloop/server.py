@@ -16,6 +16,7 @@ import importlib
 import json
 import logging
 import os
+import queue
 import signal as _signal
 import socket as _socket
 import subprocess
@@ -257,6 +258,8 @@ def _serve_single(
     lid = None
     installed_signals = []
     served = False
+    access_log = None
+    stats_lid = None
     try:
         _trace("about to run lifespan.startup")
         lifespan.startup()
@@ -293,7 +296,10 @@ def _serve_single(
         if config.immediate_flush:
             loop._core.set_immediate_flush(True)
         if config.access_log:
-            loop._core.set_access_log(_access_sink(logging.getLogger("cadeloop.access")))
+            access_log = _AccessLog(logging.getLogger("cadeloop.access"))
+            loop._core.set_access_log(access_log.sink)
+        if config.stats_endpoint is not None and worker_id in (None, 0):
+            stats_lid, _ = _start_stats_endpoint(loop, config.stats_endpoint, worker_id)
         _arm_timeout_sweep(loop, config)
         # R-075: freeze the post-startup heap out of the cyclic collector.
         if config.gc_mode == "freeze":
@@ -331,8 +337,12 @@ def _serve_single(
                 pass
         if lid is not None:
             loop._core.listener_close(lid)
+        if stats_lid is not None:
+            loop._core.listener_close(stats_lid)
         if served:
             _drain_connections(loop, config.grace)
+        if access_log is not None:
+            access_log.close()
         lifespan.shutdown()
         loop.close()
         asyncio.set_event_loop(None)
@@ -377,22 +387,116 @@ def _drain_connections(loop, grace):
         )
 
 
-def _access_sink(access_logger):
-    """R-140 access-log sink: called from the engine per completed request
-    with (peername, method, target_bytes, status, duration_ms)."""
+def _start_stats_endpoint(loop, port: int, worker_id):
+    """R-141: serve `loop.stats()` as JSON, bound to loopback only.
 
-    def sink(peer, method, target, status, dur_ms):
-        client = f"{peer[0]}:{peer[1]}" if peer else "-"
-        access_logger.info(
-            '%s "%s %s" %d %.2fms',
-            client,
-            method,
-            target.decode("latin-1"),
-            status,
-            dur_ms,
+    Documented in docs/ops.md since M2 but never implemented -- setting
+    the option configured nothing and the endpoint was silently absent.
+
+    Bound on one worker only. Every worker binding the same port would
+    hand each scrape whichever process the kernel happened to pick,
+    making a counter series meaningless; the payload carries `worker` so
+    the reader knows whose numbers these are.
+    """
+
+    async def stats_app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        payload = dict(loop._core.stats())
+        payload["worker"] = 0 if worker_id is None else worker_id
+        body = json.dumps(payload).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
         )
+        await send({"type": "http.response.body", "body": body})
 
-    return sink
+    lid, bound, _fd = loop._core.http_listen("127.0.0.1", port, stats_app, loop)
+    logger.info("cadeloop stats endpoint on http://127.0.0.1:%s", bound[1])
+    return lid, bound[1]
+
+
+class _AccessLog:
+    """R-140 access log, emitted off the loop thread.
+
+    The engine calls the sink inline, on the loop thread, once per
+    completed request. A logging handler is free to block -- a file
+    handler on a slow disk, a stream into a full pipe, anything
+    network-backed -- and one such call stalls every connection the
+    worker is holding and adds its own latency to the request it is
+    logging. Records go to a bounded queue instead and a daemon thread
+    does the emitting.
+
+    The queue is bounded on purpose: a writer that cannot keep up should
+    cost bounded memory, not unbounded memory and not the request path.
+    Records past the bound are dropped and counted, and the count is
+    reported once the writer catches up -- silently losing them would
+    make the log quietly wrong, which is worse than a gap you can see.
+    """
+
+    __slots__ = ("_logger", "_queue", "_thread", "_dropped", "_lock")
+
+    def __init__(self, logger, maxsize: int = 10_000):
+        self._logger = logger
+        self._queue: queue.Queue = queue.Queue(maxsize)
+        self._dropped = 0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="cadeloop-access-log", daemon=True
+        )
+        self._thread.start()
+
+    def sink(self, peer, method, target, status, dur_ms):
+        """Called from the engine, on the loop thread. Must not block."""
+        try:
+            self._queue.put_nowait((peer, method, target, status, dur_ms))
+        except queue.Full:
+            with self._lock:
+                self._dropped += 1
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            with self._lock:
+                dropped, self._dropped = self._dropped, 0
+            if dropped:
+                self._logger.warning(
+                    "access log fell behind: %d record(s) dropped", dropped
+                )
+            peer, method, target, status, dur_ms = item
+            client = f"{peer[0]}:{peer[1]}" if peer else "-"
+            try:
+                self._logger.info(
+                    '%s "%s %s" %d %.2fms',
+                    client,
+                    method,
+                    target.decode("latin-1"),
+                    status,
+                    dur_ms,
+                )
+            except Exception:  # a handler failing must not kill the writer
+                logger.exception("access log handler raised")
+
+    def close(self, timeout: float = 2.0):
+        """Flush what is queued, then stop the writer."""
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:  # pragma: no cover - drain and retry
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(None)
+            except queue.Empty:
+                pass
+        self._thread.join(timeout)
 
 
 def _arm_timeout_sweep(loop, config: Config):

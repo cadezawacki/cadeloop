@@ -122,3 +122,47 @@ def test_installed_policy_keeps_the_posix_child_watcher():
         assert hasattr(watcher, "add_child_handler")
     finally:
         asyncio.set_event_loop_policy(previous)
+
+
+def test_stats_endpoint_serves_json_on_loopback():
+    """R-141 was documented in docs/ops.md from M2 but never
+    implemented: setting the option configured nothing and the endpoint
+    was silently absent."""
+    import asyncio
+    import json
+
+    from cadeloop.server import _start_stats_endpoint
+
+    lp = cadeloop.new_event_loop()
+    asyncio.set_event_loop(lp)
+    try:
+        lid, port = _start_stats_endpoint(lp, 0, None)
+
+        async def fetch():
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(b"GET /stats HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+            await w.drain()
+            data = await asyncio.wait_for(r.read(), 5.0)
+            w.close()
+            return data
+
+        resp = lp.run_until_complete(fetch())
+        lp._core.listener_close(lid)
+    finally:
+        asyncio.set_event_loop(None)
+        lp.close()
+
+    head, _, body = resp.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200"), head[:60]
+    assert b"application/json" in head.lower(), head
+    payload = json.loads(body)
+    assert "ticks" in payload and "backend" in payload, payload
+    assert payload["worker"] == 0
+
+
+def test_stats_endpoint_port_is_validated():
+    for bad in (0, -1, 70000):
+        with pytest.raises(ValueError, match="stats_endpoint"):
+            cadeloop.Config(stats_endpoint=bad)
+    assert cadeloop.Config(stats_endpoint=None).stats_endpoint is None
+    assert cadeloop.Config(stats_endpoint=9001).stats_endpoint == 9001

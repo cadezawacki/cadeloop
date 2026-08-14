@@ -381,6 +381,9 @@ impl NetState {
 pub(crate) enum NetEvent {
     /// Plain-protocol data: payload prebuilt, slot already re-posted.
     Data {
+        /// Needed so a failing callback can close the connection it
+        /// arrived on -- see the dispatch site.
+        tid: u64,
         data_received: Py<PyAny>,
         payload: Py<PyAny>,
     },
@@ -425,6 +428,7 @@ pub(crate) enum NetEvent {
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
     BufData {
+        tid: u64,
         get_buffer: Py<PyAny>,
         buffer_updated: Py<PyAny>,
         slot: SlotId,
@@ -1582,7 +1586,7 @@ fn on_recv_done(
                     let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
                     Bound::from_owned_ptr(py, obj).unbind()
                 };
-                net.events.push(NetEvent::Data { data_received, payload });
+                net.events.push(NetEvent::Data { tid, data_received, payload });
             } else {
                 // BufferedProtocol: the transport's slot reference transfers
                 // to the phase-2 event (released there after the copy); a
@@ -1590,7 +1594,13 @@ fn on_recv_done(
                 let get_buffer = p.get_buffer.as_ref().unwrap().clone_ref(py);
                 let buffer_updated = p.buffer_updated.as_ref().unwrap().clone_ref(py);
                 entry.recv_slot = None; // ref now owned by the BufData event
-                net.events.push(NetEvent::BufData { get_buffer, buffer_updated, slot, len: bytes as usize });
+                net.events.push(NetEvent::BufData {
+                    tid,
+                    get_buffer,
+                    buffer_updated,
+                    slot,
+                    len: bytes as usize,
+                });
             }
         }
         ProtoKind::Http(conn) => {
@@ -1828,15 +1838,16 @@ pub(crate) fn dispatch_events(
     let core = slf.get();
     for event in events {
         match event {
-            NetEvent::Data { data_received, payload } => {
-                core.guard_protocol_call(py, data_received.call1(py, (payload,)))?;
+            NetEvent::Data { tid, data_received, payload } => {
+                let res = data_received.call1(py, (payload,));
+                fatal_protocol_error(py, core, tid, res)?;
             }
-            NetEvent::BufData { get_buffer, buffer_updated, slot, len } => {
+            NetEvent::BufData { tid, get_buffer, buffer_updated, slot, len } => {
                 let res = fill_app_buffer(py, core, &get_buffer, &buffer_updated, slot, len);
                 core.with_net(|net, _| {
                     net.buffers.release(slot);
                 })?;
-                core.guard_protocol_call(py, res)?;
+                fatal_protocol_error(py, core, tid, res)?;
             }
             NetEvent::Eof { eof_received, transport } => match eof_received.call0(py) {
                 Ok(keep_open) => {
@@ -2337,6 +2348,26 @@ impl Transport {
         })?;
         Ok(Some(obj))
     }
+}
+
+/// Report an exception out of a receive callback and close the
+/// connection it arrived on.
+///
+/// The receive for the next chunk has already been posted by the time the
+/// callback runs, so merely reporting the exception (which is what the
+/// generic `guard_protocol_call` does) left the connection open and kept
+/// feeding bytes to a protocol whose state may be inconsistent. The
+/// stdlib's socket transport treats this as fatal and closes; so does
+/// this, and the Windows pipe transport already did.
+fn fatal_protocol_error<T>(py: Python<'_>, core: &CoreLoop, tid: u64, res: PyResult<T>) -> PyResult<()> {
+    if res.is_ok() {
+        return Ok(());
+    }
+    core.guard_protocol_call(py, res)?;
+    core.with_net(|net, reactor| {
+        teardown_with(py, net, reactor.backend_mut(), tid, None);
+    })?;
+    core.drain_graveyards(py)
 }
 
 /// A plain `socket.socket` over a duplicate of `raw`.
