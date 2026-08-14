@@ -1248,9 +1248,13 @@ pub(crate) fn http_sweep(
         // could be torn down mid-transmission by the idle sweep.
         let busy = http_conn_busy(entry);
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
+        // `!saw_request` is the head phase too: a connection that has
+        // sent nothing at all reports `in_head() == false`, and calling
+        // that keep-alive idle exempted it from the head deadline it has
+        // never yet satisfied.
         let phase: u8 = if busy {
             2
-        } else if conn.parser.in_head() {
+        } else if conn.parser.in_head() || !conn.saw_request {
             1
         } else {
             0
@@ -1889,13 +1893,17 @@ pub(crate) fn resume_reading_after_backpressure(
 /// as zero for HTTPS/WSS however much the producer has written -- the
 /// backpressure would have been inert on exactly the connections whose
 /// encryption makes them slowest. Count both.
-pub(crate) fn write_pressure(net: &NetState, tid: u64) -> Option<(usize, usize)> {
+/// Returns (queued including staged plaintext, high water, low water).
+/// The low mark rides along because a caller deciding whether to RESUME
+/// needs the same staged-inclusive number the pause decision used; two
+/// accessors would have let those drift apart.
+pub(crate) fn write_pressure(net: &NetState, tid: u64) -> Option<(usize, usize, usize)> {
     net.transports.get(&tid).map(|e| {
         let staged = match &e.proto {
             ProtoKind::Http(conn) => conn.tls.as_ref().map(|t| t.staged.len()).unwrap_or(0),
             ProtoKind::Py(_) => 0,
         };
-        (e.queued_bytes + staged, e.high_water)
+        (e.queued_bytes + staged, e.high_water, e.low_water)
     })
 }
 

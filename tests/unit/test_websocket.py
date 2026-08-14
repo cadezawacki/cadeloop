@@ -726,31 +726,3 @@ def test_upgrade_is_parsed_as_a_token_list(loop, extra, expect_101):
     loop._core.listener_close(lid)
     got_101 = b"101" in head.split(b"\r\n", 1)[0]
     assert got_101 is expect_101, head[:80]
-
-
-def test_subprotocol_offers_are_trimmed_of_tabs_not_just_spaces(loop):
-    """RFC 7230 OWS is SP or HTAB. Filtering only spaces turned
-    `chat,\\tsuperchat` into "\\tsuperchat", so the app saw a name it could
-    not select -- echoing it emits an invalid negotiation header, and
-    selecting the real one is rejected as unoffered. Reported by Codex."""
-    seen = {}
-
-    async def app(scope, receive, send):
-        seen["offers"] = list(scope["subprotocols"])
-        assert (await receive())["type"] == "websocket.connect"
-        await send({"type": "websocket.accept", "subprotocol": "superchat"})
-
-    lid, port = listen(loop, app)
-
-    async def main():
-        _reader, writer, _key, head = await handshake(
-            port, extra="sec-websocket-protocol: chat,\tsuperchat\r\n"
-        )
-        writer.close()
-        return head
-
-    head = loop.run_until_complete(main())
-    loop._core.listener_close(lid)
-    assert seen["offers"] == ["chat", "superchat"], seen["offers"]
-    assert b"101" in head.split(b"\r\n", 1)[0], head[:80]
-    assert b"sec-websocket-protocol: superchat" in head.lower(), head

@@ -131,6 +131,17 @@ pub(crate) struct HttpConn {
     pub(crate) sweep_phase: u8,
     pub(crate) sweep_seen: u32,
     pub(crate) sweep_anchor_ns: u64,
+    /// A request has been parsed on this connection at least once.
+    ///
+    /// Until then the connection owes us a request head, even though the
+    /// parser reports `in_head() == false` because not one byte has
+    /// arrived. Treating that as keep-alive IDLE meant a client could
+    /// connect and send nothing: with `keepalive_idle=0` the connection
+    /// never expired at all, and with the defaults it sat for 75s instead
+    /// of the 5s the slow-request limit is there to enforce -- so a
+    /// no-byte flood held sockets and per-connection state for as long as
+    /// it liked.
+    pub(crate) saw_request: bool,
     // --- R-140 access log (populated only while a sink is installed) ---
     pub(crate) log_method: &'static str,
     pub(crate) log_target: Vec<u8>,
@@ -281,6 +292,7 @@ impl HttpConn {
             sweep_phase: 0,
             sweep_seen: 0,
             sweep_anchor_ns: 0,
+            saw_request: false,
             log_method: "",
             log_target: Vec::new(),
             log_status: 0,
@@ -341,6 +353,7 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
     }
     while let Some(req) = conn.parser.next_request() {
         conn.pending_bytes += req.queued_size();
+        conn.saw_request = true;
         conn.pending.push_back(req);
     }
     Ok(FeedOutcome {
@@ -848,7 +861,7 @@ impl HttpSend {
         // unbounded, and the configured watermarks never applied to the
         // ASGI producer the way they apply to a Python protocol.
         let over = core.with_net(|net, _| {
-            net::write_pressure(net, self.tid).map(|(queued, high)| queued > high).unwrap_or(false)
+            net::write_pressure(net, self.tid).map(|(queued, high, _)| queued > high).unwrap_or(false)
         })?;
         if !over {
             return Ok(completed(py).clone_ref(py).into_any());
@@ -2118,31 +2131,48 @@ pub(crate) fn ws_ingest(
         }
     }
     // R-087: WS_MAX_MESSAGE bounds ONE message; nothing bounded the queue
-    // of them. An app that reads slower than the peer writes could be fed
-    // an unlimited number of individually valid messages until the worker
-    // died. Stop reading here; ws_resume_reading releases it as receive()
-    // drains the inbox.
-    if let Some(conn) = net.http_conn_mut(tid) {
-        if let Some(wsc) = conn.ws.as_mut() {
-            if !wsc.inbox_paused && wsc.inbox_bytes >= WS_MAX_INBOX {
-                wsc.inbox_paused = true;
-                net::pause_reading_for_backpressure(net, tid);
-            }
-        }
-    }
+    // of them, nor the write queue the control frames we owe the peer pile
+    // up in. Both are read-side pressure, and both are decided in one
+    // place -- see ws_sync_read_pause.
+    ws_sync_read_pause(py, net, backend, tid);
 }
 
 /// R-087: re-post the recv the inbox budget suppressed, once receive()
 /// has drained it far enough. In-cell.
 pub(crate) fn ws_resume_reading(py: Python<'_>, net: &mut NetState, backend: net::Backend<'_>, tid: u64) {
-    let resume = match net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-        Some(wsc) if wsc.inbox_paused && wsc.inbox_bytes * 2 < WS_MAX_INBOX => {
-            wsc.inbox_paused = false;
-            true
-        }
-        _ => false,
+    ws_sync_read_pause(py, net, backend, tid);
+}
+
+/// Decide, from EVERY reason at once, whether this WebSocket should be
+/// reading -- and make it so.
+///
+/// There are two reasons to stop: the app is behind on `receive()` (the
+/// inbox budget), and the peer is not reading what we owe it (the write
+/// queue). The second had no read-side limit at all, so a peer that sent
+/// masked pings and stopped reading got a pong queued per ping, for ever,
+/// with nothing bounding the transport's write queue.
+///
+/// Both reasons share one `reading_paused` flag on the transport, so they
+/// cannot each own a resume path: whichever released first would start
+/// reading again while the other still wanted it stopped. One function
+/// recomputes the answer instead. Hysteresis on both sides, so a
+/// connection sitting near a threshold does not thrash.
+pub(crate) fn ws_sync_read_pause(py: Python<'_>, net: &mut NetState, backend: net::Backend<'_>, tid: u64) {
+    let Some((queued, high, low)) = net::write_pressure(net, tid) else { return };
+    let Some(wsc) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) else { return };
+    let want_pause = if wsc.inbox_paused {
+        // Already paused: hold until BOTH pressures have properly eased.
+        wsc.inbox_bytes * 2 >= WS_MAX_INBOX || queued > low
+    } else {
+        wsc.inbox_bytes >= WS_MAX_INBOX || queued > high
     };
-    if resume {
+    if want_pause == wsc.inbox_paused {
+        return;
+    }
+    wsc.inbox_paused = want_pause;
+    if want_pause {
+        net::pause_reading_for_backpressure(net, tid);
+    } else {
         net::resume_reading_after_backpressure(py, net, backend, tid);
     }
 }

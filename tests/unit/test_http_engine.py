@@ -2420,3 +2420,40 @@ def test_request_trailers_do_not_reach_the_asgi_headers(loop):
     assert names.count("host") == 1, seen["headers"]
     assert ("host", "attacker") not in seen["headers"], seen["headers"]
     assert "x-injected" not in names, seen["headers"]
+
+
+def test_a_connection_that_sends_nothing_hits_the_head_timeout(loop):
+    """`in_head()` is false until the first byte arrives, so a client that
+    connected and said nothing was classified as keep-alive IDLE rather
+    than as owing a request head. With keepalive_idle=0 it never expired
+    at all, and with the defaults it sat for 75s instead of the 5s the
+    slow-request limit exists to enforce -- a no-byte flood could hold
+    sockets and per-connection state indefinitely. Reported by Codex."""
+
+    async def app(scope, receive, send):  # pragma: no cover - never reached
+        await receive()
+
+    # keepalive_idle=0 disables the idle window entirely: only the head
+    # deadline can close this connection, which is the point.
+    lid, port = listen(loop, app, request_line_timeout=0.2, keepalive_idle=0.0)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        # Not one byte is sent.
+        for _ in range(60):
+            loop._core.http_sweep()
+            await asyncio.sleep(0.05)
+            if loop._core.http_connection_count() == 0:
+                break
+        # The head deadline answers 408 and then closes, so a clean EOF
+        # after whatever it sent is the signal -- not an empty first read.
+        rest = await asyncio.wait_for(reader.read(), 5.0)
+        writer.close()
+        return rest
+
+    rest = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert loop._core.http_connection_count() == 0, (
+        "a connection that never sent a byte was never timed out"
+    )
+    assert rest.startswith(b"HTTP/1.1 408"), rest[:60]
