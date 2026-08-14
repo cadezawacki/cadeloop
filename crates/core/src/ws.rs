@@ -112,11 +112,31 @@ pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Encode a close frame with a status code and (truncated) reason.
+///
+/// A close payload is capped at 125 bytes, leaving 123 for the reason.
+/// Truncation lands on a character boundary, not a byte one: slicing mid
+/// sequence emits invalid UTF-8, and RFC 6455 requires the reason to be
+/// valid UTF-8, so a compliant peer would answer our close with a
+/// protocol error (Codex review, PR #1).
 pub fn close_frame(code: u16, reason: &str) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(2 + reason.len().min(123));
+    let reason = truncate_on_char_boundary(reason, 123);
+    let mut payload = Vec::with_capacity(2 + reason.len());
     payload.extend_from_slice(&code.to_be_bytes());
-    payload.extend_from_slice(&reason.as_bytes()[..reason.len().min(123)]);
+    payload.extend_from_slice(reason.as_bytes());
     frame(OP_CLOSE, &payload)
+}
+
+/// Largest prefix of `s` that fits in `max` bytes without splitting a
+/// character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// One inbound event, message-assembled.
@@ -388,6 +408,23 @@ mod tests {
         let mut out = Vec::new();
         rx.push(&client_frame(OP_TEXT, &[0xFF, 0xFE], true), &mut out);
         assert_eq!(out, vec![WsEvent::Fail(1007, "text message not utf-8")]);
+    }
+
+    #[test]
+    fn close_reason_truncates_on_char_boundaries() {
+        // 122 ASCII bytes + a 3-byte character: byte-slicing at 123 would
+        // emit the first third of the character and invalidate the frame.
+        let reason = format!("{}\u{20ac}", "a".repeat(122));
+        let f = close_frame(1000, &reason);
+        let payload = &f[2..]; // 2-byte header for a <126-byte payload
+        assert!(payload.len() <= 125);
+        std::str::from_utf8(&payload[2..]).expect("close reason must stay valid UTF-8");
+        assert_eq!(&payload[2..], "a".repeat(122).as_bytes());
+
+        // A reason that fits is untouched, multibyte and all.
+        let short = "ok \u{20ac}";
+        let f = close_frame(1000, short);
+        assert_eq!(&f[4..], short.as_bytes());
     }
 
     #[test]
