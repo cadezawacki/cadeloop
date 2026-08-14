@@ -1,0 +1,329 @@
+%PDF-1.4
+%
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+2 0 obj
+<< /Length 3944 >>
+stream
+BT
+/F1 8 Tf
+10 TL
+1 0 0 1 36 755 Tm (INDEPENDENT EVENT-LOOP AND ASGI REVIEW OF CADELOOP) Tj
+1 0 0 1 36 741 Tm () Tj
+1 0 0 1 36 731 Tm (Date: 2026-08-14T10:28:23Z  ) Tj
+1 0 0 1 36 721 Tm (Environment: Linux-6.18.35-x86_64-with-glibc2.39; CPython 3.11.15; 3 visible CPUs.  ) Tj
+1 0 0 1 36 711 Tm (Scope warning: This is an independent bounded review. Repository benchmark files and ) Tj
+1 0 0 1 36 701 Tm (published numbers were not executed or used as measurements.) Tj
+1 0 0 1 36 691 Tm () Tj
+1 0 0 1 36 681 Tm (EXECUTIVE FINDING) Tj
+1 0 0 1 36 667 Tm () Tj
+1 0 0 1 36 657 Tm (The run cannot honestly name cadeloop, uvloop, rloop, rsloop, or any third-party ASGI server) Tj
+1 0 0 1 36 647 Tm ( as the measured winner: outbound package/index access was blocked \(HTTP CONNECT 403\), the ) Tj
+1 0 0 1 36 637 Tm (checkout had no configured remote, and cadeloop's Rust dependency graph was not cached. Only) Tj
+1 0 0 1 36 627 Tm ( stdlib asyncio was executable. Any cross-library performance ranking would therefore be ) Tj
+1 0 0 1 36 617 Tm (fabricated. The useful result is a reproducible stdlib control, a source-level cadeloop ) Tj
+1 0 0 1 36 607 Tm (assessment, an explicit availability matrix, and a fair validation/report-card framework.) Tj
+1 0 0 1 36 597 Tm () Tj
+1 0 0 1 36 587 Tm (Measured winner in this environment: stdlib asyncio, by default and not by demonstrated ) Tj
+1 0 0 1 36 577 Tm (superiority. Recommended external follow-up: run this harness in a network-enabled CPython ) Tj
+1 0 0 1 36 567 Tm (3.11 Linux host and on Windows 11; do not accept README figures as substitutes.) Tj
+1 0 0 1 36 557 Tm () Tj
+1 0 0 1 36 547 Tm (METHOD AND ROBUSTNESS) Tj
+1 0 0 1 36 533 Tm () Tj
+1 0 0 1 36 523 Tm (* A new harness under review/ was used; it imports nothing from bench/.) Tj
+1 0 0 1 36 513 Tm (* Every scenario runs in a fresh subprocess with a hard 15 s timeout, two warmups, five ) Tj
+1 0 0 1 36 503 Tm (measured samples, and medians.) Tj
+1 0 0 1 36 493 Tm (* Payloads are deliberately sized for roughly 1-4 seconds per sample group; no individual ) Tj
+1 0 0 1 36 483 Tm (task is allowed to stale indefinitely.) Tj
+1 0 0 1 36 473 Tm (* Loopback TCP uses a fixed 1 KiB payload and sequential request/reply to expose loop wakeup) Tj
+1 0 0 1 36 463 Tm ( overhead rather than load-generator concurrency.) Tj
+1 0 0 1 36 453 Tm (* The ASGI exchange benchmark measures app/protocol coroutine overhead in-process, not HTTP ) Tj
+1 0 0 1 36 443 Tm (parsing or a server stack.) Tj
+1 0 0 1 36 433 Tm (* Results are local controls, not universal capacity claims; no CPU pinning, frequency ) Tj
+1 0 0 1 36 423 Tm (isolation, or two-host networking was available.) Tj
+1 0 0 1 36 413 Tm () Tj
+1 0 0 1 36 403 Tm (INSTALLATION AND EXECUTION MATRIX) Tj
+1 0 0 1 36 389 Tm () Tj
+1 0 0 1 36 379 Tm (| Candidate | Installed/executable | Outcome |) Tj
+1 0 0 1 36 369 Tm (|---|---|---|) Tj
+1 0 0 1 36 359 Tm (| stdlib asyncio | yes | fully measured |) Tj
+1 0 0 1 36 349 Tm (| cadeloop | no | build blocked: missing cached proptest; registry access blocked |) Tj
+1 0 0 1 36 339 Tm (| uvloop | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 329 Tm (| rloop | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 319 Tm (| rsloop | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 309 Tm (| uvicorn | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 299 Tm (| hypercorn | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 289 Tm (| granian | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 279 Tm (| daphne | no | PyPI CONNECT tunnel 403 |) Tj
+1 0 0 1 36 269 Tm (| winloop | not applicable | Windows-only candidate on Linux |) Tj
+1 0 0 1 36 259 Tm (| tokio/pyo3 bridge | not comparable | runtime integration, not AbstractEventLoop replacement |) Tj
+1 0 0 1 36 249 Tm (| aiohttp / Trio / AnyIO | not installed | broader ecosystem comparators, not direct identical surfaces ) Tj
+1 0 0 1 36 239 Tm (|) Tj
+1 0 0 1 36 229 Tm () Tj
+ET
+BT /F1 7 Tf 1 0 0 1 280 20 Tm (Page 1 of 5) Tj ET
+endstream
+endobj
+3 0 obj
+<< /Type /Page /Parent 12 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 2 0 R >>
+endobj
+4 0 obj
+<< /Length 3818 >>
+stream
+BT
+/F1 8 Tf
+10 TL
+1 0 0 1 36 755 Tm (MEASURED STDLIB CONTROL) Tj
+1 0 0 1 36 741 Tm () Tj
+1 0 0 1 36 731 Tm (| Area | Median | Interpretation |) Tj
+1 0 0 1 36 721 Tm (|---|---:|---|) Tj
+1 0 0 1 36 711 Tm (| call_soon chain | 197.0 K callbacks/s | dependency chain / tick latency |) Tj
+1 0 0 1 36 701 Tm (| call_soon burst | 292.5 K callbacks/s | ready-queue drain |) Tj
+1 0 0 1 36 691 Tm (| zero-delay timer fire | 111.2 K timers/s | timer heap + dispatch |) Tj
+1 0 0 1 36 681 Tm (| sleep\(0\) chain | 194.5 K awaits/s | task rescheduling |) Tj
+1 0 0 1 36 671 Tm (| task fan-out | 46.5 K tasks/s | creation/gather overhead |) Tj
+1 0 0 1 36 661 Tm (| queue ping-pong | 459.6 K exchanges/s | asyncio primitive-heavy path |) Tj
+1 0 0 1 36 651 Tm (| in-process ASGI exchange | 380.2 K requests/s | app call only; no network/parser |) Tj
+1 0 0 1 36 641 Tm (| TCP echo, 1 KiB | 11.63 K msg/s | sequential loopback |) Tj
+1 0 0 1 36 631 Tm (| TCP p50 / p99 | 61.8 / 335.7 us | median of run percentiles |) Tj
+1 0 0 1 36 621 Tm () Tj
+1 0 0 1 36 611 Tm (THROUGHPUT CHART \(HIGHER IS BETTER; UNLIKE UNITS ARE SHOWN ONLY FOR SCALE INSPECTION\)) Tj
+1 0 0 1 36 597 Tm () Tj
+1 0 0 1 36 587 Tm (call_soon chain         197.0 K/s |################) Tj
+1 0 0 1 36 577 Tm (call_soon burst         292.5 K/s |########################) Tj
+1 0 0 1 36 567 Tm (timer fire              111.2 K/s |#########) Tj
+1 0 0 1 36 557 Tm (sleep\(0\)                194.5 K/s |################) Tj
+1 0 0 1 36 547 Tm (task fan-out             46.5 K/s |###) Tj
+1 0 0 1 36 537 Tm (queue ping-pong         459.6 K/s |######################################) Tj
+1 0 0 1 36 527 Tm (ASGI exchange           380.2 K/s |###############################) Tj
+1 0 0 1 36 517 Tm (TCP echo                 11.6 K/s |#) Tj
+1 0 0 1 36 507 Tm () Tj
+1 0 0 1 36 497 Tm (VARIABILITY AND CONFIDENCE) Tj
+1 0 0 1 36 483 Tm () Tj
+1 0 0 1 36 473 Tm (The stdlib chain ranged from 157.1 to 215.3 K/s; task fan-out ranged from 34.3 to 48.7 K/s. ) Tj
+1 0 0 1 36 463 Tm (That spread is large enough that single-run claims would be misleading. Five samples are ) Tj
+1 0 0 1 36 453 Tm (adequate for a screening run, not publication-grade inference. Cross-library comparisons ) Tj
+1 0 0 1 36 443 Tm (should report medians, p95/p99 latency, dispersion, failures, and timeout counts?not just ) Tj
+1 0 0 1 36 433 Tm (best throughput.) Tj
+1 0 0 1 36 423 Tm () Tj
+1 0 0 1 36 413 Tm (CADELOOP EVENT-LOOP SOURCE REVIEW) Tj
+1 0 0 1 36 399 Tm () Tj
+1 0 0 1 36 389 Tm (STRENGTHS) Tj
+1 0 0 1 36 375 Tm () Tj
+1 0 0 1 36 365 Tm (* The architecture separates Python compatibility from Rust scheduling/reactor state, with ) Tj
+1 0 0 1 36 355 Tm (hot scheduling methods bound directly to the loop instance.) Tj
+1 0 0 1 36 345 Tm (* The tick explicitly orders corked write flushes, polling, network callbacks, a second ) Tj
+1 0 0 1 36 335 Tm (flush, teardown dispatch, and ready callbacks. This is a credible low-latency design.) Tj
+1 0 0 1 36 325 Tm (* Blocking polls release the GIL while zero-timeout polls retain it; this is sensible, ) Tj
+1 0 0 1 36 315 Tm (provided all zero-timeout backend paths are provably nonblocking.) Tj
+1 0 0 1 36 305 Tm (* Cross-thread scheduling captures context and uses a wakeup object rather than relying on ) Tj
+1 0 0 1 36 295 Tm (polling.) Tj
+1 0 0 1 36 285 Tm (* The facade covers lifecycle, task/future factories, executors, DNS, signals, async ) Tj
+1 0 0 1 36 275 Tm (generators, readiness, TCP, UDP, TLS, subprocess support on POSIX, and debug hooks.) Tj
+1 0 0 1 36 265 Tm (* Configuration validates watermarks, timeouts, limits, worker counts, and experimental RIO ) Tj
+1 0 0 1 36 255 Tm (opt-in early.) Tj
+1 0 0 1 36 245 Tm () Tj
+1 0 0 1 36 235 Tm (RISKS AND DEFECTS TO INVESTIGATE) Tj
+1 0 0 1 36 221 Tm () Tj
+ET
+BT /F1 7 Tf 1 0 0 1 280 20 Tm (Page 2 of 5) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 12 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 4689 >>
+stream
+BT
+/F1 8 Tf
+10 TL
+1 0 0 1 36 755 Tm (1. Support mismatch: package metadata declares CPython 3.11 and Windows production targeting) Tj
+1 0 0 1 36 745 Tm ( while Linux is a development backend. Claims must be split by OS/backend and wheel ) Tj
+1 0 0 1 36 735 Tm (availability.) Tj
+1 0 0 1 36 725 Tm (2. Alpha maturity: RIO is explicitly unvalidated and Windows subprocess pipes remain ) Tj
+1 0 0 1 36 715 Tm (incomplete; these materially reduce drop-in confidence.) Tj
+1 0 0 1 36 705 Tm (3. Private asyncio coupling: the facade uses private asyncio.events, futures, and tasks ) Tj
+1 0 0 1 36 695 Tm (internals. The 3.11 pin limits exposure but raises upgrade cost.) Tj
+1 0 0 1 36 685 Tm (4. Temporary production traces: server and native tick paths retain environment-gated/worker) Tj
+1 0 0 1 36 675 Tm ( trace scaffolding tied to a Windows access violation investigation. Treat multi-worker ) Tj
+1 0 0 1 36 665 Tm (Windows as high risk until resolved.) Tj
+1 0 0 1 36 655 Tm (5. Spin defaults: a 20 us balanced spin trades CPU/energy and noisy-neighbor behavior for ) Tj
+1 0 0 1 36 645 Tm (latency. Benchmark CPU-seconds/request and idle CPU, not only throughput.) Tj
+1 0 0 1 36 635 Tm (6. Lifespan semantics: startup errors before completion are treated as unsupported lifespan.) Tj
+1 0 0 1 36 625 Tm ( This mirrors common auto behavior but can mask application startup defects; strict mode ) Tj
+1 0 0 1 36 615 Tm (would improve operability.) Tj
+1 0 0 1 36 605 Tm (7. HTTP specialization: native HTTP/1.1 can avoid Python parser costs, but protocol breadth ) Tj
+1 0 0 1 36 595 Tm (must be scored separately: HTTP/2, HTTP/3, proxy headers, trailers, disconnects, WebSocket ) Tj
+1 0 0 1 36 585 Tm (fragmentation, backpressure, and malformed-input behavior.) Tj
+1 0 0 1 36 575 Tm (8. Eager coroutine stepping: potentially valuable but compatibility-sensitive. Test ) Tj
+1 0 0 1 36 565 Tm (contextvars, cancellation injection, custom task factories, tracing/profiling, exception ) Tj
+1 0 0 1 36 555 Tm (groups, and apps that suspend at unusual points.) Tj
+1 0 0 1 36 545 Tm (9. GC freeze default: helpful for stable long-lived heaps, but app-dependent. Measure memory) Tj
+1 0 0 1 36 535 Tm ( retention and startup object lifetime.) Tj
+1 0 0 1 36 525 Tm (10. Fairness cap: ready batches are capped at 128, which helps I/O fairness; validate timer ) Tj
+1 0 0 1 36 515 Tm (drift and socket starvation under callback floods.) Tj
+1 0 0 1 36 505 Tm () Tj
+1 0 0 1 36 495 Tm (REQUIRED EVENT-LOOP TEST GRID) Tj
+1 0 0 1 36 481 Tm () Tj
+1 0 0 1 36 471 Tm (| Dimension | Cases | Pass criterion |) Tj
+1 0 0 1 36 461 Tm (|---|---|---|) Tj
+1 0 0 1 36 451 Tm (| Scheduling | chain, burst, recursive, cancellation, contextvars | semantic parity; no starvation |) Tj
+1 0 0 1 36 441 Tm (| Timers | same deadline, far future, cancellation storms, clock jump simulation | stable ordering; ) Tj
+1 0 0 1 36 431 Tm (bounded memory |) Tj
+1 0 0 1 36 421 Tm (| Threads | 1/4/16 producers, close race, context propagation | no loss/deadlock; correct context |) Tj
+1 0 0 1 36 411 Tm (| TCP | streams/protocols, half-close, reset, pause/resume, backpressure | byte exact; bounded buffers |) Tj
+1 0 0 1 36 401 Tm (| TLS | handshake failure, cancellation, short write, close_notify, start_tls | no truncation/hang |) Tj
+1 0 0 1 36 391 Tm (| UDP | connected/unconnected, zero length, truncation, send saturation | correct peer/data/errors |) Tj
+1 0 0 1 36 381 Tm (| Readiness | pipes/socketpair, replacement callbacks, removal races | asyncio-compatible behavior |) Tj
+1 0 0 1 36 371 Tm (| DNS | cancellation, cache on/off/expiry, executor shutdown | no leaked futures/threads |) Tj
+1 0 0 1 36 361 Tm (| Subprocess | stdout/stderr pressure, cancellation, signals, child watcher | no deadlock/zombie |) Tj
+1 0 0 1 36 351 Tm (| Lifecycle | nested run rejection, close races, asyncgen/executor shutdown | parity and clean resource ) Tj
+1 0 0 1 36 341 Tm (exit |) Tj
+1 0 0 1 36 331 Tm (| Debug | slow callbacks, exception handler failure, origin tracking | actionable diagnostics |) Tj
+1 0 0 1 36 321 Tm () Tj
+1 0 0 1 36 311 Tm (REQUIRED ASGI/PROTOCOL TEST GRID) Tj
+1 0 0 1 36 297 Tm () Tj
+1 0 0 1 36 287 Tm (| Area | Essential cases |) Tj
+1 0 0 1 36 277 Tm (|---|---|) Tj
+1 0 0 1 36 267 Tm (| HTTP parsing | split boundaries, pipelining, chunk extensions, CL/TE conflicts, malformed fields, ) Tj
+1 0 0 1 36 257 Tm (smuggling corpus |) Tj
+1 0 0 1 36 247 Tm (| Request body | streaming, early response, disconnect, max-body enforcement, slowloris |) Tj
+1 0 0 1 36 237 Tm (| Response | empty body, HEAD, 1xx/204/304, content-length mismatch, chunking, streaming cancellation |) Tj
+ET
+BT /F1 7 Tf 1 0 0 1 280 20 Tm (Page 3 of 5) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 12 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 4835 >>
+stream
+BT
+/F1 8 Tf
+10 TL
+1 0 0 1 36 755 Tm (| WebSocket | accept/reject, ping/pong, fragmentation, UTF-8 errors, close race, max frame/message |) Tj
+1 0 0 1 36 745 Tm (| Lifespan | unsupported, failure, timeout, cancellation, state copy/isolation |) Tj
+1 0 0 1 36 735 Tm (| Frameworks | bare ASGI, Starlette, FastAPI, Django ASGI, Channels where supported |) Tj
+1 0 0 1 36 725 Tm (| Operations | signals, graceful drain, worker death/restart, access logs, stats, TLS reload story |) Tj
+1 0 0 1 36 715 Tm (| Security | h11 differential corpus, request smuggling, header limits, URI normalization, ) Tj
+1 0 0 1 36 705 Tm (fuzz/ASAN/Miri where applicable |) Tj
+1 0 0 1 36 695 Tm () Tj
+1 0 0 1 36 685 Tm (WHICH LIBRARY SHOULD WIN WHERE \(PRIOR, NOT THIS RUN'S MEASUREMENT\)) Tj
+1 0 0 1 36 671 Tm () Tj
+1 0 0 1 36 661 Tm (| Area | Candidate to validate first | Why / caveat |) Tj
+1 0 0 1 36 651 Tm (|---|---|---|) Tj
+1 0 0 1 36 641 Tm (| broad compatibility | stdlib asyncio | reference semantics and universal availability |) Tj
+1 0 0 1 36 631 Tm (| POSIX asyncio throughput | uvloop | mature libuv-based implementation; still measure workload |) Tj
+1 0 0 1 36 621 Tm (| Windows baseline | stdlib ProactorEventLoop | supported reference; compare winloop/cadeloop IOCP on ) Tj
+1 0 0 1 36 611 Tm (real Windows |) Tj
+1 0 0 1 36 601 Tm (| raw scheduling experiments | rloop / rsloop | interesting Rust schedulers; incomplete surfaces and ) Tj
+1 0 0 1 36 591 Tm (hang gates matter |) Tj
+1 0 0 1 36 581 Tm (| HTTP/1.1 minimal ASGI | cadeloop native / granian | native parser/serialization potential; protocol ) Tj
+1 0 0 1 36 571 Tm (and framework conformance decide |) Tj
+1 0 0 1 36 561 Tm (| mature general ASGI | uvicorn + uvloop \(POSIX\) | ecosystem and operations maturity |) Tj
+1 0 0 1 36 551 Tm (| protocol breadth | hypercorn | HTTP/2 and optional HTTP/3 focus; speed may not lead |) Tj
+1 0 0 1 36 541 Tm (| Django Channels | daphne | ecosystem alignment rather than peak plaintext speed |) Tj
+1 0 0 1 36 531 Tm (| structured concurrency | Trio/AnyIO | semantics and cancellation model, not drop-in loop speed |) Tj
+1 0 0 1 36 521 Tm () Tj
+1 0 0 1 36 511 Tm (REPORT CARD METHODOLOGY) Tj
+1 0 0 1 36 497 Tm () Tj
+1 0 0 1 36 487 Tm (Scores are 0-100 and intentionally separate measured performance confidence from ) Tj
+1 0 0 1 36 477 Tm (architecture reputation. Performance confidence is low for every unexecuted candidate in ) Tj
+1 0 0 1 36 467 Tm (this environment. Overall is a judgment-weighted screening score \(compatibility 20%, ) Tj
+1 0 0 1 36 457 Tm (features 18%, maturity 18%, portability 12%, performance confidence 20%, operations 12%\), ) Tj
+1 0 0 1 36 447 Tm (rounded. It is not a benchmark leaderboard.) Tj
+1 0 0 1 36 437 Tm () Tj
+1 0 0 1 36 427 Tm (| Library / stack | API compat | Features | Maturity | Portability | Perf. confidence | Ops | Overall | ) Tj
+1 0 0 1 36 417 Tm (Verdict |) Tj
+1 0 0 1 36 407 Tm (|---|---:|---:|---:|---:|---:|---:|---:|---|) Tj
+1 0 0 1 36 397 Tm (| stdlib asyncio | 100 | 94 | 98 | 100 | 55 | 92 | 90 | safest baseline; only runtime measured here |) Tj
+1 0 0 1 36 387 Tm (| cadeloop native loop | 88 | 84 | 42 | 55 | 25 | 68 | 60 | promising alpha; not buildable in this ) Tj
+1 0 0 1 36 377 Tm (offline Linux run |) Tj
+1 0 0 1 36 367 Tm (| cadeloop native ASGI | 80 | 69 | 38 | 55 | 25 | 64 | 55 | high-upside HTTP/1.1 specialization; ) Tj
+1 0 0 1 36 357 Tm (validate externally |) Tj
+1 0 0 1 36 347 Tm (| uvloop | 95 | 91 | 94 | 62 | 90 | 88 | 87 | default performance choice on supported POSIX systems |) Tj
+1 0 0 1 36 337 Tm (| rloop | 67 | 37 | 30 | 54 | 35 | 34 | 43 | experimental scheduler, not broad drop-in I/O |) Tj
+1 0 0 1 36 327 Tm (| rsloop | 72 | 52 | 34 | 58 | 35 | 36 | 48 | experimental; require hang/conformance gates |) Tj
+1 0 0 1 36 317 Tm (| winloop | 87 | 78 | 49 | 24 | 45 | 55 | 59 | useful Windows candidate, platform-specific |) Tj
+1 0 0 1 36 307 Tm (| uvicorn + asyncio | 96 | 91 | 95 | 96 | 58 | 92 | 88 | mature general ASGI baseline |) Tj
+1 0 0 1 36 297 Tm (| uvicorn + uvloop | 94 | 91 | 94 | 61 | 88 | 91 | 88 | strong POSIX production default |) Tj
+1 0 0 1 36 287 Tm (| hypercorn | 92 | 96 | 87 | 94 | 57 | 83 | 85 | best protocol breadth \(HTTP/2/3 dependent on extras\) |) Tj
+1 0 0 1 36 277 Tm (| granian | 86 | 87 | 76 | 77 | 82 | 79 | 81 | compelling Rust server; independently load-test |) Tj
+1 0 0 1 36 267 Tm (| daphne | 91 | 87 | 90 | 92 | 45 | 83 | 81 | mature Channels/WebSocket choice, not speed-first |) Tj
+1 0 0 1 36 257 Tm (| tokio/pyo3 async bridge | 38 | 35 | 77 | 78 | 50 | 45 | 54 | integration primitive, not an asyncio ) Tj
+1 0 0 1 36 247 Tm (loop replacement |) Tj
+1 0 0 1 36 237 Tm (| aiohttp server \(non-ASGI\) | 45 | 86 | 94 | 94 | 70 | 88 | 80 | strong native ecosystem; not direct ) Tj
+ET
+BT /F1 7 Tf 1 0 0 1 280 20 Tm (Page 4 of 5) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 12 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 8 0 R >>
+endobj
+10 0 obj
+<< /Length 1949 >>
+stream
+BT
+/F1 8 Tf
+10 TL
+1 0 0 1 36 755 Tm (ASGI substitute |) Tj
+1 0 0 1 36 745 Tm (| Trio/AnyIO \(structured concurrency\) | 42 | 78 | 89 | 90 | 52 | 84 | 75 | semantics choice, not drop-in) Tj
+1 0 0 1 36 735 Tm ( event-loop contender |) Tj
+1 0 0 1 36 725 Tm () Tj
+1 0 0 1 36 715 Tm (FINAL CONCLUSION) Tj
+1 0 0 1 36 701 Tm () Tj
+1 0 0 1 36 691 Tm (Cadeloop shows technically serious design work: a native scheduler/reactor, bounded ready ) Tj
+1 0 0 1 36 681 Tm (batches, explicit GIL boundaries, transport backpressure, native HTTP/ASGI, and substantial ) Tj
+1 0 0 1 36 671 Tm (compatibility scaffolding. Its largest obstacles are validation, not ideas: the package ) Tj
+1 0 0 1 36 661 Tm (could not be built here, the production target differs from this host, RIO remains ) Tj
+1 0 0 1 36 651 Tm (experimental, and a Windows worker crash investigation is visible in source. The unbiased ) Tj
+1 0 0 1 36 641 Tm (decision today is do not declare cadeloop fastest from this run. Use stdlib for maximum ) Tj
+1 0 0 1 36 631 Tm (compatibility, uvloop/uvicorn as the first mature POSIX performance baseline, Hypercorn ) Tj
+1 0 0 1 36 621 Tm (where protocol breadth dominates, and independently validate cadeloop native and Granian for) Tj
+1 0 0 1 36 611 Tm ( HTTP/1.1 throughput.) Tj
+1 0 0 1 36 601 Tm () Tj
+1 0 0 1 36 591 Tm (REPRODUCTION AND ARTIFACTS) Tj
+1 0 0 1 36 577 Tm () Tj
+1 0 0 1 36 567 Tm (* review/run_independent_review.py - bounded harness.) Tj
+1 0 0 1 36 557 Tm (* review/independent-results.json - all raw samples and environment metadata.) Tj
+1 0 0 1 36 547 Tm (* review/cadeloop-independent-review.pdf - this report.) Tj
+1 0 0 1 36 537 Tm (* Network/install attempt: uv pip install ... failed with CONNECT tunnel 403.) Tj
+1 0 0 1 36 527 Tm (* Build attempts: cargo build --release -p cadeloop-pyshim could not reach crates.io; ) Tj
+1 0 0 1 36 517 Tm (offline resolution lacked proptest.) Tj
+ET
+BT /F1 7 Tf 1 0 0 1 280 20 Tm (Page 5 of 5) Tj ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 12 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 1 0 R >> >> /Contents 10 0 R >>
+endobj
+12 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R 11 0 R] /Count 5 >>
+endobj
+13 0 obj
+<< /Type /Catalog /Pages 12 0 R >>
+endobj
+xref
+0 14
+0000000000 65535 f 
+0000000015 00000 n 
+0000000085 00000 n 
+0000004081 00000 n 
+0000004208 00000 n 
+0000008078 00000 n 
+0000008205 00000 n 
+0000012946 00000 n 
+0000013073 00000 n 
+0000017960 00000 n 
+0000018087 00000 n 
+0000020089 00000 n 
+0000020218 00000 n 
+0000020301 00000 n 
+trailer
+<< /Size 14 /Root 13 0 R >>
+startxref
+20352
+%%EOF

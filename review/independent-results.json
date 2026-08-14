@@ -1,0 +1,160 @@
+{
+  "generated_utc": "2026-08-14T10:28:23Z",
+  "python": "3.11.15 (main, May  1 2026, 05:54:36) [GCC 13.3.0]",
+  "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+  "cpu_count": 3,
+  "timeout_s": 15,
+  "method": "fresh subprocess; 2 warmups + 5 samples; medians; no repository benchmark code",
+  "availability": {
+    "cadeloop": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'cadeloop'"
+    },
+    "uvloop": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'uvloop'"
+    },
+    "rloop": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'rloop'"
+    },
+    "rsloop": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'rsloop'"
+    },
+    "uvicorn": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'uvicorn'"
+    },
+    "hypercorn": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'hypercorn'"
+    },
+    "granian": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'granian'"
+    },
+    "daphne": {
+      "available": false,
+      "detail": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'daphne'"
+    }
+  },
+  "results": {
+    "chain": {
+      "median_ops_s": 197033.6794327925,
+      "min": 157060.04528195996,
+      "max": 215288.35436383772,
+      "samples": [
+        193382.67872699047,
+        215288.35436383772,
+        203683.65474439875,
+        157060.04528195996,
+        197033.6794327925
+      ]
+    },
+    "burst": {
+      "median_ops_s": 292534.5464576448,
+      "min": 240224.22721550753,
+      "max": 315855.885875126,
+      "samples": [
+        240224.22721550753,
+        268668.7734705042,
+        310990.0796693905,
+        315855.885875126,
+        292534.5464576448
+      ]
+    },
+    "timer": {
+      "median_ops_s": 111200.92207250126,
+      "min": 105521.70300610222,
+      "max": 115953.55846631652,
+      "samples": [
+        111200.92207250126,
+        114227.74403197475,
+        108305.06115457867,
+        115953.55846631652,
+        105521.70300610222
+      ]
+    },
+    "sleep0": {
+      "median_ops_s": 194510.67886053197,
+      "min": 188189.14913461328,
+      "max": 205124.78063139334,
+      "samples": [
+        205124.78063139334,
+        190797.46190530114,
+        188189.14913461328,
+        194510.67886053197,
+        201012.0315229792
+      ]
+    },
+    "tasks": {
+      "median_ops_s": 46492.934422554914,
+      "min": 34294.57071162043,
+      "max": 48740.23006887291,
+      "samples": [
+        46976.833976797214,
+        34294.57071162043,
+        36794.480936771215,
+        46492.934422554914,
+        48740.23006887291
+      ]
+    },
+    "queue": {
+      "median_ops_s": 459559.25647777354,
+      "min": 429641.5275176713,
+      "max": 522888.86529311194,
+      "samples": [
+        493707.8629992229,
+        522888.86529311194,
+        431628.3158784722,
+        459559.25647777354,
+        429641.5275176713
+      ]
+    },
+    "asgi": {
+      "median_ops_s": 380170.75663531653,
+      "min": 357735.9748716077,
+      "max": 416989.13015228533,
+      "samples": [
+        382942.33215005,
+        380170.75663531653,
+        416989.13015228533,
+        375444.47369474475,
+        357735.9748716077
+      ]
+    },
+    "tcp_echo": {
+      "median_ops_s": 11626.70577581044,
+      "p50_us": 61.7625,
+      "p99_us": 335.661,
+      "samples": [
+        [
+          11626.70577581044,
+          60.93,
+          320.679
+        ],
+        [
+          12919.920900455289,
+          62.3235,
+          331.819
+        ],
+        [
+          11621.87252213956,
+          61.724,
+          422.524
+        ],
+        [
+          11925.483046766862,
+          62.1865,
+          335.661
+        ],
+        [
+          10813.771017304602,
+          61.7625,
+          432.304
+        ]
+      ]
+    }
+  }
+}
