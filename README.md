@@ -11,8 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | WebSocket | Inbox budget not decremented on the steady-state delivery path (stalled connections) | `HEAD` |
-> | CI | ADR-24 tracing switched off after two clean Windows runs | `HEAD` |
+> | WebSocket | Inbox budget not decremented on the steady-state delivery path (stalled connections) | `09696cf` |
+> | CI | ADR-24 tracing switched off after two clean Windows runs | `09696cf` |
 > | HTTP | HTTP/1.0 requests now get an `HTTP/1.0` status line | `d0cdad0` |
 > | WebSocket | `websocket.accept` rejects reserved handshake headers | `d0cdad0` |
 > | Server | Fork supervisor cleans up workers when a later fork fails | `d0cdad0` |
