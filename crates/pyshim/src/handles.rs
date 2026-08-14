@@ -92,6 +92,16 @@ pub enum DispatchOutcome {
     Failed(PyErr),
 }
 
+/// Split a callback-path error into "unwind the loop" and "report and keep
+/// going", the way asyncio's `Handle._run` does: only KeyboardInterrupt
+/// and SystemExit stop the loop.
+fn fatal_or_failed(py: Python<'_>, err: PyErr) -> PyResult<DispatchOutcome> {
+    if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
+        return Err(err);
+    }
+    Ok(DispatchOutcome::Failed(err))
+}
+
 /// Invoke `handle.callback(*handle.args)` inside `handle.context`.
 ///
 /// Fast path adopted after profiling rloop/rsloop (R-054): enter/exit the
@@ -115,7 +125,15 @@ pub fn run_handle(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DispatchOu
 
     let result = unsafe {
         if ffi::PyContext_Enter(ctx) != 0 {
-            return Err(PyErr::fetch(py));
+            // Entering can fail on the CALLER's account -- the usual way
+            // is a Context already entered elsewhere, which is what
+            // handing the same contextvars.Context to two overlapping
+            // callbacks produces. Returning Err here made that unwind
+            // run_forever and stop the loop, where the identical mistake
+            // inside the callback is reported and survived. Same
+            // treatment: fatal errors propagate, everything else is one
+            // failed handle.
+            return fatal_or_failed(py, PyErr::fetch(py));
         }
         let n = ffi::PyTuple_GET_SIZE(args);
         let res = if n == 0 {
@@ -136,11 +154,7 @@ pub fn run_handle(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DispatchOu
         res
     };
     if result.is_null() {
-        let err = PyErr::fetch(py);
-        if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
-            return Err(err);
-        }
-        return Ok(DispatchOutcome::Failed(err));
+        return fatal_or_failed(py, PyErr::fetch(py));
     }
     unsafe { ffi::Py_DECREF(result) };
     Ok(DispatchOutcome::Done)

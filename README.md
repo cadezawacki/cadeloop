@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Loop | A Context that could not be entered stopped the loop instead of one callback | `` |
 > | Server | A stalled worker took unbounded connection handoffs until it ran out of handles | `14e50ec` |
 > | HTTP | A non-eager spawn failure killed the worker's loop instead of failing one request | `14e50ec` |
 > | WS | A receive() after teardown reported `http.disconnect` and lost the close code | `14e50ec` |

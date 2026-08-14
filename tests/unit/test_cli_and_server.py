@@ -329,9 +329,15 @@ def test_serve_does_not_extend_a_freeze_the_caller_already_owns():
     assert caller_owned > 0
     try:
         _serve_briefly(cadeloop.Config(grace=0.0, gc_mode="freeze"))
-        assert _gc.get_freeze_count() == caller_owned, (
-            "serve() added its own objects to a permanent generation it "
-            "could not later separate them from"
+        # Not equality: freezing exempts objects from COLLECTION, not from
+        # refcount deallocation, so the permanent generation legitimately
+        # shrinks when frozen objects die during the run (observed on
+        # Windows, where four of them did). The invariant is that serve()
+        # did not ADD to it -- and the bug added the whole startup heap,
+        # tens of thousands of objects, so this still discriminates.
+        assert _gc.get_freeze_count() <= caller_owned, (
+            f"serve() added {_gc.get_freeze_count() - caller_owned} objects to a "
+            "permanent generation it could not later separate them from"
         )
     finally:
         _gc.unfreeze()

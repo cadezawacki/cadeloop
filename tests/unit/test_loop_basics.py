@@ -808,3 +808,34 @@ def test_closed_loop_is_collectable():
     gc.collect()
     alive = sum(1 for r in refs if r() is not None)
     assert alive == 0, f"{alive}/{len(refs)} closed loops were never collected"
+
+
+def test_a_context_that_cannot_be_entered_fails_one_callback_not_the_loop():
+    """Entering a handle's Context can fail on the caller's account -- the
+    plain way being to run the loop itself inside that same Context, which
+    leaves it already entered when the handle tries. That returned Err
+    from run_handle, which the dispatcher treats as fatal, so it unwound
+    run_forever and stopped the loop. The identical mistake made *inside*
+    a callback is reported and survived; asyncio's Handle._run stops the
+    loop only for KeyboardInterrupt/SystemExit."""
+    import contextvars
+
+    lp = cadeloop.new_event_loop()
+    ctx = contextvars.copy_context()
+    hits = []
+    errors = []
+    lp.set_exception_handler(lambda _loop, c: errors.append(c.get("exception")))
+    try:
+        lp.call_soon(lambda: hits.append("a"), context=ctx)
+        lp.call_soon(lambda: hits.append("b"))
+        lp.call_soon(lp.stop)
+        # run_forever executes INSIDE ctx, so ctx is already entered when
+        # the first handle tries to enter it.
+        ctx.run(lp.run_forever)
+    finally:
+        lp.close()
+
+    assert errors and isinstance(errors[0], RuntimeError), errors
+    assert "already entered" in str(errors[0])
+    # The loop kept going: the callback after the failing one still ran.
+    assert hits == ["b"], hits
