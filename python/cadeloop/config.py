@@ -8,6 +8,7 @@ environment.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import typing
 
@@ -122,7 +123,17 @@ class Config:
             if getattr(self, field) < minimum:
                 raise ValueError(f"{field} must be >= {minimum}")
         for field in ("request_line_timeout", "keepalive_idle", "grace", "dns_cache_ttl"):
-            if getattr(self, field) < 0:
+            value = getattr(self, field)
+            # NaN fails every comparison, so a bare `< 0` check waves it
+            # through -- and a NaN request timeout converts to zero
+            # downstream, silently disabling the slow-request guard it was
+            # meant to configure. An infinite grace is the same shape:
+            # a shutdown that waits without a usable bound. These arrive
+            # from environment variables and CLI flags as readily as from
+            # code, so they are worth rejecting where they are read.
+            if not math.isfinite(value):
+                raise ValueError(f"{field} must be a finite number, got {value!r}")
+            if value < 0:
                 raise ValueError(f"{field} must be >= 0")
         if self.max_body is not None and self.max_body < 0:
             raise ValueError("max_body must be None or >= 0")

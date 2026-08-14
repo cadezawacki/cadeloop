@@ -201,7 +201,17 @@ class ReadPipeTransport(_PipeTransportBase, transports.ReadTransport):
                 self._fatal_error(exc, "Fatal error: protocol.buffer_updated() call failed.")
                 return
         else:
-            self._protocol.data_received(data)
+            # Symmetric with the buffered branch above. Unguarded, an
+            # ordinary exception out of data_received() escaped to the
+            # loop's callback error handler -- but _loop_reading() has
+            # already posted the next read, so the pipe stayed open and
+            # kept feeding a protocol whose state may be inconsistent.
+            try:
+                self._protocol.data_received(data)
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                self._fatal_error(exc, "Fatal error: protocol.data_received() call failed.")
 
     def _loop_reading(self, fut=None):
         length = -1

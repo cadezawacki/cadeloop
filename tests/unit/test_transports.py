@@ -1321,3 +1321,37 @@ def test_set_write_buffer_limits_derives_high_from_low(loop):
         await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fd counting is POSIX-only")
+def test_failing_protocol_factory_does_not_leak_the_connected_socket(loop):
+    """Between a successful connect and the transport that would own it,
+    the descriptor has no owner. A protocol_factory that raises therefore
+    leaked one connected socket per failure -- invisible until the process
+    ran out of them."""
+    import errno
+
+    def open_fds():
+        return len(os.listdir("/proc/self/fd"))
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        try:
+
+            def boom():
+                raise RuntimeError("no protocol for you")
+
+            for _ in range(3):  # warm any lazily-created fds first
+                with pytest.raises(RuntimeError, match="no protocol"):
+                    await loop.create_connection(boom, *addr)
+            before = open_fds()
+            for _ in range(20):
+                with pytest.raises(RuntimeError, match="no protocol"):
+                    await loop.create_connection(boom, *addr)
+            leaked = open_fds() - before
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert leaked == 0, f"{leaked} descriptors leaked across 20 failed connects"
+
+    loop.run_until_complete(main())

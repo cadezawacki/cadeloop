@@ -96,3 +96,13 @@ def test_from_env_bad_bool(monkeypatch):
     monkeypatch.setenv("CADELOOP_PIN", "maybe")
     with pytest.raises(ValueError):
         Config.from_env()
+
+
+def test_non_finite_durations_are_rejected():
+    """NaN fails every comparison, so a bare `< 0` check waved it through
+    -- and a NaN request timeout becomes zero downstream, silently
+    disabling the guard it was meant to configure."""
+    for field in ("request_line_timeout", "keepalive_idle", "grace", "dns_cache_ttl"):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="finite"):
+                Config(**{field: bad})

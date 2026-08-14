@@ -1130,6 +1130,25 @@ impl CoreLoop {
         Ok(())
     }
 
+    /// Close a connected socket that never reached `attach_stream`.
+    ///
+    /// The facade uses this when `protocol_factory()` (or building the
+    /// SSLContext) raises between a successful connect and the transport
+    /// that would have owned the descriptor: at that moment nothing else
+    /// holds it, so the fd would leak, one per failure.
+    ///
+    /// It detaches before closing (ADR-25). The socket was registered
+    /// with the backend by `tcp_connect`; closing it while the backend
+    /// still lists it as associated leaves an entry keyed by a handle
+    /// value the OS will hand out again, and the next socket to reuse
+    /// that value is treated as already registered -- so its completions
+    /// are never queued and it hangs silently.
+    fn discard_socket(&self, sock: u64) -> PyResult<()> {
+        self.with_net(|_, reactor| reactor.backend_mut().detach_socket(sock as RawSocket))?;
+        netsys::close(sock as RawSocket);
+        Ok(())
+    }
+
     /// Wire a connected socket (from tcp_connect's future) into a transport.
     fn attach_stream(
         slf: &Bound<'_, Self>,
@@ -1482,7 +1501,16 @@ impl CoreLoop {
             .transpose()?
             .unwrap_or_else(|| py.None());
         let lid = self.with_net(|net, reactor| -> std::io::Result<u64> {
-            reactor.backend_mut().register_socket(sock)?;
+            if let Err(e) = reactor.backend_mut().register_socket(sock) {
+                // Nothing owns this descriptor yet: `listener_create` has
+                // not run, so no listener entry will ever close it. For
+                // tcp_listen/http_listen that leaves the port we just
+                // bound held for the life of the process; for
+                // create_server(sock=...) the caller already detached its
+                // socket object, so the fd has no owner at all.
+                netsys::close(sock);
+                return Err(e);
+            }
             let lid = net::listener_create(net, sock, kind, accept_pool);
             if start {
                 if let Err(e) = net::listener_start(net, reactor.backend_mut(), lid) {

@@ -279,12 +279,25 @@ class TcpSurface:
         *,
         server_side=False,
     ):
+        # Until attach_stream() takes it, this descriptor has no owner:
+        # it came back from a native connect, or from a `sock=` the caller
+        # already detached. A protocol_factory that raises (or an
+        # SSLContext that will not build) therefore leaked one connected
+        # socket per failure -- invisible until the process ran out.
         if not ssl:
-            protocol = protocol_factory()
+            try:
+                protocol = protocol_factory()
+            except BaseException:
+                self._core.discard_socket(fd)
+                raise
             transport = self._core.attach_stream(fd, protocol)
             return transport, protocol
-        sslcontext = self._make_ssl_context(ssl, server_side=server_side)
-        app_protocol = protocol_factory()
+        try:
+            sslcontext = self._make_ssl_context(ssl, server_side=server_side)
+            app_protocol = protocol_factory()
+        except BaseException:
+            self._core.discard_socket(fd)
+            raise
         waiter = self.create_future()
         protocol = self._make_ssl_protocol(
             app_protocol,

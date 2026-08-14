@@ -11,6 +11,10 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Transport | `protocol_factory` raising leaked the connected socket, one per failure | `HEAD` |
+> | Net | Listener socket left open when backend registration failed | `HEAD` |
+> | Config | NaN/inf durations passed the `< 0` check and disabled the guard they set | `HEAD` |
+> | Pipes | Windows `data_received` exceptions left the pipe open and reading | `HEAD` |
 > | Perf | Immediate-flush latency mode: selectable, honestly unmeasured | `dfe01b0` |
 > | TLS | `h2` could be negotiated, then every request failed against the HTTP/1 parser | `HEAD` |
 > | Server | Shutdown truncated in-flight responses; `grace` was never applied inside a worker | `65fe5c8` |
