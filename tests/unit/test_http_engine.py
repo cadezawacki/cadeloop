@@ -2563,3 +2563,46 @@ def test_a_slow_body_upload_is_not_killed_by_the_head_deadline(loop):
     loop._core.listener_close(lid)
     assert head.startswith(b"HTTP/1.1 200"), head[:60]
     assert got == [800], got
+
+
+def test_scope_metadata_dicts_are_not_shared_between_requests(loop):
+    """`scope["asgi"]` and `scope["extensions"]` were one process-wide
+    dict each, handed to every request. They are NESTED inside the scope,
+    so the shallow copy an application customarily makes does not protect
+    them: one middleware writing there changed what every later request --
+    and every other loop in the process -- was told about the spec version
+    or which extensions exist. Reported by Codex on PR #1."""
+    seen = []
+
+    async def app(scope, receive, send):
+        await receive()
+        seen.append((dict(scope["asgi"]), dict(scope["extensions"])))
+        # What a middleware might plausibly do, and used to do globally.
+        scope["asgi"]["spec_version"] = "tampered"
+        scope["extensions"].clear()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"2")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def one():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+        await w.drain()
+        await asyncio.wait_for(r.read(), 5.0)
+        w.close()
+
+    loop.run_until_complete(one())
+    loop.run_until_complete(one())
+    loop._core.listener_close(lid)
+
+    assert len(seen) == 2, seen
+    assert seen[0] == seen[1], f"request 2 inherited request 1's mutations: {seen}"
+    assert seen[1][0]["spec_version"] == "2.3", seen[1][0]
+    assert "http.response.trailers" in seen[1][1], seen[1][1]

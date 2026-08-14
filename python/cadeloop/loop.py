@@ -117,6 +117,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         core.set_error_hook(self._on_callback_error)
         core.set_net_error_hook(self._on_net_error)
         core.set_slow_callback_hook(self._on_slow_callback)
+        # asyncio's own knob, and a real attribute rather than a stub: the
+        # native dispatcher had 100ms baked in, so tuning this silently did
+        # nothing and merely READING it raised AttributeError. A property
+        # keeps the two sides from drifting apart again.
+        self._slow_callback_duration = 0.1
 
         # R-050: native fast paths bound straight onto the instance —
         # attribute lookup finds the bound native method, no Python frame.
@@ -586,6 +591,17 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
     def _on_net_error(self, message, exc):
         self.call_exception_handler({"message": message, "exception": exc})
+
+    @property
+    def slow_callback_duration(self):
+        return self._slow_callback_duration
+
+    @slow_callback_duration.setter
+    def slow_callback_duration(self, seconds):
+        # Pushed straight through: a value the core never hears about is
+        # exactly the bug this replaces.
+        self._core.set_slow_callback_duration(seconds)
+        self._slow_callback_duration = seconds
 
     def _on_slow_callback(self, handle, seconds):
         # R-142: slow-callback warnings in debug mode (>100ms).

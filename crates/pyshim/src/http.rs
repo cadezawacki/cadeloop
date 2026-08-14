@@ -478,9 +478,6 @@ pub(crate) fn date_line(net: &mut NetState, unix_secs: u64) -> &[u8] {
 // scope construction (R-081, R-082)                                     //
 // --------------------------------------------------------------------- //
 
-static ASGI_INFO: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
-/// ASGI `scope["extensions"]` -- the engine's declared optional features.
-static EXTENSIONS: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
 static EMPTY_BYTES: PyOnceLock<Py<PyBytes>> = PyOnceLock::new();
 static COMPLETED: PyOnceLock<Py<CompletedAwaitable>> = PyOnceLock::new();
 
@@ -552,22 +549,25 @@ fn build_scope<'py>(
     } else {
         scope.set_item(intern!(py, "type"), intern!(py, "http"))?;
     }
-    let asgi = ASGI_INFO.get_or_try_init(py, || -> PyResult<Py<PyDict>> {
-        let d = PyDict::new(py);
-        d.set_item(intern!(py, "version"), intern!(py, "3.0"))?;
-        d.set_item(intern!(py, "spec_version"), intern!(py, "2.3"))?;
-        Ok(d.unbind())
-    })?;
+    // Fresh per scope, not a shared singleton. These are nested inside
+    // the scope, so the shallow copy an application customarily makes
+    // does NOT protect them: one middleware writing to scope["asgi"] or
+    // scope["extensions"] changed what every later request -- and every
+    // other loop in the process -- was told about the spec version or
+    // which extensions exist. Keys and values stay interned, so only the
+    // dict object itself is new.
+    let asgi = PyDict::new(py);
+    asgi.set_item(intern!(py, "version"), intern!(py, "3.0"))?;
+    asgi.set_item(intern!(py, "spec_version"), intern!(py, "2.3"))?;
     scope.set_item(intern!(py, "asgi"), asgi)?;
     if !ws {
         // ASGI extension discovery: an application checks this before
         // setting `trailers: True`, so the engine has to declare it or
         // nothing will ever use the feature.
-        let exts = EXTENSIONS.get_or_try_init(py, || -> PyResult<Py<PyDict>> {
-            let d = PyDict::new(py);
-            d.set_item(intern!(py, "http.response.trailers"), PyDict::new(py))?;
-            Ok(d.unbind())
-        })?;
+        // Fresh, and so is the nested per-extension dict: sharing that
+        // one would have leaked just as far.
+        let exts = PyDict::new(py);
+        exts.set_item(intern!(py, "http.response.trailers"), PyDict::new(py))?;
         scope.set_item(intern!(py, "extensions"), exts)?;
     }
     scope.set_item(

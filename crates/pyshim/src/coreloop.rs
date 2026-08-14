@@ -69,6 +69,11 @@ pub struct CoreLoop {
     net_error_hook: OnceLock<Py<PyAny>>,
     /// Facade hook: `(handle, seconds) -> None` (R-142 slow callbacks).
     slow_callback_hook: OnceLock<Py<PyAny>>,
+    /// asyncio's `loop.slow_callback_duration`, in nanoseconds. A fixed
+    /// 100ms was baked in here, so the standard knob applications and
+    /// test harnesses tune did nothing -- and the facade did not even
+    /// carry the attribute, so reading it raised AttributeError.
+    slow_callback_ns: AtomicU64,
     /// The `cadeloop.Loop` facade that owns this core, so the native
     /// `create_task` / `create_future` fast paths can pass `loop=` without
     /// a round trip through Python. Strong, like the hooks above -- the
@@ -420,7 +425,7 @@ impl CoreLoop {
                 }
                 if let Some(started) = started {
                     let elapsed = started.elapsed();
-                    if elapsed > Duration::from_millis(100) {
+                    if elapsed.as_nanos() as u64 > self.slow_callback_ns.load(Ordering::Relaxed) {
                         if let Some(hook) = self.slow_callback_hook.get() {
                             if let Err(e) = hook.call1(py, (&token, elapsed.as_secs_f64())) {
                                 e.write_unraisable(py, Some(token.bind(py)));
@@ -554,6 +559,7 @@ impl CoreLoop {
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
             slow_callback_hook: OnceLock::new(),
+            slow_callback_ns: AtomicU64::new(100_000_000),
             owner: OnceLock::new(),
             high_water,
             low_water,
@@ -1476,6 +1482,15 @@ impl CoreLoop {
 
     fn set_net_error_hook(&self, hook: Bound<'_, PyAny>) {
         let _ = self.net_error_hook.set(hook.unbind());
+    }
+
+    /// Seconds, matching asyncio's `loop.slow_callback_duration`.
+    fn set_slow_callback_duration(&self, seconds: f64) -> PyResult<()> {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return Err(PyValueError::new_err("slow_callback_duration must be a positive number"));
+        }
+        self.slow_callback_ns.store((seconds * 1e9) as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     fn set_slow_callback_hook(&self, hook: Bound<'_, PyAny>) {

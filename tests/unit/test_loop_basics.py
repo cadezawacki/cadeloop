@@ -838,3 +838,38 @@ def test_a_context_that_cannot_be_entered_fails_one_callback_not_the_loop():
     assert "already entered" in str(errors[0])
     # The loop kept going: the callback after the failing one still ran.
     assert hits == ["b"], hits
+
+
+def test_slow_callback_duration_is_a_real_knob(caplog):
+    """The native dispatcher had 100ms baked in, so asyncio's standard
+    `loop.slow_callback_duration` did nothing when set -- and the facade
+    did not carry the attribute at all, so merely reading it raised
+    AttributeError. Reported by Codex on PR #1."""
+    import logging
+
+    lp = cadeloop.new_event_loop()
+    lp.set_debug(True)
+    caplog.set_level(logging.WARNING, logger="cadeloop")
+    try:
+        assert lp.slow_callback_duration == 0.1  # asyncio's default
+        lp.slow_callback_duration = 0.005
+        assert lp.slow_callback_duration == 0.005
+
+        def slow():
+            _time.sleep(0.05)  # 10x the configured threshold
+            lp.stop()
+
+        lp.call_soon(slow)
+        lp.run_forever()
+    finally:
+        lp.close()
+
+    # Reported through the logger, which is where _on_slow_callback sends
+    # it -- not the exception handler.
+    assert any("took" in r.getMessage() for r in caplog.records), caplog.text
+    with pytest.raises(ValueError):
+        lp2 = cadeloop.new_event_loop()
+        try:
+            lp2.slow_callback_duration = 0
+        finally:
+            lp2.close()
