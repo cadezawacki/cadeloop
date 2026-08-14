@@ -11,13 +11,13 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | Request trailers were merged into `scope["headers"]`, smuggling a second `Host` | `` |
-> | WS | Empty frames cost nothing against the inbox budget, so it never bounded the queue | `` |
-> | WS | `Upgrade` was compared whole instead of parsed as a token list | `` |
-> | WS | Subprotocol offers were trimmed of spaces but not tabs | `` |
-> | UDP | Empty datagrams cost nothing against the send-queue cap | `` |
-> | Server | `serve()` reset an embedder's signal handlers to default instead of restoring them | `` |
-> | Config | Negative watermarks passed validation and failed later as an `OverflowError` | `` |
+> | HTTP | Request trailers were merged into `scope["headers"]`, smuggling a second `Host` | `7249648` |
+> | WS | Empty frames cost nothing against the inbox budget, so it never bounded the queue | `7249648` |
+> | WS | `Upgrade` was compared whole instead of parsed as a token list | `7249648` |
+> | WS | Subprotocol offers were trimmed of spaces but not tabs | `7249648` |
+> | UDP | Empty datagrams cost nothing against the send-queue cap | `7249648` |
+> | Server | `serve()` reset an embedder's signal handlers to default instead of restoring them | `7249648` |
+> | Config | Negative watermarks passed validation and failed later as an `OverflowError` | `7249648` |
 > | Server | A lifespan that returned after `startup.complete` left the worker serving without it | `b0c2632` |
 > | Transport | `sendfile` fallback counted writes a closing transport had discarded | `b0c2632` |
 > | Transport | `loop.sendfile` validated none of its parameters, unlike `sock_sendfile` | `b0c2632` |
