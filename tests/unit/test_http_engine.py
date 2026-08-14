@@ -2457,3 +2457,53 @@ def test_a_connection_that_sends_nothing_hits_the_head_timeout(loop):
         "a connection that never sent a byte was never timed out"
     )
     assert rest.startswith(b"HTTP/1.1 408"), rest[:60]
+
+
+def test_a_trailer_does_not_leak_into_the_next_pipelined_request(loop):
+    """The trailer section's LAST field/value pair stays in the parser's
+    accumulator -- nothing calls commit_header() after it, because the
+    message ended instead of another header starting. The next PIPELINED
+    request then committed it as its own first header: `Authorization:
+    Bearer stolen` from request one arrived as request two's opening
+    field, on a keep-alive connection that a proxy may well be pooling.
+    Round 10 stopped trailers reaching their OWN request; this is the same
+    injection crossing a request boundary. Reported by Codex on PR #1."""
+    seen = []
+
+    async def app(scope, receive, send):
+        while True:
+            if not (await receive()).get("more_body"):
+                break
+        seen.append([(k.decode(), v.decode()) for k, v in scope["headers"]])
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"2")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"POST /one HTTP/1.1\r\nHost: legit\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"4\r\nbody\r\n0\r\n"
+            b"Authorization: Bearer stolen\r\n\r\n"
+            b"GET /two HTTP/1.1\r\nHost: legit\r\nX-Real: yes\r\n\r\n"
+        )
+        await w.drain()
+        for _ in range(40):
+            await asyncio.sleep(0.02)
+            if len(seen) >= 2:
+                break
+        w.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert len(seen) == 2, seen
+    names = [k for k, _ in seen[1]]
+    assert "authorization" not in names, seen[1]
+    assert names == ["host", "x-real"], seen[1]

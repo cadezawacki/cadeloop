@@ -11,6 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | HTTP | A trailer leaked into the next pipelined request as its first header | `` |
+> | Server | The stats endpoint inherited `max_body=None`, buffering any body sent to it | `` |
+> | Net | `create_server(sock=...)` accepted a connected socket and span on failing accepts | `` |
 > | HTTP | A connection that sent nothing never hit the head timeout | `383f049` |
 > | WS | A ping flood from a peer that stops reading queued pongs without bound | `383f049` |
 > | Server | The spawn supervisor kept the old restart rule the fork one had outgrown | `7649432` |

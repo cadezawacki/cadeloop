@@ -329,6 +329,17 @@ unsafe extern "C" fn on_message_complete(p: *mut Llhttp) -> c_int {
         body: std::mem::take(&mut a.body),
     });
     a.header_bytes = 0;
+    // The trailer section's LAST field/value pair is still sitting in the
+    // accumulator: nothing calls commit_header() after it, because the
+    // message ended instead of another header starting. Leaving it there
+    // let the next PIPELINED request commit it as its own first header --
+    // `Authorization: Bearer stolen` from one request arriving as request
+    // two's opening field, verified on a keep-alive connection. Round 10
+    // stopped trailers being committed to their OWN request; this is the
+    // same injection crossing a request boundary instead.
+    a.field.clear();
+    a.value.clear();
+    a.in_value = false;
     0
 }
 

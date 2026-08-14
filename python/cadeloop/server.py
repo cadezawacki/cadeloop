@@ -555,7 +555,13 @@ def _start_stats_endpoint(loop, port: int, worker_id):
         )
         await send({"type": "http.response.body", "body": body})
 
-    lid, bound, _fd = loop._core.http_listen("127.0.0.1", port, stats_app, loop)
+    # max_body=0: the engine buffers a whole request body before the app
+    # reaches receive(), and this listener inherited http_listen()'s
+    # max_body=None ("no cap") rather than the server's own limit -- so
+    # anything able to reach loopback could stream an arbitrarily large
+    # POST and exhaust the serving worker. A read-only endpoint needs no
+    # body at all.
+    lid, bound, _fd = loop._core.http_listen("127.0.0.1", port, stats_app, loop, max_body=0)
     logger.info("cadeloop stats endpoint on http://127.0.0.1:%s", bound[1])
     return lid, bound[1]
 

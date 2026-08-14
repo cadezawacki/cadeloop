@@ -524,6 +524,20 @@ class TcpSurface:
                 # socket handed in ready to go.
                 if exc.errno not in (errno.EINVAL, errno.EISCONN):
                     raise
+                # ...but EINVAL is ambiguous: a CONNECTED socket reports it
+                # too, and swallowing that handed back a Server whose every
+                # accept fails. On epoll each failure is an inline
+                # completion that re-arms another, so it spins reporting
+                # accept errors and never serves. getpeername() separates
+                # the two -- it succeeds only on the connected one.
+                try:
+                    sock.getpeername()
+                except OSError:
+                    pass  # not connected: genuinely already listening
+                else:
+                    raise ValueError(
+                        f"A listening socket was expected, got a connected socket {sock!r}"
+                    ) from exc
             fd = sock.detach()
             try:
                 lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)

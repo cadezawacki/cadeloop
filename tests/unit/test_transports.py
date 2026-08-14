@@ -2008,3 +2008,30 @@ def test_sendfile_fallback_stops_when_the_peer_goes_away(loop):
     assert fh.tell() == t.written, (
         f"file left at {fh.tell()} after only {t.written} bytes actually reached the peer"
     )
+
+
+def test_create_server_rejects_a_connected_socket(loop):
+    """listen() on a CONNECTED socket raises EINVAL -- the same errno an
+    already-listening socket gives -- and swallowing it handed back a
+    Server whose every accept fails. On epoll each failure is an inline
+    completion that re-arms another, so it spins reporting accept errors
+    and never serves. Reported by Codex on PR #1."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    client = socket.socket()
+    try:
+        client.connect(srv.getsockname())
+        with pytest.raises(ValueError, match="listening socket was expected"):
+            loop.run_until_complete(loop.create_server(asyncio.Protocol, sock=client))
+        # An actually-listening socket still works: repeated listen() is
+        # legal, and that path must not have been broken by the check.
+        again = socket.socket()
+        again.bind(("127.0.0.1", 0))
+        again.listen(1)
+        server = loop.run_until_complete(loop.create_server(asyncio.Protocol, sock=again))
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+    finally:
+        client.close()
+        srv.close()
