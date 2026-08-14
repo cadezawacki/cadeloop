@@ -11,8 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | ASGI `http.response.trailers` implemented and declared in the scope | `HEAD` |
-> | HTTP | Idle sweep could tear down a connection still writing its response | `HEAD` |
+> | HTTP | ASGI `http.response.trailers` implemented and declared in the scope | `1e48aff` |
+> | HTTP | Idle sweep could tear down a connection still writing its response | `1e48aff` |
 > | WebSocket | `accept` could select a subprotocol the client never offered | `52347cd` |
 > | Loop | `add_reader`/`add_writer` left a phantom watcher when `set_watch` failed | `e9ebd2d` |
 > | Transport | Cancelling a connect left the native op running until the OS gave up | `e9ebd2d` |
