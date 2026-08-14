@@ -11,6 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | WebSocket | Inbox budget not decremented on the steady-state delivery path (stalled connections) | `HEAD` |
+> | CI | ADR-24 tracing switched off after two clean Windows runs | `HEAD` |
 > | HTTP | HTTP/1.0 requests now get an `HTTP/1.0` status line | `d0cdad0` |
 > | WebSocket | `websocket.accept` rejects reserved handshake headers | `d0cdad0` |
 > | Server | Fork supervisor cleans up workers when a later fork fails | `d0cdad0` |
@@ -54,13 +56,16 @@
 > `data_received` guard, UDP `set_protocol` rewiring, config validation,
 > Ruff/typing in CI.
 >
-> **Known issue** — an intermittent Windows hang in
-> `test_starlette_routes_and_streaming` (`/bg`). The request never reaches
-> the app; the loop parks with one transport and an op belonging to none.
-> `5d96fcb` addresses one mechanism with that signature and was green on
-> both Windows runners, but this is not yet confirmed closed. The
-> `CADELOOP_TRACE_TICK` / `CADELOOP_TRACE_APP` instrumentation stays until
-> it is.
+> **Watching** — the intermittent Windows hang in
+> `test_starlette_routes_and_streaming` (`/bg`) has not reproduced since
+> `5d96fcb`, across two clean runs on both Windows runners (and the first
+> fully-green pipeline, `stress` and `benchmark-regression` included).
+> `5d96fcb` fixes a real bug matching its signature — a recycled SOCKET
+> value letting a socket skip IOCP association, so its connect completion
+> was never delivered — but the mechanism was never confirmed from a trace,
+> so this is empirically settled rather than proven. CI tracing is off; the
+> `CADELOOP_TRACE_TICK` / `CADELOOP_TRACE_APP` instrumentation stays in the
+> tree, costing nothing unset, in case it returns.
 
 A maximum-performance asyncio event loop + ASGI stack with a Rust core.
 Windows (IOCP, with a Registered I/O backend implemented and awaiting

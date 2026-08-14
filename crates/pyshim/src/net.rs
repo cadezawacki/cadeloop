@@ -1797,9 +1797,29 @@ pub(crate) fn dispatch_events(
             }
             NetEvent::WsWake { tid, fut } => {
                 // Deliver ONE queued WS event to the waiter (R-087).
+                //
+                // This is the STEADY-STATE path -- an app already parked in
+                // receive() is woken here, not through HttpReceive.__call__
+                // -- so the inbox budget must be decremented here too. It
+                // was not, so inbox_bytes only ever grew: after ~4 MiB of
+                // cumulative traffic ws_ingest paused reads permanently on
+                // a connection whose application had consumed every single
+                // message.
                 let msg = core.with_net(|net, _| {
-                    net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()).and_then(|w| w.inbox.pop_front())
+                    let m =
+                        net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()).and_then(|w| w.inbox.pop_front());
+                    if let Some(m) = m.as_ref() {
+                        if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
+                            w.inbox_bytes = w.inbox_bytes.saturating_sub(m.byte_len());
+                        }
+                    }
+                    m
                 })?;
+                if msg.is_some() {
+                    core.with_net(|net, reactor| {
+                        crate::http::ws_resume_reading(py, net, reactor.backend_mut(), tid);
+                    })?;
+                }
                 let fut = fut.bind(py);
                 let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
                 match (done, msg) {

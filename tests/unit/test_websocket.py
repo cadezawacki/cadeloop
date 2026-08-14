@@ -459,3 +459,49 @@ def test_reserved_upgrade_headers_are_rejected(loop, header):
     head = loop.run_until_complete(main())
     assert b"101" not in head.split(b"\r\n", 1)[0], head[:60]
     loop._core.listener_close(lid)
+
+
+def test_sustained_traffic_does_not_stall_the_connection(loop):
+    """The inbox budget must be decremented on BOTH delivery paths. An app
+    already parked in receive() is woken through WsWake, not through
+    HttpReceive.__call__, and that path did not subtract the message it
+    delivered — so inbox_bytes only ever grew and reads paused for good
+    after ~4 MiB, on a connection whose app had consumed everything.
+    Reported by Codex review on PR #1; regression from my own inbox cap.
+
+    The client waits for each echo before sending the next message. That
+    is what forces the WsWake path: a flooding client keeps the inbox
+    non-empty, so receive() takes the immediate path instead and the bug
+    stays hidden."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        while True:
+            msg = await receive()
+            if msg["type"] == "websocket.disconnect":
+                return
+            await send({"type": "websocket.send", "bytes": b"ack"})
+
+    lid, port = listen(loop, app)
+    payload = b"m" * 60000
+    n = 100  # 6 MiB total, well past the 4 MiB inbox budget
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        acked = 0
+        for _ in range(n):
+            writer.write(client_frame(0x2, payload))
+            await writer.drain()
+            # Waiting for the ack guarantees the app is parked in
+            # receive() with an empty inbox when the next message lands.
+            _fin, op, _payload = await asyncio.wait_for(read_server_frame(reader), 5)
+            assert op == 0x2
+            acked += 1
+        writer.close()
+        return acked
+
+    acked = loop.run_until_complete(main())
+    assert acked == n, f"stalled after {acked} of {n} messages"
+    loop._core.listener_close(lid)
