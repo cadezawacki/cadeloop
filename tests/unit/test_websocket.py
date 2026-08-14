@@ -505,3 +505,79 @@ def test_sustained_traffic_does_not_stall_the_connection(loop):
     acked = loop.run_until_complete(main())
     assert acked == n, f"stalled after {acked} of {n} messages"
     loop._core.listener_close(lid)
+
+
+def test_accept_rejects_a_subprotocol_the_client_did_not_offer(loop):
+    """RFC 6455 4.1: the server may select one of the client's offers or
+    none. Sending an unoffered one produced a handshake that looked clean
+    on this side and made browsers fail the connection immediately -- a
+    disconnect with nothing here to explain it."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept", "subprotocol": "superchat"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(
+            port, extra="sec-websocket-protocol: chat\r\n"
+        )
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"101" not in head.split(b"\r\n", 1)[0], head[:80]
+    assert b"superchat" not in head.lower(), head
+    loop._core.listener_close(lid)
+
+
+def test_accept_allows_selecting_none_of_the_offers(loop):
+    """Declining every offer is explicitly permitted, and must not be
+    confused with selecting an unoffered one."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, key, head = await handshake(
+            port, extra="sec-websocket-protocol: chat, superchat\r\n"
+        )
+        writer.close()
+        return key, head
+
+    key, head = loop.run_until_complete(main())
+    assert head.split(b"\r\n", 1)[0].endswith(b"101 Switching Protocols"), head[:80]
+    assert expect_accept(key).encode() in head
+    assert b"sec-websocket-protocol" not in head.lower(), head
+    loop._core.listener_close(lid)
+
+
+def test_accept_matches_an_offer_from_a_multi_value_header(loop):
+    """The offer list the check reads must be the same one the app sees
+    in its scope -- otherwise an app selecting straight out of its own
+    scope gets rejected."""
+    scopes = []
+
+    async def app(scope, receive, send):
+        scopes.append(scope["subprotocols"])
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept", "subprotocol": scope["subprotocols"][1]})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(
+            port, extra="sec-websocket-protocol: chat,  superchat\r\n"
+        )
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert scopes == [["chat", "superchat"]], scopes
+    assert head.split(b"\r\n", 1)[0].endswith(b"101 Switching Protocols"), head[:80]
+    assert b"sec-websocket-protocol: superchat" in head.lower(), head
+    loop._core.listener_close(lid)

@@ -169,6 +169,12 @@ pub(crate) struct WsConn {
     pub(crate) connect_sent: bool,
     /// Client's Sec-WebSocket-Key (accept-key derivation at accept time).
     pub(crate) key: Vec<u8>,
+    /// Subprotocols the client offered, in offer order. RFC 6455 4.1
+    /// allows the server to select one of *these* or none at all;
+    /// browsers fail the connection outright on anything else, which
+    /// looks like a clean handshake on the server and an instant
+    /// disconnect on the client.
+    pub(crate) offered: Vec<String>,
 }
 
 /// R-087: default cap on an assembled inbound message (1009 beyond it).
@@ -474,15 +480,8 @@ fn build_scope<'py>(
         // client's offered subprotocols.
         scope.set_item(intern!(py, "type"), intern!(py, "websocket"))?;
         let subs = PyList::empty(py);
-        for (name, value) in &req.headers {
-            if name == b"sec-websocket-protocol" {
-                for part in value.split(|&b| b == b',') {
-                    let t: Vec<u8> = part.iter().copied().filter(|&b| b != b' ').collect();
-                    if !t.is_empty() {
-                        subs.append(String::from_utf8_lossy(&t).into_owned())?;
-                    }
-                }
-            }
+        for name in offered_subprotocols(req) {
+            subs.append(name)?;
         }
         scope.set_item(intern!(py, "subprotocols"), subs)?;
     } else {
@@ -898,6 +897,28 @@ fn status_forbids_content_length(status: u16) -> bool {
     // response cannot keep. The engine emits `content-length: 0` for it
     // instead of copying that through.
     (100..200).contains(&status) || status == 204 || status == 205
+}
+
+/// Subprotocols offered by the client, in offer order.
+///
+/// One parser for both the `subprotocols` the app sees in its scope and
+/// the check on what it selects -- two would eventually disagree about
+/// whitespace or empty tokens, and then an accept the app read straight
+/// out of its own scope would be rejected.
+fn offered_subprotocols(req: &cadeloop_core::http::Request) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, value) in &req.headers {
+        if name != b"sec-websocket-protocol" {
+            continue;
+        }
+        for part in value.split(|&b| b == b',') {
+            let t: Vec<u8> = part.iter().copied().filter(|&b| b != b' ').collect();
+            if !t.is_empty() {
+                out.push(String::from_utf8_lossy(&t).into_owned());
+            }
+        }
+    }
+    out
 }
 
 /// RFC 7230 `tchar`.
@@ -1609,6 +1630,23 @@ fn ws_send(
                         "websocket.accept sent an invalid subprotocol: {why}"
                     )));
                 }
+                // RFC 6455 4.1: the selected subprotocol must be one the
+                // client offered. Sending an unoffered one produced a
+                // handshake that looked clean here and made browsers fail
+                // the connection immediately -- a disconnect with nothing
+                // on the server side to explain it.
+                let offered = core.with_net(|net, _| {
+                    net.http_conn_mut(tid)
+                        .and_then(|c| c.ws.as_ref())
+                        .map(|w| w.offered.clone())
+                        .unwrap_or_default()
+                })?;
+                if !offered.iter().any(|o| o == sp) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "websocket.accept selected subprotocol {sp:?}, which the client \
+                         did not offer (offered: {offered:?})"
+                    )));
+                }
             }
             let mut extra: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             if let Some(headers) = message.get_item(intern!(py, "headers"))? {
@@ -1987,6 +2025,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                             closing: false,
                             connect_sent: false,
                             key: key.clone(),
+                            offered: offered_subprotocols(&req),
                         }));
                     }
                     WsVerdict::Bad => {}

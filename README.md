@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | WebSocket | `accept` could select a subprotocol the client never offered | `HEAD` |
 > | Loop | `add_reader`/`add_writer` left a phantom watcher when `set_watch` failed | `e9ebd2d` |
 > | Transport | Cancelling a connect left the native op running until the OS gave up | `e9ebd2d` |
 > | CLI | `--max-body none` was unexpressible, so the cap could not be turned off | `e9ebd2d` |
