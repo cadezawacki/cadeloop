@@ -78,6 +78,11 @@ pub struct CoreLoop {
     owner: OnceLock<Py<PyAny>>,
     high_water: usize,
     low_water: usize,
+    /// R-038 TCP Fast Open on listeners this loop creates.
+    tfo: bool,
+    /// R-038 SIO_LOOPBACK_FAST_PATH on connected/accepted sockets
+    /// (Windows only; a no-op elsewhere).
+    loopback_fast_path: bool,
 }
 
 impl CoreLoop {
@@ -297,6 +302,15 @@ impl CoreLoop {
                 self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
                 let timeout = if stopping || !st.net.events.is_empty() {
                     Duration::ZERO
+                } else if st.net.any_starved_listener {
+                    // R-032: a starved listener or datagram endpoint has
+                    // NO operation outstanding -- that is what starved
+                    // means -- so nothing will ever complete to wake this
+                    // park. Without a bound the loop sleeps until some
+                    // unrelated event arrives, and on an idle server that
+                    // is never: the resource stays deaf even after
+                    // whatever exhausted the system has recovered.
+                    st.reactor.poll_timeout().min(STARVED_RETRY_INTERVAL)
                 } else {
                     st.reactor.poll_timeout()
                 };
@@ -362,11 +376,16 @@ impl CoreLoop {
                 }
                 if !comps.is_empty() {
                     net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
-                    // A listener whose accept pool ran dry on a transient
-                    // failure has no completion left to retry it (R-032).
-                    net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut());
                     comps.clear();
                 }
+                // A listener whose accept pool ran dry on a transient
+                // failure has no completion left to retry it (R-032) --
+                // which is exactly why this cannot live inside the
+                // completions branch. On an otherwise idle loop no
+                // completion ever arrives, so gating the retry on one left
+                // the listener deaf for good. Cheap when nothing is
+                // starved: one bool load and return.
+                net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut());
                 st.completions_scratch = comps;
                 // Readiness watch callbacks join the ordinary ready queue.
                 if !st.net.ready_scratch.is_empty() {
@@ -518,6 +537,13 @@ const CO_COROUTINE: i32 = 0x80;
 /// 100ms park this is roughly one line every two seconds.
 const IDLE_TRACE_EVERY: u64 = 20;
 
+/// R-032: upper bound on the park while a listener or datagram endpoint
+/// is starved. Nothing is outstanding to complete and wake us -- that is
+/// what starved means -- so the retry needs a tick of its own. 50ms is
+/// short enough that recovery is prompt and long enough that a starved
+/// resource that cannot recover does not spin the CPU.
+const STARVED_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 fn trace_tick_enabled() -> bool {
     static TRACE_TICK: OnceLock<bool> = OnceLock::new();
     *TRACE_TICK.get_or_init(|| std::env::var_os("CADELOOP_TRACE_TICK").is_some())
@@ -543,7 +569,8 @@ pub(crate) fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
 impl CoreLoop {
     #[new]
     #[pyo3(signature = (backend="auto", spin_us=20, high_water=65536, low_water=16384,
-                        rio_cq_size=65536, rio_rq_recv=32, rio_rq_send=32))]
+                        rio_cq_size=65536, rio_rq_recv=32, rio_rq_send=32,
+                        tfo=false, loopback_fast_path=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         backend: &str,
@@ -553,6 +580,8 @@ impl CoreLoop {
         rio_cq_size: u32,
         rio_rq_recv: u32,
         rio_rq_send: u32,
+        tfo: bool,
+        loopback_fast_path: bool,
     ) -> PyResult<Self> {
         let kind = BackendKind::parse(backend).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -589,6 +618,8 @@ impl CoreLoop {
             owner: OnceLock::new(),
             high_water,
             low_water,
+            tfo,
+            loopback_fast_path,
         })
     }
 
@@ -767,7 +798,7 @@ impl CoreLoop {
         start: bool,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
-        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port)?;
+        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port, self.tfo)?;
         self.listen_socket(py, sock, net::ListenerKind::Factory(factory.unbind()), accept_pool, start)
     }
 
@@ -809,7 +840,7 @@ impl CoreLoop {
             _ => PyDict::new(py).into_any().unbind(),
         };
         let secs_to_ns = |s: f64| if s > 0.0 { (s * 1e9) as u64 } else { 0 };
-        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port)?;
+        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port, self.tfo)?;
         let kind = net::ListenerKind::Http {
             app: app.unbind(),
             pyloop: pyloop.unbind(),
@@ -1094,26 +1125,40 @@ impl CoreLoop {
 
     /// Begin an async connect; `fut` resolves to the connected socket
     /// handle (u64) or an OSError.
-    #[pyo3(signature = (ip, port, fut, local_ip=None, local_port=0))]
+    #[pyo3(signature = (addr, fut, local_addr=None))]
+    /// Begin an async connect to a resolved address.
+    ///
+    /// Both addresses are the socket module's sockaddr tuples, not
+    /// host/port pairs: `(host, port)` for IPv4 and
+    /// `(host, port, flowinfo, scope_id)` for IPv6. Flattening the IPv6
+    /// form loses the interface scope, and a link-local peer
+    /// (`fe80::...%eth0`) is then unreachable however cleanly it
+    /// resolved.
     fn tcp_connect(
         &self,
         _py: Python<'_>,
-        ip: &str,
-        port: u16,
+        addr: Bound<'_, PyAny>,
         fut: Bound<'_, PyAny>,
-        local_ip: Option<&str>,
-        local_port: u16,
+        local_addr: Option<Bound<'_, PyAny>>,
     ) -> PyResult<(u32, u32)> {
         self.check_closed()?;
-        let addr: std::net::IpAddr =
-            ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
-        let sockaddr = std::net::SocketAddr::new(addr, port);
+        let sockaddr = parse_addr_tuple(addr)?;
         let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
         let sock = netsys::create_tcp(family)?;
-        if let Some(lip) = local_ip {
-            let laddr: std::net::IpAddr =
-                lip.parse().map_err(|_| PyValueError::new_err(format!("invalid local IP: {lip:?}")))?;
-            let lsa = netsys::build_sockaddr(std::net::SocketAddr::new(laddr, local_port));
+        if self.loopback_fast_path {
+            // Best-effort by design (R-038/R-131): it needs both ends to
+            // opt in and is unsupported on some builds.
+            let _ = netsys::set_loopback_fast_path(sock);
+        }
+        if let Some(local) = local_addr.filter(|a| !a.is_none()) {
+            let laddr = match parse_addr_tuple(local) {
+                Ok(a) => a,
+                Err(e) => {
+                    netsys::close(sock);
+                    return Err(e);
+                }
+            };
+            let lsa = netsys::build_sockaddr(laddr);
             if let Err(e) = netsys::bind(sock, &lsa) {
                 netsys::close(sock);
                 return Err(e.into());
@@ -1647,6 +1692,7 @@ fn bind_listen_socket(
     backlog: i32,
     reuse_addr: bool,
     reuse_port: bool,
+    tfo: bool,
 ) -> PyResult<RawSocket> {
     let addr: std::net::IpAddr =
         ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
@@ -1654,11 +1700,26 @@ fn bind_listen_socket(
     let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
     let sock = netsys::create_tcp(family)?;
     let setup = (|| -> std::io::Result<()> {
+        if family == netsys::AF_INET6 {
+            // A wildcard IPv6 socket accepts IPv4 too on Linux (v6only
+            // defaults off), so `create_server(host=None, port=P)` --
+            // which resolves to BOTH 0.0.0.0 and :: and binds a listener
+            // per family -- had whichever bound second fail EADDRINUSE,
+            // and the Python layer then rolled back an otherwise valid
+            // server. Separate per-family listeners require this.
+            netsys::set_v6only(sock, true)?;
+        }
         if reuse_addr {
             netsys::set_reuse_addr(sock, true)?;
         }
         if reuse_port {
             netsys::set_reuse_port(sock, true)?;
+        }
+        if tfo {
+            // R-038. Not best-effort: the option was asked for
+            // explicitly, and silently serving without it is how it came
+            // to be a no-op in the first place.
+            netsys::set_fastopen(sock, backlog)?;
         }
         netsys::bind(sock, &netsys::build_sockaddr(sockaddr))?;
         netsys::listen(sock, backlog)

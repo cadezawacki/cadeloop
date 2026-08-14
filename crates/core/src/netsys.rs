@@ -124,6 +124,29 @@ mod imp {
         Ok(())
     }
 
+    pub fn set_v6only(sock: RawSocket, on: bool) -> io::Result<()> {
+        let v: i32 = on as i32;
+        cvt(unsafe {
+            libc::setsockopt(sock as i32, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (&v as *const i32).cast(), 4)
+        })?;
+        Ok(())
+    }
+
+    /// R-038 TCP Fast Open on a listener. The Linux option takes the
+    /// pending-SYN-data queue length rather than a boolean.
+    pub fn set_fastopen(sock: RawSocket, queue: i32) -> io::Result<()> {
+        const TCP_FASTOPEN: i32 = 23;
+        cvt(unsafe {
+            libc::setsockopt(sock as i32, libc::IPPROTO_TCP, TCP_FASTOPEN, (&queue as *const i32).cast(), 4)
+        })?;
+        Ok(())
+    }
+
+    /// R-038 SIO_LOOPBACK_FAST_PATH has no Linux counterpart.
+    pub fn set_loopback_fast_path(_sock: RawSocket) -> io::Result<()> {
+        Ok(())
+    }
+
     pub fn shutdown_send(sock: RawSocket) -> io::Result<()> {
         cvt(unsafe { libc::shutdown(sock as i32, libc::SHUT_WR) })?;
         Ok(())
@@ -158,8 +181,8 @@ mod imp {
     use super::*;
     use windows_sys::Win32::Networking::WinSock::{
         bind as ws_bind, closesocket, getpeername, getsockname, listen as ws_listen, setsockopt, shutdown,
-        WSAGetLastError, WSASocketW, IPPROTO_TCP, SD_SEND, SOCKADDR, SOCKET_ERROR, SOL_SOCKET, SO_REUSEADDR,
-        TCP_NODELAY, WSA_FLAG_OVERLAPPED,
+        WSAGetLastError, WSAIoctl, WSASocketW, IPPROTO_TCP, SD_SEND, SOCKADDR, SOCKET_ERROR, SOL_SOCKET,
+        SO_REUSEADDR, TCP_NODELAY, WSA_FLAG_OVERLAPPED,
     };
 
     fn wsa_err() -> io::Error {
@@ -204,6 +227,53 @@ mod imp {
         // No SO_REUSEPORT on Windows; load distribution comes from
         // WSADuplicateSocketW listener sharing (R-090).
         Err(io::Error::new(io::ErrorKind::Unsupported, "SO_REUSEPORT is not available on Windows"))
+    }
+
+    pub fn set_v6only(sock: RawSocket, on: bool) -> io::Result<()> {
+        // IPPROTO_IPV6 = 41, IPV6_V6ONLY = 27 (ws2ipdef.h). Windows
+        // defaults this ON, so setting it is belt-and-braces there --
+        // it is Linux, which defaults it off, that needs it.
+        let v: u32 = on as u32;
+        let rc = unsafe { setsockopt(sock, 41, 27, (&v as *const u32).cast(), 4) };
+        if rc == SOCKET_ERROR {
+            return Err(wsa_err());
+        }
+        Ok(())
+    }
+
+    /// R-038 TCP Fast Open on a listener. Windows takes a boolean here,
+    /// unlike Linux's queue length.
+    pub fn set_fastopen(sock: RawSocket, _queue: i32) -> io::Result<()> {
+        const TCP_FASTOPEN: i32 = 15;
+        let v: u32 = 1;
+        let rc = unsafe { setsockopt(sock, IPPROTO_TCP, TCP_FASTOPEN, (&v as *const u32).cast(), 4) };
+        if rc == SOCKET_ERROR {
+            return Err(wsa_err());
+        }
+        Ok(())
+    }
+
+    /// R-038 SIO_LOOPBACK_FAST_PATH. Best-effort: it needs both ends to
+    /// set it and is unsupported on some builds, so a failure is not a
+    /// reason to fail the connection.
+    pub fn set_loopback_fast_path(sock: RawSocket) -> io::Result<()> {
+        const SIO_LOOPBACK_FAST_PATH: u32 = 0x9800_0010;
+        let mut enabled: u32 = 1;
+        let mut bytes: u32 = 0;
+        unsafe {
+            let _ = WSAIoctl(
+                sock,
+                SIO_LOOPBACK_FAST_PATH,
+                (&mut enabled as *mut u32).cast(),
+                4,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes,
+                std::ptr::null_mut(),
+                None,
+            );
+        }
+        Ok(())
     }
 
     pub fn set_nodelay(sock: RawSocket, on: bool) -> io::Result<()> {
@@ -251,8 +321,8 @@ mod imp {
 }
 
 pub use imp::{
-    bind, close, create_tcp, listen, peername, set_nodelay, set_reuse_addr, set_reuse_port, shutdown_send,
-    sockname,
+    bind, close, create_tcp, listen, peername, set_fastopen, set_loopback_fast_path, set_nodelay,
+    set_reuse_addr, set_reuse_port, set_v6only, shutdown_send, sockname,
 };
 
 #[cfg(test)]

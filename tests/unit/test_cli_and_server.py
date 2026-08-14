@@ -197,3 +197,41 @@ def test_cli_rejects_a_non_numeric_body_cap(monkeypatch):
     with pytest.raises(SystemExit):
         with contextlib.redirect_stderr(io.StringIO()):
             cli.main(["mod:app", "--max-body", "banana"])
+
+
+def test_lifespan_crash_after_startup_stops_the_worker():
+    """A lifespan task that raises after startup.complete used to be
+    logged and ignored, leaving a worker that looked healthy while the
+    resources its lifespan was holding had already gone."""
+    import asyncio
+    import threading
+
+    from cadeloop.server import _serve_single
+
+    crashed = threading.Event()
+
+    async def app(scope, receive, send):
+        if scope["type"] != "lifespan":
+            return  # pragma: no cover
+        await receive()
+        await send({"type": "lifespan.startup.complete"})
+        await asyncio.sleep(0.1)
+        crashed.set()
+        raise RuntimeError("pool died")
+
+    cfg = cadeloop.Config(grace=0.0)
+    result = {}
+
+    def run():
+        try:
+            _serve_single(app, "127.0.0.1", 0, cfg)
+        except BaseException as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=20)
+    assert not t.is_alive(), "worker kept serving after its lifespan crashed"
+    assert crashed.is_set()
+    assert isinstance(result.get("error"), RuntimeError), result
+    assert "lifespan task crashed" in str(result["error"])

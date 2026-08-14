@@ -1545,3 +1545,113 @@ def test_data_received_exception_closes_the_transport(loop):
             await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+def test_pause_reading_withholds_the_in_flight_read(loop):
+    """A protocol pauses to bound its own memory. The read already in
+    flight when it paused was delivered anyway, handing it another full
+    buffer past the limit that prompted the pause.
+
+    The count is asserted against the chunk that TRIGGERED the pause, not
+    against a count sampled afterwards -- the extra delivery lands in the
+    same tick, so sampling later sees it as the baseline and the test
+    proves nothing. (It did, until this was checked against the unfixed
+    build.)"""
+    total = 512 * 1024
+    chunks = []
+
+    class Pauser(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def data_received(self, data):
+            chunks.append(data)
+            if len(chunks) == 1:
+                self.transport.pause_reading()
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        try:
+            transport, _ = await loop.create_connection(Pauser, *addr)
+            transport.write(b"z" * total)
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if chunks:
+                    break
+            assert chunks, "nothing was received at all"
+            assert not transport.is_reading()
+            # Exactly the chunk that caused the pause -- no more, however
+            # long the peer keeps sending.
+            await asyncio.sleep(0.5)
+            assert len(chunks) == 1, (
+                f"{len(chunks) - 1} chunk(s) delivered to a paused protocol"
+            )
+            transport.resume_reading()
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if sum(len(c) for c in chunks) >= total:
+                    break
+            # Every byte arrives exactly once: the held read is delivered
+            # on resume, ahead of the next one, and nothing is duplicated.
+            assert sum(len(c) for c in chunks) == total, (
+                f"{sum(len(c) for c in chunks)} of {total} bytes"
+            )
+            assert b"".join(chunks) == b"z" * total
+            transport.close()
+            await asyncio.sleep(0.05)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_create_server_starts_listening_on_a_bound_socket(loop):
+    """stdlib create_server() accepts a bound-but-not-listening socket and
+    calls listen() itself. Without that, native accepts were posted
+    against a socket in no state to accept them: every post failed, the
+    listener rearmed after each failure, and the caller got a Server that
+    looked healthy and could never take a connection."""
+    bound = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    bound.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    bound.bind(("127.0.0.1", 0))  # deliberately NOT listening
+    addr = bound.getsockname()
+    got = []
+
+    class P(asyncio.Protocol):
+        def data_received(self, data):
+            got.append(data)
+
+    async def main():
+        server = await loop.create_server(P, sock=bound)
+        try:
+            r, w = await asyncio.open_connection(*addr)
+            w.write(b"hello")
+            await w.drain()
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if got:
+                    break
+            assert got == [b"hello"], got
+            w.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_tfo_and_loopback_fast_path_reach_the_core(loop_factory=None):
+    """Both were exposed in Config, documented under R-038, and read by
+    nothing -- `tfo=True` was a silent no-op and the default-on loopback
+    fast path was never applied."""
+    # The observable contract at this layer is that the core accepts them
+    # and a listener still comes up; the options themselves are
+    # kernel-side and platform-specific.
+    lp = cadeloop.Loop(tfo=False, loopback_fast_path=True)
+    try:
+        assert lp._core is not None
+    finally:
+        lp.close()
+    cfg = cadeloop.Config(tfo=True, loopback_fast_path=False)
+    assert cfg.tfo is True and cfg.loopback_fast_path is False

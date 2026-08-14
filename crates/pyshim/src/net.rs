@@ -175,6 +175,11 @@ pub(crate) struct TransportEntry {
     flush_scheduled: bool,
     pub peername: Option<Py<PyAny>>,
     pub sockname: Option<Py<PyAny>>,
+    /// Bytes that completed while `reading_paused` was set (R-034).
+    /// Held rather than delivered: a protocol pauses to bound its own
+    /// memory, and handing it another read defeats exactly that.
+    /// Delivered by `resume_reading`.
+    paused_recv: Option<Vec<u8>>,
     /// `get_extra_info("socket")`, built on first ask and kept. Moved to
     /// `graveyard_sockets` at teardown to be closed, not merely dropped
     /// -- see the note there.
@@ -427,6 +432,14 @@ pub(crate) enum NetEvent {
     },
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
+    /// Buffered-protocol delivery from an owned copy: the held bytes a
+    /// paused transport accumulated, which have no slot of their own.
+    BufDataOwned {
+        tid: u64,
+        get_buffer: Py<PyAny>,
+        buffer_updated: Py<PyAny>,
+        data: Vec<u8>,
+    },
     BufData {
         tid: u64,
         get_buffer: Py<PyAny>,
@@ -1581,6 +1594,24 @@ fn on_recv_done(
     debug_assert_eq!(entry.recv_slot, Some(slot), "op slot / transport slot mismatch");
     let mut parse_err = None;
     let mut continue_owed = false;
+    if entry.reading_paused && matches!(entry.proto, ProtoKind::Py(_)) {
+        // A protocol that called pause_reading() did so to stop consuming;
+        // the read already in flight when it paused must not be delivered
+        // anyway, or a fast peer hands it another full buffer past the
+        // limit that prompted the pause. Held here, delivered by
+        // resume_reading. (Cancelling instead would race the completion
+        // and the slot reuse, and on Windows the bytes have already left
+        // the kernel buffer, so they would simply be lost.)
+        let ptr = net.buffers.slot_ptr(slot);
+        let data = unsafe { std::slice::from_raw_parts(ptr, bytes as usize) };
+        match &mut entry.paused_recv {
+            Some(held) => held.extend_from_slice(data),
+            None => entry.paused_recv = Some(data.to_vec()),
+        }
+        entry.recv_slot = None;
+        net.buffers.release(slot);
+        return;
+    }
     match &mut entry.proto {
         ProtoKind::Py(p) => {
             if let Some(data_received) = &p.data_received {
@@ -1673,6 +1704,33 @@ fn on_recv_done(
     post_recv(py, net, backend, tid);
 }
 
+/// Deliver bytes a paused transport held, if any. In-cell; the actual
+/// protocol call happens in phase 2 like every other receive.
+fn flush_paused_recv(py: Python<'_>, net: &mut NetState, tid: u64) {
+    let Some(entry) = net.transports.get_mut(&tid) else { return };
+    if entry.conn_lost || entry.closing {
+        entry.paused_recv = None;
+        return;
+    }
+    let Some(data) = entry.paused_recv.take() else { return };
+    let ProtoKind::Py(p) = &entry.proto else { return };
+    if let Some(data_received) = &p.data_received {
+        let payload = unsafe {
+            let obj = ffi::PyBytes_FromStringAndSize(data.as_ptr().cast(), data.len() as ffi::Py_ssize_t);
+            Bound::from_owned_ptr(py, obj).unbind()
+        };
+        let data_received = data_received.clone_ref(py);
+        net.events.push(NetEvent::Data { tid, data_received, payload });
+    } else if let (Some(get_buffer), Some(buffer_updated)) = (&p.get_buffer, &p.buffer_updated) {
+        net.events.push(NetEvent::BufDataOwned {
+            tid,
+            get_buffer: get_buffer.clone_ref(py),
+            buffer_updated: buffer_updated.clone_ref(py),
+            data,
+        });
+    }
+}
+
 /// Stop reading on a transport for engine-level backpressure (R-085/
 /// R-087). Distinct from the user-facing `pause_reading()`: the engine
 /// owns this flag and releases it itself.
@@ -1695,6 +1753,7 @@ pub(crate) fn resume_reading_after_backpressure(
         }
         e.reading_paused = false;
     }
+    flush_paused_recv(py, net, tid);
     post_recv(py, net, backend, tid);
 }
 
@@ -1847,6 +1906,10 @@ pub(crate) fn dispatch_events(
         match event {
             NetEvent::Data { tid, data_received, payload } => {
                 let res = data_received.call1(py, (payload,));
+                fatal_protocol_error(py, core, tid, res)?;
+            }
+            NetEvent::BufDataOwned { tid, get_buffer, buffer_updated, data } => {
+                let res = copy_into_app_buffer(py, &get_buffer, &buffer_updated, data.as_ptr(), data.len());
                 fatal_protocol_error(py, core, tid, res)?;
             }
             NetEvent::BufData { tid, get_buffer, buffer_updated, slot, len } => {
@@ -2107,6 +2170,23 @@ fn fill_app_buffer(
     len: usize,
 ) -> PyResult<Py<PyAny>> {
     let src = core.with_net(|net, _| net.buffers.slot_ptr(slot))?;
+    copy_into_app_buffer(py, get_buffer, buffer_updated, src, len)
+}
+
+/// The copy loop itself, over any source. Split out so held bytes (which
+/// have no pool slot) reach the protocol by exactly the same path as a
+/// fresh read.
+///
+/// SAFETY: `src` must be valid for `len` bytes and must stay valid across
+/// the `get_buffer`/`buffer_updated` calls -- either a live pool slot the
+/// caller still owns, or a `Vec` the caller keeps alive.
+fn copy_into_app_buffer(
+    py: Python<'_>,
+    get_buffer: &Py<PyAny>,
+    buffer_updated: &Py<PyAny>,
+    src: *const u8,
+    len: usize,
+) -> PyResult<Py<PyAny>> {
     let mut copied = 0usize;
     while copied < len {
         let buf_obj = get_buffer.call1(py, (len - copied,))?;
@@ -2217,6 +2297,7 @@ pub(crate) fn wire_stream(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
+                paused_recv: None,
                 extra_sock: None,
                 peername: peer,
                 sockname: name,
@@ -2290,6 +2371,7 @@ pub(crate) fn wire_http(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
+                paused_recv: None,
                 extra_sock: None,
                 peername: peer,
                 sockname: name,
@@ -2584,11 +2666,14 @@ impl Transport {
         let _ = tid;
         core.with_net(|net, _reactor| {
             if let Some(entry) = net.transports.get_mut(&tid) {
-                // The in-flight recv (if any) is left to complete and its
-                // data is delivered (it already left the kernel buffer) —
-                // it is simply not re-posted. Cancelling here creates
-                // completion/slot-reuse races and costs syscalls; asyncio's
-                // pause_reading is advisory, so late delivery is conformant.
+                // The in-flight recv is left to complete -- cancelling
+                // races the completion and the slot reuse, and on Windows
+                // the bytes have already left the kernel buffer, so they
+                // would be lost. But its data is HELD, not delivered: a
+                // protocol pauses to bound its own memory, and handing it
+                // one more full buffer is precisely what it asked us not
+                // to do. resume_reading delivers it, ahead of the next
+                // read so the stream stays in order.
                 entry.reading_paused = true;
             }
         })
@@ -2601,7 +2686,12 @@ impl Transport {
             if let Some(entry) = net.transports.get_mut(&tid) {
                 if entry.reading_paused {
                     entry.reading_paused = false;
-                    if entry.recv_op.is_none() {
+                    // Anything that completed while paused goes out first,
+                    // ahead of whatever the fresh recv brings, or the
+                    // stream would be reordered.
+                    flush_paused_recv(py, net, tid);
+                    let still_idle = net.transports.get(&tid).is_some_and(|e| e.recv_op.is_none());
+                    if still_idle {
                         post_recv(py, net, reactor.backend_mut(), tid);
                     }
                 }

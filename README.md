@@ -11,6 +11,15 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Net | A starved listener stayed deaf: the retry only ran when other I/O arrived | `HEAD` |
+> | Net | Wildcard IPv6 listeners need `IPV6_V6ONLY`; `host=None` failed `EADDRINUSE` | `HEAD` |
+> | Transport | `pause_reading()` still delivered the in-flight read, defeating backpressure | `HEAD` |
+> | Transport | `create_server(sock=)` never called `listen()` | `HEAD` |
+> | Transport | `connect` dropped IPv6 scope, so link-local peers were unreachable | `HEAD` |
+> | Transport | TLS handshake cancellation left the transport attached | `HEAD` |
+> | UDP | A failing `udp_open()` leaked the detached descriptor | `HEAD` |
+> | Server | Lifespan crashing after startup left the worker serving | `HEAD` |
+> | Config | `tfo` / `loopback_fast_path` were read by nothing | `HEAD` |
 > | HTTP | ASGI `http.response.trailers` implemented and declared in the scope | `1e48aff` |
 > | HTTP | Idle sweep could tear down a connection still writing its response | `1e48aff` |
 > | WebSocket | `accept` could select a subprotocol the client never offered | `52347cd` |

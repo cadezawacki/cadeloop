@@ -62,6 +62,9 @@ class _Lifespan:
         self._startup: asyncio.Future | None = None
         self._shutdown: asyncio.Future | None = None
         self._task = None
+        # Set when the lifespan task raises AFTER startup completed: the
+        # worker is serving but the application's lifespan is gone.
+        self.crashed: BaseException | None = None
 
     async def _receive(self):
         assert self._queue is not None
@@ -109,7 +112,15 @@ class _Lifespan:
                     self._startup.set_result(None)
                     logger.debug("lifespan disabled: %r", exc)
                 else:
+                    # Startup already succeeded, so the worker is serving
+                    # -- but the application's lifespan task is gone, and
+                    # whatever it was holding open (pools, clients,
+                    # background tasks) may have failed or been torn down
+                    # with it. Logging and carrying on left a worker that
+                    # looks healthy and is not. Stop serving instead.
                     logger.exception("lifespan task crashed")
+                    self.crashed = exc
+                    self.loop.stop()
             if not self._startup.done():
                 # Returned without startup.complete: no lifespan support.
                 self.enabled = False
@@ -120,6 +131,10 @@ class _Lifespan:
         self._task = loop.create_task(_run())
         self._queue.put_nowait({"type": "lifespan.startup"})
         loop.run_until_complete(self._startup)  # raises on startup.failed
+        if self.crashed is not None:
+            # Crashed in the same breath as startup.complete: the future
+            # was already resolved, so the wait above saw success.
+            raise RuntimeError("lifespan task crashed during startup") from self.crashed
 
     def shutdown(self) -> None:
         if not self.enabled or self._task is None or self._task.done():
@@ -251,6 +266,8 @@ def _serve_single(
         rio_rq_send=config.rio_rq_send,
         dns_cache=config.dns_cache,
         dns_cache_ttl=config.dns_cache_ttl,
+        tfo=config.tfo,
+        loopback_fast_path=config.loopback_fast_path,
     )
     _trace("loop constructed")
     asyncio.set_event_loop(loop)
@@ -327,6 +344,14 @@ def _serve_single(
             loop.run_forever()
         except KeyboardInterrupt:
             pass
+        if lifespan.crashed is not None:
+            # Raised inside the try, so the drain and teardown below still
+            # run -- in-flight requests finish, then the caller (or the
+            # supervisor, which restarts on a non-zero exit) learns the
+            # worker is not serviceable.
+            raise RuntimeError(
+                "lifespan task crashed; worker stopped serving"
+            ) from lifespan.crashed
     finally:
         if config.gc_mode == "disable":
             gc.enable()

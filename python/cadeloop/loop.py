@@ -75,6 +75,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         rio_rq_send: int = 32,
         dns_cache: bool = False,
         dns_cache_ttl: float = 5.0,
+        tfo: bool = False,
+        loopback_fast_path: bool = True,
     ):
         # Backend resolution: explicit arg > CADELOOP_BACKEND env (lets the
         # whole test/bench suite run against a chosen backend, e.g. "rio"
@@ -105,6 +107,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             rio_cq_size=rio_cq_size,
             rio_rq_recv=rio_rq_recv,
             rio_rq_send=rio_rq_send,
+            tfo=tfo,
+            loopback_fast_path=loopback_fast_path,
         )
         self._core = core
         self._accept_pool = accept_pool  # R-032

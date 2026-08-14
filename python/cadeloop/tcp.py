@@ -219,11 +219,15 @@ class TcpSurface:
         errors = []
 
         async def attempt(address, af):
-            local_ip, local_port = None, 0
+            # The whole sockaddr, not host/port: an IPv6 one carries the
+            # flow info and interface scope in elements 2 and 3, and a
+            # link-local peer (fe80::...%eth0) is unreachable without the
+            # scope however cleanly it resolved.
+            local_sockaddr = None
             if laddr_infos is not None:
                 for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
                     if lfamily == af:
-                        local_ip, local_port = laddr[0], laddr[1]
+                        local_sockaddr = laddr
                         break
                 else:
                     exc = OSError(f"no matching local address with family={af!r} found")
@@ -231,9 +235,7 @@ class TcpSurface:
                     raise exc
             fut = self.create_future()
             try:
-                op = self._core.tcp_connect(
-                    address[0], address[1], fut, local_ip, local_port
-                )
+                op = self._core.tcp_connect(address, fut, local_sockaddr)
             except OSError as exc:
                 errors.append(exc)
                 raise
@@ -323,8 +325,18 @@ class TcpSurface:
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
-        self._core.attach_stream(fd, protocol)
-        await waiter  # handshake
+        transport = self._core.attach_stream(fd, protocol)
+        try:
+            await waiter  # handshake
+        except BaseException:
+            # Cancellation (an application wrapping this in wait_for) or a
+            # handshake failure both land here. The transport is already
+            # attached and the SSL protocol would otherwise keep the socket
+            # until its own handshake timeout -- and could still complete
+            # and call into the application protocol after the caller
+            # believes the connection attempt was abandoned.
+            transport.close()
+            raise
         return protocol._app_transport, app_protocol
 
     async def connect_accepted_socket(
@@ -468,8 +480,27 @@ class TcpSurface:
             if host is not None or port is not None:
                 raise ValueError("host/port and sock can not be specified at the same time")
             sock.setblocking(False)
+            # stdlib create_server() accepts a bound-but-not-listening
+            # socket and calls listen() itself. Without this the native
+            # accepts were posted against a socket in no state to accept
+            # them: every post failed, the listener rearmed after each
+            # failure, and the caller got a Server that looked like it was
+            # serving and could never take a connection.
+            try:
+                sock.listen(backlog)
+            except OSError as exc:
+                # Already listening is fine and is the common case for a
+                # socket handed in ready to go.
+                if exc.errno not in (errno.EINVAL, errno.EISCONN):
+                    raise
             fd = sock.detach()
-            lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)
+            try:
+                lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)
+            except BaseException:
+                # detach() already ran, so nothing else owns this
+                # descriptor; without the close it leaks.
+                self._core.discard_socket(fd)
+                raise
             entries.append((lid, name, rawfd))
             return Server(self, entries, factory, accept_pool, start_serving)
 
@@ -1033,12 +1064,19 @@ class _DatagramTransport(asyncio.DatagramTransport):
         except OSError:
             self._extra["peername"] = None
         fd = self._sock_obj.detach()
-        self._did = self._loop._core.udp_open(
-            fd,
-            self._protocol.datagram_received,
-            self._protocol.error_received,
-            self._connection_lost,
-        )
+        try:
+            self._did = self._loop._core.udp_open(
+                fd,
+                self._protocol.datagram_received,
+                self._protocol.error_received,
+                self._connection_lost,
+            )
+        except BaseException:
+            # detach() has already run, so neither the caller nor
+            # create_datagram_endpoint's cleanup holds a socket object
+            # that owns this descriptor any more.
+            self._loop._core.discard_socket(fd)
+            raise
         # Synchronous: guarantees connection_made precedes any
         # datagram_received (those dispatch only from future loop ticks).
         try:
