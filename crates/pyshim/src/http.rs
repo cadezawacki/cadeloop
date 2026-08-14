@@ -114,8 +114,12 @@ pub(crate) struct HttpConn {
     /// it once everything ahead of it has been answered.
     pub(crate) deferred_error: Option<Vec<u8>>,
     pub(crate) disconnected: bool,
-    /// Pending receive() waiter, resolved with http.disconnect.
-    pub(crate) recv_waiter: Option<Py<PyAny>>,
+    /// Pending receive() waiters, in call order. A queue, not a slot:
+    /// concurrent receive() calls each park here, and parking the second
+    /// by displacing the first left the displaced awaiter pending
+    /// forever. On disconnect every waiter resolves; a WS wake delivers
+    /// one inbox message per waiter (the surplus re-park).
+    pub(crate) recv_waiters: VecDeque<Py<PyAny>>,
     /// R-084: an ASGI producer parked because the write queue crossed its
     /// high-water mark; resolved when it drains below the low-water mark
     /// (or when the connection dies).
@@ -294,7 +298,7 @@ impl HttpConn {
             req_body: None,
             deferred_error: None,
             disconnected: false,
-            recv_waiter: None,
+            recv_waiters: VecDeque::new(),
             drain_waiter: None,
             recv_obj: None,
             send_obj: None,
@@ -317,8 +321,8 @@ impl HttpConn {
         }
     }
 
-    pub(crate) fn take_recv_waiter(&mut self) -> Option<Py<PyAny>> {
-        self.recv_waiter.take()
+    pub(crate) fn take_recv_waiters(&mut self) -> VecDeque<Py<PyAny>> {
+        std::mem::take(&mut self.recv_waiters)
     }
 
     /// The pipeline queue is at its depth or byte budget.
@@ -877,15 +881,18 @@ impl HttpReceive {
             R::Wait(pyloop) => {
                 let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
                 let store = fut.clone().unbind();
-                let (stored, old) = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
-                    Some(conn) => (true, conn.recv_waiter.replace(store)),
-                    None => (false, Some(store)),
+                // Parked, never displacing: an earlier waiter still gets
+                // resolved (disconnect resolves every one; a WS wake
+                // hands out one message per waiter). The unstored clone
+                // in the None arm drops out-of-cell, here.
+                let unstored = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
+                    Some(conn) => {
+                        conn.recv_waiters.push_back(store);
+                        None
+                    }
+                    None => Some(store),
                 })?;
-                if let Some(old) = old {
-                    core.with_net(|net, _| net.graveyard_py.push(old))?;
-                    core.drain_graveyards(py)?;
-                }
-                if !stored {
+                if unstored.is_some() {
                     let msg = gone_message(py, core, self.tid)?;
                     let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
                 }
@@ -2177,8 +2184,12 @@ pub(crate) fn ws_ingest(
         net::http_close_after_write(py, net, backend, tid);
     }
     if wake {
-        if let Some(fut) = net.http_conn_mut(tid).and_then(|c| c.take_recv_waiter()) {
-            net.events.push(crate::net::NetEvent::WsWake { tid, fut });
+        // One wake per waiter: each WsWake delivers one inbox message,
+        // and a waiter whose wake finds the inbox empty re-parks.
+        if let Some(conn) = net.http_conn_mut(tid) {
+            for fut in conn.take_recv_waiters() {
+                net.events.push(crate::net::NetEvent::WsWake { tid, fut });
+            }
         }
     }
     // R-087: WS_MAX_MESSAGE bounds ONE message; nothing bounded the queue
@@ -2615,19 +2626,24 @@ fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
 }
 
 pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let (waiter, log) = core.with_net(|net, reactor| {
+    let (waiters, log) = core.with_net(|net, reactor| {
         let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
         let log = take_access_record(py, net, tid, now_ns);
-        let (waiter, driver, close, parked_error) = {
-            let Some(conn) = net.http_conn_mut(tid) else { return (None, None) };
+        let (waiters, driver, close, parked_error) = {
+            let Some(conn) = net.http_conn_mut(tid) else { return (VecDeque::new(), None) };
             conn.active = false;
             conn.req_body = None;
             conn.activity = conn.activity.wrapping_add(1);
             // A parse error parked by conn_parse_failed goes out only
             // once everything ahead of it in the pipeline is answered.
             let parked_error = if conn.pending.is_empty() { conn.deferred_error.take() } else { None };
-            (conn.take_recv_waiter(), conn.driver.take(), !conn.keep_alive || conn.disconnected, parked_error)
+            (
+                conn.take_recv_waiters(),
+                conn.driver.take(),
+                !conn.keep_alive || conn.disconnected,
+                parked_error,
+            )
         };
         if let Some(d) = driver {
             net.graveyard_py.push(d.into_any());
@@ -2645,11 +2661,11 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             // that suppressed reading may have freed up.
             net::http_resume_reading(py, net, backend, tid);
         }
-        (waiter, log)
+        (waiters, log)
     })?;
     emit_access_record(py, log);
     core.drain_graveyards(py)?;
-    if let Some(fut) = waiter {
+    for fut in waiters {
         let fut = fut.bind(py);
         let done: bool = fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
         if !done {

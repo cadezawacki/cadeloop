@@ -133,6 +133,38 @@ def test_handshake_echo_and_close(loop):
     loop._core.listener_close(lid)
 
 
+def test_concurrent_ws_receives_each_get_a_message(loop):
+    """Two receive() calls awaiting concurrently must each resolve with
+    a distinct inbound message. Parking the second waiter used to
+    displace the first future, whose awaiter then stayed pending
+    forever. Reported on PR #1."""
+    results = {}
+    done = asyncio.Event()
+
+    async def app(scope, receive, send):
+        await receive()  # websocket.connect
+        await send({"type": "websocket.accept"})
+        r1, r2 = await asyncio.gather(receive(), receive())
+        results["texts"] = sorted([r1["text"], r2["text"]])
+        done.set()
+        await send({"type": "websocket.close"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        writer.write(client_frame(0x1, b"a"))
+        writer.write(client_frame(0x1, b"b"))
+        await writer.drain()
+        await asyncio.wait_for(done.wait(), 5)
+        writer.close()
+
+    loop.run_until_complete(main())
+    assert results["texts"] == ["a", "b"]
+    loop._core.listener_close(lid)
+
+
 def test_ping_gets_pong_and_fragmentation(loop):
     lid, port = listen(loop, ws_echo_app)
 

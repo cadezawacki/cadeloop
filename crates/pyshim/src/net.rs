@@ -657,7 +657,7 @@ pub(crate) fn teardown_with(
                 // lets its next send() raise properly instead of hanging.
                 net.events.push(NetEvent::HttpDrained { fut });
             }
-            if let Some(fut) = conn.take_recv_waiter() {
+            for fut in conn.take_recv_waiters() {
                 net.events.push(NetEvent::HttpDisconnect { fut, ws });
             }
         }
@@ -1689,7 +1689,7 @@ fn on_recv_done(
     }
     if bytes == 0 {
         // Peer EOF. Recv is NOT re-posted.
-        let (http_idle, waiter) = match &mut entry.proto {
+        let (http_idle, waiters) = match &mut entry.proto {
             ProtoKind::Py(p) => {
                 // Phase 2 decides close-vs-keep from eof_received().
                 let ev = NetEvent::Eof {
@@ -1708,11 +1708,11 @@ fn on_recv_done(
                 // keep writing the response; finish_request closes it.
                 conn.disconnected = true;
                 let ws = conn.ws.is_some();
-                ((!conn.active && conn.pending.is_empty(), ws), conn.take_recv_waiter())
+                ((!conn.active && conn.pending.is_empty(), ws), conn.take_recv_waiters())
             }
         };
         let (http_idle, waiter_ws) = (http_idle.0, http_idle.1);
-        if let Some(fut) = waiter {
+        for fut in waiters {
             net.events.push(NetEvent::HttpDisconnect { fut, ws: waiter_ws });
         }
         if http_idle {
@@ -2233,7 +2233,7 @@ pub(crate) fn dispatch_events(
                         let stored = fut.clone().unbind();
                         core.with_net(|net, _| {
                             if let Some(c) = net.http_conn_mut(tid) {
-                                c.recv_waiter = Some(stored);
+                                c.recv_waiters.push_back(stored);
                             }
                         })?;
                     }

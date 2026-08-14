@@ -374,6 +374,37 @@ def test_parse_error_waits_for_inflight_response(loop):
     loop._core.listener_close(lid)
 
 
+def test_concurrent_receive_waiters_all_resolve_on_disconnect(loop):
+    """Two receive() calls awaiting concurrently must BOTH resolve when
+    the client disconnects. Parking the second waiter used to displace
+    the first future, whose awaiter then stayed pending forever.
+    Reported on PR #1."""
+    results = {}
+    done = asyncio.Event()
+
+    async def app(scope, receive, send):
+        await receive()  # body
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+        r1, r2 = await asyncio.gather(receive(), receive())
+        results["types"] = (r1["type"], r2["type"])
+        done.set()
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(_read_one_response(reader), 5)
+        writer.close()  # disconnect must release BOTH waiters
+        await asyncio.wait_for(done.wait(), 5)
+
+    loop.run_until_complete(main())
+    assert results["types"] == ("http.disconnect", "http.disconnect")
+    loop._core.listener_close(lid)
+
+
 def test_request_parsed_ahead_of_malformed_bytes_still_answered(loop):
     """The parser keeps requests that completed ahead of malformed bytes
     in the same buffer. Dropping them on the parse error made the client
