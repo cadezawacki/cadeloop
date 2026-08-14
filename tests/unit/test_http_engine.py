@@ -552,6 +552,107 @@ def test_fastapi_route(loop):
     loop._core.listener_close(lid)
 
 
+def test_fastapi_sync_route(loop):
+    """Plain `def` routes/dependencies run via anyio.to_thread.run_sync
+    (Starlette's run_in_threadpool) under the eager engine. anyio's
+    WorkerThread reads `current_task()._loop` and calls
+    `current_task().add_done_callback(...)` on the AppTask driving the
+    request — both previously missing, crashing every sync route with
+    AttributeError -> HTTP 500."""
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi import Depends, FastAPI
+
+    app = FastAPI()
+
+    def sync_dependency():
+        return "dep-ok"
+
+    @app.get("/sync/{item_id}")
+    def read_item_sync(item_id: int, dep: str = Depends(sync_dependency)):
+        return {"item_id": item_id, "dep": dep}
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(
+        _request(port, b"GET /sync/7 HTTP/1.1\r\nHost: h\r\n\r\n")
+    )
+    assert resp.startswith(b"HTTP/1.1 200 OK\r\n"), resp[:200]
+    assert json.loads(_body(resp)) == {"item_id": 7, "dep": "dep-ok"}
+    loop._core.listener_close(lid)
+
+
+def test_contextvar_isolation_across_requests(loop):
+    """AppTask::step_inner previously drove coroutines with no
+    PyContext_Enter/Exit boundary, so a contextvar set in one request
+    stayed visible to every later (or concurrently interleaved) request
+    on the same worker — silent state corruption for anything using
+    Sentry/OTel/structlog/correlation-ID-style ContextVar patterns."""
+    import contextvars
+
+    cv = contextvars.ContextVar("cadeloop_test_cv", default=None)
+
+    async def cv_app(scope, receive, send):
+        await receive()
+        seen_before = cv.get()
+        cv.set(scope["raw_path"].decode())
+        await asyncio.sleep(0)  # also exercise isolation across a suspend/resume
+        seen_after = cv.get()
+        body = json.dumps({"seen_before": seen_before, "seen_after": seen_after}).encode()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, cv_app)
+
+    async def main():
+        first = await _request(port, b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n")
+        second = await _request(port, b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+        return first, second
+
+    first, second = loop.run_until_complete(main())
+    first_data = json.loads(_body(first))
+    second_data = json.loads(_body(second))
+    assert first_data == {"seen_before": None, "seen_after": "/a"}
+    assert second_data == {"seen_before": None, "seen_after": "/b"}, (
+        "contextvar leaked from an earlier request: " + repr(second_data)
+    )
+    loop._core.listener_close(lid)
+
+
+def test_contextvar_isolation_concurrent_requests(loop):
+    """Same as above but genuinely interleaved: two requests in flight at
+    once (each suspending mid-request), so a shared ambient context would
+    let one request's ContextVar.set() bleed into the other's next step
+    while both are still pending — not just across separate connections
+    handled back-to-back."""
+    import contextvars
+
+    cv = contextvars.ContextVar("cadeloop_test_cv2", default=None)
+
+    async def cv_app(scope, receive, send):
+        await receive()
+        tag = scope["raw_path"].decode()
+        cv.set(tag)
+        await asyncio.sleep(0.01)  # let the other in-flight request run
+        seen = cv.get()
+        body = json.dumps({"tag": tag, "seen": seen}).encode()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, cv_app)
+
+    async def main():
+        return await asyncio.gather(
+            _request(port, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n"),
+            _request(port, b"GET /y HTTP/1.1\r\nHost: h\r\n\r\n"),
+        )
+
+    resp_x, resp_y = loop.run_until_complete(main())
+    data_x = json.loads(_body(resp_x))
+    data_y = json.loads(_body(resp_y))
+    assert data_x == {"tag": "/x", "seen": "/x"}, data_x
+    assert data_y == {"tag": "/y", "seen": "/y"}, data_y
+    loop._core.listener_close(lid)
+
+
 # --------------------------------------------------------------------- #
 # serve() + lifespan + CLI (R-081, R-101)                               #
 # --------------------------------------------------------------------- #

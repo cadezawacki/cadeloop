@@ -1713,6 +1713,23 @@ pub struct AppTask {
     /// The future this task is suspended on (cancel() forwards to it,
     /// mirroring Task.cancel()).
     waiting_on: Option<Py<PyAny>>,
+    /// Captured at spawn() time (contextvars.Context.copy(), mirroring
+    /// real asyncio.Task.__init__) and entered/exited around every
+    /// coroutine step in step_inner — without this, contextvars set
+    /// during one request are visible to unrelated concurrent or later
+    /// requests on the same worker (handles.rs::run_handle already
+    /// applies this discipline to plain callbacks; AppTask's raw
+    /// PyIter_Send stepping never did).
+    context: Py<PyAny>,
+    /// Future/Task done-callback protocol. anyio's asyncio backend
+    /// resolves the "root task" for a thread-offload
+    /// (anyio.to_thread.run_sync, which FastAPI's plain `def` routes and
+    /// sync Depends() go through) to whatever `asyncio.current_task()`
+    /// returns — the AppTask itself under the eager engine — then reads
+    /// `root_task._loop` and calls `root_task.add_done_callback(...)`.
+    /// Without these AppTask previously raised AttributeError on every
+    /// sync route/dependency.
+    callbacks: Vec<(Py<PyAny>, Py<PyAny>)>,
 }
 
 #[pymethods]
@@ -1792,12 +1809,63 @@ impl AppTask {
         self.pyloop.clone_ref(py)
     }
 
+    /// Read directly (not called) by anyio's `WorkerThread.__init__`
+    /// (`root_task._loop`) when resolving the loop to hand a
+    /// thread-offloaded call back to.
+    #[getter(_loop)]
+    fn loop_attr(&self, py: Python<'_>) -> Py<PyAny> {
+        self.pyloop.clone_ref(py)
+    }
+
     fn get_coro(&self, py: Python<'_>) -> Py<PyAny> {
         self.coro.clone_ref(py)
     }
 
     fn get_name(&self) -> &'static str {
         "cadeloop.AppTask"
+    }
+
+    /// Future/Task protocol (mirrors asyncio.Future.add_done_callback):
+    /// pending -> queued for firing when the task finishes; already-done
+    /// -> scheduled via call_soon immediately, same as real asyncio.
+    #[pyo3(signature = (fn_, *, context=None))]
+    fn add_done_callback(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        fn_: Py<PyAny>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let ctx = match context {
+            Some(c) => c,
+            None => crate::coreloop::copy_context(py)?,
+        };
+        let finished = slf.borrow().finished;
+        if finished {
+            AppTask::schedule_callback(&slf, py, fn_, ctx)?;
+        } else {
+            slf.borrow_mut().callbacks.push((fn_, ctx));
+        }
+        Ok(())
+    }
+
+    /// Mirrors asyncio.Future.remove_done_callback: drops every
+    /// registered entry equal (by `==`, e.g. anyio compares bound
+    /// methods) to `fn_`, returns the count removed.
+    fn remove_done_callback(&mut self, py: Python<'_>, fn_: Py<PyAny>) -> PyResult<usize> {
+        let target = fn_.bind(py);
+        let before = self.callbacks.len();
+        let mut err = None;
+        self.callbacks.retain(|(cb, _)| match cb.bind(py).eq(target) {
+            Ok(same) => !same,
+            Err(e) => {
+                err.get_or_insert(e);
+                true
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(before - self.callbacks.len())
     }
 
     fn __repr__(&self) -> String {
@@ -1813,6 +1881,7 @@ impl AppTask {
         coro: Py<PyAny>,
         pyloop: Py<PyAny>,
     ) -> PyResult<Py<AppTask>> {
+        let context = crate::coreloop::copy_context(py)?;
         Py::new(
             py,
             AppTask {
@@ -1823,8 +1892,45 @@ impl AppTask {
                 finished: false,
                 must_cancel: false,
                 waiting_on: None,
+                context,
+                callbacks: Vec::new(),
             },
         )
+    }
+
+    /// call_soon(callback, self, context=ctx) — the exact scheduling this
+    /// codebase already uses for the bare-yield resume path (below), just
+    /// with the task itself as the sole positional argument.
+    fn schedule_callback(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        ctx: Py<PyAny>,
+    ) -> PyResult<()> {
+        let core_py = slf.borrow().core.clone_ref(py);
+        let core_bound = core_py.bind(py);
+        let core = core_bound.get();
+        let self_arg = PyTuple::new(py, [slf.clone().into_any()])?;
+        let handle =
+            core.make_handle(py, callback.bind(py), &self_arg, Some(ctx.bind(py)), "add_done_callback")?;
+        let token: Py<PyAny> = Py::new(py, handle)?.into_any();
+        core.with_net(move |_, reactor| reactor.push_ready(token))?;
+        Ok(())
+    }
+
+    /// Future.__schedule_callbacks mirror: fires once, when the task
+    /// transitions to done (Finished/Failed). Failures here are reported
+    /// unraisable rather than propagated — a broken done-callback must
+    /// not corrupt the request whose completion triggered it, matching
+    /// the _leave_task error handling right above in step().
+    fn fire_done_callbacks(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        let callbacks = std::mem::take(&mut slf.borrow_mut().callbacks);
+        for (cb, ctx) in callbacks {
+            if let Err(e) = AppTask::schedule_callback(slf, py, cb, ctx) {
+                e.write_unraisable(py, None);
+            }
+        }
+        Ok(())
     }
 
     /// Step the coroutine until it suspends or finishes. Runs OUTSIDE the
@@ -1851,11 +1957,36 @@ impl AppTask {
         }
         if matches!(out, Ok(StepOutcome::Finished) | Ok(StepOutcome::Failed)) {
             slf.borrow_mut().finished = true;
+            AppTask::fire_done_callbacks(slf, py)?;
         }
         out
     }
 
+    /// Enters the Context captured at spawn() around the whole step
+    /// (mirrors run_handle's enter -> call -> always-exit discipline in
+    /// handles.rs) so contextvars stay isolated per request, then
+    /// delegates to step_body for the actual coroutine stepping.
     fn step_inner(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        throw: Option<PyErr>,
+    ) -> PyResult<StepOutcome> {
+        let ctx = slf.borrow().context.clone_ref(py);
+        let ctx_ptr = ctx.as_ptr();
+        if unsafe { ffi::PyContext_Enter(ctx_ptr) } != 0 {
+            return Err(PyErr::fetch(py));
+        }
+        let result = AppTask::step_body(slf, py, throw);
+        if unsafe { ffi::PyContext_Exit(ctx_ptr) } != 0 {
+            // Context-stack corruption is a Rust-side invariant break —
+            // surface it loudly rather than let it silently mis-scope a
+            // later, unrelated step's contextvars.
+            return Err(PyErr::fetch(py));
+        }
+        result
+    }
+
+    fn step_body(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         mut throw: Option<PyErr>,

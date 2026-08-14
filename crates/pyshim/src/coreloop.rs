@@ -374,7 +374,7 @@ fn take_graveyards(st: &mut LoopState) -> Graveyards {
     )
 }
 
-fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
+pub(crate) fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
     unsafe {
         let ptr = ffi::PyContext_CopyCurrent();
         if ptr.is_null() {
