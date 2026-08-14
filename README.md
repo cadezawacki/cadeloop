@@ -11,12 +11,12 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Transport | `protocol_factory` raising leaked the connected socket, one per failure | `HEAD` |
-> | Net | Listener socket left open when backend registration failed | `HEAD` |
-> | Config | NaN/inf durations passed the `< 0` check and disabled the guard they set | `HEAD` |
-> | Pipes | Windows `data_received` exceptions left the pipe open and reading | `HEAD` |
+> | Transport | `protocol_factory` raising leaked the connected socket, one per failure | `355e82f` |
+> | Net | Listener socket left open when backend registration failed | `355e82f` |
+> | Config | NaN/inf durations passed the `< 0` check and disabled the guard they set | `355e82f` |
+> | Pipes | Windows `data_received` exceptions left the pipe open and reading | `355e82f` |
 > | Perf | Immediate-flush latency mode: selectable, honestly unmeasured | `dfe01b0` |
-> | TLS | `h2` could be negotiated, then every request failed against the HTTP/1 parser | `HEAD` |
+> | TLS | `h2` could be negotiated, then every request failed against the HTTP/1 parser | `355e82f` |
 > | Server | Shutdown truncated in-flight responses; `grace` was never applied inside a worker | `65fe5c8` |
 > | Server | Failed *replacement* fork left every surviving worker running unsupervised | `65fe5c8` |
 > | WebSocket | Shutdown now sends a 1012 close frame instead of dropping the TCP connection | `65fe5c8` |
