@@ -10,9 +10,11 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | 1xx rejected on the final-response path; `Content-Length` stripped from 204 | `a1795ad` |
-> | Server | `server.sockets` returns `()` after close (was EBADF / stale dups) | `a1795ad` |
-> | Transport | Changing watermarks now re-takes the pause/resume decision | `a1795ad` |
+> | Server | Grace deadline now entered as soon as shutdown begins | `c1649f7` |
+> | UDP | Endpoint torn down when `connection_made` raises | `c1649f7` |
+> | HTTP | 1xx rejected on the final-response path; `Content-Length` stripped from 204 | `38cdbd9` |
+> | Server | `server.sockets` returns `()` after close (was EBADF / stale dups) | `38cdbd9` |
+> | Transport | Changing watermarks now re-takes the pause/resume decision | `38cdbd9` |
 > | HTTP | ASGI `send()` now applies write backpressure at the watermarks | `5298130` |
 > | HTTP/TLS | Pipeline bound never applied to HTTPS (repost ignored the flag) | `5298130` |
 > | Loop | Close freed pipe buffers the kernel could still be writing | `5298130` |

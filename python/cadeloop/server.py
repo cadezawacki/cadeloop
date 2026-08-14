@@ -505,6 +505,15 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
     crash_streak = 0
     try:
         while children:
+            if stopping:
+                # Leave the blocking reap the moment shutdown begins. The
+                # bounded drain below (config.grace, then SIGKILL) is what
+                # enforces the deadline, and waitpid(-1, 0) never returns
+                # for a worker stuck in synchronous application code that
+                # cannot run its Python signal handler -- so staying here
+                # meant the deadline was reached only after every child had
+                # already exited, i.e. never when it mattered.
+                break
             try:
                 pid, status = os.waitpid(-1, 0)
             except ChildProcessError:
@@ -798,6 +807,12 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
     crash_streak = 0
     try:
         while _live_workers():
+            if stopping:
+                # Same reason as the fork supervisor: once shutdown starts,
+                # the bounded drain in `finally` owns the deadline. Spinning
+                # here waiting for a wedged worker to exit meant grace was
+                # only ever enforced after it already had.
+                break
             time.sleep(0.2)
             for w in [w for w in _live_workers() if not w.alive()]:
                 with workers_lock:

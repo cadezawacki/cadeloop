@@ -225,3 +225,30 @@ def test_datagram_close_completes_after_queued_sends(loop):
     assert loop.run_until_complete(main()) is True
     # Endpoint fully torn down: no pool slots retained.
     assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_datagram_endpoint_closed_when_connection_made_raises(loop):
+    """udp_open has already detached the socket and installed the native
+    endpoint by the time connection_made runs, so the caller's cleanup
+    (which closes the now-detached Python socket) left the descriptor, its
+    outstanding receive and the protocol callbacks alive until the whole
+    loop closed. Reported by Codex review on PR #1 (twice)."""
+
+    class Boom(RuntimeError):
+        pass
+
+    class P(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            raise Boom("factory said no")
+
+    async def main():
+        for _ in range(10):
+            with pytest.raises(Boom):
+                await loop.create_datagram_endpoint(P, local_addr=("127.0.0.1", 0))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+    # Every endpoint torn down: no pool slots and no live datagram state.
+    assert loop._core.stats()["buffers_in_use"] == 0

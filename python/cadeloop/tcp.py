@@ -1006,7 +1006,21 @@ class _DatagramTransport(asyncio.DatagramTransport):
         )
         # Synchronous: guarantees connection_made precedes any
         # datagram_received (those dispatch only from future loop ticks).
-        self._protocol.connection_made(self)
+        try:
+            self._protocol.connection_made(self)
+        except BaseException:
+            # udp_open already detached the socket and installed the native
+            # endpoint, so the caller's cleanup (which only closes the now-
+            # detached Python socket) would leave the descriptor, its
+            # outstanding receive and the protocol callbacks alive until the
+            # whole loop closed. Tear the endpoint down before propagating.
+            did, self._did = self._did, None
+            if did is not None:
+                try:
+                    self._loop._core.udp_close(did, abort=True)
+                except (OSError, RuntimeError):
+                    pass
+            raise
 
     def _connection_lost(self, exc):
         self._closing = True
