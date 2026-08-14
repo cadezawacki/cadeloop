@@ -11,9 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Loop | `add_reader`/`add_writer` left a phantom watcher when `set_watch` failed | `HEAD` |
-> | Transport | Cancelling a connect left the native op running until the OS gave up | `HEAD` |
-> | CLI | `--max-body none` was unexpressible, so the cap could not be turned off | `HEAD` |
+> | Loop | `add_reader`/`add_writer` left a phantom watcher when `set_watch` failed | `e9ebd2d` |
+> | Transport | Cancelling a connect left the native op running until the OS gave up | `e9ebd2d` |
+> | CLI | `--max-body none` was unexpressible, so the cap could not be turned off | `e9ebd2d` |
 > | UDP | Datagram endpoint resolved hostnames twice, the second time blocking the loop | `cf696dc` |
 > | Transport | `data_received` exceptions left the connection open and reading | `2750ecc` |
 > | Ops | Access log ran on the loop thread; now a bounded queue + writer thread | `2750ecc` |
