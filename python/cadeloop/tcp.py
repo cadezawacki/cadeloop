@@ -61,6 +61,12 @@ class Server(asyncio.AbstractServer):
 
     @property
     def sockets(self):
+        if self._closed:
+            # asyncio reports an empty tuple after close. Rebuilding here
+            # would duplicate descriptors the native listener has already
+            # closed -- raising EBADF, or worse, handing back a duplicate
+            # of whatever unrelated socket has since reused the number.
+            return ()
         if self._sockets is None:
             socks = []
             for _lid, _name, fd in self._entries:
@@ -116,6 +122,8 @@ class Server(asyncio.AbstractServer):
         if self._sockets:
             for s in self._sockets:
                 s.close()
+        self._sockets = ()
+        self._entries = []  # the raw descriptors are gone; do not reuse them
         for waiter in self._close_waiters:
             if not waiter.done():
                 waiter.set_result(None)

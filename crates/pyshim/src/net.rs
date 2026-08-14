@@ -2189,12 +2189,33 @@ impl Transport {
         if low > high {
             return Err(pyo3::exceptions::PyValueError::new_err("high must be >= low must be >= 0"));
         }
-        core.with_net(|net, _| {
-            if let Some(e) = net.transports.get_mut(&self.tid) {
-                e.high_water = high;
-                e.low_water = low;
+        // Applying the limits is not enough: the queue already has a
+        // depth, and the pause/resume decision has to be re-taken against
+        // the new marks. Lowering `high` under an existing backlog left
+        // the protocol unpaused until its next write; raising the limits
+        // on a paused transport could leave it paused indefinitely if no
+        // further write completion arrived.
+        let action = core.with_net(|net, _| {
+            let e = net.transports.get_mut(&self.tid)?;
+            e.high_water = high;
+            e.low_water = low;
+            if !e.proto_paused && e.queued_bytes > e.high_water {
+                e.proto_paused = true;
+                if let ProtoKind::Py(p) = &e.proto {
+                    return Some((true, p.pause_writing.clone_ref(py)));
+                }
+            } else if e.proto_paused && e.queued_bytes <= e.low_water {
+                e.proto_paused = false;
+                if let ProtoKind::Py(p) = &e.proto {
+                    return Some((false, p.resume_writing.clone_ref(py)));
+                }
             }
-        })
+            None
+        })?;
+        if let Some((_pausing, cb)) = action {
+            core.guard_protocol_call(py, cb.call0(py))?;
+        }
+        Ok(())
     }
 
     // ---- read path -----------------------------------------------------

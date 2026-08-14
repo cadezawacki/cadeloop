@@ -905,6 +905,18 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 "ASGI application sent an invalid response status: {status}"
             )));
         }
+        // 1xx is INTERIM: a client keeps waiting for a final response
+        // after one. This path allows a single http.response.start and
+        // treats its body as the complete response, so emitting 1xx here
+        // would leave the client reading the next keep-alive response as
+        // this request's final one. Rejected until interim responses are
+        // modelled properly.
+        if (100..200).contains(&status) {
+            return Err(PyRuntimeError::new_err(format!(
+                "ASGI application sent informational status {status}; interim \
+                 responses are not supported on http.response.start"
+            )));
+        }
         // Serialize caller headers OUTSIDE the cell (arbitrary Python
         // objects), then commit in-cell.
         let mut head: Vec<u8> = Vec::with_capacity(256);
@@ -924,6 +936,14 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     return Err(PyRuntimeError::new_err(format!(
                         "ASGI application sent an invalid response header: {why}"
                     )));
+                }
+                if name.eq_ignore_ascii_case(b"content-length") && status_forbids_body(status) {
+                    // HTTP forbids Content-Length on a 204. Suppressing
+                    // only the GENERATED framing was not enough: an
+                    // app-supplied header was still copied through, and a
+                    // client honouring it reads the next keep-alive
+                    // response's bytes as this one's body.
+                    continue;
                 }
                 if name.eq_ignore_ascii_case(b"content-length") {
                     // Parsed, not merely noted: the body path enforces it,

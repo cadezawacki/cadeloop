@@ -10,9 +10,12 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | ASGI `send()` now applies write backpressure at the watermarks | *pending* |
-> | HTTP/TLS | Pipeline bound never applied to HTTPS (repost ignored the flag) | *pending* |
-> | Loop | Close freed pipe buffers the kernel could still be writing | *pending* |
+> | HTTP | 1xx rejected on the final-response path; `Content-Length` stripped from 204 | `a1795ad` |
+> | Server | `server.sockets` returns `()` after close (was EBADF / stale dups) | `a1795ad` |
+> | Transport | Changing watermarks now re-takes the pause/resume decision | `a1795ad` |
+> | HTTP | ASGI `send()` now applies write backpressure at the watermarks | `5298130` |
+> | HTTP/TLS | Pipeline bound never applied to HTTPS (repost ignored the flag) | `5298130` |
+> | Loop | Close freed pipe buffers the kernel could still be writing | `5298130` |
 > | epoll | Accept pool overwrote one parked slot 64x, stranding 63 slab entries | `57e0b7d` |
 > | Transport | `sock_accept` fast path returned a *blocking* socket (froze the loop) | `57e0b7d` |
 > | WebSocket | Post-accept inbox unbounded; now budgeted with read backpressure | `57e0b7d` |
