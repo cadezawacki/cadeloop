@@ -62,9 +62,12 @@ class _Lifespan:
         self._startup: asyncio.Future | None = None
         self._shutdown: asyncio.Future | None = None
         self._task = None
-        # Set when the lifespan task raises AFTER startup completed: the
-        # worker is serving but the application's lifespan is gone.
+        # Set when the lifespan task ENDS after startup completed without
+        # a shutdown having been asked for -- by raising, or by simply
+        # returning. Either way the worker is serving and the
+        # application's lifespan is gone.
         self.crashed: BaseException | None = None
+        self._shutdown_requested = False
 
     async def _receive(self):
         assert self._queue is not None
@@ -125,6 +128,21 @@ class _Lifespan:
                 # Returned without startup.complete: no lifespan support.
                 self.enabled = False
                 self._startup.set_result(None)
+            elif self.enabled and self.crashed is None and not self._shutdown_requested:
+                # Returned NORMALLY after startup.complete, with nobody
+                # having asked for shutdown. Nothing raised, so the branch
+                # above never ran -- but the lifespan context has exited
+                # and taken its pools, clients and background tasks with
+                # it, and the worker was about to serve as though it had
+                # not. Exactly the "looks healthy and is not" state the
+                # crash path exists to prevent, reached without an
+                # exception, so it gets the same outcome.
+                self.crashed = RuntimeError(
+                    "lifespan task returned after startup.complete without a shutdown "
+                    "request; its context and resources are already gone"
+                )
+                logger.error("%s", self.crashed)
+                self.loop.stop()
             if not self._shutdown.done():
                 self._shutdown.set_result(None)
 
@@ -137,6 +155,7 @@ class _Lifespan:
             raise RuntimeError("lifespan task crashed during startup") from self.crashed
 
     def shutdown(self) -> None:
+        self._shutdown_requested = True
         if not self.enabled or self._task is None or self._task.done():
             return
         self._queue.put_nowait({"type": "lifespan.shutdown"})

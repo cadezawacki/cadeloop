@@ -1777,6 +1777,13 @@ def test_sendfile_fallback_reports_position_after_a_failed_write(loop):
         def get_write_buffer_size(self):
             return 0
 
+        def is_closing(self):
+            # Part of the WriteTransport ABC, so every real transport has
+            # it. This double failed here on a RAISING write, which is a
+            # different path from the silent-discard one is_closing()
+            # guards -- it must stay open for the raise to be reached.
+            return False
+
     t = FailingTransport()
     with pytest.raises(ConnectionResetError):
         loop.run_until_complete(loop._sendfile_fallback(t, fh, 0, None))
@@ -1920,3 +1927,84 @@ def _open_fd_count():
     import gc as _gc
 
     return len([o for o in _gc.get_objects() if isinstance(o, socket.socket)])
+
+
+def test_sendfile_validates_its_parameters_like_sock_sendfile(loop):
+    """`sock_sendfile` validated binary mode, offset and count; `sendfile`
+    validated none of them, despite sock_sendfile's docstring claiming the
+    two mirrored each other's "validation shape exactly". count=0 quietly
+    returned zero instead of raising and a text-mode file went straight to
+    os.sendfile. Both now share one `_check_sendfile_params`. Reported by
+    Codex on PR #1."""
+    import tempfile
+
+    async def main():
+        transport, _ = await loop.create_connection(asyncio.Protocol, *srv.getsockname())
+        try:
+            with tempfile.NamedTemporaryFile("wb", suffix=".bin", delete=False) as fh:
+                fh.write(b"payload" * 100)
+                path = fh.name
+            with open(path, "rb") as binf:
+                with pytest.raises(ValueError, match="count must be a positive"):
+                    await loop.sendfile(transport, binf, count=0)
+                with pytest.raises(ValueError, match="count must be a positive"):
+                    await loop.sendfile(transport, binf, count=-1)
+                with pytest.raises(TypeError, match="count must be a positive"):
+                    await loop.sendfile(transport, binf, count="lots")
+                with pytest.raises(ValueError, match="offset must be a non-negative"):
+                    await loop.sendfile(transport, binf, offset=-1)
+            with open(path, "r") as textf:
+                with pytest.raises(ValueError, match="binary mode"):
+                    await loop.sendfile(transport, textf)
+            os.unlink(path)
+        finally:
+            transport.close()
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    try:
+        loop.run_until_complete(main())
+    finally:
+        srv.close()
+
+
+def test_sendfile_fallback_stops_when_the_peer_goes_away(loop):
+    """A closing transport DISCARDS write() silently. Counting every
+    non-raising write as sent meant that once the peer went away the
+    fallback -- the path every Windows and SSL transport takes -- read the
+    rest of the file, reported bytes that never left the process, and left
+    the file positioned past a transfer that never happened. Reported by
+    Codex on PR #1."""
+    import io
+
+    class ClosingTransport:
+        """Accepts one write, then behaves as asyncio does after loss."""
+
+        def __init__(self):
+            self.written = 0
+            self._closing = False
+
+        def write(self, data):
+            if self._closing:
+                return  # silently discarded, exactly like the real one
+            self.written += len(data)
+            self._closing = True  # peer went away right after the first write
+
+        def is_closing(self):
+            return self._closing
+
+        def get_write_buffer_size(self):
+            return 0
+
+    payload = b"z" * (16384 * 8)
+    fh = io.BytesIO(payload)
+    fh.mode = "rb"
+    t = ClosingTransport()
+
+    with pytest.raises(ConnectionResetError):
+        loop.run_until_complete(loop._sendfile_fallback(t, fh, 0, None))
+    assert t.written == 16384, t.written
+    assert fh.tell() == t.written, (
+        f"file left at {fh.tell()} after only {t.written} bytes actually reached the peer"
+    )

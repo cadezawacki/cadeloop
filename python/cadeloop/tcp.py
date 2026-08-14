@@ -994,17 +994,18 @@ class TcpSurface:
         finally:
             self._core.remove_writer(fd)
 
-    async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=True):
-        """Native os.sendfile first (TransmitFile is the remaining R-036
-        refinement on Windows, same caveat as loop.py's sendfile()), the
-        chunked read + sock_sendall path as the fallback — mirrors
-        sendfile()'s own native-first/fallback/validation shape exactly;
-        this previously always took the chunked path regardless of
-        fallback= and skipped every one of these checks."""
+    @staticmethod
+    def _check_sendfile_params(file, offset, count):
+        """The checks both sendfile entry points owe their callers.
+
+        ONE definition, deliberately. `sock_sendfile`'s docstring used to
+        claim it mirrored `sendfile()`'s "native-first/fallback/validation
+        shape exactly" -- and `sendfile()` had no validation at all, so
+        `count=0` returned zero instead of raising and a text-mode file
+        went straight to os.sendfile. A comment is not a mechanism.
+        """
         if "b" not in getattr(file, "mode", "b"):
             raise ValueError("file should be opened in binary mode")
-        if sock.type != socket.SOCK_STREAM:
-            raise ValueError("only SOCK_STREAM type sockets are supported")
         if count is not None:
             if not isinstance(count, int):
                 raise TypeError(f"count must be a positive integer (got {count!r})")
@@ -1014,6 +1015,18 @@ class TcpSurface:
             raise TypeError(f"offset must be a non-negative integer (got {offset!r})")
         if offset < 0:
             raise ValueError(f"offset must be a non-negative integer (got {offset!r})")
+
+    async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=True):
+        """Native os.sendfile first (TransmitFile is the remaining R-036
+        refinement on Windows, same caveat as loop.py's sendfile()), the
+        chunked read + sock_sendall path as the fallback. Shares its
+        parameter validation with `sendfile()` via
+        `_check_sendfile_params`; this previously always took the chunked
+        path regardless of fallback= and skipped every one of these
+        checks."""
+        self._check_sendfile_params(file, offset, count)
+        if sock.type != socket.SOCK_STREAM:
+            raise ValueError("only SOCK_STREAM type sockets are supported")
 
         can_native = hasattr(os, "sendfile") and hasattr(file, "fileno")
         if can_native:

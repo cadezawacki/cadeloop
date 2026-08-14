@@ -265,6 +265,12 @@ def _serve_briefly(cfg):
         lp.call_later(0.2, sample)
         lp.call_later(0.4, lp.stop)
         started.set()
+        # A lifespan app stays parked here until shutdown is requested.
+        # Returning straight after startup.complete would tear the
+        # lifespan context down under a worker that is about to serve --
+        # which serve() now treats as fatal.
+        await receive()
+        await send({"type": "lifespan.shutdown.complete"})
 
     result = {}
 
@@ -375,6 +381,8 @@ def test_serve_accepts_a_hostname_not_just_an_ip_literal():
         lp = asyncio.get_running_loop()
         lp.call_later(0.2, lp.stop)
         started.set()
+        await receive()
+        await send({"type": "lifespan.shutdown.complete"})
 
     result = {}
 
@@ -392,3 +400,39 @@ def test_serve_accepts_a_hostname_not_just_an_ip_literal():
     t.join(timeout=20)
     assert not t.is_alive()
     assert not result, f"serve(host='localhost') failed: {result.get('error')!r}"
+
+
+def test_a_lifespan_that_returns_after_startup_stops_the_worker():
+    """An app that sends startup.complete and then RETURNS has exited its
+    lifespan context and released whatever it held -- pools, clients,
+    background tasks -- while the worker is about to serve as though it
+    had not. Nothing raises, so the crash path never ran and the worker
+    served in exactly the "looks healthy and is not" state that path
+    exists to prevent. Reported by Codex on PR #1."""
+    from cadeloop.server import _serve_single
+
+    started = threading.Event()
+
+    async def app(scope, receive, send):
+        if scope["type"] != "lifespan":
+            return  # pragma: no cover
+        await receive()
+        await send({"type": "lifespan.startup.complete"})
+        started.set()
+        # ...and returns, without waiting for lifespan.shutdown.
+
+    result = {}
+
+    def run():
+        try:
+            _serve_single(app, "127.0.0.1", 0, cadeloop.Config(grace=0.0))
+        except BaseException as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    assert started.wait(20)
+    t.join(timeout=20)
+    assert not t.is_alive(), "worker kept serving after its lifespan context exited"
+    assert isinstance(result.get("error"), RuntimeError), result
+    assert "lifespan task crashed" in str(result["error"])

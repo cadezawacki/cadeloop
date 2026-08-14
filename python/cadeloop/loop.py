@@ -494,6 +494,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             *[ag.aclose() for ag in closing_agens], return_exceptions=True
         )
         for result, agen in zip(results, closing_agens, strict=True):
+            # `Exception`, not `BaseException`, verbatim from CPython's
+            # base_events.shutdown_asyncgens. Widening it was suggested on
+            # the grounds that the standard loop tests BaseException; it
+            # does not (checked against 3.11), and for a drop-in loop
+            # matching the stdlib's reporting is the point.
             if isinstance(result, Exception):
                 self.call_exception_handler(
                     {
@@ -709,6 +714,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         TransmitFile on Windows is the remaining native refinement; there
         (and for SSL transports, which have no raw fd) the chunked
         transport-write fallback applies."""
+        # Validated BEFORE a path is chosen, and by the same helper
+        # sock_sendfile uses: without it `count=0` quietly returned zero
+        # instead of raising, a text-mode file went straight to
+        # os.sendfile, and every other bad value failed later with an
+        # exception that depended on which path had been taken.
+        self._check_sendfile_params(file, offset, count)
         if transport.is_closing():
             raise RuntimeError("Transport is closing")
         fileno = getattr(transport, "fileno", None)
@@ -800,9 +811,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 data = await self.run_in_executor(None, file.read, blocksize)
                 if not data:
                     break
+                # A closing transport DISCARDS write() silently, so
+                # counting every non-raising write as sent meant that once
+                # the peer went away this loop read the rest of the file,
+                # reported bytes that never left the process, and left the
+                # file positioned past a transfer that never happened.
+                if transport.is_closing():
+                    raise ConnectionResetError("transport closed while sending file")
                 transport.write(data)
                 total += len(data)
                 while transport.get_write_buffer_size() > 64 * 1024:
+                    if transport.is_closing():
+                        raise ConnectionResetError("transport closed while sending file")
                     await tasks.sleep(0.001)
             return total
         finally:
