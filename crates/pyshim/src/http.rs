@@ -143,6 +143,10 @@ pub(crate) struct TlsState {
     pub(crate) handshaking: bool,
     pub(crate) staged: Vec<u8>,
     pub(crate) close_after: bool,
+    /// A `close_notify` alert has been produced for this session (R-059).
+    /// Until it has, `http_close_after_write` defers the socket shutdown
+    /// so the alert can be queued ahead of it.
+    pub(crate) shutdown_sent: bool,
 }
 
 /// R-087 per-connection WebSocket session state.
@@ -1197,6 +1201,7 @@ pub(crate) fn tls_wrap(py: Python<'_>, ctx: &Py<PyAny>) -> PyResult<TlsState> {
         handshaking: true,
         staged: Vec::new(),
         close_after: false,
+        shutdown_sent: false,
     })
 }
 
@@ -1473,6 +1478,7 @@ pub(crate) fn tls_flush_conn(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64
         return Ok(());
     }
     if close_after {
+        tls_send_close_notify(py, core, tid, &sslobj, &outbio)?;
         core.with_net(|net, reactor| {
             if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
                 t.close_after = false;
@@ -1481,6 +1487,45 @@ pub(crate) fn tls_flush_conn(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64
         })?;
     }
     Ok(())
+}
+
+/// Queue the TLS `close_notify` alert ahead of the socket shutdown
+/// (R-059).
+///
+/// Without it the peer sees the TCP connection end mid-session -- a
+/// ragged EOF -- and a strict client reports `SSLEOFError` even though
+/// the HTTP response (or WebSocket close) that preceded it was complete
+/// and correct.
+///
+/// `SSLObject.unwrap()` writes the alert into the out BIO and then raises
+/// `SSLWantReadError`, because a full TLS shutdown is a two-way exchange
+/// and it also wants the peer's alert back. We do not wait for that: a
+/// server closing after its own response has nothing further to read, and
+/// blocking on the peer would turn a clean close into a hang. Sending
+/// ours is what makes the EOF orderly.
+fn tls_send_close_notify(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    sslobj: &Py<PyAny>,
+    outbio: &Py<PyAny>,
+) -> PyResult<()> {
+    let already = core.with_net(|net, _| match net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
+        Some(t) if t.shutdown_sent => true,
+        Some(t) => {
+            t.shutdown_sent = true;
+            false
+        }
+        None => true,
+    })?;
+    if already {
+        return Ok(());
+    }
+    // Any exception here -- the expected want-read, or a session already
+    // torn down by the peer -- means no alert to send and nothing useful
+    // left to do, since the connection is closing either way.
+    let _ = sslobj.call_method0(py, intern!(py, "unwrap"));
+    tls_pump_out(py, core, tid, outbio)
 }
 
 /// R-087: websocket.* sends (accept / send / close).

@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | TLS | Close sent no `close_notify`: strict clients got `SSLEOFError` and lost the response | `HEAD` |
 > | Transport | `get_extra_info("socket")` answered (non-owning dup, built once) | `2b579c7` |
 > | Net | IPv6 addresses lost flowinfo/scope_id; `sendto` now takes the 4-tuple | `2b579c7` |
 > | Transport | `protocol_factory` raising leaked the connected socket, one per failure | `355e82f` |

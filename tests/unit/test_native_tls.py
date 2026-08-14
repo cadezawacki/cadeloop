@@ -263,3 +263,84 @@ def test_serve_pins_alpn_to_http11():
     with pytest.raises(TypeError, match="callable"):
         cadeloop.serve(object(), ssl=ctx)
     assert recorded == [["http/1.1"]], recorded
+
+
+def test_close_sends_a_tls_close_notify(loop, certs):
+    """Closing the socket without unwrapping the session leaves the peer
+    with a ragged EOF: a strict TLS client reports SSLEOFError even
+    though the response that preceded it was complete and correct.
+
+    `suppress_ragged_eofs=False` is what makes this observable -- with the
+    default the stdlib hides exactly the bug under test, turning a missing
+    close_notify into an ordinary b"" and the test into a tautology."""
+    import socket as _socket
+    import threading
+
+    server_ctx, _client_ctx = certs
+
+    async def once_app(scope, receive, send):
+        await receive()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"2"), (b"connection", b"close")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen_tls(loop, once_app, server_ctx)
+    result = {}
+
+    def blocking_client():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            raw = _socket.create_connection(("127.0.0.1", port), timeout=10)
+            sock = ctx.wrap_socket(
+                raw, server_hostname="localhost", suppress_ragged_eofs=False
+            )
+        except Exception as exc:  # pragma: no cover - setup failure
+            result["error"] = exc
+            return
+        try:
+            sock.sendall(b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+            body = b""
+            while True:
+                # Returns b"" only on an orderly shutdown; a ragged EOF
+                # raises SSLEOFError because ragged EOFs are unsuppressed.
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            result["body"] = body
+            # Independent probe: unwrap() completes the TLS shutdown
+            # handshake, which needs the peer's close_notify. It fails
+            # with SHUTDOWN_WHILE_IN_INIT if none ever arrived.
+            sock.settimeout(5.0)
+            sock.unwrap()
+            result["unwrapped"] = True
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=blocking_client, daemon=True)
+    t.start()
+
+    async def tick_until_done():
+        for _ in range(500):
+            if not t.is_alive():
+                return
+            await asyncio.sleep(0.02)
+
+    loop.run_until_complete(tick_until_done())
+    t.join(timeout=5)
+    loop._core.listener_close(lid)
+    assert "error" not in result, f"client saw a ragged close: {result['error']!r}"
+    assert result.get("body", b"").endswith(b"ok"), result.get("body")
+    assert result.get("unwrapped"), "TLS shutdown handshake never completed"

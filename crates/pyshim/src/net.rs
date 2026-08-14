@@ -1175,17 +1175,30 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
 /// (`connection: close`, parse errors, app failures). In-cell.
 pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
-    // R-059: staged plaintext must reach the wire first — defer to the
-    // TlsFlush that will encrypt it.
+    let healthy = !entry.conn_lost && !entry.closing;
+    // R-059, two reasons to defer a TLS connection's shutdown:
+    //   1. staged plaintext must reach the wire first, and
+    //   2. the session owes the peer a `close_notify` alert -- without it
+    //      the peer sees the TCP connection end mid-session and a strict
+    //      client reports SSLEOFError even though the response that came
+    //      before it was complete.
+    // Both are handled by the same TlsFlush round trip, which runs
+    // outside the state cell where the SSLObject can actually be called;
+    // it comes back here with `shutdown_sent` set and falls through.
     if let ProtoKind::Http(conn) = &mut entry.proto {
         if let Some(tls) = conn.tls.as_mut() {
             if !tls.staged.is_empty() {
                 tls.close_after = true;
                 return;
             }
+            if healthy && !tls.shutdown_sent {
+                tls.close_after = true;
+                net.events.push(NetEvent::TlsFlush { tid });
+                return;
+            }
         }
     }
-    if entry.conn_lost || entry.closing {
+    if !healthy {
         return;
     }
     entry.closing = true;
