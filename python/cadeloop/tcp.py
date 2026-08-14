@@ -1058,6 +1058,15 @@ class _DatagramTransport(asyncio.DatagramTransport):
 
     def set_protocol(self, protocol):
         self._protocol = protocol
+        # _open() cached BOUND methods of the previous protocol in the
+        # native endpoint, so without this every datagram and send error
+        # kept going to the old object while get_protocol() reported the
+        # new one. connection_lost already routes through a transport
+        # method, which is why only these two need swapping.
+        if self._did is not None:
+            self._loop._core.udp_set_callbacks(
+                self._did, protocol.datagram_received, protocol.error_received
+            )
 
     def get_write_buffer_size(self):
         # Payloads are copied into the engine, but they still sit in its

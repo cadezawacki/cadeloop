@@ -727,9 +727,13 @@ impl IoBackend for IocpBackend {
     /// still posts to the port, which keeps post_pipe_read/write simple
     /// (no inline fast path to reason about; pipes are not the hot path).
     fn register_pipe(&mut self, handle: RawSocket) -> io::Result<()> {
-        if self.associated.contains(&handle) {
-            return Ok(());
-        }
+        // Deliberately NOT short-circuited on `associated`, for exactly the
+        // reason register_socket is not: the set is keyed by HANDLE VALUE
+        // and Windows recycles those. A closed pipe's value left behind
+        // makes the next handle given that number look associated when it
+        // is not, and its overlapped ReadFile/WriteFile completion is then
+        // delivered nowhere -- the future hangs forever with no error.
+        // Fixing this for sockets and not for pipes was an oversight.
         let rc = unsafe { CreateIoCompletionPort(handle as HANDLE, self.port.0, KEY_IO, 0) };
         if rc.is_null() {
             return Err(win_error());

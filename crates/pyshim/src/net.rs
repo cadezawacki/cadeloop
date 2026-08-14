@@ -941,6 +941,27 @@ pub(crate) fn udp_sendto(
     Ok(())
 }
 
+/// Swap a datagram endpoint's cached protocol callbacks (R-058).
+///
+/// `udp_open` caches BOUND methods of the protocol object, so
+/// `set_protocol()` changing only the Python attribute left every
+/// datagram and send error going to the old protocol while
+/// `get_protocol()` reported the new one. Displaced references drop via
+/// the graveyard, never in-cell (ADR-5).
+pub(crate) fn udp_set_callbacks(
+    net: &mut NetState,
+    did: u64,
+    datagram_received: Py<PyAny>,
+    error_received: Py<PyAny>,
+) -> bool {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return false };
+    let old_dr = std::mem::replace(&mut entry.datagram_received, datagram_received);
+    let old_er = std::mem::replace(&mut entry.error_received, error_received);
+    net.graveyard_py.push(old_dr);
+    net.graveyard_py.push(old_er);
+    true
+}
+
 /// Bytes queued behind the in-flight send, for the transport's
 /// `get_write_buffer_size()`.
 pub(crate) fn udp_queued_bytes(net: &NetState, did: u64) -> usize {
@@ -1850,9 +1871,16 @@ pub(crate) fn dispatch_events(
                         })?;
                     }
                     (true, Some(m)) => {
-                        // Waiter was cancelled: keep the event for the next receive().
+                        // Waiter was cancelled: keep the event for the next
+                        // receive() -- and put its bytes BACK on the inbox
+                        // budget, which was debited when it was popped
+                        // above. Without this, repeated cancellable
+                        // receives drift the accounting down until real
+                        // traffic can exceed WS_MAX_INBOX with the read
+                        // pause never engaging.
                         core.with_net(|net, _| {
                             if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
+                                w.inbox_bytes = w.inbox_bytes.saturating_add(m.byte_len());
                                 w.inbox.push_front(m);
                             }
                         })?;
@@ -2163,13 +2191,25 @@ impl Transport {
         let tid = self.tid;
         let mut pause: Option<Py<PyAny>> = None;
         let mut dirty = false;
+        let mut eof_misuse = false;
         core.with_net(|net, reactor| {
             let Some(entry) = net.transports.get_mut(&tid) else {
                 net.graveyard_bufs.push(buf);
                 dirty = true;
                 return; // write after connection_lost: silently dropped
             };
-            if entry.closing || entry.eof_wanted || entry.conn_lost {
+            if entry.eof_wanted && !entry.closing && !entry.conn_lost {
+                // Half-close MISUSE, not a dead connection: the asyncio
+                // write-transport contract raises here. Silently
+                // succeeding let protocol code believe output was queued
+                // when it can never reach the peer -- undetected
+                // truncation.
+                net.graveyard_bufs.push(buf);
+                dirty = true;
+                eof_misuse = true;
+                return;
+            }
+            if entry.closing || entry.conn_lost {
                 net.graveyard_bufs.push(buf);
                 dirty = true;
                 return;
@@ -2203,6 +2243,9 @@ impl Transport {
         if dirty {
             // Rare paths only (dropped write, >=64KiB flush that tore down).
             core.drain_graveyards(py)?;
+        }
+        if eof_misuse {
+            return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
         }
         if let Some(pause_writing) = pause {
             core.guard_protocol_call(py, pause_writing.call0(py))?;
@@ -2251,8 +2294,16 @@ impl Transport {
         low: Option<usize>,
     ) -> PyResult<()> {
         let core = self.core_ref(py);
-        let high = high.unwrap_or(64 * 1024);
-        let low = low.unwrap_or(high / 4);
+        // asyncio's rule: high defaults to 4 * low when only `low` is
+        // supplied (not a fixed 64 KiB, which rejected low > 64 KiB
+        // outright and gave a different pause threshold from every other
+        // loop for smaller values).
+        let (high, low) = match (high, low) {
+            (Some(h), Some(l)) => (h, l),
+            (Some(h), None) => (h, h / 4),
+            (None, Some(l)) => (l * 4, l),
+            (None, None) => (64 * 1024, 16 * 1024),
+        };
         if low > high {
             return Err(pyo3::exceptions::PyValueError::new_err("high must be >= low must be >= 0"));
         }

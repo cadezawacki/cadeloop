@@ -270,3 +270,39 @@ def test_create_datagram_endpoint_rejects_stream_socket(loop):
         assert s.fileno() != -1
     finally:
         s.close()
+
+
+def test_set_protocol_redirects_datagrams(loop):
+    """_open() cached BOUND methods of the original protocol in the native
+    endpoint, so set_protocol() changing only the Python attribute left
+    every datagram going to the old object while get_protocol() reported
+    the new one. Reported by Codex review on PR #1 (three times)."""
+    first, second = [], []
+
+    class P1(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            first.append(data)
+
+    class P2(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            second.append(data)
+
+    async def main():
+        transport, _p = await loop.create_datagram_endpoint(
+            P1, local_addr=("127.0.0.1", 0)
+        )
+        peer = transport.get_extra_info("sockname")
+        transport.sendto(b"one", peer)
+        await asyncio.sleep(0.1)
+
+        new = P2()
+        transport.set_protocol(new)
+        assert transport.get_protocol() is new
+        transport.sendto(b"two", peer)
+        await asyncio.sleep(0.1)
+        transport.close()
+        await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+    assert first == [b"one"], f"first protocol got {first}"
+    assert second == [b"two"], f"replacement protocol got {second}"

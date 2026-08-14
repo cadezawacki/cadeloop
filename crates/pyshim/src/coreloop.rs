@@ -886,6 +886,22 @@ impl CoreLoop {
         Ok(did)
     }
 
+    /// R-058: swap a datagram endpoint's cached protocol callbacks so
+    /// `DatagramTransport.set_protocol()` actually redirects events.
+    fn udp_set_callbacks(
+        &self,
+        py: Python<'_>,
+        did: u64,
+        datagram_received: Bound<'_, PyAny>,
+        error_received: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let swapped = self.with_net(|net, _| {
+            net::udp_set_callbacks(net, did, datagram_received.unbind(), error_received.unbind())
+        })?;
+        self.drain_graveyards(py)?;
+        Ok(swapped)
+    }
+
     /// Bytes queued behind a datagram endpoint's in-flight send (R-058).
     fn udp_queued_bytes(&self, did: u64) -> PyResult<usize> {
         self.with_net(|net, _| net::udp_queued_bytes(net, did))

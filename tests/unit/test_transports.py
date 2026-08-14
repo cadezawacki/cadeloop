@@ -1281,3 +1281,43 @@ def test_sendfile_fallback_honours_offset_zero(loop, tmp_path):
         f"sent {len(received[0])} bytes starting {received[0][:8]!r}; "
         f"expected the whole {len(payload)}-byte file from byte zero"
     )
+
+
+def test_write_after_write_eof_raises(loop):
+    """The asyncio write-transport contract raises here. Silently
+    succeeding let protocol code believe output was queued when it can
+    never reach the peer — undetected truncation. A CLOSED transport still
+    drops silently, which is also the contract. Reported by Codex review
+    on PR #1 (twice)."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        _reader, writer = await asyncio.open_connection(*addr)
+        t = writer.transport
+        t.write(b"before")
+        t.write_eof()
+        with pytest.raises(RuntimeError, match="write_eof"):
+            t.write(b"after")
+        t.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_set_write_buffer_limits_derives_high_from_low(loop):
+    """asyncio defines high as 4 * low when only low is supplied; a fixed
+    64 KiB rejected low > 64 KiB outright and gave a different pause
+    threshold from every other loop. Reported by Codex review on PR #1."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        _reader, writer = await asyncio.open_connection(*addr)
+        t = writer.transport
+        t.set_write_buffer_limits(low=256 * 1024)  # would have raised
+        assert t.get_write_buffer_limits() == (256 * 1024, 4 * 256 * 1024)
+        t.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())

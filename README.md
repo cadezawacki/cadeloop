@@ -11,6 +11,10 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | IOCP | Recycled pipe HANDLEs skipped association (the pipe sibling of `5d96fcb`) | `HEAD` |
+> | UDP | `set_protocol()` now rewires the native callbacks | `HEAD` |
+> | Transport | `write()` after `write_eof()` raises; watermarks derive `high` from `low` | `HEAD` |
+> | WebSocket | Inbox budget restored when a cancelled delivery is requeued | `HEAD` |
 > | Net | Accepted socket leaked when `wire_http` failed (fallout from my ownership change) | `e799e9c` |
 > | WebSocket | Pre-accept cap wrote a WS frame before the 101; now answers 413 | `e799e9c` |
 > | HTTP | HTTP/1.1 requires exactly one `Host` (RFC 7230 5.4) | `e799e9c` |
