@@ -97,7 +97,13 @@ def test_pipe_transports_direct(loop):
     async def main():
         from asyncio import windows_utils
 
-        h_read, h_write = windows_utils.pipe(duplex=False)
+        # duplex=True: WritePipeTransport's peer-closed probe (stdlib
+        # parity — see _winpipes.WritePipeTransport's docstring) issues a
+        # phantom ReadFile on the write handle to detect the reader
+        # going away. That requires GENERIC_READ on the write handle too
+        # — exactly why windows_utils.Popen always opens stdin pipes
+        # duplex=True, not just GENERIC_WRITE.
+        h_read, h_write = windows_utils.pipe(duplex=True)
         r_handle = windows_utils.PipeHandle(h_read)
         w_handle = windows_utils.PipeHandle(h_write)
         rx = asyncio.get_event_loop().create_future()

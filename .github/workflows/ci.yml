@@ -77,6 +77,8 @@ jobs:
           maturin build --release --out dist
           pip install --no-index --find-links dist cadeloop
           pip install pytest-timeout uvicorn aiohttp trustme starlette fastapi
+      - name: copy extension into source tree (subprocess tests import from repo PYTHONPATH)
+        run: copy target\release\_core.dll python\cadeloop\_core.pyd
       - name: unit + conformance subset
         run: python -m pytest tests/unit tests/conformance -q --timeout=120
       - name: CPython asyncio conformance suite (R-120)

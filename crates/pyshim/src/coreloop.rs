@@ -34,7 +34,7 @@ use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit, PyType
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 
 use crate::gil_boundary::StateCell;
 use crate::handles::{run_handle, DispatchOutcome, Handle, TimerHandle};
@@ -908,15 +908,36 @@ impl CoreLoop {
     /// = EOF) or an OSError.
     fn pipe_read(&self, handle: u64, nbytes: usize, fut: Bound<'_, PyAny>) -> PyResult<()> {
         self.check_closed()?;
+        let py = fut.py();
         let mut buf = vec![0u8; nbytes];
         let ptr = buf.as_mut_ptr();
         let fut: Py<PyAny> = fut.unbind();
+        // Held for the ERROR_BROKEN_PIPE-on-post path below — `fut` itself
+        // moves into OpTarget::PipeRead on the (overwhelmingly common)
+        // success path, so it's gone by the time `?` could inspect it.
+        let fut_for_broken_pipe = fut.clone_ref(py);
         let res = self.with_net(|net, reactor| -> std::io::Result<()> {
             let op = reactor.backend_mut().post_pipe_read(handle as RawSocket, ptr, nbytes as u32)?;
             net.ops.insert(op, net::OpTarget::PipeRead { fut, buf });
             Ok(())
         })?;
-        res.map_err(PyErr::from)
+        if let Err(e) = res {
+            // ReadFile can fail *synchronously* with ERROR_BROKEN_PIPE
+            // (the writer already closed) instead of returning
+            // ERROR_IO_PENDING — no op was posted, so no completion will
+            // ever arrive via poll() to apply net.rs's usual
+            // ERROR_BROKEN_PIPE-is-EOF translation. Apply it here instead,
+            // resolving the future with b"" rather than raising, so this
+            // path matches the async-completion path exactly (both from
+            // _winpipes.py's point of view and stdlib's own
+            // IocpProactor.recv() convention).
+            if e.raw_os_error() == Some(net::ERROR_BROKEN_PIPE as i32) {
+                fut_for_broken_pipe.call_method1(py, "set_result", (PyBytes::new(py, b""),))?;
+                return Ok(());
+            }
+            return Err(PyErr::from(e));
+        }
+        Ok(())
     }
 
     /// Begin an overlapped write; `fut` resolves to the byte count

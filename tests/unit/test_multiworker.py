@@ -107,14 +107,20 @@ def test_worker_pool_balances_restarts_and_drains(tmp_path):
             proc.kill()
 
 
+async def _reject_port_zero_app(scope, receive, send):  # pragma: no cover - never runs
+    pass
+
+
 def test_multiworker_rejects_port_zero():
     import cadeloop
 
-    async def app(scope, receive, send):  # pragma: no cover - never runs
-        pass
-
+    # An import-string app spec (not a bare callable) so this exercises the
+    # port==0 check inside _serve_multi/_serve_multi_spawn on every
+    # platform — a bare callable would instead hit the (platform-specific,
+    # separately tested) "requires an app import string" rejection on
+    # non-fork platforms before ever reaching the port check.
     with pytest.raises(ValueError, match="explicit port"):
-        cadeloop.serve(app, "127.0.0.1", 0, workers=2)
+        cadeloop.serve("test_multiworker:_reject_port_zero_app", "127.0.0.1", 0, workers=2)
 
 
 def test_spawn_worker_pool_serves_and_stops(tmp_path):

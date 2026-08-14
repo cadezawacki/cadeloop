@@ -665,6 +665,13 @@ impl IoBackend for IocpBackend {
         Ok(())
     }
 
+    // `buf` validity for the lifetime of the op is the same reactor-level
+    // discipline post_recv/post_send rely on (the pyshim caller parks the
+    // owning buffer until completion) — post_recv dodges this lint only
+    // because it re-derives its pointer from a WSABUF field instead of
+    // passing the parameter straight into the unsafe call; the safety
+    // story is identical either way.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn post_pipe_read(&mut self, handle: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
         let id = self.new_op(OpKind::PipeRead, handle);
         let ov = self.overlapped_ptr(id);

@@ -1431,8 +1431,12 @@ pub(crate) fn dispatch_events(
 
 /// Win32 ERROR_BROKEN_PIPE: ReadFile on a pipe whose write end closed can
 /// fail with this instead of returning a 0-byte success — stdlib's own
-/// proactor treats it identically to EOF (R-051).
-const ERROR_BROKEN_PIPE: u32 = 109;
+/// proactor treats it identically to EOF (R-051). `pub(crate)` since
+/// coreloop.rs's `pipe_read` needs the same constant to apply the
+/// identical translation on the *synchronous*-failure path (ReadFile
+/// returning FALSE immediately never queues a completion, so it can't
+/// be handled here in the poll-dispatch path at all).
+pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
 
 /// BufferedProtocol receive: get_buffer -> memcpy -> buffer_updated.
 fn fill_app_buffer(

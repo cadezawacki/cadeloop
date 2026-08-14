@@ -995,13 +995,20 @@ def test_rst_during_write_surfaces_connection_lost(loop):
 
         class Server(asyncio.Protocol):
             def connection_made(self, transport):
-                # SO_LINGER(0) + close = RST instead of FIN.
-                sock = socket.socket(fileno=os.dup(transport.fileno()))
+                # SO_LINGER(0) + close = RST instead of FIN. Wrap the
+                # transport's fileno directly and detach() before the
+                # wrapper is GC'd, rather than os.dup()+close(): os.dup()
+                # assumes a CRT fd-table entry, which a raw Windows SOCKET
+                # (what transport.fileno() returns there) is not — dup()
+                # raises "Bad file descriptor" on Windows. detach() sets
+                # the option on the real socket without ever needing a
+                # second descriptor, so it works identically everywhere.
+                sock = socket.socket(fileno=transport.fileno())
                 sock.setsockopt(
                     socket.SOL_SOCKET, socket.SO_LINGER,
                     __import__("struct").pack("ii", 1, 0),
                 )
-                sock.close()  # option is set on the shared socket; drop the dup
+                sock.detach()
                 transport.abort()
 
         class Client(asyncio.Protocol):
