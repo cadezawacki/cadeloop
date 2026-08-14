@@ -143,3 +143,85 @@ def test_udp_close_is_idempotent_and_loses_connection(loop):
         assert proto.lost_called and proto.lost is None
 
     loop.run_until_complete(main())
+
+
+def test_datagram_write_buffer_size_is_reported(loop):
+    """R-058: payloads are copied into the engine, but they still sit in
+    its send queue behind the one in-flight datagram. Reporting zero made
+    monitoring and flow control claim nothing was ever queued no matter
+    how far behind the socket fell. Reported by Codex review on PR #1."""
+
+    class P(asyncio.DatagramProtocol):
+        pass
+
+    async def main():
+        transport, _proto = await loop.create_datagram_endpoint(
+            P, local_addr=("127.0.0.1", 0)
+        )
+        peer = transport.get_extra_info("sockname")
+        assert transport.get_write_buffer_size() == 0
+        # Burst hard enough that sends queue behind the in-flight one.
+        for _ in range(200):
+            transport.sendto(b"y" * 1024, peer)
+        queued = transport.get_write_buffer_size()
+        transport.close()
+        return queued
+
+    queued = loop.run_until_complete(main())
+    assert isinstance(queued, int) and queued >= 0
+
+
+def test_datagram_send_queue_is_bounded(loop):
+    """An unbounded queue lets a producer that outruns the socket take the
+    process down. UDP is lossy by contract, so overflow drops the datagram
+    and reports ENOBUFS through error_received. Reported by Codex review
+    on PR #1 (F08)."""
+    errors = []
+
+    class P(asyncio.DatagramProtocol):
+        def error_received(self, exc):
+            errors.append(exc)
+
+    async def main():
+        transport, _proto = await loop.create_datagram_endpoint(
+            P, local_addr=("127.0.0.1", 0)
+        )
+        peer = transport.get_extra_info("sockname")
+        chunk = b"z" * 60000
+        # Far past the 1 MiB cap, all inside one callback.
+        for _ in range(400):
+            transport.sendto(chunk, peer)
+        peak = transport.get_write_buffer_size()
+        await asyncio.sleep(0.05)
+        transport.close()
+        await asyncio.sleep(0.05)
+        return peak
+
+    peak = loop.run_until_complete(main())
+    assert peak <= (1 << 20) + 60000, f"queue grew to {peak} bytes"
+
+
+def test_datagram_close_completes_after_queued_sends(loop):
+    """A synchronous post failure used to strand the rest of the queue and
+    skip the deferred-close check, leaving the endpoint open for good.
+    Reported by Codex review on PR #1."""
+
+    class P(asyncio.DatagramProtocol):
+        pass
+
+    async def main():
+        transport, _proto = await loop.create_datagram_endpoint(
+            P, local_addr=("127.0.0.1", 0)
+        )
+        peer = transport.get_extra_info("sockname")
+        for _ in range(50):
+            transport.sendto(b"q" * 512, peer)
+        transport.close()
+        for _ in range(30):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.1)
+        return transport.is_closing()
+
+    assert loop.run_until_complete(main()) is True
+    # Endpoint fully torn down: no pool slots retained.
+    assert loop._core.stats()["buffers_in_use"] == 0

@@ -1024,4 +1024,10 @@ class _DatagramTransport(asyncio.DatagramTransport):
         self._protocol = protocol
 
     def get_write_buffer_size(self):
-        return 0  # sends are copied into the engine immediately
+        # Payloads are copied into the engine, but they still sit in its
+        # send queue behind the one in-flight datagram — reporting zero
+        # made monitoring and flow control claim there was never anything
+        # queued, no matter how far behind the socket fell.
+        if self._did is None:
+            return 0
+        return self._loop._core.udp_queued_bytes(self._did)

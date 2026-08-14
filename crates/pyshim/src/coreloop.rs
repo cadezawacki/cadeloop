@@ -856,6 +856,11 @@ impl CoreLoop {
         Ok(did)
     }
 
+    /// Bytes queued behind a datagram endpoint's in-flight send (R-058).
+    fn udp_queued_bytes(&self, did: u64) -> PyResult<usize> {
+        self.with_net(|net, _| net::udp_queued_bytes(net, did))
+    }
+
     /// R-058 sendto. `addr` None = connected-mode send().
     #[pyo3(signature = (did, data, addr=None))]
     fn udp_sendto(&self, py: Python<'_>, did: u64, data: &[u8], addr: Option<(String, u16)>) -> PyResult<()> {

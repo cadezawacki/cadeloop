@@ -227,9 +227,30 @@ pub(crate) struct DatagramEntry {
     /// Sends beyond the in-flight one (the backend allows one parked
     /// write-side op per fd).
     pub send_queue: VecDeque<(Vec<u8>, Option<std::net::SocketAddr>)>,
+    /// Bytes sitting in `send_queue`. Reported through the transport's
+    /// `get_write_buffer_size()`, which used to always answer zero.
+    pub queued_bytes: usize,
+    /// The recv could not be reposted (transient). Nothing is outstanding
+    /// to deliver the completion that would retry, so the tick does.
+    pub recv_starved: bool,
     pub closing: bool,
     pub conn_lost: bool,
 }
+
+/// Ceiling on a datagram endpoint's queued output (R-058). UDP is lossy
+/// by contract, so the deterministic overflow policy is to drop the
+/// datagram and report ENOBUFS through `error_received` -- unlike a
+/// stream, there is nothing to be gained by growing without bound.
+pub(crate) const DGRAM_SEND_QUEUE_MAX: usize = 1 << 20;
+
+/// Reported to `error_received` when a datagram is dropped for queue
+/// overflow. WSAENOBUFS on Windows, ENOBUFS on Linux -- the same errno an
+/// oversubscribed kernel socket buffer raises, which is what callers
+/// already expect to see here.
+#[cfg(windows)]
+const ENOBUFS: u32 = 10055; // WSAENOBUFS
+#[cfg(not(windows))]
+const ENOBUFS: u32 = 105; // ENOBUFS on Linux
 
 #[derive(Default)]
 pub(crate) struct NetState {
@@ -499,6 +520,9 @@ fn cancel_transport_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut Tr
 /// reference (the entry's — `post_recv_from` takes no op reference), so it
 /// is moved into the guard rather than released.
 fn cancel_dgram_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut DatagramEntry) {
+    entry.send_queue.clear();
+    entry.queued_bytes = 0;
+    entry.recv_starved = false;
     if let Some(op) = entry.recv_op.take() {
         let _ = backend.cancel(op);
         if let Some(slot) = entry.recv_slot.take() {
@@ -650,6 +674,8 @@ pub(crate) fn udp_wire(
             recv_slot: None,
             send_op: None,
             send_queue: VecDeque::new(),
+            queued_bytes: 0,
+            recv_starved: false,
             closing: false,
             conn_lost: false,
         },
@@ -719,7 +745,17 @@ fn on_dgram_recv_done(
     } else {
         return; // cancelled: teardown owns the endpoint
     }
-    let _ = dgram_post_recv(net, backend, did);
+    if dgram_post_recv(net, backend, did).is_err() {
+        // Transient (descriptor or kernel-resource exhaustion). With no
+        // recv outstanding no completion can ever retry this, so the
+        // endpoint would stay open and silently deaf; flag it and let the
+        // tick re-arm, exactly as a starved accept pool does.
+        if let Some(e) = net.datagrams.get_mut(&did) {
+            e.recv_starved = true;
+            net.any_starved_listener = true;
+            net.stats_accept_starved += 1;
+        }
+    }
 }
 
 fn on_dgram_send_done(
@@ -736,14 +772,30 @@ fn on_dgram_send_done(
         let error_received = entry.error_received.clone_ref(py);
         net.events.push(NetEvent::DgramError { error_received, err: os_error });
     }
-    // Drain the queue (one in-flight send per endpoint).
-    if let Some((data, addr)) = net.datagrams.get_mut(&did).and_then(|e| e.send_queue.pop_front()) {
-        let _ = dgram_send_now(py, net, backend, did, &data, addr.as_ref());
-        return;
+    dgram_pump_send(py, net, backend, did);
+}
+
+/// Post queued datagrams until one is actually in flight or the queue is
+/// empty, then honour a deferred close.
+///
+/// A synchronous `post_send_to` failure is a per-packet error, not an
+/// endpoint failure -- but it also means no completion is coming for that
+/// packet. Returning after one failed post therefore stranded every
+/// remaining datagram behind it (send_op is None, so nothing re-enters
+/// here) and skipped the deferred-close check, leaving the endpoint open
+/// for good.
+fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u64) {
+    loop {
+        let Some(entry) = net.datagrams.get_mut(&did) else { return };
+        if entry.send_op.is_some() {
+            return; // a send is in flight; its completion resumes us
+        }
+        let Some((data, addr)) = entry.send_queue.pop_front() else { break };
+        entry.queued_bytes = entry.queued_bytes.saturating_sub(data.len());
+        dgram_send_now(py, net, backend, did, &data, addr.as_ref());
     }
-    // Deferred close: the queue is empty now.
-    let entry = net.datagrams.get_mut(&did).unwrap();
-    if entry.closing && !entry.conn_lost {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return };
+    if entry.closing && !entry.conn_lost && entry.send_op.is_none() {
         udp_teardown(py, net, backend, did, None);
     }
 }
@@ -755,23 +807,23 @@ fn dgram_send_now(
     did: u64,
     data: &[u8],
     addr: Option<&std::net::SocketAddr>,
-) -> io::Result<()> {
-    let Some(entry) = net.datagrams.get_mut(&did) else { return Ok(()) };
+) {
+    let Some(entry) = net.datagrams.get_mut(&did) else { return };
     let sock = entry.socket;
     match backend.post_send_to(sock, data, addr) {
         Ok(op) => {
             net.datagrams.get_mut(&did).unwrap().send_op = Some(op);
             net.ops.insert(op, OpTarget::DgramSend(did));
-            Ok(())
         }
         Err(e) => {
             // Synchronous refusal: per-packet error, endpoint stays up.
+            // The caller keeps draining -- no completion is coming for
+            // this packet, so it must not be treated as "in flight".
             if let Some(entry) = net.datagrams.get_mut(&did) {
                 let error_received = entry.error_received.clone_ref(py);
                 net.events
                     .push(NetEvent::DgramError { error_received, err: e.raw_os_error().unwrap_or(0) as u32 });
             }
-            Ok(())
         }
     }
 }
@@ -793,10 +845,26 @@ pub(crate) fn udp_sendto(
         return Err(io::Error::new(io::ErrorKind::NotFound, "datagram endpoint closing"));
     }
     if entry.send_op.is_some() {
+        if entry.queued_bytes + data.len() > DGRAM_SEND_QUEUE_MAX {
+            // Deterministic overflow policy: drop and report. Growing
+            // without bound is the alternative, and a producer that can
+            // outrun the socket would take the process down with it.
+            let error_received = entry.error_received.clone_ref(py);
+            net.events.push(NetEvent::DgramError { error_received, err: ENOBUFS });
+            return Ok(());
+        }
+        entry.queued_bytes += data.len();
         entry.send_queue.push_back((data.to_vec(), addr));
         return Ok(());
     }
-    dgram_send_now(py, net, backend, did, data, addr.as_ref())
+    dgram_send_now(py, net, backend, did, data, addr.as_ref());
+    Ok(())
+}
+
+/// Bytes queued behind the in-flight send, for the transport's
+/// `get_write_buffer_size()`.
+pub(crate) fn udp_queued_bytes(net: &NetState, did: u64) -> usize {
+    net.datagrams.get(&did).map(|e| e.queued_bytes).unwrap_or(0)
 }
 
 /// close() flushes queued sends first; abort() drops them (asyncio
@@ -1021,9 +1089,25 @@ pub(crate) fn retry_starved_listeners(net: &mut NetState, backend: Backend<'_>) 
     }
     let starved: Vec<u64> =
         net.listeners.iter().filter(|(_, l)| l.starved && !l.closing).map(|(&lid, _)| lid).collect();
+    let starved_dgrams: Vec<u64> = net
+        .datagrams
+        .iter()
+        .filter(|(_, e)| e.recv_starved && !e.closing && !e.conn_lost)
+        .map(|(&did, _)| did)
+        .collect();
     net.any_starved_listener = false;
     for lid in starved {
         post_accepts(net, backend, lid);
+    }
+    for did in starved_dgrams {
+        match dgram_post_recv(net, backend, did) {
+            Ok(()) => {
+                if let Some(e) = net.datagrams.get_mut(&did) {
+                    e.recv_starved = false;
+                }
+            }
+            Err(_) => net.any_starved_listener = true, // try again next tick
+        }
     }
 }
 
