@@ -21,7 +21,10 @@ def test_defaults_match_spec():
     assert c.max_url == 8 * 1024
     assert c.request_line_timeout == 5.0
     assert c.keepalive_idle == 75.0
-    assert c.max_body is None
+    # Finite by default (see Config.max_body): the engine buffers a whole
+    # body before dispatch, so an unlimited default was an unauthenticated
+    # memory-exhaustion vector. None stays available as an explicit opt-in.
+    assert c.max_body == 16 * 1024 * 1024
     assert c.reuse_scope is False  # R-083
     assert c.write_high_water == 64 * 1024  # R-122
     assert c.write_low_water == 16 * 1024

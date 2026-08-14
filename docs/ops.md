@@ -43,9 +43,15 @@ dedicated cores.
   native-HTTP workload, profiles merge via llvm-profdata, and the final
   build compiles with `-Cprofile-use`.
 - `wheel-win-pgo-v3` — same, plus `-C target-cpu=x86-64-v3` (AVX2/BMI2/
-  FMA baseline). Wheel tags cannot express micro-arch levels, so this
-  ships as a release artifact installed by direct URL, not via PyPI:
-  `pip install https://github.com/<org>/cadeloop/releases/download/vX.Y.Z/<wheel>`.
-  It refuses nothing at runtime — on a pre-v3 CPU it dies with SIGILL —
-  so only deploy it to fleets known to be Haswell/Zen1 or newer.
-- `wheel-linux` — the plain Linux dev/test wheel.
+  FMA baseline). It refuses nothing at runtime — on a pre-v3 CPU it dies
+  with SIGILL — so only deploy it to fleets known to be Haswell/Zen1 or
+  newer.
+- `wheel-linux` — the Linux wheel.
+
+**Nothing is published yet.** These are GitHub Actions *run artifacts*:
+the workflow does not create a GitHub Release, upload release assets, or
+push to PyPI, so there is no `pip install <url>` or `pip install cadeloop`
+route today. Download them from the workflow run, or build from source
+with `maturin build --release`. Publication will be turned on
+deliberately; until then, treat any install instruction that names a
+release URL as wrong.

@@ -1,12 +1,15 @@
-# Release wheels (R-110/R-111): PGO-optimized cp311-win_amd64 (the
-# production wheel), a -v3 variant (x86-64-v3: AVX2/BMI2/FMA baseline),
-# and the plain Linux dev wheel. PGO profiles are gathered by running the
-# repo's own benchmark workload against an instrumented build — the same
-# hot paths the loop serves in production (scheduling, echo, native HTTP).
+# Release wheels (R-110/R-111): PGO-optimized cp311-win_amd64, a -v3
+# variant (x86-64-v3: AVX2/BMI2/FMA baseline), and the Linux wheel. PGO
+# profiles are gathered by running the repo's own benchmark workload
+# against an instrumented build — the same hot paths the loop serves in
+# production (scheduling, echo, native HTTP).
 #
-# The -v3 wheel is published as a separately-named RELEASE ARTIFACT (not a
-# PyPI upload): wheel tags cannot express micro-arch levels, so it installs
-# via direct URL (documented in docs/ops.md).
+# DELIBERATELY DOES NOT PUBLISH. Every wheel here is uploaded as a GitHub
+# Actions run artifact only: no GitHub Release is created, no release
+# asset is attached, and nothing goes to PyPI. Both platforms are
+# supported targets and both are built and tested on every tag; turning
+# publication on is a separate, deliberate decision. Do not add a
+# publish step without that decision being made.
 name: release
 
 on:

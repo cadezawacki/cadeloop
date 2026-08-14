@@ -99,7 +99,19 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_header_bytes: 64 * 1024, max_headers: 100, max_url: 8 * 1024, max_body: None }
+        Limits {
+            max_header_bytes: 64 * 1024,
+            max_headers: 100,
+            max_url: 8 * 1024,
+            // Finite BY DEFAULT (R-086). The engine buffers a whole body
+            // before dispatching the request, so an unlimited default let
+            // any unauthenticated client turn one request into unbounded
+            // resident memory. 16 MiB covers ordinary JSON, form and
+            // multipart payloads while bounding the worst case; a larger
+            // limit (or None for unlimited) is an explicit opt-in, and
+            // exceeding it answers 413 rather than closing silently.
+            max_body: Some(16 * 1024 * 1024),
+        }
     }
 }
 

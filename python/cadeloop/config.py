@@ -53,7 +53,11 @@ class Config:
     max_url: int = 8 * 1024
     request_line_timeout: float = 5.0
     keepalive_idle: float = 75.0
-    max_body: int | None = None
+    # Finite by default: the engine buffers a whole request body before
+    # dispatch, so `None` (unlimited) lets an unauthenticated client turn
+    # one request into unbounded memory. Raise it, or set None explicitly,
+    # for large-upload workloads; over the limit the client gets a 413.
+    max_body: int | None = 16 * 1024 * 1024
     reuse_scope: bool = False  # R-083 (correctness default)
     # --- transports ---------------------------------------------------------
     write_high_water: int = 64 * 1024  # R-122 backpressure defaults

@@ -1370,3 +1370,54 @@ def test_pipelined_burst_behind_a_slow_request_is_bounded(loop):
     # happily against an unbounded queue.
     assert loop._core.stats()["pipeline_pauses"] > 0, "reading was never paused"
     loop._core.listener_close(lid)
+
+
+def test_oversized_body_is_rejected_by_default(loop):
+    """R-086: the engine buffers a whole request body before dispatching,
+    so an unlimited default let any unauthenticated client turn one
+    request into unbounded resident memory. The default is now finite and
+    over it the client gets a 413, not a silent close."""
+    from cadeloop.config import Config
+
+    assert Config().max_body == 16 * 1024 * 1024, "default must stay finite"
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    # Small explicit cap so the test does not have to push 16 MiB.
+    lid, port = listen(loop, app, max_body=8)
+    resp = loop.run_until_complete(
+        _request(
+            port,
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 32\r\n\r\n" + b"x" * 32,
+            read_all=True,
+        )
+    )
+    assert b"413" in resp.split(b"\r\n", 1)[0], resp[:60]
+    loop._core.listener_close(lid)
+
+
+def test_unlimited_body_is_still_available_explicitly(loop):
+    """`max_body=None` remains an explicit opt-in for large uploads."""
+
+    async def app(scope, receive, send):
+        msg = await receive()
+        n = str(len(msg["body"])).encode()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": n})
+
+    lid, port = listen(loop, app, max_body=None)
+    body = b"y" * 200_000
+    resp = loop.run_until_complete(
+        _request(
+            port,
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: "
+            + str(len(body)).encode()
+            + b"\r\n\r\n"
+            + body,
+        )
+    )
+    assert _body(resp) == b"200000"
+    loop._core.listener_close(lid)
