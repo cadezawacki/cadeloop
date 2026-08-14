@@ -180,8 +180,10 @@ def serve(
                 "worker or terminate TLS upstream"
             )
         if app_spec is not None:
-            # Windows spawn model (R-090): one shared listener duplicated
-            # into each worker via WSADuplicateSocketW (socket.share).
+            # Fork-free model (R-090): the supervisor owns the listener and
+            # the accept loop and hands each ACCEPTED connection to a
+            # worker. The listener itself never crosses the boundary — see
+            # ADR-25 for why sharing it cannot work on Windows.
             return _serve_multi_spawn(app_spec, host, port, config, n)
         # Spawned workers re-import the app, so a bare callable cannot
         # cross the process boundary (uvicorn has the same rule). Matches
@@ -207,16 +209,16 @@ def _serve_single(
     *,
     reuse_port: bool = False,
     worker_id=None,
-    listen_sock=None,
-    control_reader=None,
+    control_channel=None,
     ssl_ctx=None,
 ):
     """One worker: loop + lifespan + native listener (the M2 path).
 
-    ``listen_sock``: an already-listening socket to adopt instead of
-    binding (the Windows spawn model shares the supervisor's listener).
-    ``control_reader``: a pipe the supervisor writes b"STOP" to for a
-    graceful drain (EOF — a dead supervisor — also stops the worker).
+    ``control_channel``: set for a spawn-model worker (R-090). Such a
+    worker never listens — the supervisor owns the accept loop and hands
+    over already-accepted connections, which this process adopts into its
+    own completion port. b"STOP" (or EOF, a dead supervisor) drains it.
+    See ADR-25 for why the listener cannot simply be shared instead.
     """
     # TEMPORARY (ADR-24): bisecting a Windows-only STATUS_ACCESS_VIOLATION
     # in the spawned worker model. worker_id is only set from
@@ -248,27 +250,17 @@ def _serve_single(
         _trace("about to run lifespan.startup")
         lifespan.startup()
         _trace("lifespan.startup returned")
-        if listen_sock is not None:
-            # Adopt the shared listener; the engine owns the handle now.
-            listen_sock.setblocking(False)
-            fd = listen_sock.detach()
-            _trace(f"about to call http_listen_fd (fd={fd})")
-            lid, bound, _fd = loop._core.http_listen_fd(
-                fd,
-                app,
-                loop,
-                state=lifespan.state,
-                accept_pool=config.accept_pool,
-                eager=config.eager_tasks,
-                max_header_bytes=config.max_header_bytes,
-                max_headers=config.max_headers,
-                max_url=config.max_url,
-                max_body=config.max_body,
-                request_line_timeout=config.request_line_timeout,
-                keepalive_idle=config.keepalive_idle,
-                tls=ssl_ctx,
-            )
-            _trace("http_listen_fd returned")
+        if control_channel is not None:
+            # Spawn-model worker: nothing to bind. Connections arrive over
+            # the channel already accepted (R-090 / ADR-25).
+            bound = None
+            _trace("starting channel pump")
+            threading.Thread(
+                target=_channel_pump,
+                args=(control_channel, loop, _make_adopter(loop, app, config, lifespan, ssl_ctx)),
+                daemon=True,
+            ).start()
+            _trace("channel pump started")
         else:
             lid, bound, _fd = loop._core.http_listen(
                 host,
@@ -287,11 +279,6 @@ def _serve_single(
                 keepalive_idle=config.keepalive_idle,
                 tls=ssl_ctx,
             )
-        if control_reader is not None:
-            threading.Thread(
-                target=_watch_control, args=(control_reader, loop), daemon=True
-            ).start()
-            _trace("control thread started")
         if config.access_log:
             loop._core.set_access_log(_access_sink(logging.getLogger("cadeloop.access")))
         _arm_timeout_sweep(loop, config)
@@ -369,14 +356,66 @@ def _arm_timeout_sweep(loop, config: Config):
     loop.call_later(interval, sweep)
 
 
-def _watch_control(reader, loop):
-    """Worker side of the spawn model's control pipe: b"STOP" (or EOF —
-    the supervisor died) requests a graceful stop."""
+def _socket_from_frame(body: bytes, fd):
+    """Materialise a handed-over connection (worker side).
+
+    Neither branch has ever been associated with a completion port: the
+    supervisor accepts with a plain blocking ``accept()`` on a listener it
+    deliberately never registers with an IOCP, which is precisely what
+    makes the receiving worker's association legal (ADR-25).
+    """
+    if fd is not None:
+        return _socket.socket(fileno=fd)  # POSIX: arrived via SCM_RIGHTS
+    return _socket.fromshare(body)  # win32: WSADuplicateSocketW blob
+
+
+def _make_adopter(loop, app, config: Config, lifespan, ssl_ctx):
+    """Build the loop-thread callback that adopts one handed-over socket
+    into the native HTTP engine."""
+
+    def adopt(sock):
+        fd = sock.detach()  # the engine owns the handle from here
+        try:
+            loop._core.http_adopt(
+                fd,
+                app,
+                loop,
+                state=lifespan.state,
+                eager=config.eager_tasks,
+                max_header_bytes=config.max_header_bytes,
+                max_headers=config.max_headers,
+                max_url=config.max_url,
+                max_body=config.max_body,
+                request_line_timeout=config.request_line_timeout,
+                keepalive_idle=config.keepalive_idle,
+                tls=ssl_ctx,
+            )
+        except Exception:  # noqa: BLE001 — one bad handoff must not kill the worker
+            logger.exception("worker %s could not adopt a connection", os.getpid())
+
+    return adopt
+
+
+def _channel_pump(chan, loop, adopt):
+    """Worker side of the spawn channel: adopt handed-over connections
+    until STOP or EOF (a dead supervisor), then stop the loop."""
     try:
         while True:
-            line = reader.readline()
-            if not line or line.strip() == b"STOP":
+            cmd, body, fd = chan.recv_frame()
+            if cmd is None or cmd == b"STOP":
                 break
+            if cmd != b"CONN":
+                continue
+            try:
+                sock = _socket_from_frame(body, fd)
+            except OSError:
+                logger.exception("worker could not materialise a handed-over connection")
+                continue
+            try:
+                loop.call_soon_threadsafe(adopt, sock)
+            except RuntimeError:
+                sock.close()
+                break  # loop already closing
     except OSError:
         pass
     try:
@@ -517,45 +556,122 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
 # --------------------------------------------------------------------- #
 
 
-def _spawn_shared_worker(spec, lsock, config: Config, idx: int, ncpu: int):
-    """Spawn one worker process and hand it the shared listener: on
-    Windows via WSADuplicateSocketW (socket.share) bytes after the JSON
-    header on stdin; on POSIX via fd inheritance (pass_fds), which keeps
-    the spawn model testable on the dev platform. Returns the Popen."""
+class _SpawnWorker:
+    """Supervisor's handle on one spawned worker: the process plus our end
+    of its control/handoff channel."""
+
+    __slots__ = ("proc", "sock", "stdin", "idx", "spawned")
+
+    def __init__(self, proc, sock, stdin, idx, spawned):
+        self.proc = proc
+        self.sock = sock
+        self.stdin = stdin
+        self.idx = idx
+        self.spawned = spawned
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def close(self):
+        for closer in (self.sock, self.stdin):
+            try:
+                if closer is not None:
+                    closer.close()
+            except OSError:
+                pass
+
+
+def _send_frame(worker: _SpawnWorker, payload: bytes, fd=None) -> None:
+    """Write one length-prefixed frame to a worker.
+
+    POSIX rides an AF_UNIX SOCK_SEQPACKET pair so a descriptor can be
+    attached to the frame it belongs to (SCM_RIGHTS needs a message
+    boundary); Windows rides the child's stdin pipe and carries the
+    connection inline as ``socket.share()`` bytes instead. The length
+    prefix is redundant on SEQPACKET but kept so both sides parse one
+    format.
+    """
+    frame = len(payload).to_bytes(4, "big") + payload
+    if worker.sock is not None:
+        if fd is None:
+            worker.sock.sendall(frame)
+        else:
+            _socket.send_fds(worker.sock, [frame], [fd])
+    else:
+        worker.stdin.write(frame)
+        worker.stdin.flush()
+
+
+def _handoff(worker: _SpawnWorker, conn) -> None:
+    """Give one ACCEPTED connection to a worker (R-090).
+
+    The socket has never been associated with a completion port — the
+    supervisor's listener is deliberately never registered with one — so
+    the receiving worker may legally associate it with its own (ADR-25).
+    """
+    if sys.platform == "win32":
+        _send_frame(worker, b"CONN " + conn.share(worker.proc.pid))
+    else:
+        _send_frame(worker, b"CONN", fd=conn.fileno())
+
+
+def _spawn_shared_worker(spec, config: Config, idx: int, ncpu: int) -> _SpawnWorker:
+    """Spawn one worker and hand it its startup header. Unlike the model
+    this replaced, no listener crosses the boundary — only connections do."""
     win = sys.platform == "win32"
-    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if win else 0
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "cadeloop._winworker"],
-        stdin=subprocess.PIPE,
-        creationflags=creationflags,
-        pass_fds=() if win else (lsock.fileno(),),
-    )
+    if win:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "cadeloop._winworker"],
+            stdin=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        worker = _SpawnWorker(proc, None, proc.stdin, idx, time.monotonic())
+    else:
+        sup, child = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_SEQPACKET)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "cadeloop._winworker"],
+                stdin=child.fileno(),
+            )
+        except BaseException:
+            sup.close()
+            raise
+        finally:
+            child.close()
+        worker = _SpawnWorker(proc, sup, None, idx, time.monotonic())
+    header = {
+        "spec": spec,
+        "config": dataclasses.asdict(config) | {"workers": 1},
+        "worker_id": idx,
+        "pin": (idx % ncpu) if config.pin else None,
+    }
     try:
-        share = lsock.share(proc.pid) if win else b""
-        header = {
-            "spec": spec,
-            "config": dataclasses.asdict(config) | {"workers": 1},
-            "worker_id": idx,
-            "pin": (idx % ncpu) if config.pin else None,
-            "share_len": len(share),
-            "listen_fd": None if win else lsock.fileno(),
-        }
-        proc.stdin.write(json.dumps(header).encode() + b"\n")
-        if share:
-            proc.stdin.write(share)
-        proc.stdin.flush()
+        _send_frame(worker, b"HELLO " + json.dumps(header).encode())
     except (OSError, ValueError):
         proc.kill()
+        worker.close()
         raise
-    return proc
+    return worker
 
 
 def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
-    """Fork-free supervisor (Windows): bind ONE listener here, duplicate
-    it into every worker (all post accepts on the same socket — the
-    kernel distributes them), restart crashed workers with the same
-    fast-crash cutoff as the fork model, and drain via the control pipe
-    within ``config.grace`` seconds (R-090..R-093)."""
+    """Fork-free supervisor (R-090..R-093): the supervisor owns the
+    listener AND the accept loop, and hands each accepted connection to a
+    worker round-robin.
+
+    It does NOT share the listener itself. On Windows a file object binds
+    to exactly one completion port for life, so a duplicated listener can
+    only ever be driven by whichever worker associated it first — the
+    others' completions get delivered to that worker's port carrying
+    pointers into their own address space, which is a crash, not a race
+    (ADR-25). Accepting centrally costs one handoff per connection and
+    keeps every socket associated exactly once, by the process that
+    drives it.
+
+    The listener is deliberately never registered with a completion port:
+    a plain blocking ``accept()`` keeps the sockets it yields unassociated,
+    which is what makes them legal to hand over.
+    """
     if port == 0:
         raise ValueError(
             "workers > 1 requires an explicit port (the supervisor binds "
@@ -569,10 +685,8 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
         lsock.close()
         raise
     ncpu = os.cpu_count() or 1
-    logger.info("cadeloop supervisor: %d workers on http://%s:%s (shared listener)", n, host, port)
-    children: dict = {}  # Popen -> (idx, spawn_time)
-    for idx in range(n):
-        children[_spawn_shared_worker(spec, lsock, config, idx, ncpu)] = (idx, time.monotonic())
+    logger.info("cadeloop supervisor: %d workers on http://%s:%s (accept+handoff)", n, host, port)
+    workers = [_spawn_shared_worker(spec, config, idx, ncpu) for idx in range(n)]
 
     stopping = False
     exit_code = 0
@@ -580,63 +694,90 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
     def _stop_all():
         nonlocal stopping
         stopping = True
-        for proc in list(children):
+        try:
+            lsock.close()  # unblocks the accept loop
+        except OSError:
+            pass
+        for w in workers:
             try:
-                proc.stdin.write(b"STOP\n")
-                proc.stdin.flush()
+                _send_frame(w, b"STOP")
             except (OSError, ValueError):
                 pass
 
+    def _accept_loop():
+        """Distribute connections round-robin over the live workers."""
+        turn = 0
+        while not stopping:
+            try:
+                conn, _addr = lsock.accept()
+            except OSError:
+                return  # listener closed: shutting down
+            try:
+                for _ in range(len(workers)):
+                    w = workers[turn % len(workers)] if workers else None
+                    turn += 1
+                    if w is None or not w.alive():
+                        continue
+                    try:
+                        _handoff(w, conn)
+                        break
+                    except (OSError, ValueError):
+                        continue  # worker died mid-handoff; try the next
+                else:
+                    # Every worker is down. Dropping beats hanging the peer;
+                    # the supervision loop below is already restarting them.
+                    logger.warning("no live worker to accept a connection; dropping it")
+            finally:
+                conn.close()  # our handle; the worker holds its own now
+
+    accepter = threading.Thread(target=_accept_loop, name="cadeloop-accept", daemon=True)
+    accepter.start()
+
     crash_streak = 0
     try:
-        while children:
+        while workers:
             time.sleep(0.2)
-            done = [p for p in children if p.poll() is not None]
-            for proc in done:
-                idx, spawned = children.pop(proc)
+            for w in [w for w in workers if not w.alive()]:
+                workers.remove(w)
+                w.close()
                 if stopping:
                     continue
-                if proc.returncode == 0:
+                if w.proc.returncode == 0:
                     # Clean self-exit means stop was requested inside the
                     # worker — treat as a shutdown signal (fork parity).
                     _stop_all()
                     continue
-                fast = time.monotonic() - spawned < _CRASH_FAST_SECS
+                fast = time.monotonic() - w.spawned < _CRASH_FAST_SECS
                 crash_streak = crash_streak + 1 if fast else 1
                 if crash_streak >= _CRASH_STREAK_LIMIT:
                     logger.error(
                         "worker %d died %d times in under %.0fs — giving up",
-                        idx,
+                        w.idx,
                         crash_streak,
                         _CRASH_FAST_SECS,
                     )
                     exit_code = 1
                     _stop_all()
                     continue
-                logger.warning(
-                    "worker %d died (status %d) — restarting", idx, proc.returncode
-                )
-                children[_spawn_shared_worker(spec, lsock, config, idx, ncpu)] = (
-                    idx,
-                    time.monotonic(),
-                )
+                logger.warning("worker %d died (status %s) — restarting", w.idx, w.proc.returncode)
+                workers.append(_spawn_shared_worker(spec, config, w.idx, ncpu))
     except KeyboardInterrupt:
         _stop_all()
     finally:
-        # Drain: give survivors `grace` seconds, then terminate (R-092).
         if not stopping:
             _stop_all()
         deadline = time.monotonic() + config.grace
-        for proc in list(children):
+        for w in list(workers):
             budget = max(0.0, deadline - time.monotonic())
             try:
-                proc.wait(timeout=budget)
+                w.proc.wait(timeout=budget)
             except subprocess.TimeoutExpired:
-                logger.warning(
-                    "worker pid %d exceeded grace=%ss — terminating", proc.pid, config.grace
-                )
-                proc.kill()
-                proc.wait()
-        lsock.close()
+                logger.warning("worker %d exceeded grace=%ss — killing", w.idx, config.grace)
+                w.proc.kill()
+            w.close()
+        try:
+            lsock.close()
+        except OSError:
+            pass
     if exit_code:
         raise SystemExit(exit_code)

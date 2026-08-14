@@ -160,7 +160,12 @@ def test_spawn_worker_pool_serves_and_stops(tmp_path):
             raise AssertionError("spawn worker pool never started serving")
         for _ in range(7):
             pids.add(_get(port))
-        assert len(pids) >= 1  # accept distribution is the kernel's call
+        # Distribution is now OURS, not the kernel's: the supervisor accepts
+        # centrally and hands each connection to a worker round-robin
+        # (ADR-25), so 8 fresh connections across 2 live workers must land
+        # on both. Under the shared-listener model this could only be
+        # asserted as ">= 1" because the kernel chose.
+        assert len(pids) >= 2, f"handoff did not distribute across workers: {pids}"
         assert all(p.isdigit() for p in (b.decode() for b in pids))
         # Supervisor death must cascade: workers see control-pipe EOF and
         # drain out; the port must stop answering.

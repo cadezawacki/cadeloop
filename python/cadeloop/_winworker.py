@@ -1,11 +1,33 @@
 """Spawned worker entry for the fork-free worker model (R-090..R-093).
 
-The supervisor (``server._serve_multi_spawn``) writes one JSON header
-line followed by ``share_len`` bytes of ``socket.share()`` output
-(WSADuplicateSocketW) to our stdin, then keeps the pipe open as the
-control channel: b"STOP" (or EOF — a dead supervisor) requests a
-graceful drain. Everything else is the ordinary single-worker path.
+The supervisor (``server._serve_multi_spawn``) owns the listener and the
+accept loop; this process never listens. Connections arrive already
+accepted, one per control-channel frame, and are adopted into this
+worker's own completion port.
+
+That split is forced by Windows, not chosen for symmetry: a file object
+binds to exactly one IOCP for life, so a listener duplicated into N
+workers can only ever be driven by whichever worker associated it first
+— the rest post ops whose completions are delivered to the winner's
+port carrying pointers into the loser's address space (ADR-25). Handing
+over ACCEPTED sockets instead keeps every socket associated exactly once,
+by the process that will actually drive it.
+
+Channel framing (see ``server._send_frame`` for the writing side): each
+frame is a length-prefixed command.
+
+* ``STOP`` — drain and exit. EOF (a dead supervisor) means the same.
+* ``CONN`` — one accepted connection. On Windows the frame body carries
+  ``socket.share()`` bytes; on POSIX the descriptor rides SCM_RIGHTS
+  alongside the frame and the body is empty.
+
+The channel is always this process's stdin: a pipe on Windows, an
+AF_UNIX SOCK_SEQPACKET socket on POSIX (the supervisor dups its end onto
+our fd 0), so the descriptor-passing path has message boundaries to hang
+ancillary data on.
 """
+
+from __future__ import annotations
 
 import json
 import socket
@@ -27,59 +49,89 @@ def _pin_to_cpu(cpu: int) -> None:
             handle = ctypes.c_void_p(-1)  # GetCurrentProcess() pseudo handle
             k32 = ctypes.windll.kernel32
             k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-            k32.SetProcessAffinityMask.restype = ctypes.c_int  # BOOL — was
-            # previously left to ctypes' default-int assumption; declaring
-            # it explicitly matches loop.py's SetConsoleCtrlHandler call
-            # (the codebase's other kernel32 FFI site) rather than leaving
-            # this one call implicit. Pinning stays best-effort — a
-            # nonzero-vs-zero result isn't acted on — but the return type
-            # itself is no longer left to inference.
+            k32.SetProcessAffinityMask.restype = ctypes.c_int
             k32.SetProcessAffinityMask(handle, 1 << cpu)
     except OSError:
         pass  # pinning is best-effort (R-091)
 
 
-def _trace(stage: str) -> None:
-    # TEMPORARY (see docs/decisions.md): bisecting a Windows-only
-    # STATUS_ACCESS_VIOLATION on worker startup that a remote CI run
-    # can't hand back a stack trace for. Each line is flushed
-    # immediately so it survives a hard crash on the *next* statement.
-    print(f"cadeloop._winworker: {stage}", file=sys.stderr, flush=True)
+class Channel:
+    """Worker's end of the supervisor channel.
+
+    Windows rides a byte pipe and needs explicit length prefixes; POSIX
+    rides SOCK_SEQPACKET, where one ``recv_fds`` yields exactly one frame
+    plus any descriptor attached to it. Both expose the same
+    ``recv_frame`` contract so the worker loop is platform-blind.
+    """
+
+    def __init__(self, sock=None, stream=None):
+        self._sock = sock
+        self._stream = stream
+
+    @classmethod
+    def from_stdin(cls):
+        if sys.platform == "win32":
+            return cls(stream=sys.stdin.buffer)
+        # POSIX: the supervisor dup'd its socketpair end onto our stdin.
+        return cls(sock=socket.socket(fileno=0, family=socket.AF_UNIX, type=socket.SOCK_SEQPACKET))
+
+    def _read_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self._stream.read(n - len(buf))
+            if not chunk:
+                return b""  # EOF
+            buf += chunk
+        return buf
+
+    def recv_frame(self):
+        """Return ``(command, body, fd)``; ``(None, b"", None)`` on EOF."""
+        if self._sock is not None:
+            data, fds, _flags, _addr = socket.recv_fds(self._sock, 65536, 1)
+            if not data:
+                return None, b"", None
+            payload = data[4:]  # length prefix is redundant here; kept for parity
+            fd = fds[0] if fds else None
+        else:
+            head = self._read_exact(4)
+            if not head:
+                return None, b"", None
+            payload = self._read_exact(int.from_bytes(head, "big"))
+            fd = None
+        cmd, _, body = payload.partition(b" ")
+        return cmd, body, fd
+
+    def close(self):
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except OSError:
+            pass
 
 
 def main() -> int:
-    _trace("start")
-    raw = sys.stdin.buffer
-    header = json.loads(raw.readline())
-    _trace("header parsed")
-    if header["share_len"]:
-        share = raw.read(header["share_len"])
-        _trace(f"share bytes read ({len(share)})")
-        lsock = socket.fromshare(share)  # WSADuplicateSocketW (win32)
-        _trace("fromshare returned")
-    else:
-        # POSIX: the listener fd was inherited via pass_fds.
-        lsock = socket.socket(fileno=header["listen_fd"])
+    chan = Channel.from_stdin()
+    # The header is the one frame that is always plain bytes on both
+    # platforms, so it is read through the same path as everything else.
+    cmd, body, _fd = chan.recv_frame()
+    if cmd != b"HELLO":
+        return 1
+    header = json.loads(body)
     if header.get("pin") is not None:
         _pin_to_cpu(header["pin"])
-        _trace("pinned")
 
     from .config import Config
     from .server import _serve_single, load_app
 
-    _trace("imports done")
     app = load_app(header["spec"])
-    _trace("app loaded")
     config = Config(**header["config"])
-    _trace("about to call _serve_single")
     _serve_single(
         app,
-        "-",  # host/port unused: the listener is adopted
+        "-",  # no listener: connections arrive over the channel
         0,
         config,
         worker_id=header.get("worker_id"),
-        listen_sock=lsock,
-        control_reader=raw,
+        control_channel=chan,
     )
     return 0
 

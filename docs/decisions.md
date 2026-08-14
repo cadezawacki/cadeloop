@@ -376,3 +376,46 @@ Consequences, once confirmed:
   associated anywhere), which costs a handoff per connection but obeys
   the one-object-one-port rule. Until then, `workers > 1` on Windows is
   not safe to advertise.
+
+## ADR-26: R-090 becomes supervisor-accept + per-connection handoff
+ADR-25's fix. The shared-listener model is removed, not patched: no
+listener crosses a process boundary any more. The supervisor binds,
+listens, and runs the accept loop itself, then hands each ACCEPTED
+connection to a worker round-robin; the worker adopts it into its own
+completion port via the new `CoreLoop.http_adopt`.
+
+The listener is deliberately never registered with a completion port —
+the supervisor accepts with a plain blocking `accept()` on a dedicated
+thread. That is load-bearing, not incidental: it is what keeps the
+sockets it yields unassociated, and therefore legal for the receiving
+worker to associate. Registering the supervisor's listener with an IOCP
+to accept "more efficiently" would reintroduce the exact bug, one level
+down, on every connection.
+
+Transport of the connection is the one platform split, behind a single
+frame format (4-byte length + `CMD [body]`):
+
+* Windows — the child's stdin pipe; the body carries `socket.share()`
+  (WSADuplicateSocketW) bytes.
+* POSIX — an AF_UNIX **SOCK_SEQPACKET** pair dup'd onto the child's
+  stdin; the descriptor rides SCM_RIGHTS attached to the frame. Seqpacket
+  rather than stream because ancillary data needs a message boundary to
+  hang on, and a buffered reader would otherwise consume the bytes an fd
+  was attached to.
+
+Using the same model on POSIX rather than keeping the old shared-listener
+path there is the point: Windows is the only platform where this bug
+bites and the slowest place to test, so the handoff path now runs in
+Linux CI on every commit. `test_spawn_worker_pool_serves_and_stops` also
+asserts distribution properly now — round-robin is ours, so 8 connections
+across 2 workers MUST reach both, where the kernel-scheduled model could
+only assert ">= 1". The fork model (`_serve_multi`, SO_REUSEPORT) is
+untouched and remains the POSIX default, so the hot Linux path pays
+nothing for this.
+
+Cost: one handoff per connection on the fork-free path. That buys
+correctness on Windows, where the alternative does not work at all.
+
+Still to confirm on Windows hardware: that `workers > 1` now serves
+end-to-end there. The ADR-24 trace markers stay in place until that
+lands, then come out.
