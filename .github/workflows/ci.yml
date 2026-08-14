@@ -34,7 +34,7 @@ jobs:
           PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.11 \
             cargo clippy -p cadeloop-pyshim --no-default-features \
             --target x86_64-pc-windows-msvc -- -D warnings
-      - name: cargo-deny (licenses: R-014) + cargo-audit
+      - name: "cargo-deny (licenses: R-014) + cargo-audit"
         run: |
           cargo install --locked cargo-deny cargo-audit
           cargo deny check licenses bans sources
