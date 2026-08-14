@@ -1458,6 +1458,31 @@ fn on_recv_done(
     post_recv(py, net, backend, tid);
 }
 
+/// Stop reading on a transport for engine-level backpressure (R-085/
+/// R-087). Distinct from the user-facing `pause_reading()`: the engine
+/// owns this flag and releases it itself.
+pub(crate) fn pause_reading_for_backpressure(net: &mut NetState, tid: u64) {
+    if let Some(e) = net.transports.get_mut(&tid) {
+        e.reading_paused = true;
+    }
+}
+
+/// The matching release: re-post the recv if nothing else is holding it.
+pub(crate) fn resume_reading_after_backpressure(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    tid: u64,
+) {
+    if let Some(e) = net.transports.get_mut(&tid) {
+        if !e.reading_paused {
+            return;
+        }
+        e.reading_paused = false;
+    }
+    post_recv(py, net, backend, tid);
+}
+
 /// R-085: re-post the recv a spent pipeline budget suppressed, once the
 /// queue has drained far enough. In-cell.
 pub(crate) fn http_resume_reading(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {

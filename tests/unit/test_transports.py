@@ -1243,3 +1243,41 @@ def test_close_restores_signal_disposition():
         lp.close()
     assert signal_module.getsignal(signal_module.SIGUSR1) is signal_module.SIG_DFL
     signal_module.signal(signal_module.SIGUSR1, before)
+
+
+def test_sendfile_fallback_honours_offset_zero(loop, tmp_path):
+    """The seek was guarded by `if offset:`, so the default offset=0 sent
+    from the file's CURRENT position on any fallback path (BytesIO, SSL,
+    Windows) while the native path sent from byte zero — the same call
+    returning different bytes depending on which path ran. Reported by
+    Codex review on PR #1 (twice)."""
+    payload = b"HEADER" + bytes((i % 251) for i in range(1000))
+    path = tmp_path / "payload.bin"
+    path.write_bytes(payload)
+
+    received = []
+
+    async def main():
+        async def handler(reader, writer):
+            received.append(await reader.read(-1))
+            writer.close()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()
+        _reader, writer = await asyncio.open_connection(*addr)
+        with open(path, "rb") as fh:
+            fh.read(6)  # advance past HEADER, as a prior read would
+            assert fh.tell() == 6
+            # offset=0 must mean byte zero, not "wherever the file is".
+            await loop._sendfile_fallback(writer.transport, fh, 0, None)
+        writer.close()
+        await asyncio.sleep(0.1)
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+    assert received, "handler never ran"
+    assert received[0] == payload, (
+        f"sent {len(received[0])} bytes starting {received[0][:8]!r}; "
+        f"expected the whole {len(payload)}-byte file from byte zero"
+    )

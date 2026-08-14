@@ -222,10 +222,21 @@ impl EpollBackend {
         Ok(())
     }
 
+    /// Park an op on the fd's read or write side. Readiness is per-fd here,
+    /// so there is exactly ONE parked slot per side -- a second park would
+    /// overwrite the first, stranding its slab entry as permanently
+    /// unreachable while still counted live. Callers that maintain a pool
+    /// (accepts) must therefore treat WouldBlock as "the pool is full".
     fn park(&mut self, id: OpId, fd: RawFd, write_side: bool) -> io::Result<OpId> {
         let entry = self.fds.entry(fd).or_default();
         let slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
-        debug_assert!(slot.is_none(), "one parked op per side per fd");
+        if slot.is_some() {
+            // Release the slab entry we were about to strand, and report a
+            // would-block so the caller stops rather than silently leaking.
+            self.slab.complete(id);
+            self.slab.release(id);
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         *slot = Some(id);
         self.sync_interest(fd, false)?;
         Ok(id)

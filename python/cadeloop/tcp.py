@@ -752,9 +752,17 @@ class TcpSurface:
 
     async def sock_accept(self, sock):
         try:
-            return sock.accept()
+            conn, addr = sock.accept()
         except (BlockingIOError, InterruptedError):
             pass
+        else:
+            # A connection already queued takes this fast path, which must
+            # normalise the socket exactly as the deferred path does: an
+            # accepted socket does NOT inherit the listener's nonblocking
+            # flag on Linux, so a later `await loop.sock_recv(conn, ...)`
+            # would run a blocking recv() and freeze the whole loop.
+            conn.setblocking(False)
+            return conn, addr
         fut = self.create_future()
         fd = sock.fileno()
 
@@ -849,7 +857,7 @@ class TcpSurface:
             if fut.done():
                 return
             try:
-                sock.sendto(data, address)
+                sent = sock.sendto(data, address)
             except (BlockingIOError, InterruptedError):
                 return
             except (SystemExit, KeyboardInterrupt):
@@ -857,7 +865,10 @@ class TcpSurface:
             except BaseException as exc:
                 fut.set_exception(exc)
             else:
-                fut.set_result(None)
+                # The immediate path returns the byte count, so this one
+                # must too: discarding it made sock_sendto's return type
+                # depend on transient socket readiness.
+                fut.set_result(sent)
 
         self._core.add_writer(fd, on_writable)
         try:
@@ -935,8 +946,11 @@ class TcpSurface:
         return total
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
-        if offset:
-            file.seek(offset)
+        # Unconditional, matching Loop._sendfile_fallback: the old guard
+        # skipped the seek for the default offset=0, so this path sent from
+        # the file's current position while the native path sent from byte
+        # zero.
+        file.seek(offset)
         blocksize = min(count, 16384) if count else 16384
         total = 0
         while True:

@@ -692,8 +692,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return total
 
     async def _sendfile_fallback(self, transport, file, offset, count):
-        if offset:
-            file.seek(offset)
+        # Seek unconditionally: with the default offset=0 the old guard
+        # skipped the seek entirely, so a fallback (BytesIO, SSL, Windows)
+        # sent from the file's CURRENT position while the native path sent
+        # from byte zero — the same call returning different bytes
+        # depending on which path was taken.
+        file.seek(offset)
         total = 0
         while True:
             blocksize = 16384 if count is None else min(count - total, 16384)

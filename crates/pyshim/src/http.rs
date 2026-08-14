@@ -146,6 +146,10 @@ pub(crate) struct WsConn {
     pub(crate) rx: cadeloop_core::ws::WsRx,
     /// Assembled inbound ASGI events awaiting receive().
     pub(crate) inbox: std::collections::VecDeque<WsMsg>,
+    /// Bytes held by `inbox`, against WS_MAX_INBOX.
+    pub(crate) inbox_bytes: usize,
+    /// Reading was stopped because the inbox budget was spent.
+    pub(crate) inbox_paused: bool,
     /// App accepted the connection (101 sent).
     pub(crate) accepted: bool,
     /// Server sent (or queued) a close frame.
@@ -159,10 +163,27 @@ pub(crate) struct WsConn {
 /// R-087: default cap on an assembled inbound message (1009 beyond it).
 const WS_MAX_MESSAGE: usize = 1 << 20;
 
+/// Aggregate cap on assembled-but-undelivered WebSocket messages
+/// (R-087). WS_MAX_MESSAGE bounds ONE message; this bounds the queue of
+/// them, which individually valid sub-limit messages could otherwise
+/// grow without end.
+const WS_MAX_INBOX: usize = 4 << 20;
+
 pub(crate) enum WsMsg {
     Text(String),
     Binary(Vec<u8>),
     Disconnect(u16),
+}
+
+impl WsMsg {
+    /// Payload bytes this message holds, for the inbox budget.
+    pub(crate) fn byte_len(&self) -> usize {
+        match self {
+            WsMsg::Text(s) => s.len(),
+            WsMsg::Binary(b) => b.len(),
+            WsMsg::Disconnect(_) => 0,
+        }
+    }
 }
 
 impl HttpConn {
@@ -621,6 +642,7 @@ impl HttpReceive {
                     ws.connect_sent = true;
                     R::WsConnect
                 } else if let Some(m) = ws.inbox.pop_front() {
+                    ws.inbox_bytes = ws.inbox_bytes.saturating_sub(m.byte_len());
                     R::Ws(m)
                 } else if disconnected {
                     R::Ws(WsMsg::Disconnect(1006))
@@ -653,7 +675,14 @@ impl HttpReceive {
                 d.set_item(intern!(py, "type"), intern!(py, "websocket.connect"))?;
                 value_awaitable(py, d.into_any().unbind())
             }
-            R::Ws(m) => value_awaitable(py, ws_message_dict(py, m)?),
+            R::Ws(m) => {
+                // A message just left the inbox, so the budget that
+                // suppressed reading may have freed up (R-087).
+                core.with_net(|net, reactor| {
+                    ws_resume_reading(py, net, reactor.backend_mut(), self.tid);
+                })?;
+                value_awaitable(py, ws_message_dict(py, m)?)
+            }
             R::Body(b) => {
                 let msg = PyDict::new(py);
                 msg.set_item(intern!(py, "type"), intern!(py, "http.request"))?;
@@ -1535,10 +1564,12 @@ pub(crate) fn ws_ingest(
         let wsc = conn.ws.as_mut().unwrap();
         match ev {
             WsEvent::Text(s) => {
+                wsc.inbox_bytes += s.len();
                 wsc.inbox.push_back(WsMsg::Text(s));
                 wake = true;
             }
             WsEvent::Binary(b) => {
+                wsc.inbox_bytes += b.len();
                 wsc.inbox.push_back(WsMsg::Binary(b));
                 wake = true;
             }
@@ -1579,6 +1610,34 @@ pub(crate) fn ws_ingest(
         if let Some(fut) = net.http_conn_mut(tid).and_then(|c| c.take_recv_waiter()) {
             net.events.push(crate::net::NetEvent::WsWake { tid, fut });
         }
+    }
+    // R-087: WS_MAX_MESSAGE bounds ONE message; nothing bounded the queue
+    // of them. An app that reads slower than the peer writes could be fed
+    // an unlimited number of individually valid messages until the worker
+    // died. Stop reading here; ws_resume_reading releases it as receive()
+    // drains the inbox.
+    if let Some(conn) = net.http_conn_mut(tid) {
+        if let Some(wsc) = conn.ws.as_mut() {
+            if !wsc.inbox_paused && wsc.inbox_bytes >= WS_MAX_INBOX {
+                wsc.inbox_paused = true;
+                net::pause_reading_for_backpressure(net, tid);
+            }
+        }
+    }
+}
+
+/// R-087: re-post the recv the inbox budget suppressed, once receive()
+/// has drained it far enough. In-cell.
+pub(crate) fn ws_resume_reading(py: Python<'_>, net: &mut NetState, backend: net::Backend<'_>, tid: u64) {
+    let resume = match net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
+        Some(wsc) if wsc.inbox_paused && wsc.inbox_bytes * 2 < WS_MAX_INBOX => {
+            wsc.inbox_paused = false;
+            true
+        }
+        _ => false,
+    };
+    if resume {
+        net::resume_reading_after_backpressure(py, net, backend, tid);
     }
 }
 
@@ -1686,6 +1745,8 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                         conn.ws = Some(Box::new(WsConn {
                             rx: cadeloop_core::ws::WsRx::new(WS_MAX_MESSAGE),
                             inbox: std::collections::VecDeque::new(),
+                            inbox_bytes: 0,
+                            inbox_paused: false,
                             accepted: false,
                             closing: false,
                             connect_sent: false,
