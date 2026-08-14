@@ -1212,6 +1212,29 @@ fn tls_pump_out(py: Python<'_>, core: &CoreLoop, tid: u64, outbio: &Py<PyAny>) -
 }
 
 /// Inbound ciphertext for a TLS connection (phase 2, R-059): feed the
+/// The negotiated ALPN protocol, when it is one this engine cannot serve.
+///
+/// `None` (no ALPN) and the HTTP/1 names are fine; anything else -- in
+/// practice `h2`, which a general-purpose `SSLContext` usually advertises
+/// -- means the peer will send a protocol the HTTP/1 parser cannot read.
+fn alpn_unsupported(py: Python<'_>, sslobj: &Py<PyAny>) -> PyResult<Option<String>> {
+    let selected = match sslobj.call_method0(py, intern!(py, "selected_alpn_protocol")) {
+        Ok(v) => v,
+        // Older/alternative SSL backends may not expose it at all; no
+        // ALPN opinion is the same as no ALPN.
+        Err(_) => return Ok(None),
+    };
+    if selected.is_none(py) {
+        return Ok(None);
+    }
+    let name: String = selected.extract(py)?;
+    if name == "http/1.1" || name == "http/1.0" {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
+}
+
 /// incoming BIO, drive the handshake, decrypt, and hand plaintext to the
 /// HTTP/WS engine exactly as the plain recv path would.
 pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, data: &[u8]) -> PyResult<()> {
@@ -1231,6 +1254,28 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
     if handshaking {
         match sslobj.call_method0(py, intern!(py, "do_handshake")) {
             Ok(_) => {
+                if let Some(proto) = alpn_unsupported(py, &sslobj)? {
+                    // The engine is HTTP/1-only. Feeding it what an `h2`
+                    // client sends -- a connection preface and binary
+                    // frames -- fails every request on an otherwise
+                    // perfectly good TLS connection, which reads as "the
+                    // server is broken" rather than "we do not speak
+                    // this". Close instead, and say why.
+                    core.report_net_error(
+                        py,
+                        &format!(
+                            "TLS client negotiated ALPN {proto:?}, which cadeloop does not \
+                             serve (HTTP/1.1 only) -- closing. Restrict the SSLContext with \
+                             set_alpn_protocols([\"http/1.1\"])."
+                        ),
+                        py.None(),
+                    );
+                    core.with_net(|net, reactor| {
+                        net::teardown_with(py, net, reactor.backend_mut(), tid, None);
+                    })?;
+                    core.drain_graveyards(py)?;
+                    return Ok(());
+                }
                 handshaking = false;
                 let flush = core.with_net(|net, _| {
                     if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {

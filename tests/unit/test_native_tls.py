@@ -200,3 +200,66 @@ def test_large_https_response_is_not_truncated(loop, certs):
     assert len(body) == len(payload), f"truncated: {len(body)} of {len(payload)}"
     assert body == payload, "corrupted"
     loop._core.listener_close(lid)
+
+
+def test_h2_alpn_selection_is_refused(loop, certs):
+    """A context that advertises h2 can negotiate it with a client that
+    prefers it -- and the decrypted bytes are then HTTP/2 frames handed to
+    an HTTP/1 parser, so every request on a perfectly good TLS connection
+    comes back malformed. The handshake must be refused instead."""
+    import trustme as _trustme
+
+    ca = _trustme.CA()
+    cert = ca.issue_cert("localhost", "127.0.0.1")
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cert.configure_cert(server_ctx)
+    server_ctx.set_alpn_protocols(["h2", "http/1.1"])
+    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ca.configure_trust(client_ctx)
+    client_ctx.set_alpn_protocols(["h2"])
+
+    reported = []
+    loop.set_exception_handler(lambda lp, ctx: reported.append(ctx.get("message", "")))
+    lid, port = listen_tls(loop, scope_echo_app, server_ctx)
+
+    async def client():
+        r, w = await asyncio.open_connection(
+            "127.0.0.1", port, ssl=client_ctx, server_hostname="localhost"
+        )
+        w.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        try:
+            await w.drain()
+        except (ConnectionResetError, BrokenPipeError, ssl.SSLError):
+            return b""
+        try:
+            return await r.read()
+        except (ConnectionResetError, ssl.SSLError):
+            return b""
+
+    got = loop.run_until_complete(client())
+    assert got == b"", f"h2 connection was served anyway: {got[:60]!r}"
+    assert any("ALPN" in m for m in reported), reported
+    loop._core.listener_close(lid)
+
+
+def test_serve_pins_alpn_to_http11():
+    """serve() pins the caller's context to http/1.1 so the negotiation
+    never selects something the engine cannot read. SSLContext exposes no
+    way to read the list back, so a recording subclass is the only way to
+    observe it."""
+    recorded = []
+
+    class _Recording(ssl.SSLContext):
+        def set_alpn_protocols(self, protocols):
+            recorded.append(list(protocols))
+            return super().set_alpn_protocols(protocols)
+
+    ctx = _Recording(ssl.PROTOCOL_TLS_SERVER)
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    recorded.clear()
+
+    # serve() pins the context during validation, then rejects the app --
+    # which is far enough to observe the pin without binding a port.
+    with pytest.raises(TypeError, match="callable"):
+        cadeloop.serve(object(), ssl=ctx)
+    assert recorded == [["http/1.1"]], recorded

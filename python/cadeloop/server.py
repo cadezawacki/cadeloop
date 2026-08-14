@@ -163,6 +163,16 @@ def serve(
 
         if not isinstance(ssl, _ssl_mod.SSLContext):
             raise TypeError(f"ssl must be an ssl.SSLContext, got {type(ssl).__name__}")
+        # The engine speaks HTTP/1.1 only. A context built for a
+        # general-purpose server usually advertises h2 as well, and a
+        # client that prefers it would negotiate h2 successfully and then
+        # have every request rejected as malformed -- a working TLS
+        # handshake followed by a server that looks broken. SSLContext
+        # exposes no way to read the list back, so the only way to know
+        # what it advertises is to set it. (The engine also refuses an
+        # unsupported ALPN selection at handshake time, which covers the
+        # contexts that reach it without passing through here.)
+        ssl.set_alpn_protocols(["http/1.1"])
     app_spec = app if isinstance(app, str) else None
     if isinstance(app, str):
         app = load_app(app)
