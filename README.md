@@ -11,7 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | CI | Python was never linted: `[tool.ruff]` existed, no workflow ran it | `` |
+> | CI | Python was never linted: `[tool.ruff]` existed, no workflow ran it | `d096b8b` |
 > | Loop | A Context that could not be entered stopped the loop instead of one callback | `1269e7c` |
 > | Server | A stalled worker took unbounded connection handoffs until it ran out of handles | `14e50ec` |
 > | HTTP | A non-eager spawn failure killed the worker's loop instead of failing one request | `14e50ec` |
