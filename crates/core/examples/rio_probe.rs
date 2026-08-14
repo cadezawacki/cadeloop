@@ -37,17 +37,14 @@ mod win {
     use std::mem::{size_of, zeroed};
 
     use windows_sys::core::GUID;
-    use windows_sys::Win32::Foundation::{
-        GetLastError, SetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
-    };
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Networking::WinSock::{
-        bind, closesocket, listen, WSAEnumProtocolsW, WSAGetLastError, WSAIoctl, WSASocketW,
-        WSAStartup, AF_INET, IPPROTO_TCP, RIO_BUFFERID, RIO_CQ, RIO_EVENT_COMPLETION,
-        RIO_EXTENSION_FUNCTION_TABLE, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
-        RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_0,
-        RIO_NOTIFICATION_COMPLETION_0_1, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKADDR,
-        SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSADATA, WSAID_MULTIPLE_RIO, WSAPROTOCOL_INFOW,
-        WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
+        bind, closesocket, listen, WSAEnumProtocolsW, WSAGetLastError, WSAIoctl, WSASocketW, WSAStartup,
+        AF_INET, IPPROTO_TCP, RIO_BUFFERID, RIO_CQ, RIO_EVENT_COMPLETION, RIO_EXTENSION_FUNCTION_TABLE,
+        RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_NOTIFICATION_COMPLETION_0,
+        RIO_NOTIFICATION_COMPLETION_0_0, RIO_NOTIFICATION_COMPLETION_0_1,
+        SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSADATA,
+        WSAID_MULTIPLE_RIO, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
     };
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -71,8 +68,7 @@ mod win {
         unsafe {
             let mut hmod: HMODULE = std::ptr::null_mut();
             let ok = GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 addr as *const u16,
                 &mut hmod,
             );
@@ -259,7 +255,8 @@ mod win {
             let mut sa: SOCKADDR_IN = zeroed();
             sa.sin_family = AF_INET;
             // port 0, INADDR_ANY
-            let rc = bind(anchor, (&sa as *const SOCKADDR_IN).cast::<SOCKADDR>(), size_of::<SOCKADDR_IN>() as i32);
+            let rc =
+                bind(anchor, (&sa as *const SOCKADDR_IN).cast::<SOCKADDR>(), size_of::<SOCKADDR_IN>() as i32);
             println!("  bind: rc={rc} (err {})", if rc != 0 { last() } else { 0 });
             let rc = listen(anchor, 16);
             println!("  listen: rc={rc} (err {})", if rc != 0 { last() } else { 0 });
@@ -276,8 +273,7 @@ mod win {
         };
         let cq_event = try_cq(&t, "event-notify", 1024, &ev_notify);
 
-        let port =
-            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
         let mut ov: Box<OVERLAPPED> = Box::new(unsafe { zeroed() });
         let iocp_notify = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_IOCP_COMPLETION,

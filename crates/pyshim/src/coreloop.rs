@@ -234,7 +234,12 @@ impl CoreLoop {
                     (py.allow_threads(move || reactor.poll(timeout)), true)
                 };
                 if poll_result.is_err() {
-                    return (poll_result, parked, Vec::new(), (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                    return (
+                        poll_result,
+                        parked,
+                        Vec::new(),
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                    );
                 }
                 // Phase 2: translate completions (no Python execution).
                 st.reactor.finish_poll_after(parked);
@@ -428,11 +433,7 @@ impl CoreLoop {
         let cfg = ReactorConfig {
             backend: kind,
             spin_us,
-            backend_opts: cadeloop_core::backend::BackendOptions {
-                rio_cq_size,
-                rio_rq_recv,
-                rio_rq_send,
-            },
+            backend_opts: cadeloop_core::backend::BackendOptions { rio_cq_size, rio_rq_recv, rio_rq_send },
             ..Default::default()
         };
         let reactor: Reactor<Py<PyAny>> = Reactor::new(cfg)?;
@@ -755,26 +756,17 @@ impl CoreLoop {
 
     /// R-058 sendto. `addr` None = connected-mode send().
     #[pyo3(signature = (did, data, addr=None))]
-    fn udp_sendto(
-        &self,
-        py: Python<'_>,
-        did: u64,
-        data: &[u8],
-        addr: Option<(String, u16)>,
-    ) -> PyResult<()> {
+    fn udp_sendto(&self, py: Python<'_>, did: u64, data: &[u8], addr: Option<(String, u16)>) -> PyResult<()> {
         self.check_closed()?;
         let addr = match addr {
             Some((ip, port)) => {
-                let ip: std::net::IpAddr = ip
-                    .parse()
-                    .map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
+                let ip: std::net::IpAddr =
+                    ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
                 Some(std::net::SocketAddr::new(ip, port))
             }
             None => None,
         };
-        self.with_net(|net, reactor| {
-            net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr)
-        })??;
+        self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))??;
         self.drain_graveyards(py)
     }
 

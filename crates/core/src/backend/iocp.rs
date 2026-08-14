@@ -39,10 +39,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockopt, setsockopt, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv,
-    WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup, AF_INET, AF_INET6, IPPROTO_TCP,
-    LPFN_ACCEPTEX, LPFN_CONNECTEX,
-    LPFN_DISCONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_LOOPBACK_FAST_PATH, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_PROTOCOL_INFOW,
+    WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup, AF_INET, AF_INET6, IPPROTO_TCP, LPFN_ACCEPTEX,
+    LPFN_CONNECTEX, LPFN_DISCONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_LOOPBACK_FAST_PATH, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_PROTOCOL_INFOW,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TCP_FASTOPEN, TCP_NODELAY, TF_REUSE_SOCKET, WSABUF,
     WSADATA, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
     WSA_IO_PENDING, XP1_IFS_HANDLES,
@@ -629,7 +628,13 @@ impl IoBackend for IocpBackend {
                 let mut t: i32 = 0;
                 let mut len = size_of::<i32>() as i32;
                 let ok = unsafe {
-                    getsockopt(socket, SOL_SOCKET, 0x1008 /* SO_TYPE */, (&mut t as *mut i32).cast(), &mut len)
+                    getsockopt(
+                        socket,
+                        SOL_SOCKET,
+                        0x1008, /* SO_TYPE */
+                        (&mut t as *mut i32).cast(),
+                        &mut len,
+                    )
                 };
                 if ok == 0 {
                     self.associated.insert(socket);

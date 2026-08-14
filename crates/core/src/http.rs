@@ -430,9 +430,7 @@ mod tests {
     #[test]
     fn header_count_limit_is_431() {
         let mut p = HttpParser::new(Limits { max_headers: 2, ..Default::default() });
-        let err = p
-            .feed(b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n")
-            .unwrap_err();
+        let err = p.feed(b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n").unwrap_err();
         assert_eq!(err.status, 431);
     }
 

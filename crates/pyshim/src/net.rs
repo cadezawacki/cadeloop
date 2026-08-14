@@ -54,9 +54,15 @@ pub(crate) fn os_err(py: Python<'_>, code: u32) -> Py<PyAny> {
 // --------------------------------------------------------------------- //
 
 pub(crate) enum OpTarget {
-    Recv { tid: u64, slot: SlotId },
+    Recv {
+        tid: u64,
+        slot: SlotId,
+    },
     Send(u64),
-    Connect { fut: Py<PyAny>, sock: RawSocket },
+    Connect {
+        fut: Py<PyAny>,
+        sock: RawSocket,
+    },
     Accept(u64),
     /// R-058 datagram endpoint ops (did keys `NetState.datagrams`).
     DgramRecv(u64),
@@ -64,11 +70,17 @@ pub(crate) enum OpTarget {
     /// R-051 Windows named-pipe ops: `fut` resolves with the bytes read
     /// (sliced from `buf`, which the backend wrote into via a raw
     /// pointer — kept alive here until the completion is reaped).
-    PipeRead { fut: Py<PyAny>, buf: Vec<u8> },
+    PipeRead {
+        fut: Py<PyAny>,
+        buf: Vec<u8>,
+    },
     /// `buf` is never read back — its only job is keeping the write data
     /// alive (pinned) until WriteFile's completion (same discipline as
     /// `WriteBuf::Bytes`'s `_keep`).
-    PipeWrite { fut: Py<PyAny>, _buf: Vec<u8> },
+    PipeWrite {
+        fut: Py<PyAny>,
+        _buf: Vec<u8>,
+    },
 }
 
 pub(crate) enum WriteBuf {
@@ -272,16 +284,11 @@ impl NetState {
     }
 
     /// (peername, sockname) for ASGI scope construction.
-    pub(crate) fn peer_local(
-        &self,
-        py: Python<'_>,
-        tid: u64,
-    ) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
+    pub(crate) fn peer_local(&self, py: Python<'_>, tid: u64) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
         match self.transports.get(&tid) {
-            Some(e) => (
-                e.peername.as_ref().map(|p| p.clone_ref(py)),
-                e.sockname.as_ref().map(|p| p.clone_ref(py)),
-            ),
+            Some(e) => {
+                (e.peername.as_ref().map(|p| p.clone_ref(py)), e.sockname.as_ref().map(|p| p.clone_ref(py)))
+            }
             None => (None, None),
         }
     }
@@ -462,8 +469,7 @@ pub(crate) fn teardown_with(
     }
     match &mut entry.proto {
         ProtoKind::Py(p) => {
-            net.events
-                .push(NetEvent::ConnLost { connection_lost: p.connection_lost.clone_ref(py), err });
+            net.events.push(NetEvent::ConnLost { connection_lost: p.connection_lost.clone_ref(py), err });
         }
         ProtoKind::Http(conn) => {
             conn.disconnected = true;
@@ -697,10 +703,8 @@ fn dgram_send_now(
             // Synchronous refusal: per-packet error, endpoint stays up.
             if let Some(entry) = net.datagrams.get_mut(&did) {
                 let error_received = entry.error_received.clone_ref(py);
-                net.events.push(NetEvent::DgramError {
-                    error_received,
-                    err: e.raw_os_error().unwrap_or(0) as u32,
-                });
+                net.events
+                    .push(NetEvent::DgramError { error_received, err: e.raw_os_error().unwrap_or(0) as u32 });
             }
             Ok(())
         }
@@ -732,13 +736,7 @@ pub(crate) fn udp_sendto(
 
 /// close() flushes queued sends first; abort() drops them (asyncio
 /// semantics). connection_lost fires exactly once via the event queue.
-pub(crate) fn udp_close(
-    py: Python<'_>,
-    net: &mut NetState,
-    backend: Backend<'_>,
-    did: u64,
-    abort: bool,
-) {
+pub(crate) fn udp_close(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u64, abort: bool) {
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
     if entry.conn_lost {
         return;
@@ -786,10 +784,7 @@ fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
-    net.events.push(NetEvent::DgramLost {
-        connection_lost: entry.connection_lost.clone_ref(py),
-        err,
-    });
+    net.events.push(NetEvent::DgramLost { connection_lost: entry.connection_lost.clone_ref(py), err });
     net.graveyard_py.push(entry.datagram_received);
     net.graveyard_py.push(entry.error_received);
     net.graveyard_py.push(entry.connection_lost);
@@ -817,10 +812,8 @@ pub(crate) fn http_sweep(
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
         // Done/Idle are between-requests states; only a live app, queued
         // pipeline, or a mid-flight response counts as busy.
-        let mid_response = matches!(
-            conn.resp,
-            crate::http::RespPhase::Started | crate::http::RespPhase::Streaming
-        );
+        let mid_response =
+            matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming);
         let busy = conn.active || !conn.pending.is_empty() || mid_response;
         let phase: u8 = if busy {
             2
@@ -831,8 +824,7 @@ pub(crate) fn http_sweep(
         };
         let moved = conn.activity != conn.sweep_seen;
         conn.sweep_seen = conn.activity;
-        if phase != conn.sweep_phase || conn.sweep_anchor_ns == 0 || phase == 2 || (phase == 0 && moved)
-        {
+        if phase != conn.sweep_phase || conn.sweep_anchor_ns == 0 || phase == 2 || (phase == 0 && moved) {
             // New phase, first sighting, busy, or fresh idle activity:
             // (re)anchor. A head in progress deliberately does NOT
             // re-anchor on activity — that is the slowloris rule.
@@ -842,12 +834,8 @@ pub(crate) fn http_sweep(
         }
         let elapsed = now_ns.saturating_sub(conn.sweep_anchor_ns);
         match phase {
-            1 if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => {
-                expire_head.push(tid)
-            }
-            0 if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => {
-                expire_idle.push(tid)
-            }
+            1 if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => expire_head.push(tid),
+            0 if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => expire_idle.push(tid),
             _ => {}
         }
     }
@@ -940,13 +928,7 @@ pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: Listene
     let lid = net.next_id();
     net.listeners.insert(
         lid,
-        ListenerEntry {
-            socket: sock,
-            kind,
-            accept_ops: Vec::new(),
-            target: target.max(1),
-            closing: false,
-        },
+        ListenerEntry { socket: sock, kind, accept_ops: Vec::new(), target: target.max(1), closing: false },
     );
     lid
 }
@@ -1351,8 +1333,7 @@ pub(crate) fn dispatch_events(
             }
             NetEvent::HttpDisconnect { fut, ws } => {
                 let fut = fut.bind(py);
-                let done: bool =
-                    fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
                 if !done {
                     let msg = if ws {
                         crate::http::ws_message_dict(py, crate::http::WsMsg::Disconnect(1006))?
@@ -1365,13 +1346,10 @@ pub(crate) fn dispatch_events(
             NetEvent::WsWake { tid, fut } => {
                 // Deliver ONE queued WS event to the waiter (R-087).
                 let msg = core.with_net(|net, _| {
-                    net.http_conn_mut(tid)
-                        .and_then(|c| c.ws.as_mut())
-                        .and_then(|w| w.inbox.pop_front())
+                    net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()).and_then(|w| w.inbox.pop_front())
                 })?;
                 let fut = fut.bind(py);
-                let done: bool =
-                    fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
                 match (done, msg) {
                     (false, Some(m)) => {
                         let d = crate::http::ws_message_dict(py, m)?;
@@ -1608,15 +1586,8 @@ pub(crate) fn wire_http(
     };
     core.with_net(|net, reactor| {
         let tid = net.next_id();
-        let mut conn = HttpConn::new(
-            app,
-            pyloop,
-            state,
-            limits,
-            eager,
-            tuning.head_timeout_ns,
-            tuning.idle_timeout_ns,
-        );
+        let mut conn =
+            HttpConn::new(app, pyloop, state, limits, eager, tuning.head_timeout_ns, tuning.idle_timeout_ns);
         conn.tls = tls_state;
         net.transports.insert(
             tid,
@@ -1915,11 +1886,9 @@ impl Transport {
 
     fn get_protocol(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| {
-            match net.transports.get(&self.tid) {
-                Some(TransportEntry { proto: ProtoKind::Py(p), .. }) => p.protocol.clone_ref(py),
-                _ => py.None(),
-            }
+        core.with_net(|net, _| match net.transports.get(&self.tid) {
+            Some(TransportEntry { proto: ProtoKind::Py(p), .. }) => p.protocol.clone_ref(py),
+            _ => py.None(),
         })
     }
 

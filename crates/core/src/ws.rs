@@ -40,12 +40,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
                 _ => (b ^ c ^ d, 0xCA62C1D6),
             };
-            let tmp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
+            let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
             e = d;
             d = c;
             c = b.rotate_left(30);

@@ -15,7 +15,7 @@ pub mod opslab;
 pub mod reactor;
 pub mod ready;
 pub mod time;
-pub mod ws;
 pub mod timer;
+pub mod ws;
 
 pub use reactor::{Reactor, ReactorConfig};

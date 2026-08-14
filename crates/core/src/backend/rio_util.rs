@@ -34,8 +34,7 @@ impl RegionMap {
     /// slab allocations); overlapping inserts are rejected.
     pub fn insert(&mut self, base: usize, len: usize, cookie: u64) -> bool {
         let at = self.regions.partition_point(|r| r.base < base);
-        let overlaps_prev =
-            at > 0 && self.regions[at - 1].base + self.regions[at - 1].len > base;
+        let overlaps_prev = at > 0 && self.regions[at - 1].base + self.regions[at - 1].len > base;
         let overlaps_next = self.regions.get(at).is_some_and(|r| base + len > r.base);
         if overlaps_prev || overlaps_next {
             return false;

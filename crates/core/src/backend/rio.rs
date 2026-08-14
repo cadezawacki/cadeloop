@@ -64,13 +64,11 @@ use std::time::Duration;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_TIMEOUT};
 use windows_sys::Win32::Networking::WinSock::{
-    closesocket, WSAGetLastError, WSAIoctl, WSASocketW, AF_INET, IPPROTO_TCP,
-    RIORESULT, RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ,
-    RIO_EXTENSION_FUNCTION_TABLE, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
-    RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_1, RIO_RQ,
-    SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKET, SOCKET_ERROR,
-    WSAID_MULTIPLE_RIO, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
-    WSA_OPERATION_ABORTED,
+    closesocket, WSAGetLastError, WSAIoctl, WSASocketW, AF_INET, IPPROTO_TCP, RIORESULT, RIO_BUF,
+    RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_EXTENSION_FUNCTION_TABLE, RIO_IOCP_COMPLETION,
+    RIO_NOTIFICATION_COMPLETION, RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_1, RIO_RQ,
+    SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKET, SOCKET_ERROR, WSAID_MULTIPLE_RIO,
+    WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSA_OPERATION_ABORTED,
 };
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -304,10 +302,7 @@ impl RioBackend {
                 // Name BOTH failures: a null-notify CQ rejecting too means
                 // the problem is not the notification struct at all.
                 let poll_err = wsa_named("RIOCreateCompletionQueue(null-notify)");
-                return Err(io::Error::new(
-                    notify_err.kind(),
-                    format!("{notify_err}; fallback {poll_err}"),
-                ));
+                return Err(io::Error::new(notify_err.kind(), format!("{notify_err}; fallback {poll_err}")));
             }
             polling_only = true;
         }
@@ -391,11 +386,7 @@ impl RioBackend {
                     self.staging.free(slot);
                 }
                 self.slab.release(id);
-                let os_error = if was_cancelled {
-                    WSA_OPERATION_ABORTED as u32
-                } else {
-                    r.Status as u32
-                };
+                let os_error = if was_cancelled { WSA_OPERATION_ABORTED as u32 } else { r.Status as u32 };
                 out.push(Completion::Io { op: tag(id), bytes: r.BytesTransferred, os_error });
             }
             if (n as usize) < DEQUEUE_BATCH {
@@ -508,11 +499,9 @@ impl IoBackend for RioBackend {
         };
         let id = self.slab.post(OpKind::Recv);
         self.slab.get_mut(id).unwrap().data = RioOp { staging: None };
-        let rbuf =
-            RIO_BUF { BufferId: cookie as RIO_BUFFERID, Offset: offset, Length: len };
-        let ok = unsafe {
-            (self.t.RIOReceive.unwrap())(rq, &rbuf, 1, 0, ctx_of(id) as *const core::ffi::c_void)
-        };
+        let rbuf = RIO_BUF { BufferId: cookie as RIO_BUFFERID, Offset: offset, Length: len };
+        let ok =
+            unsafe { (self.t.RIOReceive.unwrap())(rq, &rbuf, 1, 0, ctx_of(id) as *const core::ffi::c_void) };
         if ok == 0 {
             let err = wsa_named("RIOReceive");
             self.slab.complete(id);
@@ -551,9 +540,8 @@ impl IoBackend for RioBackend {
         let id = self.slab.post(OpKind::Send);
         self.slab.get_mut(id).unwrap().data = RioOp { staging: Some(slot) };
         let rbuf = RIO_BUF { BufferId: buf_id, Offset: base_off, Length: copied as u32 };
-        let ok = unsafe {
-            (self.t.RIOSend.unwrap())(rq, &rbuf, 1, 0, ctx_of(id) as *const core::ffi::c_void)
-        };
+        let ok =
+            unsafe { (self.t.RIOSend.unwrap())(rq, &rbuf, 1, 0, ctx_of(id) as *const core::ffi::c_void) };
         if ok == 0 {
             let err = wsa_named("RIOSend");
             self.staging.free(slot);
@@ -622,10 +610,7 @@ impl IoBackend for RioBackend {
         self.inner.detach_socket(socket);
     }
 
-    fn register_buffers(
-        &mut self,
-        regions: &mut [(*mut u8, usize, &mut Option<u64>)],
-    ) -> io::Result<()> {
+    fn register_buffers(&mut self, regions: &mut [(*mut u8, usize, &mut Option<u64>)]) -> io::Result<()> {
         for (ptr, len, cookie) in regions.iter_mut() {
             if cookie.is_some() {
                 continue;

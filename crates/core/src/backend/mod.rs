@@ -251,11 +251,9 @@ pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn Io
     {
         match kind {
             BackendKind::Iocp | BackendKind::Auto => Ok(Box::new(iocp::IocpBackend::new()?)),
-            BackendKind::Rio => Ok(Box::new(rio::RioBackend::new(
-                opts.rio_cq_size,
-                opts.rio_rq_recv,
-                opts.rio_rq_send,
-            )?)),
+            BackendKind::Rio => {
+                Ok(Box::new(rio::RioBackend::new(opts.rio_cq_size, opts.rio_rq_recv, opts.rio_rq_send)?))
+            }
             BackendKind::Epoll => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "epoll backend is Linux-only (use 'auto', 'iocp' or 'rio')",

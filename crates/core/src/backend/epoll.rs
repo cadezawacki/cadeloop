@@ -58,15 +58,31 @@ fn cvt(rc: i32) -> io::Result<i32> {
 #[allow(clippy::large_enum_variant)]
 enum Pending {
     Accept,
-    Recv { buf: *mut u8, len: u32 },
-    Send { bufs: [IoSlice; MAX_GATHER], n: u8, done: u32 },
+    Recv {
+        buf: *mut u8,
+        len: u32,
+    },
+    Send {
+        bufs: [IoSlice; MAX_GATHER],
+        n: u8,
+        done: u32,
+    },
     Connect,
     /// R-058: peer address captured into the op; the slot lives until
     /// `take_recv_from_addr` (accept-socket lifecycle).
-    RecvFrom { buf: *mut u8, len: u32, from: [u8; 128], from_len: u32 },
+    RecvFrom {
+        buf: *mut u8,
+        len: u32,
+        from: [u8; 128],
+        from_len: u32,
+    },
     /// R-058: the datagram is copied in (no caller pinning); UDP sendto
     /// either sends whole or fails — no partial resumption.
-    SendTo { data: Box<[u8]>, to: [u8; 128], to_len: u32 },
+    SendTo {
+        data: Box<[u8]>,
+        to: [u8; 128],
+        to_len: u32,
+    },
 }
 
 struct EpollOp {
@@ -112,7 +128,6 @@ impl FdEntry {
         }
         ev
     }
-
 }
 
 struct WakeShared {
@@ -310,14 +325,7 @@ impl EpollBackend {
             Pending::RecvFrom { buf, len, from, from_len } => {
                 let mut sl: libc::socklen_t = from.len() as libc::socklen_t;
                 let rc = unsafe {
-                    libc::recvfrom(
-                        fd,
-                        (*buf).cast(),
-                        *len as usize,
-                        0,
-                        from.as_mut_ptr().cast(),
-                        &mut sl,
-                    )
+                    libc::recvfrom(fd, (*buf).cast(), *len as usize, 0, from.as_mut_ptr().cast(), &mut sl)
                 };
                 if rc >= 0 {
                     *from_len = sl as u32;
@@ -529,9 +537,7 @@ impl IoBackend for EpollBackend {
 
     fn take_recv_from_addr(&mut self, op: OpId) -> Option<std::net::SocketAddr> {
         let addr = self.slab.get(op).and_then(|s| match &s.data.pending {
-            Pending::RecvFrom { from, from_len, .. } => {
-                netsys::parse_sockaddr(&from[..*from_len as usize])
-            }
+            Pending::RecvFrom { from, from_len, .. } => netsys::parse_sockaddr(&from[..*from_len as usize]),
             _ => None,
         });
         if self.slab.get(op).is_some() {
@@ -616,10 +622,7 @@ impl IoBackend for EpollBackend {
             let slot = self.slab.get(op).expect("cancelled op is live");
             (
                 slot.data.fd,
-                matches!(
-                    slot.data.pending,
-                    Pending::Send { .. } | Pending::Connect | Pending::SendTo { .. }
-                ),
+                matches!(slot.data.pending, Pending::Send { .. } | Pending::Connect | Pending::SendTo { .. }),
                 matches!(slot.data.pending, Pending::Accept),
                 slot.data.accepted,
             )

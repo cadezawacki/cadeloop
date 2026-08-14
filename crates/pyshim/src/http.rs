@@ -599,11 +599,7 @@ impl HttpReceive {
                 let msg = PyDict::new(py);
                 msg.set_item(intern!(py, "type"), intern!(py, "http.request"))?;
                 let body_obj = if b.is_empty() {
-                    EMPTY_BYTES
-                        .get_or_init(py, || PyBytes::new(py, b"").unbind())
-                        .bind(py)
-                        .clone()
-                        .into_any()
+                    EMPTY_BYTES.get_or_init(py, || PyBytes::new(py, b"").unbind()).bind(py).clone().into_any()
                 } else {
                     PyBytes::new(py, &b).into_any()
                 };
@@ -614,11 +610,9 @@ impl HttpReceive {
             R::Wait(pyloop) => {
                 let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
                 let store = fut.clone().unbind();
-                let (stored, old) = core.with_net(move |net, _| {
-                    match net.http_conn_mut(self.tid) {
-                        Some(conn) => (true, conn.recv_waiter.replace(store)),
-                        None => (false, Some(store)),
-                    }
+                let (stored, old) = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
+                    Some(conn) => (true, conn.recv_waiter.replace(store)),
+                    None => (false, Some(store)),
                 })?;
                 if let Some(old) = old {
                     core.with_net(|net, _| net.graveyard_py.push(old))?;
@@ -641,11 +635,7 @@ pub struct HttpSend {
 
 #[pymethods]
 impl HttpSend {
-    fn __call__(
-        &self,
-        py: Python<'_>,
-        message: Bound<'_, PyDict>,
-    ) -> PyResult<Py<CompletedAwaitable>> {
+    fn __call__(&self, py: Python<'_>, message: Bound<'_, PyDict>) -> PyResult<Py<CompletedAwaitable>> {
         let core = self.core.bind(py).get();
         process_send(py, core, self.tid, &message)?;
         Ok(completed(py).clone_ref(py))
@@ -675,8 +665,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
     let mtype = mtype.downcast::<PyString>().map_err(PyErr::from)?;
     let kind = mtype.to_str()?;
 
-    let is_ws =
-        core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
+    let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
     if is_ws {
         return ws_send(py, core, tid, kind, message);
     }
@@ -859,8 +848,7 @@ pub(crate) fn tls_wrap(py: Python<'_>, ctx: &Py<PyAny>) -> PyResult<TlsState> {
     let outbio = ssl_mod.call_method0(intern!(py, "MemoryBIO"))?;
     let kwargs = PyDict::new(py);
     kwargs.set_item(intern!(py, "server_side"), true)?;
-    let sslobj =
-        ctx.bind(py).call_method(intern!(py, "wrap_bio"), (&inbio, &outbio), Some(&kwargs))?;
+    let sslobj = ctx.bind(py).call_method(intern!(py, "wrap_bio"), (&inbio, &outbio), Some(&kwargs))?;
     Ok(TlsState {
         sslobj: sslobj.unbind(),
         inbio: inbio.unbind(),
@@ -885,22 +873,12 @@ fn tls_pump_out(py: Python<'_>, core: &CoreLoop, tid: u64, outbio: &Py<PyAny>) -
 /// Inbound ciphertext for a TLS connection (phase 2, R-059): feed the
 /// incoming BIO, drive the handshake, decrypt, and hand plaintext to the
 /// HTTP/WS engine exactly as the plain recv path would.
-pub(crate) fn tls_ingest(
-    py: Python<'_>,
-    slf: &Bound<'_, CoreLoop>,
-    tid: u64,
-    data: &[u8],
-) -> PyResult<()> {
+pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, data: &[u8]) -> PyResult<()> {
     let core = slf.get();
     let Some((sslobj, inbio, outbio, mut handshaking)) = core.with_net(|net, _| {
-        net.http_conn_mut(tid).and_then(|c| c.tls.as_ref()).map(|t| {
-            (
-                t.sslobj.clone_ref(py),
-                t.inbio.clone_ref(py),
-                t.outbio.clone_ref(py),
-                t.handshaking,
-            )
-        })
+        net.http_conn_mut(tid)
+            .and_then(|c| c.tls.as_ref())
+            .map(|t| (t.sslobj.clone_ref(py), t.inbio.clone_ref(py), t.outbio.clone_ref(py), t.handshaking))
     })?
     else {
         return Ok(());
@@ -1074,43 +1052,42 @@ fn ws_send(
                     extra.push((pair.get_item(0)?.extract()?, pair.get_item(1)?.extract()?));
                 }
             }
-            let trailing = core.with_net(|net, reactor| {
-                let backend = reactor.backend_mut();
-                let Some(conn) = net.http_conn_mut(tid) else { return Err(SendErr::Gone) };
-                let Some(wsc) = conn.ws.as_mut() else { return Err(SendErr::Gone) };
-                if wsc.accepted {
-                    return Err(SendErr::Proto("websocket.accept sent twice"));
-                }
-                wsc.accepted = true;
-                let mut head = Vec::with_capacity(192);
-                head.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
-                head.extend_from_slice(b"upgrade: websocket\r\nconnection: Upgrade\r\n");
-                head.extend_from_slice(b"sec-websocket-accept: ");
-                head.extend_from_slice(ws::accept_key(&wsc.key).as_bytes());
-                head.extend_from_slice(b"\r\n");
-                if let Some(sp) = &subprotocol {
-                    head.extend_from_slice(b"sec-websocket-protocol: ");
-                    head.extend_from_slice(sp.as_bytes());
+            let trailing = core
+                .with_net(|net, reactor| {
+                    let backend = reactor.backend_mut();
+                    let Some(conn) = net.http_conn_mut(tid) else { return Err(SendErr::Gone) };
+                    let Some(wsc) = conn.ws.as_mut() else { return Err(SendErr::Gone) };
+                    if wsc.accepted {
+                        return Err(SendErr::Proto("websocket.accept sent twice"));
+                    }
+                    wsc.accepted = true;
+                    let mut head = Vec::with_capacity(192);
+                    head.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
+                    head.extend_from_slice(b"upgrade: websocket\r\nconnection: Upgrade\r\n");
+                    head.extend_from_slice(b"sec-websocket-accept: ");
+                    head.extend_from_slice(ws::accept_key(&wsc.key).as_bytes());
                     head.extend_from_slice(b"\r\n");
-                }
-                for (n, v) in &extra {
-                    head.extend_from_slice(n);
-                    head.extend_from_slice(b": ");
-                    head.extend_from_slice(v);
+                    if let Some(sp) = &subprotocol {
+                        head.extend_from_slice(b"sec-websocket-protocol: ");
+                        head.extend_from_slice(sp.as_bytes());
+                        head.extend_from_slice(b"\r\n");
+                    }
+                    for (n, v) in &extra {
+                        head.extend_from_slice(n);
+                        head.extend_from_slice(b": ");
+                        head.extend_from_slice(v);
+                        head.extend_from_slice(b"\r\n");
+                    }
                     head.extend_from_slice(b"\r\n");
-                }
-                head.extend_from_slice(b"\r\n");
-                conn.log_status = 101;
-                let trailing = std::mem::take(&mut conn.ws_trailing);
-                net::http_enqueue(py, net, backend, tid, head);
-                Ok(trailing)
-            })?
-            .map_err(send_err)?;
+                    conn.log_status = 101;
+                    let trailing = std::mem::take(&mut conn.ws_trailing);
+                    net::http_enqueue(py, net, backend, tid, head);
+                    Ok(trailing)
+                })?
+                .map_err(send_err)?;
             if !trailing.is_empty() {
                 // Client frames that raced ahead of the accept.
-                core.with_net(|net, reactor| {
-                    ws_ingest(py, net, reactor.backend_mut(), tid, &trailing)
-                })?;
+                core.with_net(|net, reactor| ws_ingest(py, net, reactor.backend_mut(), tid, &trailing))?;
             }
             core.drain_graveyards(py)?;
             Ok(())
@@ -1126,11 +1103,7 @@ fn ws_send(
                         let v: Vec<u8> = b.extract()?;
                         ws::frame(ws::OP_BINARY, &v)
                     }
-                    _ => {
-                        return Err(PyRuntimeError::new_err(
-                            "websocket.send needs 'text' or 'bytes'",
-                        ))
-                    }
+                    _ => return Err(PyRuntimeError::new_err("websocket.send needs 'text' or 'bytes'")),
                 },
             };
             core.with_net(|net, reactor| {
@@ -1501,13 +1474,12 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
     if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
         return Err(err);
     }
-    let disconnect = err.is_instance_of::<PyConnectionResetError>(py)
-        || err.is_instance_of::<PyBrokenPipeError>(py);
+    let disconnect =
+        err.is_instance_of::<PyConnectionResetError>(py) || err.is_instance_of::<PyBrokenPipeError>(py);
     if !disconnect {
         core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any());
     }
-    let is_ws =
-        core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
+    let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
     if is_ws {
         // R-087: app died mid-session -> 1011 (or reject if never accepted).
         use cadeloop_core::ws;
@@ -1519,8 +1491,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
                 wsc.accepted = true;
                 wsc.closing = true;
                 conn.log_status = 500;
-                let body =
-                    error_response(ParseError { status: 500, reason: "internal server error" });
+                let body = error_response(ParseError { status: 500, reason: "internal server error" });
                 net::http_enqueue(py, net, backend, tid, body);
             } else if !wsc.closing {
                 wsc.closing = true;
@@ -1530,8 +1501,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
         })?;
         return finish_request(py, core, tid);
     }
-    let phase =
-        core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.resp))?;
+    let phase = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.resp))?;
     match phase {
         None => Ok(()), // connection already gone
         Some(RespPhase::Done) => {
@@ -1549,8 +1519,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
                     c.log_status = 500;
                 }
                 let log = take_access_record(py, net, tid, now_ns);
-                let body =
-                    error_response(ParseError { status: 500, reason: "internal server error" });
+                let body = error_response(ParseError { status: 500, reason: "internal server error" });
                 net::http_enqueue(py, net, backend, tid, body);
                 net::http_close_after_write(py, net, backend, tid);
                 log
@@ -1560,9 +1529,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
         }
         Some(_) => {
             // Mid-response: the framing cannot be repaired — hard close.
-            core.with_net(|net, reactor| {
-                net::teardown_with(py, net, reactor.backend_mut(), tid, None)
-            })?;
+            core.with_net(|net, reactor| net::teardown_with(py, net, reactor.backend_mut(), tid, None))?;
             core.drain_graveyards(py)
         }
     }
@@ -1615,11 +1582,7 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             conn.active = false;
             conn.req_body = None;
             conn.activity = conn.activity.wrapping_add(1);
-            (
-                conn.take_recv_waiter(),
-                conn.driver.take(),
-                !conn.keep_alive || conn.disconnected,
-            )
+            (conn.take_recv_waiter(), conn.driver.take(), !conn.keep_alive || conn.disconnected)
         };
         if let Some(d) = driver {
             net.graveyard_py.push(d.into_any());
@@ -1943,11 +1906,7 @@ impl AppTask {
     /// Step the coroutine until it suspends or finishes. Runs OUTSIDE the
     /// state cell. Never pumps — completion handling is the caller's job
     /// (keeps pipelined bursts iterative).
-    pub(crate) fn step(
-        slf: &Bound<'_, Self>,
-        py: Python<'_>,
-        throw: Option<PyErr>,
-    ) -> PyResult<StepOutcome> {
+    pub(crate) fn step(slf: &Bound<'_, Self>, py: Python<'_>, throw: Option<PyErr>) -> PyResult<StepOutcome> {
         let pyloop = {
             let mut this = slf.borrow_mut();
             this.waiting_on = None;
@@ -1957,9 +1916,7 @@ impl AppTask {
         // (anyio/Starlette task groups weakref the current task).
         task_hook(py, &ENTER_TASK, "_enter_task")?.call1(py, (&pyloop, slf))?;
         let out = Self::step_inner(slf, py, throw);
-        if let Err(e) = task_hook(py, &LEAVE_TASK, "_leave_task")
-            .and_then(|f| f.call1(py, (&pyloop, slf)))
-        {
+        if let Err(e) = task_hook(py, &LEAVE_TASK, "_leave_task").and_then(|f| f.call1(py, (&pyloop, slf))) {
             e.write_unraisable(py, None);
         }
         if matches!(out, Ok(StepOutcome::Finished) | Ok(StepOutcome::Failed)) {
@@ -1973,11 +1930,7 @@ impl AppTask {
     /// (mirrors run_handle's enter -> call -> always-exit discipline in
     /// handles.rs) so contextvars stay isolated per request, then
     /// delegates to step_body for the actual coroutine stepping.
-    fn step_inner(
-        slf: &Bound<'_, Self>,
-        py: Python<'_>,
-        throw: Option<PyErr>,
-    ) -> PyResult<StepOutcome> {
+    fn step_inner(slf: &Bound<'_, Self>, py: Python<'_>, throw: Option<PyErr>) -> PyResult<StepOutcome> {
         let ctx = slf.borrow().context.clone_ref(py);
         let ctx_ptr = ctx.as_ptr();
         if unsafe { ffi::PyContext_Enter(ctx_ptr) } != 0 {
@@ -1993,11 +1946,7 @@ impl AppTask {
         result
     }
 
-    fn step_body(
-        slf: &Bound<'_, Self>,
-        py: Python<'_>,
-        mut throw: Option<PyErr>,
-    ) -> PyResult<StepOutcome> {
+    fn step_body(slf: &Bound<'_, Self>, py: Python<'_>, mut throw: Option<PyErr>) -> PyResult<StepOutcome> {
         let (coro, core_py, tid) = {
             let mut this = slf.borrow_mut();
             if this.must_cancel {
@@ -2053,10 +2002,8 @@ impl AppTask {
                             return Ok(StepOutcome::Suspended);
                         }
                         _ => {
-                            throw = Some(PyRuntimeError::new_err(format!(
-                                "Task got bad yield: {}",
-                                y.repr()?
-                            )));
+                            throw =
+                                Some(PyRuntimeError::new_err(format!("Task got bad yield: {}", y.repr()?)));
                         }
                     }
                 }
