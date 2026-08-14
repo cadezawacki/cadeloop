@@ -204,7 +204,20 @@ impl CoreLoop {
     /// anatomy showed the per-tick claim/release rounds are what a
     /// queue-depth-1 chain actually benchmarks.
     fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>) -> PyResult<()> {
+        // TEMPORARY (ADR-24): bisecting a Windows-only worker-model crash.
+        // Prior tracing (server.py, _winworker.py) proved every setup stage
+        // through "about to call run_forever" succeeds; further tracing
+        // directly in iocp.rs proved take_accept_socket is never reached
+        // (no accept ever completes before the crash) — so the crash is in
+        // this tick's poll/translate machinery itself, on the very first
+        // call. Env-gated (CADELOOP_TRACE_TICK) since this is a genuine
+        // hot path exercised by every test, not just the worker model.
+        let trace_tick = trace_tick_enabled();
         let stopping = self.stopping.load(Ordering::Acquire);
+        if trace_tick {
+            eprintln!("cadeloop-tick: start stopping={stopping}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
         DISPATCH_BUF.with_borrow_mut(|batch| -> PyResult<()> {
             debug_assert!(batch.is_empty());
             type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Graveyards);
@@ -223,6 +236,10 @@ impl CoreLoop {
                 } else {
                     st.reactor.poll_timeout()
                 };
+                if trace_tick {
+                    eprintln!("cadeloop-tick: about to poll timeout={timeout:?}");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
                 let reactor = &mut st.reactor;
                 let (poll_result, parked) = if timeout.is_zero() {
                     // Non-blocking reap: keeping the GIL is legal (nothing
@@ -233,6 +250,10 @@ impl CoreLoop {
                     // `claim` guarantees no other thread enters this state.
                     (py.detach(move || reactor.poll(timeout)), true)
                 };
+                if trace_tick {
+                    eprintln!("cadeloop-tick: poll returned ok={} parked={parked}", poll_result.is_ok());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
                 if poll_result.is_err() {
                     return (
                         poll_result,
@@ -248,9 +269,17 @@ impl CoreLoop {
                 }
                 let mut comps = std::mem::take(&mut st.completions_scratch);
                 st.reactor.drain_completions(&mut comps);
+                if trace_tick {
+                    eprintln!("cadeloop-tick: drained {} completions", comps.len());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
                 if !comps.is_empty() {
                     net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
                     comps.clear();
+                }
+                if trace_tick {
+                    eprintln!("cadeloop-tick: translate done");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
                 st.completions_scratch = comps;
                 // Readiness watch callbacks join the ordinary ready queue.
@@ -393,6 +422,16 @@ fn take_graveyards(st: &mut LoopState) -> Graveyards {
 /// asyncio.iscoroutinefunction does — the common mistake (passing an
 /// `async def` function or bound method directly) is what this catches.
 const CO_COROUTINE: i32 = 0x80;
+
+/// TEMPORARY (ADR-24): CADELOOP_TRACE_TICK-gated tick tracing for the
+/// Windows worker-model crash bisection. Checked once per process via a
+/// cached OnceLock (a plain per-tick env var read would itself be a
+/// measurable hot-path cost). Remove alongside the eprintln! call sites
+/// in `CoreLoop::tick` once the crash site is found.
+fn trace_tick_enabled() -> bool {
+    static TRACE_TICK: OnceLock<bool> = OnceLock::new();
+    *TRACE_TICK.get_or_init(|| std::env::var_os("CADELOOP_TRACE_TICK").is_some())
+}
 
 fn is_coroutine_function(py: Python<'_>, callback: &Bound<'_, PyAny>) -> bool {
     let Ok(code) = callback.getattr(intern!(py, "__code__")) else { return false };

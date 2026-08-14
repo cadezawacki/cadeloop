@@ -133,6 +133,12 @@ def test_spawn_worker_pool_serves_and_stops(tmp_path):
     env = dict(os.environ)
     pkg = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
     env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), pkg, env.get("PYTHONPATH", "")])
+    # TEMPORARY (ADR-24): bisecting the Windows worker-model crash. The
+    # supervisor process's env propagates to its spawned workers (they
+    # inherit os.environ — _spawn_shared_worker's Popen call passes no
+    # explicit env=), so setting this once here reaches the worker
+    # process the crash actually happens in.
+    env["CADELOOP_TRACE_TICK"] = "1"
     driver = (
         "from cadeloop.server import _serve_multi_spawn\n"
         "from cadeloop.config import Config\n"
