@@ -7,12 +7,23 @@
 name: ci
 
 on:
+  # Deliberately NOT push-on-feature-branches. A branch with an open PR
+  # matched both this and `pull_request`, so every commit started two
+  # identical 6-job runs — half of them on Windows runners, which bill at
+  # a multiple. Feature branches are covered by the pull_request trigger.
   push:
-    branches: ["main", "claude/**"]
+    branches: ["main"]
   pull_request:
   schedule:
     - cron: "0 4 * * *" # nightly: full soak + benchmark regression
   workflow_dispatch:
+
+# Superseded runs are wasted runs: pushing a follow-up commit while a run
+# is still going leaves the old one burning Windows minutes on a revision
+# nobody will look at again.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
