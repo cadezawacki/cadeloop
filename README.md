@@ -11,7 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Loop | `run_until_complete` scheduled the coroutine before refusing to run it | `` |
+> | Loop | `run_until_complete` scheduled the coroutine before refusing to run it | `fc8da98` |
 > | ASGI | `scope["asgi"]` and `scope["extensions"]` were shared process-wide and mutable | `5c0e21a` |
 > | Loop | `slow_callback_duration` was absent from the facade and ignored by the core | `5c0e21a` |
 > | Net | A WS read-pause re-check could remove the transport an `unwrap()` then assumed | `17aefb3` |
