@@ -11,9 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Server | The spawn supervisor kept the old restart rule the fork one had outgrown | `` |
-> | Windows | `SO_REUSEADDR` let another process bind a live listener; now exclusive | `` |
-> | Core | Sub-millisecond waits truncated to zero, busy-polling a core until the timer fired | `` |
+> | Server | The spawn supervisor kept the old restart rule the fork one had outgrown | `7649432` |
+> | Windows | `SO_REUSEADDR` let another process bind a live listener; now exclusive | `7649432` |
+> | Core | Sub-millisecond waits truncated to zero, busy-polling a core until the timer fired | `7649432` |
 > | Server | A slow-failing worker restarted forever; the crash-loop guard never engaged | `52ca2dc` |
 > | CI | Actions ran from moving tags and a branch; now pinned to commit SHAs | `becb220` |
 > | HTTP | Request trailers were merged into `scope["headers"]`, smuggling a second `Host` | `7249648` |
