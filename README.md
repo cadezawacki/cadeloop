@@ -11,8 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | ASGI | `scope["asgi"]` and `scope["extensions"]` were shared process-wide and mutable | `` |
-> | Loop | `slow_callback_duration` was absent from the facade and ignored by the core | `` |
+> | ASGI | `scope["asgi"]` and `scope["extensions"]` were shared process-wide and mutable | `5c0e21a` |
+> | Loop | `slow_callback_duration` was absent from the facade and ignored by the core | `5c0e21a` |
 > | Net | A WS read-pause re-check could remove the transport an `unwrap()` then assumed | `17aefb3` |
 > | Server | Each forked worker inherited every earlier worker's readiness pipe | `17aefb3` |
 > | HTTP | The head deadline killed body uploads that ran past it while actively sending | `e4e2a70` |
