@@ -286,15 +286,42 @@ the first-ever fully green `build-windows` on BOTH runners — every
 step, including the CPython conformance suite — and reached `stress`
 (passed) and `benchmark-regression` (new failure) for the first time,
 since both are gated on `needs: build-windows`. Neither the crash nor
-the hang reproduced. Plausible explanation, not yet confirmed: the
-added synchronization (flushing on nearly every coroutine step)
-altered timing enough to close both race windows — consistent with
-`benchmark-regression`'s failure, since EVERY cadeloop scheduling
-microbenchmark (`call_soon_chain`, `sleep0_chain`, `task_spawn`,
-`future_chain`, ...) regressed 25-69% against the stored baseline,
-exactly the class of hot-path overhead per-step stderr flushing would
-add. Until this is confirmed by the markers surviving another run
-cleanly and then being removed with the bugs still absent, treat this
-as "not yet reproduced" rather than "fixed" — the baseline itself
-should not be touched while the markers remain, since it would just
-calcify a debug-inflated number.
+the hang reproduced — but neither is confirmed fixed, since both are
+intermittent (the crash has since recurred on one runner while the
+other stayed green, and has hit worker 0 and worker 1 on different
+runs), so treat them as "not reproduced in this run", never "fixed".
+
+`benchmark-regression`'s failure was FIRST attributed here to the
+tracing markers' own overhead. That attribution was wrong, and the
+correction matters because it points at a broken gate rather than a
+real regression:
+
+* Every regressed entry is a *scheduling* microbenchmark
+  (`call_soon_chain`, `timer_fire`, `task_spawn`, `future_chain`,
+  `gather_fanin`, `queue_pingpong`, ...). None of them issue an HTTP
+  request or spawn a worker, so they never execute a single line of
+  the instrumented paths — the markers cannot be the cause.
+* The gate runs `--suite sched --loops cadeloop` on a shared
+  GitHub-hosted runner and compares against `bench/baselines/
+  windows-sched.json`, which was recorded on the owner's own Windows
+  machine (it still carries `asyncio`/`winloop`/`rsloop` contenders,
+  hence the run's "missing from current run" lines for all three).
+  Dedicated local hardware vs. a shared virtualized runner differs by
+  far more than the 5% threshold permanently, so the gate as
+  configured can never pass in CI regardless of code quality.
+
+The fix is to record a CI-hardware baseline (or scope the gate to
+nightly on a consistent runner), NOT to chase a phantom regression.
+A pyo3 0.24 -> 0.29 cost cannot be ruled out from this data alone, but
+the hardware mismatch already explains the full magnitude.
+
+Separately, the `http.rs` markers were a real defect while they
+existed: unlike the `coreloop.rs` tick tracing (env-gated behind
+`CADELOOP_TRACE_TICK`) and the Python-side markers (scoped to worker
+processes), they were UNCONDITIONAL on the request hot path — four
+flushed stderr lines per request. Measured locally at 2000 requests:
+41.8k req/s with them vs 70.7k without when stderr is captured the way
+pytest/CI captures it. They have been removed; the /bg hang had not
+recurred in the runs after they landed, so they were costing ~40% of
+request throughput while yielding no new signal. If that hang returns,
+re-add them env-gated like the tick tracing rather than unconditional.

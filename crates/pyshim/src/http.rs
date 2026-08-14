@@ -1415,11 +1415,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         if eager {
             // R-056: step inline; only a suspension allocates a driver.
             let task = AppTask::spawn(py, slf, tid, coro.unbind(), pyloop)?;
-            let initial_out = AppTask::step(task.bind(py), py, None)?;
-            // TEMPORARY (ADR-24): see on_coro_finished's comment.
-            eprintln!("cadeloop: initial step tid={tid} out={initial_out:?}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            match initial_out {
+            match AppTask::step(task.bind(py), py, None)? {
                 StepOutcome::Suspended => {
                     core.with_net(|net, _| {
                         if let Some(c) = net.http_conn_mut(tid) {
@@ -1445,13 +1441,6 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
 /// The app coroutine returned: verify the response completed (R-086) and
 /// finish the request cycle.
 fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    // TEMPORARY (ADR-24): bisecting a Windows-only hang where run_forever()
-    // never wakes again during a request. If this line is the last thing
-    // seen before the hang, the coroutine legitimately finished and the
-    // stall is downstream (finish_request/connection teardown); if it's
-    // MISSING, the coroutine itself never reached StopIteration.
-    eprintln!("cadeloop: on_coro_finished tid={tid}");
-    let _ = std::io::Write::flush(&mut std::io::stderr());
     let (complete, is_ws, disconnected) = core.with_net(|net, _| {
         net.http_conn_mut(tid)
             .map(|c| (c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected))
@@ -1584,9 +1573,6 @@ fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
 }
 
 pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    // TEMPORARY (ADR-24): see on_coro_finished's comment — same bisection.
-    eprintln!("cadeloop: finish_request start tid={tid}");
-    let _ = std::io::Write::flush(&mut std::io::stderr());
     let (waiter, log) = core.with_net(|net, reactor| {
         let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
@@ -1615,9 +1601,6 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             let _ = fut.call_method1(intern!(py, "set_result"), (disconnect_message(py)?,));
         }
     }
-    // TEMPORARY (ADR-24): see on_coro_finished's comment — same bisection.
-    eprintln!("cadeloop: finish_request end tid={tid}");
-    let _ = std::io::Write::flush(&mut std::io::stderr());
     Ok(())
 }
 
@@ -1643,7 +1626,6 @@ fn drop_driver(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
 // AppTask: the eager continuation driver                                //
 // --------------------------------------------------------------------- //
 
-#[derive(Debug)]
 pub(crate) enum StepOutcome {
     Suspended,
     Finished,
@@ -2037,17 +2019,6 @@ impl AppTask {
     /// _resume_bare). The initial eager step in pump_requests handles its
     /// outcomes inline instead.
     fn after_step(slf: &Bound<'_, Self>, py: Python<'_>, out: StepOutcome) -> PyResult<()> {
-        // TEMPORARY (ADR-24): see on_coro_finished's comment — same hang
-        // bisection. Logs every resume, not just the terminal one, so a
-        // request that suspends more than once (as the Starlette
-        // BackgroundTask case does: one suspend for the response write,
-        // then a resume that should run straight through to completion)
-        // shows its full resume history leading up to a hang.
-        {
-            let this = slf.borrow();
-            eprintln!("cadeloop: after_step tid={} out={:?}", this.tid, out);
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-        }
         if matches!(out, StepOutcome::Suspended) {
             return Ok(());
         }
