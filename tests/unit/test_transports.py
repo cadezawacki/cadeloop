@@ -1355,3 +1355,132 @@ def test_failing_protocol_factory_does_not_leak_the_connected_socket(loop):
         assert leaked == 0, f"{leaked} descriptors leaked across 20 failed connects"
 
     loop.run_until_complete(main())
+
+
+def test_get_extra_info_socket_is_live_and_non_owning(loop):
+    """Libraries reach for the socket through the standard transport API
+    to read the family or set an option such as keepalive; returning None
+    for a live connection made them fail or silently skip that setup.
+
+    The object must not be a second owner of the engine's descriptor: the
+    engine closes that one at teardown, and a second close could land on
+    a number the OS has since handed to an unrelated connection."""
+
+    class P(asyncio.Protocol):
+        pass
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        try:
+            transport, _ = await loop.create_connection(P, *addr)
+            sock = transport.get_extra_info("socket")
+            assert sock is not None, 'get_extra_info("socket") returned None'
+            assert sock.family == socket.AF_INET
+            assert sock.type == socket.SOCK_STREAM
+            assert sock.getpeername()[:2] == tuple(addr[:2])
+            # Standard use: read and set an option through the wrapper.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+            # Stable across calls -- not a fresh dup each time.
+            assert transport.get_extra_info("socket") is sock
+            # Non-owning: after the engine closes its descriptor this one
+            # is still usable. Were it the same number, the engine's close
+            # would have invalidated it and getsockopt would raise EBADF.
+            transport.close()
+            await asyncio.sleep(0.05)
+            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_ipv6_addresses_keep_flowinfo_and_scope_id(loop):
+    """Python represents an IPv6 address as (host, port, flowinfo,
+    scope_id). Flattening it to two elements loses the interface scope,
+    and a link-local peer's address then cannot be passed back to
+    sendto()."""
+
+    class P(asyncio.Protocol):
+        pass
+
+    async def main():
+        server = await asyncio.start_server(lambda r, w: None, "::1", 0)
+        try:
+            addr = server.sockets[0].getsockname()
+            transport, _ = await loop.create_connection(P, "::1", addr[1])
+            peer = transport.get_extra_info("peername")
+            name = transport.get_extra_info("sockname")
+            assert len(peer) == 4, f"IPv6 peername lost its scope fields: {peer!r}"
+            assert len(name) == 4, f"IPv6 sockname lost its scope fields: {name!r}"
+            assert peer[1] == addr[1]
+            transport.close()
+            await asyncio.sleep(0.05)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    try:
+        loop.run_until_complete(main())
+    except OSError as exc:  # no IPv6 loopback on this host
+        pytest.skip(f"IPv6 unavailable: {exc}")
+
+
+def test_datagram_sendto_round_trips_an_ipv6_address(loop):
+    """The four-element form has to be accepted on the way back out --
+    it is exactly what datagram_received hands the application."""
+
+    got = []
+
+    class Echo(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            got.append((data, addr))
+
+    async def main():
+        t1, _ = await loop.create_datagram_endpoint(Echo, local_addr=("::1", 0))
+        t2, _ = await loop.create_datagram_endpoint(Echo, local_addr=("::1", 0))
+        try:
+            dest = t1.get_extra_info("sockname")
+            assert len(dest) == 4, dest
+            t2.sendto(b"ping", dest)  # 4-tuple straight back into sendto
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if got:
+                    break
+            assert got, "no datagram arrived at the 4-tuple address"
+            assert got[0][0] == b"ping"
+            assert len(got[0][1]) == 4, got[0][1]
+        finally:
+            t1.close()
+            t2.close()
+            await asyncio.sleep(0.05)
+
+    try:
+        loop.run_until_complete(main())
+    except OSError as exc:
+        pytest.skip(f"IPv6 unavailable: {exc}")
+
+
+def test_sendto_rejects_a_malformed_address_tuple(loop):
+    """The 4-element form is IPv6-only, and neither form may be a
+    different length -- worth checking on a host without IPv6, where the
+    round-trip test above can only skip."""
+
+    class P(asyncio.DatagramProtocol):
+        pass
+
+    async def main():
+        transport, _ = await loop.create_datagram_endpoint(P, local_addr=("127.0.0.1", 0))
+        try:
+            with pytest.raises(ValueError, match="IPv6-only"):
+                transport.sendto(b"x", ("127.0.0.1", 9, 0, 0))
+            with pytest.raises(ValueError, match="2 elements"):
+                transport.sendto(b"x", ("127.0.0.1", 9, 0))
+            with pytest.raises(ValueError, match="invalid IP address"):
+                transport.sendto(b"x", ("not-an-ip", 9))
+        finally:
+            transport.close()
+            await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())

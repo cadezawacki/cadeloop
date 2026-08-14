@@ -11,6 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Transport | `get_extra_info("socket")` answered (non-owning dup, built once) | `HEAD` |
+> | Net | IPv6 addresses lost flowinfo/scope_id; `sendto` now takes the 4-tuple | `HEAD` |
 > | Transport | `protocol_factory` raising leaked the connected socket, one per failure | `355e82f` |
 > | Net | Listener socket left open when backend registration failed | `355e82f` |
 > | Config | NaN/inf durations passed the `< 0` check and disabled the guard they set | `355e82f` |

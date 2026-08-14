@@ -965,17 +965,22 @@ impl CoreLoop {
     }
 
     /// R-058 sendto. `addr` None = connected-mode send().
+    ///
+    /// Accepts both address forms the socket module uses: `(host, port)`
+    /// and the IPv6 `(host, port, flowinfo, scope_id)`. The four-element
+    /// form has to round-trip, because it is what `datagram_received`
+    /// hands the application for an IPv6 peer -- and for a link-local one
+    /// the scope id is what makes the reply routable.
     #[pyo3(signature = (did, data, addr=None))]
-    fn udp_sendto(&self, py: Python<'_>, did: u64, data: &[u8], addr: Option<(String, u16)>) -> PyResult<()> {
+    fn udp_sendto(
+        &self,
+        py: Python<'_>,
+        did: u64,
+        data: &[u8],
+        addr: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         self.check_closed()?;
-        let addr = match addr {
-            Some((ip, port)) => {
-                let ip: std::net::IpAddr =
-                    ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
-                Some(std::net::SocketAddr::new(ip, port))
-            }
-            None => None,
-        };
+        let addr = addr.filter(|a| !a.is_none()).map(parse_addr_tuple).transpose()?;
         self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))??;
         self.drain_graveyards(py)
     }
@@ -1525,6 +1530,35 @@ impl CoreLoop {
             Ok(lid)
         })??;
         Ok((lid, name_obj, sock as u64))
+    }
+}
+
+/// `(host, port)` or `(host, port, flowinfo, scope_id)` -> `SocketAddr`.
+fn parse_addr_tuple(addr: Bound<'_, PyAny>) -> PyResult<std::net::SocketAddr> {
+    let n = addr.len().map_err(|_| {
+        PyTypeError::new_err("address must be a (host, port) or (host, port, flowinfo, scope_id) tuple")
+    })?;
+    if n != 2 && n != 4 {
+        return Err(PyValueError::new_err(format!(
+            "address must have 2 elements (IPv4) or 4 (IPv6), got {n}"
+        )));
+    }
+    let host: String = addr.get_item(0)?.extract()?;
+    let port: u16 = addr.get_item(1)?.extract()?;
+    let ip: std::net::IpAddr =
+        host.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {host:?}")))?;
+    if n == 2 {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    let flowinfo: u32 = addr.get_item(2)?.extract()?;
+    let scope_id: u32 = addr.get_item(3)?.extract()?;
+    match ip {
+        std::net::IpAddr::V6(v6) => {
+            Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(v6, port, flowinfo, scope_id)))
+        }
+        std::net::IpAddr::V4(_) => {
+            Err(PyValueError::new_err("a 4-element address is IPv6-only; got an IPv4 host"))
+        }
     }
 }
 

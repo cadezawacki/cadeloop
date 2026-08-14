@@ -33,8 +33,9 @@ use cadeloop_core::netsys;
 use cadeloop_core::opslab::OpId;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 use crate::coreloop::CoreLoop;
 use crate::http::HttpConn;
@@ -174,6 +175,10 @@ pub(crate) struct TransportEntry {
     flush_scheduled: bool,
     pub peername: Option<Py<PyAny>>,
     pub sockname: Option<Py<PyAny>>,
+    /// `get_extra_info("socket")`, built on first ask and kept. Dropped
+    /// with the entry (outside the state cell, like every other Py ref
+    /// an entry holds).
+    pub extra_sock: Option<Py<PyAny>>,
 }
 
 /// What an accepted connection turns into.
@@ -2086,11 +2091,25 @@ fn cache_proto(py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<ProtoRef
     })
 }
 
+/// The Python form of a socket address: `(host, port)` for IPv4 and
+/// `(host, port, flowinfo, scope_id)` for IPv6, exactly as every socket
+/// API in the standard library represents them.
+///
+/// Flattening IPv6 to two elements loses the scope id, and for a
+/// link-local peer that is not cosmetic: the address a callback hands the
+/// application can no longer be passed back to `sendto()`, because
+/// without the interface scope the reply is unroutable or leaves through
+/// the wrong interface.
 fn addr_tuple(py: Python<'_>, addr: Option<std::net::SocketAddr>) -> Option<Py<PyAny>> {
-    addr.map(|a| {
-        let ip = a.ip().to_string();
-        let port = a.port();
-        (ip, port).into_pyobject(py).unwrap().into_any().unbind()
+    addr.map(|a| match a {
+        std::net::SocketAddr::V4(v4) => {
+            (v4.ip().to_string(), v4.port()).into_pyobject(py).unwrap().into_any().unbind()
+        }
+        std::net::SocketAddr::V6(v6) => (v6.ip().to_string(), v6.port(), v6.flowinfo(), v6.scope_id())
+            .into_pyobject(py)
+            .unwrap()
+            .into_any()
+            .unbind(),
     })
 }
 
@@ -2143,6 +2162,7 @@ pub(crate) fn wire_stream(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
+                extra_sock: None,
                 peername: peer,
                 sockname: name,
             },
@@ -2215,6 +2235,7 @@ pub(crate) fn wire_http(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
+                extra_sock: None,
                 peername: peer,
                 sockname: name,
             },
@@ -2238,6 +2259,59 @@ pub struct Transport {
 impl Transport {
     fn core_ref<'a>(&'a self, py: Python<'a>) -> &'a CoreLoop {
         self.core.bind(py).get()
+    }
+
+    /// `get_extra_info("socket")`.
+    ///
+    /// Protocols and libraries reach for this through the standard
+    /// transport API to read the address family, inspect socket options,
+    /// or set one such as keepalive. Returning `None` for a live
+    /// connection made them either fail or silently skip that setup, so
+    /// the key is answered -- but with a socket object owning its own
+    /// `dup()` of the descriptor, never the engine's. The engine's
+    /// descriptor is closed by teardown; a second Python owner of the
+    /// same number would close it again, and by then the OS may have
+    /// handed that number to an unrelated connection.
+    ///
+    /// Built on first ask (nothing pays for it otherwise) and kept on the
+    /// entry, so repeated calls return the same object rather than
+    /// leaking one duplicate per call.
+    fn extra_socket(&self, py: Python<'_>, core: &CoreLoop) -> PyResult<Option<Py<PyAny>>> {
+        let (cached, raw) = core.with_net(|net, _| match net.transports.get(&self.tid) {
+            Some(e) => (e.extra_sock.as_ref().map(|s| s.clone_ref(py)), Some(e.socket)),
+            None => (None, None),
+        })?;
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let Some(raw) = raw else { return Ok(None) };
+        let obj = build_transport_socket(py, raw)?;
+        // Only ever set from None (the cached branch above returns
+        // first), so nothing is dropped inside the cell -- ADR-5.
+        core.with_net(|net, _| {
+            if let Some(e) = net.transports.get_mut(&self.tid) {
+                e.extra_sock = Some(obj.clone_ref(py));
+            }
+        })?;
+        Ok(Some(obj))
+    }
+}
+
+/// A `socket` object over a duplicate of `raw`, wrapped in asyncio's own
+/// `TransportSocket` -- the type callers expect back from
+/// `get_extra_info("socket")`, and the one that refuses the mutating
+/// operations that would desynchronise the transport.
+fn build_transport_socket(py: Python<'_>, raw: RawSocket) -> PyResult<Py<PyAny>> {
+    let socket_mod = py.import("socket")?;
+    // socket.dup(), not os.dup(): on Windows a SOCKET is not a file
+    // descriptor and only this one does the right thing.
+    let dup = socket_mod.call_method1(intern!(py, "dup"), (raw as u64,))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(intern!(py, "fileno"), dup)?;
+    let sock = socket_mod.getattr(intern!(py, "socket"))?.call((), Some(&kwargs))?;
+    match py.import("asyncio.trsock") {
+        Ok(m) => Ok(m.getattr(intern!(py, "TransportSocket"))?.call1((sock,))?.unbind()),
+        Err(_) => Ok(sock.unbind()),
     }
 }
 
@@ -2557,6 +2631,10 @@ impl Transport {
     #[pyo3(signature = (name, default=None))]
     fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         let core = self.core_ref(py);
+        if name == "socket" {
+            let out = self.extra_socket(py, core)?;
+            return Ok(out.or(default).unwrap_or_else(|| py.None()));
+        }
         let out = core.with_net(|net, _| {
             net.transports.get(&self.tid).and_then(|e| match name {
                 "peername" => e.peername.as_ref().map(|p| p.clone_ref(py)),
