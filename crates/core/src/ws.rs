@@ -192,12 +192,24 @@ impl WsRx {
             }
             len = u64::from(u16::from_be_bytes([b[off], b[off + 1]]));
             off += 2;
+            if len < 126 {
+                return ParseOne::Event(WsEvent::Fail(1002, "non-minimal payload length"));
+            }
         } else if len == 127 {
             if b.len() < off + 8 {
                 return ParseOne::NeedMore;
             }
+            // RFC 6455 section 5.2 limits this field to 63 bits.  Check
+            // before converting to usize so a malicious length cannot wrap
+            // on a 32-bit target either.
+            if b[off] & 0x80 != 0 {
+                return ParseOne::Event(WsEvent::Fail(1002, "invalid payload length"));
+            }
             len = u64::from_be_bytes(b[off..off + 8].try_into().unwrap());
             off += 8;
+            if len <= u16::MAX as u64 {
+                return ParseOne::Event(WsEvent::Fail(1002, "non-minimal payload length"));
+            }
         }
         if opcode >= OP_CLOSE && (len > 125 || !fin) {
             return ParseOne::Event(WsEvent::Fail(1002, "malformed control frame"));
@@ -224,8 +236,14 @@ impl WsRx {
             OP_PING => ParseOne::Event(WsEvent::Ping(payload)),
             OP_PONG => ParseOne::Event(WsEvent::Pong),
             OP_CLOSE => {
+                if payload.len() == 1 {
+                    return ParseOne::Event(WsEvent::Fail(1002, "malformed close payload"));
+                }
                 let (code, reason) = if payload.len() >= 2 {
                     let code = u16::from_be_bytes([payload[0], payload[1]]);
+                    if !valid_close_code(code) {
+                        return ParseOne::Event(WsEvent::Fail(1002, "invalid close code"));
+                    }
                     match String::from_utf8(payload[2..].to_vec()) {
                         Ok(r) => (code, r),
                         Err(_) => return ParseOne::Event(WsEvent::Fail(1007, "close reason not utf-8")),
@@ -277,6 +295,10 @@ impl WsRx {
             ParseOne::Event(WsEvent::Binary(payload))
         }
     }
+}
+
+fn valid_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1014 | 3000..=4999) && !matches!(code, 1004..=1006 | 1015)
 }
 
 enum ParseOne {
@@ -366,5 +388,36 @@ mod tests {
         let mut out = Vec::new();
         rx.push(&client_frame(OP_TEXT, &[0xFF, 0xFE], true), &mut out);
         assert_eq!(out, vec![WsEvent::Fail(1007, "text message not utf-8")]);
+    }
+
+    #[test]
+    fn rejects_malformed_lengths_and_close_payloads() {
+        fn parse(frame: &[u8]) -> Vec<WsEvent> {
+            let mut rx = WsRx::new(1 << 20);
+            let mut out = Vec::new();
+            rx.push(frame, &mut out);
+            out
+        }
+
+        // Length 1 encoded with the 16-bit form is forbidden by section 5.2.
+        let non_minimal = [0x81, 0xFE, 0, 1];
+        assert_eq!(parse(&non_minimal), vec![WsEvent::Fail(1002, "non-minimal payload length")]);
+
+        // The most significant bit of a 64-bit payload length must be zero.
+        let oversized = [0x82, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse(&oversized), vec![WsEvent::Fail(1002, "invalid payload length")]);
+
+        // A close body cannot contain only half of its two-byte status code.
+        assert_eq!(
+            parse(&client_frame(OP_CLOSE, &[0x03], true)),
+            vec![WsEvent::Fail(1002, "malformed close payload")]
+        );
+
+        for code in [999u16, 1005, 1015, 2000, 5000] {
+            assert_eq!(
+                parse(&client_frame(OP_CLOSE, &code.to_be_bytes(), true)),
+                vec![WsEvent::Fail(1002, "invalid close code")]
+            );
+        }
     }
 }
