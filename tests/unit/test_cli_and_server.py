@@ -27,6 +27,21 @@ def test_serve_validates_config_before_binding():
         cadeloop.serve("not-an-app-spec")  # string apps resolve via load_app
 
 
+def test_serve_bare_callable_workers_no_fork_raises(monkeypatch):
+    """Spawned workers re-import the app, so workers>1 with a bare
+    callable (not an import string) on a platform without os.fork
+    previously just logged a warning and silently ran 1 worker — an easy
+    mistake (cadeloop.serve(app, workers=4) with a live app object) that
+    looked like "scaling isn't working" rather than a clear config error.
+    Simulates the no-fork (Windows) branch on any platform by removing
+    os.fork for the duration of the test."""
+    import cadeloop.server as server_module
+
+    monkeypatch.delattr(server_module.os, "fork", raising=False)
+    with pytest.raises(ValueError, match="import string"):
+        cadeloop.serve(dummy_app, workers=4)
+
+
 def test_load_app_errors():
     with pytest.raises(ValueError, match="module:attribute"):
         load_app("no-colon")

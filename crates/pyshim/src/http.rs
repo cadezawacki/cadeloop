@@ -1468,15 +1468,22 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
 /// The app coroutine returned: verify the response completed (R-086) and
 /// finish the request cycle.
 fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let (complete, is_ws) = core.with_net(|net, _| {
+    let (complete, is_ws, disconnected) = core.with_net(|net, _| {
         net.http_conn_mut(tid)
-            .map(|c| (c.resp == RespPhase::Done, c.ws.is_some()))
-            .unwrap_or((true, false))
+            .map(|c| (c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected))
+            .unwrap_or((true, false, false))
     })?;
     if is_ws {
         return ws_app_done(py, core, tid);
     }
-    if complete {
+    if complete || disconnected {
+        // A disconnect-triggered early return (StreamingResponse/SSE:
+        // the peer went away mid-stream, so the app coroutine returns
+        // without ever sending the final chunk) is a normal ASGI
+        // outcome, not an application bug — real uvicorn logs nothing
+        // for the identical scenario. Mirrors how app_failure already
+        // treats ConnectionResetError/BrokenPipeError as benign, just
+        // reached from the "returned normally" side instead of a raise.
         finish_request(py, core, tid)
     } else {
         app_failure(

@@ -184,11 +184,17 @@ def serve(
             # into each worker via WSADuplicateSocketW (socket.share).
             return _serve_multi_spawn(app_spec, host, port, config, n)
         # Spawned workers re-import the app, so a bare callable cannot
-        # cross the process boundary (uvicorn has the same rule).
-        logger.warning(
-            "workers=%d on this platform requires an app import string "
-            '("module:attribute"); running a single worker',
-            n,
+        # cross the process boundary (uvicorn has the same rule). Matches
+        # the ssl+workers>1 precedent above: fail loudly rather than
+        # silently running 1 worker when workers=N was explicitly asked
+        # for — a warning buried in logs reads as "scaling isn't working"
+        # instead of the actual, easy-to-fix configuration mistake.
+        raise ValueError(
+            f"workers={n} on this platform requires an app import string "
+            '("module:attribute"), not a bare callable — spawned workers '
+            "re-import the app, so it cannot cross the process boundary. "
+            "Pass app as a string, or workers=1 to run a single process "
+            "with the callable as given."
         )
     return _serve_single(app, host, port, config, ssl_ctx=ssl)
 
@@ -221,6 +227,8 @@ def _serve_single(
         rio_cq_size=config.rio_cq_size,
         rio_rq_recv=config.rio_rq_recv,
         rio_rq_send=config.rio_rq_send,
+        dns_cache=config.dns_cache,
+        dns_cache_ttl=config.dns_cache_ttl,
     )
     asyncio.set_event_loop(loop)
     lifespan = _Lifespan(app, loop)

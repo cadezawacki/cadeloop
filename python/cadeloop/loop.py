@@ -73,6 +73,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         rio_cq_size: int = 65536,
         rio_rq_recv: int = 32,
         rio_rq_send: int = 32,
+        dns_cache: bool = False,
+        dns_cache_ttl: float = 5.0,
     ):
         # Backend resolution: explicit arg > CADELOOP_BACKEND env (lets the
         # whole test/bench suite run against a chosen backend, e.g. "rio"
@@ -131,8 +133,14 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._executor_shutdown_called = False
         self._dns_executor = None
         self._dns_cache: dict = {}
-        self._dns_cache_enabled = True
-        self._dns_cache_ttl = 5.0  # R-055 (documented: RFC TTLs ignored)
+        # R-055: off by default (matches the AbstractEventLoop contract —
+        # real asyncio.getaddrinfo never caches). cadeloop.Config/serve()
+        # default this on (documented: RFC TTLs ignored) since a short
+        # server-side cache is a deliberate, reasonable tradeoff there;
+        # direct Loop() construction gets stdlib-faithful behavior unless
+        # asked for otherwise.
+        self._dns_cache_enabled = dns_cache
+        self._dns_cache_ttl = dns_cache_ttl
         self._asyncgens = weakref.WeakSet()
         self._asyncgens_shutdown_called = False
 

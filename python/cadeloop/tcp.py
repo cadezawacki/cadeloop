@@ -8,10 +8,12 @@ replaces it in M4). Mixed into ``cadeloop.Loop``.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import socket
 import sys
-from asyncio import sslproto
+from asyncio import sslproto, staggered
+from asyncio.base_events import _interleave_addrinfos
 
 try:
     import ssl as ssl_module
@@ -168,6 +170,11 @@ class TcpSurface:
         if host is None or port is None:
             raise ValueError("host and port was not specified and no sock specified")
 
+        if happy_eyeballs_delay is not None and interleave is None:
+            # RFC 6555 default: interleave by address family once racing
+            # is on (matches base_events.create_connection).
+            interleave = 1
+
         infos = await self.getaddrinfo(
             host, port, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
         )
@@ -176,24 +183,50 @@ class TcpSurface:
         local_ip, local_port = None, 0
         if local_addr is not None:
             local_ip, local_port = local_addr[0], local_addr[1]
+        if interleave:
+            infos = _interleave_addrinfos(infos, interleave)
 
         errors = []
-        for _af, _st, _pr, _cname, address in infos:
+
+        async def attempt(address):
             fut = self.create_future()
             try:
                 self._core.tcp_connect(address[0], address[1], fut, local_ip, local_port)
-                fd = await fut
+                return await fut
             except OSError as exc:
                 errors.append(exc)
-                continue
-            return await self._wrap_outgoing(
-                fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
+                raise
+
+        if happy_eyeballs_delay is None:
+            fd = None
+            for _af, _st, _pr, _cname, address in infos:
+                try:
+                    fd = await attempt(address)
+                    break
+                except OSError:
+                    continue
+        else:
+            # Staggered concurrent attempts (RFC 6555): a slow/broken
+            # address family no longer stalls every later candidate
+            # behind it — reuses stdlib's own racing logic, just racing
+            # the native tcp_connect fast path instead of a plain socket.
+            fd, _, _ = await staggered.staggered_race(
+                (
+                    functools.partial(attempt, address)
+                    for _af, _st, _pr, _cname, address in infos
+                ),
+                happy_eyeballs_delay,
+                loop=self,
             )
-        if len(errors) == 1:
-            raise errors[0]
-        raise OSError(
-            f"Multiple exceptions: {', '.join(str(e) for e in errors)}"
-        ) from (errors[0] if errors else None)
+        if fd is None:
+            if len(errors) == 1:
+                raise errors[0]
+            raise OSError(
+                f"Multiple exceptions: {', '.join(str(e) for e in errors)}"
+            ) from (errors[0] if errors else None)
+        return await self._wrap_outgoing(
+            fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
+        )
 
     async def _wrap_outgoing(
         self, fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout

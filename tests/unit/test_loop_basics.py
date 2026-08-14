@@ -405,8 +405,56 @@ def test_getaddrinfo_numeric(loop):
 
     res = loop.run_until_complete(main())
     assert res and res[0][4][0] == "127.0.0.1"
-    # Cached second call returns identical result (R-055).
     assert loop.run_until_complete(main()) == res
+
+
+def test_getaddrinfo_no_cache_by_default():
+    """R-055: a plain Loop() must match the AbstractEventLoop contract
+    (real asyncio.getaddrinfo never caches) — caching is an opt-in
+    cadeloop.Config/serve() default, not a Loop()-level default."""
+    lp = cadeloop.new_event_loop()
+    try:
+        assert lp._dns_cache_enabled is False
+        calls = []
+        real = __import__("socket").getaddrinfo
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        import unittest.mock
+
+        with unittest.mock.patch("socket.getaddrinfo", counting):
+            lp.run_until_complete(lp.getaddrinfo("127.0.0.1", 80, type=1))
+            lp.run_until_complete(lp.getaddrinfo("127.0.0.1", 80, type=1))
+        assert len(calls) == 2, "getaddrinfo was cached despite dns_cache defaulting to off"
+    finally:
+        lp.close()
+
+
+def test_getaddrinfo_cache_opt_in():
+    """dns_cache=True (cadeloop.Config's own default) makes a second
+    identical lookup within the TTL hit the cache instead of resolving
+    again."""
+    from cadeloop.loop import Loop
+
+    lp = Loop(dns_cache=True, dns_cache_ttl=5.0)
+    try:
+        calls = []
+        real = __import__("socket").getaddrinfo
+
+        def counting(*a, **kw):
+            calls.append(1)
+            return real(*a, **kw)
+
+        import unittest.mock
+
+        with unittest.mock.patch("socket.getaddrinfo", counting):
+            lp.run_until_complete(lp.getaddrinfo("127.0.0.1", 80, type=1))
+            lp.run_until_complete(lp.getaddrinfo("127.0.0.1", 80, type=1))
+        assert len(calls) == 1, "second lookup within the TTL should have hit the cache"
+    finally:
+        lp.close()
 
 
 def test_asyncio_run_with_policy_installed():

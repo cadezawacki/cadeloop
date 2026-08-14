@@ -534,6 +534,51 @@ def test_starlette_routes_and_streaming(loop):
     loop._core.listener_close(lid)
 
 
+def test_streaming_disconnect_no_spurious_error(loop):
+    """A client that disconnects mid-StreamingResponse is normal ASGI
+    traffic (SSE clients, tab closes, LB idle timeouts): Starlette's
+    disconnect race makes the app coroutine return before sending the
+    final chunk (resp != Done), which cadeloop's on_coro_finished used to
+    report as 'ASGI application returned without completing the
+    response' even though nothing went wrong — real uvicorn logs nothing
+    for the identical scenario."""
+    starlette = pytest.importorskip("starlette.applications")
+    from starlette.applications import Starlette
+    from starlette.responses import StreamingResponse
+    from starlette.routing import Route
+
+    async def stream(request):
+        async def gen():
+            yield b"first-chunk"
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                yield b"more"  # never reached once the client disconnects
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    app = Starlette(routes=[Route("/stream", stream)])
+    lid, port = listen(loop, app)
+
+    errors = []
+    loop.set_exception_handler(lambda l, ctx: errors.append(ctx))
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /stream HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await reader.readuntil(b"\r\n\r\n")  # head
+        await reader.read(64)  # first chunk
+        writer.close()
+        await writer.wait_closed()
+        # Give the server time to notice the disconnect and unwind the
+        # generator via Starlette's cancel-the-other-task race.
+        await asyncio.sleep(0.5)
+
+    loop.run_until_complete(main())
+    assert errors == [], f"spurious error(s) logged for a normal client disconnect: {errors}"
+    loop._core.listener_close(lid)
+
+
 def test_fastapi_route(loop):
     fastapi = pytest.importorskip("fastapi")
     from fastapi import FastAPI

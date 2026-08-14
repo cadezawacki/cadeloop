@@ -34,6 +34,10 @@ class Config:
     loopback_fast_path: bool = True  # R-038 (benchmark-only relevance)
     tfo: bool = False  # R-038 TCP Fast Open on listeners
     # --- DNS (R-055) ------------------------------------------------------
+    # serve()'s own default (on): a short server-side cache is a
+    # reasonable tradeoff for a request-serving process. Loop() built
+    # directly (bypassing Config) defaults to off, matching the
+    # AbstractEventLoop contract (real asyncio.getaddrinfo never caches).
     dns_cache: bool = True
     dns_cache_ttl: float = 5.0  # documented: RFC TTLs ignored
     # --- tasks / GC -------------------------------------------------------

@@ -318,6 +318,68 @@ def test_connection_refused(loop):
     loop.run_until_complete(main())
 
 
+def test_happy_eyeballs_delay_invokes_staggered_race(loop, monkeypatch):
+    """happy_eyeballs_delay/interleave were previously accepted but
+    silently ignored -- connection attempts stayed strictly sequential
+    even with an explicit delay. Proves the staggered-race path is
+    genuinely wired up (not a silent no-op) by intercepting
+    asyncio.staggered.staggered_race itself, then confirms the
+    connection still succeeds through it."""
+    from cadeloop import tcp as cadeloop_tcp
+
+    calls = []
+    real_staggered_race = cadeloop_tcp.staggered.staggered_race
+
+    async def spy(coro_fns, delay, *, loop=None):
+        calls.append(delay)
+        return await real_staggered_race(coro_fns, delay, loop=loop)
+
+    monkeypatch.setattr(cadeloop_tcp.staggered, "staggered_race", spy)
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        transport, _proto = await loop.create_connection(
+            asyncio.Protocol, addr[0], addr[1], happy_eyeballs_delay=0.1
+        )
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+    assert calls == [0.1], f"staggered_race not invoked with happy_eyeballs_delay: {calls}"
+
+
+def test_happy_eyeballs_falls_through_bad_address(loop):
+    """A broken first candidate must not prevent a working second one
+    from connecting under happy_eyeballs_delay (same contract as the
+    pre-existing sequential-fallback path, now exercised through
+    staggered_race instead of a plain for-loop)."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+        probe.close()
+
+        async def fake_getaddrinfo(host, port, **kw):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", closed_port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", addr),
+            ]
+
+        loop.getaddrinfo = fake_getaddrinfo
+        transport, _proto = await loop.create_connection(
+            asyncio.Protocol, "ignored", 0, happy_eyeballs_delay=0.05
+        )
+        assert transport.get_extra_info("peername")[1] == addr[1]
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 def test_server_start_serving_deferred(loop):
     async def main():
         connected = []
