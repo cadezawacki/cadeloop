@@ -58,11 +58,22 @@ pub struct SlotId {
     pub class: SizeClass,
     /// Global slot index within the class: region * slots_per_region + slot.
     pub index: u32,
+    /// Bumped every time the slot is recycled, so an id kept past its
+    /// release stops resolving (R-073).
+    ///
+    /// Without this a stale id is indistinguishable from a live one: the
+    /// index is still in range and the slot is very likely re-acquired,
+    /// so `release()` on it would decrement -- and quite possibly free --
+    /// a buffer that now belongs to a different connection, leaving two
+    /// owners writing the same memory. That is the shape of the UAF the
+    /// spec calls out as the top risk (16), reached from the buffer side
+    /// rather than the OVERLAPPED side.
+    pub generation: u32,
 }
 
 impl fmt::Display for SlotId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "buf[{:?}:{}]", self.class, self.index)
+        write!(f, "buf[{:?}:{}#{}]", self.class, self.index, self.generation)
     }
 }
 
@@ -133,12 +144,25 @@ struct ClassPool {
     freelist: Vec<u32>,
     /// Refcount per allocated slot index; 0 == free.
     refcounts: Vec<u32>,
+    /// Parallel to `refcounts`; see `SlotId::generation`.
+    generations: Vec<u32>,
+    /// `retain`/`release` calls refused because the id was stale or out of
+    /// range. Always zero in a correct run.
+    stale_rejections: u64,
     in_use: usize,
 }
 
 impl ClassPool {
     fn new(class: SizeClass) -> Self {
-        ClassPool { class, regions: Vec::new(), freelist: Vec::new(), refcounts: Vec::new(), in_use: 0 }
+        ClassPool {
+            class,
+            regions: Vec::new(),
+            freelist: Vec::new(),
+            refcounts: Vec::new(),
+            generations: Vec::new(),
+            stale_rejections: 0,
+            in_use: 0,
+        }
     }
 
     fn grow(&mut self) {
@@ -147,9 +171,18 @@ impl ClassPool {
         self.regions.push(region);
         let n = self.class.slots_per_region() as u32;
         self.refcounts.resize(self.refcounts.len() + n as usize, 0);
+        self.generations.resize(self.generations.len() + n as usize, 0);
         for i in (0..n).rev() {
             self.freelist.push(base + i);
         }
+    }
+
+    /// Is this id both in range and current? Bounds are checked because an
+    /// id can outlive the pool state it names, and an out-of-range index
+    /// should resolve to "not live" rather than panic.
+    fn live(&self, id: SlotId) -> bool {
+        let i = id.index as usize;
+        self.refcounts.get(i).is_some_and(|&rc| rc > 0) && self.generations.get(i) == Some(&id.generation)
     }
 
     fn slot_ptr(&self, index: u32) -> *mut u8 {
@@ -209,15 +242,17 @@ impl BufferPool {
         debug_assert_eq!(pool.refcounts[index as usize], 0, "acquired slot has live refs");
         pool.refcounts[index as usize] = 1;
         pool.in_use += 1;
-        SlotId { class, index }
+        SlotId { class, index, generation: pool.generations[index as usize] }
     }
 
     /// Add a reference (e.g. a memoryview export or a posted kernel op).
     pub fn retain(&mut self, id: SlotId) {
         let pool = self.class_mut(id.class);
-        let rc = &mut pool.refcounts[id.index as usize];
-        debug_assert!(*rc > 0, "retain on free slot {id}");
-        *rc += 1;
+        if !pool.live(id) {
+            pool.stale_rejections += 1;
+            return;
+        }
+        pool.refcounts[id.index as usize] += 1;
     }
 
     /// Drop a reference; slot returns to the freelist at zero (R-073).
@@ -225,11 +260,21 @@ impl BufferPool {
     pub fn release(&mut self, id: SlotId) -> bool {
         let size = id.class.size();
         let pool = self.class_mut(id.class);
-        let rc = &mut pool.refcounts[id.index as usize];
-        debug_assert!(*rc > 0, "release on free slot {id}");
-        if *rc == 0 {
-            return false; // release() over-call in release builds: ignore
+        if !pool.live(id) {
+            // Refusing is the whole point of the generation: the index is
+            // still in range and the slot has very likely been re-acquired
+            // by someone else, so decrementing here could free a buffer
+            // that is in active use by another connection.
+            //
+            // Counted rather than `debug_assert!`ed. An assertion would
+            // make the detector fire only in debug builds, i.e. everywhere
+            // except where it matters; a counter works in both profiles,
+            // and `stats()["stale_buffer_ids"]` being non-zero in
+            // production is an unambiguous ownership bug worth seeing.
+            pool.stale_rejections += 1;
+            return false;
         }
+        let rc = &mut pool.refcounts[id.index as usize];
         *rc -= 1;
         if *rc != 0 {
             return false;
@@ -238,13 +283,20 @@ impl BufferPool {
             // R-073: poison freed slots.
             unsafe { std::ptr::write_bytes(pool.slot_ptr(id.index), 0xDD, size) };
         }
+        // Recycled: every id handed out for this slot is now stale.
+        pool.generations[id.index as usize] = pool.generations[id.index as usize].wrapping_add(1);
         pool.in_use -= 1;
         pool.freelist.push(id.index);
         true
     }
 
     pub fn refcount(&self, id: SlotId) -> u32 {
-        self.class(id.class).refcounts[id.index as usize]
+        let pool = self.class(id.class);
+        if pool.live(id) {
+            pool.refcounts[id.index as usize]
+        } else {
+            0
+        }
     }
 
     /// Raw slot memory. Valid until the slot's refcount reaches zero; the
@@ -261,6 +313,13 @@ impl BufferPool {
     /// Buffers currently held (for `loop.stats()`, R-103).
     pub fn in_use(&self) -> usize {
         self.classes.iter().map(|c| c.in_use).sum()
+    }
+
+    /// `retain`/`release` calls refused because the `SlotId` was stale or
+    /// out of range. Non-zero means something held a buffer id past its
+    /// release -- an ownership bug, and the near miss of a use-after-free.
+    pub fn stale_rejections(&self) -> u64 {
+        self.classes.iter().map(|c| c.stale_rejections).sum()
     }
 
     /// (ptr, len, rio_cookie) per region of a class, for one-time
@@ -295,6 +354,42 @@ impl BufferPool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stale_slot_id_cannot_free_someone_elses_buffer() {
+        // The dangerous shape: A releases, the slot is recycled to B, and
+        // A releases again (a double-release, or an id kept past its
+        // handover). Without a generation the index is still in range and
+        // the refcount is still positive, so the second release frees a
+        // buffer B is actively using -- two owners, same memory.
+        let mut p = BufferPool::new();
+        let a = p.acquire(SizeClass::S64K);
+        assert!(p.release(a));
+        let b = p.acquire(SizeClass::S64K);
+        assert_eq!(a.index, b.index, "test needs the slot to be recycled");
+        assert_ne!(a.generation, b.generation);
+
+        assert!(!p.release(a), "stale id freed the slot its successor owns");
+        assert_eq!(p.stale_rejections(), 1);
+        assert_eq!(p.refcount(b), 1, "B's buffer was released out from under it");
+        assert_eq!(p.refcount(a), 0, "a stale id must not report a live count");
+
+        // B's own lifecycle still works.
+        p.retain(b);
+        assert_eq!(p.refcount(b), 2);
+        assert!(!p.release(b));
+        assert!(p.release(b));
+    }
+
+    #[test]
+    fn an_out_of_range_slot_id_is_not_live() {
+        let mut p = BufferPool::new();
+        let bogus = SlotId { class: SizeClass::S64K, index: 9_999_999, generation: 0 };
+        assert_eq!(p.refcount(bogus), 0);
+        assert!(!p.release(bogus));
+        p.retain(bogus); // must not panic
+        assert_eq!(p.stale_rejections(), 2);
+    }
+
     use super::*;
     use proptest::prelude::*;
 

@@ -1493,6 +1493,7 @@ impl CoreLoop {
                     st.net.stats_pipeline_pauses,
                     st.net.stats_sends_posted,
                     st.net.accept_ops_outstanding(),
+                    st.net.buffers.stale_rejections(),
                 ),
                 net::op_breakdown(&st.net),
                 st.reactor.backend_mut().diag(),
@@ -1522,6 +1523,10 @@ impl CoreLoop {
         d.set_item("pipeline_pauses", netstats.7)?;
         d.set_item("sends_posted", netstats.8)?;
         d.set_item("accept_ops", netstats.9)?;
+        // Buffer ids refused because they were stale (R-073). Non-zero
+        // means something held a slot past its release; the pool refused,
+        // so no memory was corrupted, but the ownership bug is real.
+        d.set_item("stale_buffer_ids", netstats.10)?;
         // What the live kernel ops are, by target. A stuck loop looks
         // healthy on every other counter; this is the one that says where
         // -- `connect` non-zero with nothing connecting, or `recv` with no

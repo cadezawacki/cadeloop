@@ -11,6 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Buffers | `SlotId` had no generation: a stale id could free a live buffer | `HEAD` |
+> | OpSlab | An out-of-range `OpId` panicked before the generation check ran | `HEAD` |
 > | ADR-24 | `/bg` trace markers removed; op-target breakdown kept in `stats()` | `d4cfe3e` |
 > | CI | Soak + benchmark gates moved to `slow.yml`, where they are not cancelled | `48e584c` |
 > | Net | A starved listener stayed deaf: the retry only ran when other I/O arrived | `999eab8` |

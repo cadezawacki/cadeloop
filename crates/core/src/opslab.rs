@@ -118,14 +118,24 @@ impl<D> OpSlab<D> {
         }
     }
 
+    /// Bounds-checked slot lookup.
+    ///
+    /// An index past the allocated chunks is not a programming error to
+    /// panic on: an `OpId` can arrive from outside the slab -- recovered
+    /// from a completion, or handed in across the Python boundary by
+    /// `cancel_connect` -- and the whole point of the generation check is
+    /// that a stale or bogus id resolves to `None`. Indexing directly
+    /// panicked BEFORE that check could run, turning "id I do not
+    /// recognise" into a crash. The modulo is always in range, so only
+    /// the chunk lookup needs checking.
     #[inline]
-    fn slot(&self, index: u32) -> &OpSlot<D> {
-        &self.chunks[index as usize / CHUNK][index as usize % CHUNK]
+    fn slot(&self, index: u32) -> Option<&OpSlot<D>> {
+        self.chunks.get(index as usize / CHUNK).map(|c| &c[index as usize % CHUNK])
     }
 
     #[inline]
-    fn slot_mut(&mut self, index: u32) -> &mut OpSlot<D> {
-        &mut self.chunks[index as usize / CHUNK][index as usize % CHUNK]
+    fn slot_mut(&mut self, index: u32) -> Option<&mut OpSlot<D>> {
+        self.chunks.get_mut(index as usize / CHUNK).map(|c| &mut c[index as usize % CHUNK])
     }
 
     /// Allocate a slot and transition Free -> Posted.
@@ -135,7 +145,8 @@ impl<D> OpSlab<D> {
         }
         let index = self.freelist.pop().expect("freelist refilled by grow");
         self.in_flight += 1;
-        let slot = self.slot_mut(index);
+        // Freelist indices are ours and always in range.
+        let slot = self.slot_mut(index).expect("freelist index within the slab");
         debug_assert_eq!(slot.state, OpState::Free, "post() on non-free slot");
         slot.state = OpState::Posted;
         slot.kind = kind;
@@ -146,7 +157,7 @@ impl<D> OpSlab<D> {
     /// Returns None for stale ids (slot recycled) — callers MUST treat that
     /// as "completion already processed", never as an error to retry.
     pub fn get(&self, id: OpId) -> Option<&OpSlot<D>> {
-        let slot = self.slot(id.index);
+        let slot = self.slot(id.index)?;
         (slot.generation == id.generation && slot.state != OpState::Free).then_some(slot)
     }
 
@@ -190,7 +201,7 @@ impl<D> OpSlab<D> {
     }
 
     pub fn get_mut(&mut self, id: OpId) -> Option<&mut OpSlot<D>> {
-        let slot = self.slot_mut(id.index);
+        let slot = self.slot_mut(id.index)?;
         (slot.generation == id.generation && slot.state != OpState::Free).then_some(slot)
     }
 
@@ -214,7 +225,10 @@ impl<D> OpSlab<D> {
     /// the kernel. Returns the op kind, plus whether the op had been
     /// cancelled (so the dispatcher can suppress user callbacks).
     pub fn complete(&mut self, id: OpId) -> Option<(OpKind, bool)> {
-        let slot = self.slot_mut(id.index);
+        let Some(slot) = self.slot_mut(id.index) else {
+            debug_assert!(false, "completion for out-of-range {id}");
+            return None;
+        };
         if slot.generation != id.generation {
             // Stale completion for a recycled slot: kernel bug or double
             // reap. Debug-fatal, ignore in release.
@@ -237,7 +251,10 @@ impl<D> OpSlab<D> {
 
     /// Completed -> Free. The ONLY transition that recycles a slot.
     pub fn release(&mut self, id: OpId) {
-        let slot = self.slot_mut(id.index);
+        let Some(slot) = self.slot_mut(id.index) else {
+            debug_assert!(false, "release() with out-of-range {id}");
+            return;
+        };
         debug_assert_eq!(slot.generation, id.generation, "release() with stale id {id}");
         debug_assert_eq!(slot.state, OpState::Completed, "release() on non-completed slot {id}");
         if slot.generation == id.generation && slot.state == OpState::Completed {
@@ -248,7 +265,7 @@ impl<D> OpSlab<D> {
     }
 
     pub fn state(&self, id: OpId) -> Option<OpState> {
-        let slot = self.slot(id.index);
+        let slot = self.slot(id.index)?;
         (slot.generation == id.generation).then_some(slot.state)
     }
 
@@ -312,6 +329,25 @@ mod tests {
         assert_eq!(s.complete(id), Some((OpKind::Recv, false)));
         assert!(!s.mark_cancelled(id));
         s.release(id);
+    }
+
+    #[test]
+    fn out_of_range_ids_resolve_to_none_rather_than_panicking() {
+        // An OpId can arrive from outside the slab: recovered from a
+        // completion, or handed across the Python boundary by
+        // cancel_connect. The generation check is meant to reject those,
+        // but indexing the chunk vec happened first and panicked.
+        let mut s: OpSlab<u32> = OpSlab::new(|| 0);
+        let live = s.post(OpKind::Recv);
+        let bogus = OpId { index: 10_000_000, generation: 0 };
+        assert!(s.get(bogus).is_none());
+        assert!(s.get_mut(bogus).is_none());
+        assert!(s.state(bogus).is_none());
+        assert!(!s.mark_cancelled(bogus));
+        // The live op is unaffected by the bogus lookups.
+        assert_eq!(s.state(live), Some(OpState::Posted));
+        assert!(s.complete(live).is_some());
+        s.release(live);
     }
 
     #[test]
