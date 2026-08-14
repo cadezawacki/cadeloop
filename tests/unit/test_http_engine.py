@@ -83,10 +83,20 @@ async def _read_one_response(reader):
         while True:
             line = await reader.readuntil(b"\r\n")
             size = int(line.strip(), 16)
+            if size == 0:
+                # The zero chunk introduces an optional trailer section
+                # closed by a blank line -- readexactly(2) here read the
+                # first two bytes of a trailer instead.
+                body += line
+                while True:
+                    tline = await reader.readuntil(b"\r\n")
+                    body += tline
+                    if tline == b"\r\n":
+                        break
+                break
             chunk = await reader.readexactly(size + 2)
             body += line + chunk
-            if size == 0:
-                return head + body
+        return head + body
     return head
 
 
@@ -1976,4 +1986,128 @@ def test_204_stays_self_framing(loop):
     )
     assert resp.startswith(b"HTTP/1.1 204"), resp[:40]
     assert b"content-length" not in resp.lower(), resp
+    loop._core.listener_close(lid)
+
+
+# --------------------------------------------------------------------- #
+# ASGI http.response.trailers extension                                 #
+# --------------------------------------------------------------------- #
+
+
+def test_scope_declares_the_trailers_extension(loop):
+    """An application checks scope["extensions"] before setting
+    trailers=True, so the engine has to declare it or nothing ever uses
+    the feature."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen.update(scope.get("extensions") or {})
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert "http.response.trailers" in seen, seen
+    loop._core.listener_close(lid)
+
+
+def test_response_trailers_ride_the_chunked_terminator(loop):
+    """Trailers live in the chunked terminator and nowhere else, so a
+    promised-trailers response must stream even when the body arrives in
+    one message -- and the terminating 0-chunk has to be withheld until
+    the trailers are there to go out with it."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"trailer", b"x-checksum")],
+                "trailers": True,
+            }
+        )
+        await send({"type": "http.response.body", "body": b"payload"})
+        await send(
+            {"type": "http.response.trailers", "headers": [(b"x-checksum", b"abc123")]}
+        )
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert b"transfer-encoding: chunked" in resp.lower(), resp
+    assert b"payload" in resp, resp
+    assert b"x-checksum: abc123" in resp, resp
+    # The terminator introduces the trailer section, and the blank line
+    # closes it -- in that order.
+    body = resp.split(b"\r\n\r\n", 1)[1]
+    assert body.endswith(b"0\r\nx-checksum: abc123\r\n\r\n"), body
+    loop._core.listener_close(lid)
+
+
+def test_trailers_can_arrive_in_several_messages(loop):
+    async def app(scope, receive, send):
+        await receive()
+        await send(
+            {"type": "http.response.start", "status": 200, "headers": [], "trailers": True}
+        )
+        await send({"type": "http.response.body", "body": b"x", "more_body": True})
+        await send({"type": "http.response.body", "body": b"y"})
+        await send(
+            {
+                "type": "http.response.trailers",
+                "headers": [(b"x-a", b"1")],
+                "more_trailers": True,
+            }
+        )
+        await send({"type": "http.response.trailers", "headers": [(b"x-b", b"2")]})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    body = resp.split(b"\r\n\r\n", 1)[1]
+    assert body.endswith(b"0\r\nx-a: 1\r\nx-b: 2\r\n\r\n"), body
+    loop._core.listener_close(lid)
+
+
+def test_a_response_without_trailers_is_unchanged(loop):
+    """The default path must not grow a withheld terminator."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"x", "more_body": True})
+        await send({"type": "http.response.body", "body": b"y"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    body = resp.split(b"\r\n\r\n", 1)[1]
+    assert body.endswith(b"0\r\n\r\n"), body
+    loop._core.listener_close(lid)
+
+
+def test_trailers_reject_fields_that_change_framing(loop):
+    """RFC 7230 4.1.2: a recipient merging trailers into the header set
+    must not have its framing or routing decided after the fact."""
+    errors = []
+
+    async def app(scope, receive, send):
+        await receive()
+        await send(
+            {"type": "http.response.start", "status": 200, "headers": [], "trailers": True}
+        )
+        await send({"type": "http.response.body", "body": b"x"})
+        try:
+            await send(
+                {
+                    "type": "http.response.trailers",
+                    "headers": [(b"content-length", b"999")],
+                }
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+            await send({"type": "http.response.trailers", "headers": []})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert errors and "not allowed in trailers" in errors[0], errors
     loop._core.listener_close(lid)

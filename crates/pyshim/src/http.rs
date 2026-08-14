@@ -49,6 +49,10 @@ pub(crate) enum RespPhase {
     Started,
     /// Streaming body (chunked, caller-framed, or close-delimited).
     Streaming,
+    /// Body complete, terminating chunk withheld: the application said it
+    /// would send trailers, so the last chunk and the trailer fields have
+    /// to go out together (ASGI `http.response.trailers`).
+    AwaitingTrailers,
     /// Response fully written.
     Done,
 }
@@ -90,6 +94,14 @@ pub(crate) struct HttpConn {
     /// 205 Reset Content: body bytes suppressed like `resp_bodyless`, but
     /// the empty payload still has to be framed (RFC 7231 6.3.6).
     pub(crate) resp_empty: bool,
+    /// The zero-length chunk that introduces the trailer section has
+    /// been written, so further trailer messages append fields only.
+    pub(crate) trailers_started: bool,
+    /// `http.response.start` set `trailers: True`. Only honoured when the
+    /// response is genuinely chunked -- HTTP/1.1 carries trailers in the
+    /// chunked terminator and nowhere else, so a caller-framed or
+    /// close-delimited response has no place to put them.
+    pub(crate) resp_trailers: bool,
     /// Active request's HTTP minor version (0 => chunked is unavailable).
     pub(crate) active_minor: u8,
     /// Body of the ACTIVE request, taken by the first `receive()`.
@@ -232,6 +244,8 @@ impl HttpConn {
             active_head: false,
             resp_bodyless: false,
             resp_empty: false,
+            resp_trailers: false,
+            trailers_started: false,
             active_minor: 1,
             req_body: None,
             disconnected: false,
@@ -426,6 +440,8 @@ pub(crate) fn date_line(net: &mut NetState, unix_secs: u64) -> &[u8] {
 // --------------------------------------------------------------------- //
 
 static ASGI_INFO: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+/// ASGI `scope["extensions"]` -- the engine's declared optional features.
+static EXTENSIONS: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
 static EMPTY_BYTES: PyOnceLock<Py<PyBytes>> = PyOnceLock::new();
 static COMPLETED: PyOnceLock<Py<CompletedAwaitable>> = PyOnceLock::new();
 
@@ -494,6 +510,17 @@ fn build_scope<'py>(
         Ok(d.unbind())
     })?;
     scope.set_item(intern!(py, "asgi"), asgi)?;
+    if !ws {
+        // ASGI extension discovery: an application checks this before
+        // setting `trailers: True`, so the engine has to declare it or
+        // nothing will ever use the feature.
+        let exts = EXTENSIONS.get_or_try_init(py, || -> PyResult<Py<PyDict>> {
+            let d = PyDict::new(py);
+            d.set_item(intern!(py, "http.response.trailers"), PyDict::new(py))?;
+            Ok(d.unbind())
+        })?;
+        scope.set_item(intern!(py, "extensions"), exts)?;
+    }
     scope.set_item(
         intern!(py, "http_version"),
         if req.http_minor == 1 { intern!(py, "1.1") } else { intern!(py, "1.0") },
@@ -1000,6 +1027,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         head.push(b' ');
         head.extend_from_slice(status_text(status).as_bytes());
         head.extend_from_slice(b"\r\n");
+        let wants_trailers = match message.get_item(intern!(py, "trailers"))? {
+            Some(v) => v.is_truthy()?,
+            None => false,
+        };
         let mut declared_length: Option<u64> = None;
         let mut saw_close = false;
         if let Some(headers) = message.get_item(intern!(py, "headers"))? {
@@ -1075,6 +1106,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 return Err(SendErr::Proto("http.response.start sent twice"));
             }
             conn.resp_head = std::mem::take(&mut head);
+            conn.resp_trailers = wants_trailers;
             conn.resp_started_with_length = declared_length.is_some();
             conn.resp_declared_length = declared_length;
             conn.resp_body_sent = 0;
@@ -1106,6 +1138,9 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             match conn.resp {
                 RespPhase::Idle => Err(SendErr::Proto("http.response.body before http.response.start")),
                 RespPhase::Done => Err(SendErr::Proto("http.response.body after the response completed")),
+                RespPhase::AwaitingTrailers => Err(SendErr::Proto(
+                    "http.response.body after the body completed; send http.response.trailers",
+                )),
                 RespPhase::Started => {
                     // First body chunk decides the framing (R-084).
                     let mut out = std::mem::take(&mut conn.resp_head);
@@ -1123,7 +1158,11 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // means to stream: it is not in rule 1's self-framing
                     // set, so the client needs an explicit length, and no
                     // body byte will ever follow to justify chunked.
-                    if !more || empty {
+                    // Trailers ride in the chunked terminator and nowhere
+                    // else, so a promised-trailers response has to stream
+                    // even when the body arrives in one message.
+                    let trailers = conn.resp_trailers && !head_req && minor >= 1 && !saw_length;
+                    if (!more && !trailers) || empty {
                         if !saw_length && !bodyless {
                             out.extend_from_slice(b"content-length: ");
                             let framed = if empty { 0 } else { body.len() };
@@ -1144,7 +1183,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         } else {
                             conn.resp = RespPhase::Done;
                         }
-                    } else if saw_length || head_req || minor == 0 {
+                    } else if !trailers && (saw_length || head_req || minor == 0) {
                         // Raw streaming: caller-framed (their CL), a HEAD
                         // response (no body bytes at all), or HTTP/1.0
                         // (close-delimited — chunked needs 1.1).
@@ -1170,7 +1209,14 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                             push_chunk(&mut out, &body);
                         }
                         conn.raw_stream = false;
-                        conn.resp = RespPhase::Streaming;
+                        conn.resp_body_sent = body.len() as u64;
+                        conn.resp = if !more {
+                            // Body done in one message, but the terminator
+                            // waits for the trailers it has to carry.
+                            RespPhase::AwaitingTrailers
+                        } else {
+                            RespPhase::Streaming
+                        };
                     }
                     net::http_enqueue(py, net, backend, tid, out);
                     Ok(())
@@ -1191,10 +1237,16 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         return Err(e);
                     }
                     if !more {
-                        if !raw && !head_req {
-                            out.extend_from_slice(b"0\r\n\r\n");
+                        if !raw && !head_req && conn.resp_trailers {
+                            // Terminator withheld: it and the trailer
+                            // fields are one unit on the wire.
+                            conn.resp = RespPhase::AwaitingTrailers;
+                        } else {
+                            if !raw && !head_req {
+                                out.extend_from_slice(b"0\r\n\r\n");
+                            }
+                            conn.resp = RespPhase::Done;
                         }
-                        conn.resp = RespPhase::Done;
                     }
                     net::http_enqueue(py, net, backend, tid, out);
                     Ok(())
@@ -1205,7 +1257,97 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         return Ok(());
     }
 
+    if kind == "http.response.trailers" {
+        let more = match message.get_item(intern!(py, "more_trailers"))? {
+            Some(v) => v.is_truthy()?,
+            None => false,
+        };
+        let mut fields: Vec<u8> = Vec::new();
+        if let Some(headers) = message.get_item(intern!(py, "headers"))? {
+            for item in headers.try_iter()? {
+                let pair = item?;
+                let name: Vec<u8> = pair.get_item(0)?.extract()?;
+                let value: Vec<u8> = pair.get_item(1)?.extract()?;
+                // Same guard as the response head: a CR/LF here would
+                // forge the end of the message and start a new one.
+                if let Err(why) = validate_response_header(&name, &value) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "ASGI application sent an invalid trailer: {why}"
+                    )));
+                }
+                // RFC 7230 4.1.2 forbids these in trailers: a recipient
+                // that merges trailers into the header set would otherwise
+                // have its framing or routing decided after the fact.
+                if is_forbidden_trailer(&name) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "ASGI application sent a trailer that is not allowed in trailers: {}",
+                        String::from_utf8_lossy(&name)
+                    )));
+                }
+                fields.extend_from_slice(&name);
+                fields.extend_from_slice(b": ");
+                fields.extend_from_slice(&value);
+                fields.extend_from_slice(b"\r\n");
+            }
+        }
+        core.with_net(|net, reactor| {
+            let backend = reactor.backend_mut();
+            let Some(conn) = net.http_conn_mut(tid) else { return Err(SendErr::Gone) };
+            if conn.resp != RespPhase::AwaitingTrailers {
+                return Err(SendErr::Proto(
+                    "http.response.trailers without a preceding body that promised them",
+                ));
+            }
+            let mut out = Vec::with_capacity(fields.len() + 8);
+            if conn.trailers_started {
+                out.extend_from_slice(&fields);
+            } else {
+                // The terminating zero-length chunk introduces the
+                // trailer section; it was withheld until now.
+                conn.trailers_started = true;
+                out.extend_from_slice(b"0\r\n");
+                out.extend_from_slice(&fields);
+            }
+            if !more {
+                out.extend_from_slice(b"\r\n");
+                conn.resp = RespPhase::Done;
+            }
+            net::http_enqueue(py, net, backend, tid, out);
+            Ok(())
+        })?
+        .map_err(send_err)?;
+        return Ok(());
+    }
+
     Err(PyRuntimeError::new_err(format!("unsupported ASGI message type: {mtype}")))
+}
+
+/// Fields RFC 7230 4.1.2 forbids in a trailer section.
+///
+/// Framing, routing and authentication must be decided from the header
+/// section; a recipient that merges trailers in would otherwise have them
+/// changed after the message was already being processed.
+fn is_forbidden_trailer(name: &[u8]) -> bool {
+    let mut lower = name.to_ascii_lowercase();
+    lower.retain(|b| !b" \t".contains(b));
+    matches!(
+        lower.as_slice(),
+        b"transfer-encoding"
+            | b"content-length"
+            | b"host"
+            | b"cache-control"
+            | b"expect"
+            | b"max-forwards"
+            | b"pragma"
+            | b"range"
+            | b"te"
+            | b"authorization"
+            | b"set-cookie"
+            | b"content-encoding"
+            | b"content-type"
+            | b"content-range"
+            | b"trailer"
+    )
 }
 
 /// Enforce a declared `content-length` (R-084). Getting this wrong is not
@@ -1999,6 +2141,8 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 conn.active_head = req.method == "HEAD";
                 conn.resp_bodyless = false;
                 conn.resp_empty = false;
+                conn.resp_trailers = false;
+                conn.trailers_started = false;
                 conn.active_minor = req.http_minor;
                 if logging {
                     // R-140: retained only while a sink is installed.

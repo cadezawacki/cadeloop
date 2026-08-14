@@ -1086,12 +1086,19 @@ pub(crate) fn http_sweep(
         if entry.conn_lost || entry.closing {
             continue;
         }
+        // A response whose last ASGI message has been produced is not
+        // finished: its bytes may still be queued or in flight. Counting
+        // that connection idle started the keep-alive clock while the
+        // response was still going out, so a large body to a slow client
+        // could be torn down mid-transmission by the idle sweep.
+        let draining = !entry.wq.is_empty() || entry.send_op.is_some();
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
         // Done/Idle are between-requests states; only a live app, queued
-        // pipeline, or a mid-flight response counts as busy.
+        // pipeline, a mid-flight response, or bytes still on the way out
+        // counts as busy.
         let mid_response =
             matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming);
-        let busy = conn.active || !conn.pending.is_empty() || mid_response;
+        let busy = conn.active || !conn.pending.is_empty() || mid_response || draining;
         let phase: u8 = if busy {
             2
         } else if conn.parser.in_head() {
