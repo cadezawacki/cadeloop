@@ -456,6 +456,80 @@ def test_happy_eyeballs_falls_through_bad_address(loop):
     loop.run_until_complete(main())
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available")
+def test_unix_socket_echo_roundtrip(loop, tmp_path):
+    """create_unix_connection/create_unix_server previously fell through
+    to AbstractEventLoop's abstract NotImplementedError. Delegates to
+    create_connection/create_server's sock= path, driven end to end here
+    via the real asyncio.open_unix_connection stream helpers."""
+    sock_path = str(tmp_path / "echo.sock")
+
+    async def main():
+        async def handler(reader, writer):
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+            writer.close()
+
+        # start_unix_server (not loop.create_unix_server directly): it
+        # wraps the reader/writer callback into a real asyncio.Protocol,
+        # which is what create_unix_server's protocol_factory contract
+        # expects — exercises the same code path as _echo_server's
+        # asyncio.start_server does for the TCP case above.
+        server = await asyncio.start_unix_server(handler, sock_path)
+        reader, writer = await asyncio.open_unix_connection(sock_path)
+        for size in (1, 100, 4096):
+            payload = os.urandom(size)
+            writer.write(payload)
+            await writer.drain()
+            assert await reader.readexactly(size) == payload
+        writer.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available")
+def test_create_unix_server_rebinds_stale_socket(loop, tmp_path):
+    """A stale socket file left by a crashed prior instance previously
+    would have made a second create_unix_server(path=...) fail with
+    'address already in use' — must be transparently cleared, matching
+    stdlib's own create_unix_server."""
+    sock_path = str(tmp_path / "stale.sock")
+
+    async def main():
+        async def handler(reader, writer):
+            writer.close()
+
+        server1 = await asyncio.start_unix_server(handler, sock_path)
+        server1.close()
+        await server1.wait_closed()
+        assert os.path.exists(sock_path)  # the file itself outlives close()
+
+        server2 = await asyncio.start_unix_server(handler, sock_path)
+        server2.close()
+        await server2.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available")
+def test_create_unix_connection_path_and_sock_mutually_exclusive(loop):
+    async def main():
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(ValueError, match="path and sock"):
+                await loop.create_unix_connection(asyncio.Protocol, "/tmp/x", sock=sock)
+        finally:
+            sock.close()
+
+    loop.run_until_complete(main())
+
+
 def test_server_start_serving_deferred(loop):
     async def main():
         connected = []

@@ -8,9 +8,11 @@ replaces it in M4). Mixed into ``cadeloop.Loop``.
 from __future__ import annotations
 
 import asyncio
+import errno
 import functools
 import os
 import socket
+import stat
 import sys
 from asyncio import sslproto, staggered
 from asyncio.base_events import _interleave_addrinfos
@@ -21,6 +23,8 @@ except ImportError:  # pragma: no cover
     ssl_module = None
 
 __all__ = ["TcpSurface", "Server"]
+
+logger = __import__("logging").getLogger("cadeloop")
 
 
 def _fileno(fd):
@@ -467,6 +471,127 @@ class TcpSurface:
             raise
         return Server(self, entries, factory, accept_pool, start_serving)
 
+    # -- AF_UNIX (delegates to create_connection/create_server's sock= ----
+    # path — the native transport/listener machinery operates on a raw
+    # socket fd via recv/send-style ops, family-agnostic, so an AF_UNIX
+    # stream socket works through it exactly like AF_INET does).
+
+    async def create_unix_connection(
+        self,
+        protocol_factory,
+        path=None,
+        *,
+        ssl=None,
+        sock=None,
+        server_hostname=None,
+        ssl_handshake_timeout=None,
+        ssl_shutdown_timeout=None,
+    ):
+        if not hasattr(socket, "AF_UNIX"):
+            raise NotImplementedError("Unix sockets are not supported on this platform")
+        assert server_hostname is None or isinstance(server_hostname, str)
+        if ssl:
+            if server_hostname is None:
+                raise ValueError("you have to pass server_hostname when using ssl")
+        else:
+            if server_hostname is not None:
+                raise ValueError("server_hostname is only meaningful with ssl")
+            if ssl_handshake_timeout is not None:
+                raise ValueError("ssl_handshake_timeout is only meaningful with ssl")
+            if ssl_shutdown_timeout is not None:
+                raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
+
+        if path is not None:
+            if sock is not None:
+                raise ValueError("path and sock can not be specified at the same time")
+            path = os.fspath(path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+            try:
+                sock.setblocking(False)
+                await self.sock_connect(sock, path)
+            except BaseException:
+                sock.close()
+                raise
+        else:
+            if sock is None:
+                raise ValueError("no path and sock were specified")
+            if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+                raise ValueError(f"A UNIX Domain Stream Socket was expected, got {sock!r}")
+            sock.setblocking(False)
+
+        return await self.create_connection(
+            protocol_factory,
+            sock=sock,
+            ssl=ssl,
+            server_hostname=server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+        )
+
+    async def create_unix_server(
+        self,
+        protocol_factory,
+        path=None,
+        *,
+        sock=None,
+        backlog=100,
+        ssl=None,
+        ssl_handshake_timeout=None,
+        ssl_shutdown_timeout=None,
+        start_serving=True,
+    ):
+        if not hasattr(socket, "AF_UNIX"):
+            raise NotImplementedError("Unix sockets are not supported on this platform")
+        if isinstance(ssl, bool):
+            raise TypeError("ssl argument must be an SSLContext or None")
+        if ssl_handshake_timeout is not None and not ssl:
+            raise ValueError("ssl_handshake_timeout is only meaningful with ssl")
+        if ssl_shutdown_timeout is not None and not ssl:
+            raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
+
+        if path is not None:
+            if sock is not None:
+                raise ValueError("path and sock can not be specified at the same time")
+            path = os.fspath(path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            # Clear a stale socket file left by a crashed prior instance
+            # (matches stdlib: abstract-namespace paths start with a NUL
+            # and have no filesystem entry to check).
+            if path[0] not in (0, "\x00"):
+                try:
+                    if stat.S_ISSOCK(os.stat(path).st_mode):
+                        os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as err:
+                    logger.error("Unable to check or remove stale UNIX socket %r: %r", path, err)
+            try:
+                sock.bind(path)
+            except OSError as exc:
+                sock.close()
+                if exc.errno == errno.EADDRINUSE:
+                    raise OSError(errno.EADDRINUSE, f"Address {path!r} is already in use") from None
+                raise
+            except BaseException:
+                sock.close()
+                raise
+        else:
+            if sock is None:
+                raise ValueError("path was not specified, and no sock specified")
+            if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+                raise ValueError(f"A UNIX Domain Stream Socket was expected, got {sock!r}")
+
+        sock.listen(backlog)  # create_server's sock= path expects this done already
+        sock.setblocking(False)
+        return await self.create_server(
+            protocol_factory,
+            sock=sock,
+            ssl=ssl,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+            start_serving=start_serving,
+        )
+
     # -- readiness callbacks (R-057) ---------------------------------------
 
     def add_reader(self, fd, callback, *args):
@@ -574,16 +699,20 @@ class TcpSurface:
             self._core.remove_writer(fd)
 
     async def sock_connect(self, sock, address):
-        # Resolve if needed (numeric fast path first).
-        try:
-            socket.inet_pton(sock.family, address[0])
-        except (OSError, ValueError, IndexError):
-            infos = await self.getaddrinfo(
-                address[0], address[1], family=sock.family, type=sock.type, proto=sock.proto
-            )
-            if not infos:
-                raise OSError(f"getaddrinfo({address!r}) returned empty list")
-            address = infos[0][4]
+        # Resolution only applies to AF_INET/AF_INET6 (matches stdlib):
+        # AF_UNIX addresses are filesystem paths, not (host, port) pairs,
+        # and any other family's address is used exactly as given.
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            # Numeric fast path first.
+            try:
+                socket.inet_pton(sock.family, address[0])
+            except (OSError, ValueError, IndexError):
+                infos = await self.getaddrinfo(
+                    address[0], address[1], family=sock.family, type=sock.type, proto=sock.proto
+                )
+                if not infos:
+                    raise OSError(f"getaddrinfo({address!r}) returned empty list")
+                address = infos[0][4]
         err = sock.connect_ex(address)
         if err == 0:
             return
