@@ -43,8 +43,8 @@ use windows_sys::Win32::Networking::WinSock::{
     LPFN_CONNECTEX, LPFN_DISCONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_LOOPBACK_FAST_PATH, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_PROTOCOL_INFOW,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TCP_FASTOPEN, TCP_NODELAY, TF_REUSE_SOCKET, WSABUF,
-    WSADATA, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
-    WSA_IO_PENDING, XP1_IFS_HANDLES,
+    WSADATA, WSAEINVAL, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAPROTOCOL_INFOW,
+    WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, XP1_IFS_HANDLES,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, SetFileCompletionNotificationModes, WriteFile};
 use windows_sys::Win32::System::IO::{
@@ -325,7 +325,7 @@ impl IocpBackend {
             watch_rearm: Vec::new(),
             probe_ops: HashMap::new(),
             skip_ok: std::collections::HashSet::new(),
-            accept_socket_flags: WSA_FLAG_OVERLAPPED,
+            accept_socket_flags: WSA_FLAG_OVERLAPPED | crate::netsys::WSA_FLAG_NO_HANDLE_INHERIT,
             associated: std::collections::HashSet::new(),
         })
     }
@@ -456,7 +456,7 @@ impl IocpBackend {
                 info
             }
         };
-        let s = unsafe {
+        let mut s = unsafe {
             WSASocketW(
                 info.iAddressFamily,
                 info.iSocketType,
@@ -467,7 +467,33 @@ impl IocpBackend {
             )
         };
         if s == !0usize {
-            return Err(wsa_error());
+            // An accepted connection is as inheritable as a listener, and
+            // just as damaging in a child: it holds the peer's connection
+            // open past the server's own close. WSAEINVAL means the
+            // no-inherit flag was refused rather than the socket failing,
+            // so drop it for good on this backend and clear the bit by
+            // hand instead (the pre-Win8 path).
+            let no_inherit = crate::netsys::WSA_FLAG_NO_HANDLE_INHERIT;
+            if unsafe { WSAGetLastError() } != WSAEINVAL || self.accept_socket_flags & no_inherit == 0 {
+                return Err(wsa_error());
+            }
+            self.accept_socket_flags &= !no_inherit;
+            s = unsafe {
+                WSASocketW(
+                    info.iAddressFamily,
+                    info.iSocketType,
+                    info.iProtocol,
+                    std::ptr::null(),
+                    0,
+                    self.accept_socket_flags,
+                )
+            };
+            if s == !0usize {
+                return Err(wsa_error());
+            }
+        }
+        if self.accept_socket_flags & crate::netsys::WSA_FLAG_NO_HANDLE_INHERIT == 0 {
+            crate::netsys::clear_handle_inherit(s);
         }
         Ok(s)
     }

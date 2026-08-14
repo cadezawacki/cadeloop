@@ -187,6 +187,10 @@ pub(crate) struct WsConn {
     /// looks like a clean handshake on the server and an instant
     /// disconnect on the client.
     pub(crate) offered: Vec<String>,
+    /// Close code the peer sent (or we failed with). Survives teardown in
+    /// `NetState.recent_ws_closes` so a receive() that arrives after the
+    /// connection is gone still reports what actually happened.
+    pub(crate) close_code: Option<u16>,
 }
 
 /// R-087: default cap on an assembled inbound message (1009 beyond it).
@@ -633,6 +637,22 @@ pub(crate) fn disconnect_message(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// The disconnect a receive() gets once its connection is already gone.
+///
+/// `http.disconnect` was returned unconditionally, even for a WebSocket
+/// scope -- which happens whenever the peer's close frame is answered and
+/// the connection torn down while the app is busy elsewhere rather than
+/// parked in receive(). An app that validates the event type rejects it,
+/// and one that does not still loses the close code the peer sent.
+/// `recent_ws_closes` keeps just enough to answer correctly.
+fn gone_message(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<Py<PyAny>> {
+    let ws_code = core.with_net(|net, _| net.recent_ws_close(tid))?;
+    match ws_code {
+        Some(code) => ws_message_dict(py, WsMsg::Disconnect(code)),
+        None => disconnect_message(py),
+    }
+}
+
 // --------------------------------------------------------------------- //
 // awaitables                                                            //
 // --------------------------------------------------------------------- //
@@ -746,7 +766,7 @@ impl HttpReceive {
             }
         })?;
         match r {
-            R::Disconnect => value_awaitable(py, disconnect_message(py)?),
+            R::Disconnect => value_awaitable(py, gone_message(py, core, self.tid)?),
             R::WsConnect => {
                 let d = PyDict::new(py);
                 d.set_item(intern!(py, "type"), intern!(py, "websocket.connect"))?;
@@ -784,7 +804,8 @@ impl HttpReceive {
                     core.drain_graveyards(py)?;
                 }
                 if !stored {
-                    let _ = fut.call_method1(intern!(py, "set_result"), (disconnect_message(py)?,));
+                    let msg = gone_message(py, core, self.tid)?;
+                    let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
                 }
                 Ok(fut.unbind())
             }
@@ -2040,6 +2061,7 @@ pub(crate) fn ws_ingest(
                         ws::close_frame(code, "")
                     });
                 }
+                wsc.close_code = Some(code);
                 wsc.inbox.push_back(WsMsg::Disconnect(code));
                 wake = true;
                 close_after = true;
@@ -2049,6 +2071,7 @@ pub(crate) fn ws_ingest(
                     wsc.closing = true;
                     enqueues.push(ws::close_frame(code, reason));
                 }
+                wsc.close_code = Some(code);
                 wsc.inbox.push_back(WsMsg::Disconnect(code));
                 wake = true;
                 close_after = true;
@@ -2210,6 +2233,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                             connect_sent: false,
                             key: key.clone(),
                             offered: offered_subprotocols(&req),
+                            close_code: None,
                         }));
                     }
                     WsVerdict::Bad => {}
@@ -2312,9 +2336,23 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         } else {
             // §16 escape hatch: full stdlib Task semantics
             // (asyncio.current_task() is a real Task; contextvars isolated).
-            let task = pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))?;
-            let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid })?;
-            task.call_method1(intern!(py, "add_done_callback"), (cb,))?;
+            //
+            // Spawning can fail on the application's account -- an ASGI
+            // callable that returns a non-coroutine, or an installed task
+            // factory that rejects it. Propagating that out of
+            // pump_requests took the error through the native tick and
+            // stopped the whole worker's loop, where the eager branch
+            // turns the same per-request mistake into a 500 and keeps
+            // serving everyone else. Route it the same way.
+            let spawned = (|| -> PyResult<()> {
+                let task = pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))?;
+                let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid })?;
+                task.call_method1(intern!(py, "add_done_callback"), (cb,))?;
+                Ok(())
+            })();
+            if let Err(e) = spawned {
+                app_failure(py, core, tid, e)?;
+            }
             return Ok(());
         }
     }

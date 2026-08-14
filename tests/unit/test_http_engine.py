@@ -2340,3 +2340,36 @@ def test_awaiting_a_foreign_loops_future_fails_the_request(loop):
     # The point is that the request TERMINATES rather than hanging until
     # the read times out; a 500 is the app-failure path doing its job.
     assert resp.startswith(b"HTTP/1.1 500"), resp[:80]
+
+
+def test_a_non_eager_spawn_failure_is_a_500_not_a_dead_worker(loop):
+    """With eager_tasks=False the request is handed to loop.create_task().
+    That can fail on the application's account -- an ASGI callable that
+    returns a non-coroutine, or an installed task factory that rejects it
+    -- and the error propagated straight out of pump_requests, through
+    the native tick, stopping the whole worker's event loop. The eager
+    path turns the same per-request mistake into a 500 and keeps serving.
+    Reported by Codex on PR #1."""
+
+    def app(scope, receive, send):  # not a coroutine function
+        return 42  # create_task() cannot take this
+
+    lid, port = listen(loop, app, eager=False)
+
+    async def main():
+        first = None
+        for _ in range(2):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(), 5.0)
+            writer.close()
+            if first is None:
+                first = data
+        return first, data
+
+    first, second = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert first.startswith(b"HTTP/1.1 500"), first[:80]
+    # The point: the loop survived the first failure and served again.
+    assert second.startswith(b"HTTP/1.1 500"), second[:80]

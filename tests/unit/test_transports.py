@@ -1880,3 +1880,43 @@ def test_close_reaps_the_buffers_of_the_sends_it_cancels(loop):
         if peer is not None:
             peer.close()
         srv.close()
+
+
+def test_a_failed_ssl_protocol_build_does_not_leak_the_connection(loop):
+    """`_make_ssl_context` returns anything that is not a bool unchanged,
+    so `ssl="bad"` reaches `_make_ssl_protocol` and raises inside
+    wrap_bio. The protocol was built outside the rollback try, so that
+    raised past the only code that would have closed the descriptor --
+    one connected socket leaked per failure, invisible until the process
+    ran out. Reported by Codex on PR #1."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    # Every attempt completes a connection the server never accepts, so
+    # the backlog must outlast the run or the connects themselves block.
+    srv.listen(128)
+    try:
+
+        async def attempt():
+            with pytest.raises(BaseException):
+                await loop.create_connection(asyncio.Protocol, *srv.getsockname(), ssl="bad")
+
+        before = _open_fd_count()
+        for _ in range(12):
+            loop.run_until_complete(attempt())
+        after = _open_fd_count()
+        # A few descriptors of slack for unrelated churn; the bug leaked
+        # one per attempt, so 12 attempts moved this by 12.
+        assert after - before < 6, (
+            f"open descriptors grew from {before} to {after} over 12 failed attempts"
+        )
+    finally:
+        srv.close()
+
+
+def _open_fd_count():
+    """Open descriptors for this process, or handles on Windows."""
+    if hasattr(os, "listdir") and os.path.isdir("/proc/self/fd"):
+        return len(os.listdir("/proc/self/fd"))
+    import gc as _gc
+
+    return len([o for o in _gc.get_objects() if isinstance(o, socket.socket)])

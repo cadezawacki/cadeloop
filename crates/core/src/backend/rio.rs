@@ -275,7 +275,9 @@ impl RioBackend {
         }
         let mut inner = IocpBackend::new()?;
         // Accepted connections must be RQ-capable (R-042).
-        inner.set_accept_socket_flags(WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO);
+        inner.set_accept_socket_flags(
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO | crate::netsys::WSA_FLAG_NO_HANDLE_INHERIT,
+        );
 
         let mut notify_overlapped: Box<OVERLAPPED> = Box::new(unsafe { zeroed() });
         let notify = RIO_NOTIFICATION_COMPLETION {

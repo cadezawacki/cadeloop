@@ -313,6 +313,31 @@ def test_serve_restores_the_collector_it_reconfigured():
         _gc.enable()
 
 
+def test_serve_does_not_extend_a_freeze_the_caller_already_owns():
+    """gc.unfreeze() is all-or-nothing, so it cannot separate our startup
+    heap from a permanent generation the caller built themselves.
+    Freezing anyway and skipping the unfreeze -- the first shape of this
+    fix -- just moved the leak: our objects joined theirs and stayed. With
+    no way to undo it, serve() leaves the caller's policy alone. Reported
+    by Codex on PR #1."""
+    import gc as _gc
+
+    assert _gc.get_freeze_count() == 0, "test needs a clean permanent generation"
+    keepalive = [object() for _ in range(50)]
+    _gc.freeze()
+    caller_owned = _gc.get_freeze_count()
+    assert caller_owned > 0
+    try:
+        _serve_briefly(cadeloop.Config(grace=0.0, gc_mode="freeze"))
+        assert _gc.get_freeze_count() == caller_owned, (
+            "serve() added its own objects to a permanent generation it "
+            "could not later separate them from"
+        )
+    finally:
+        _gc.unfreeze()
+        del keepalive
+
+
 def test_serve_accepts_a_hostname_not_just_an_ip_literal():
     """`http_listen` parses its host with Rust's IpAddr, so a NAME --
     `localhost`, or any DNS host -- was rejected outright with

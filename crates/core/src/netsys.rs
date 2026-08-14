@@ -236,22 +236,53 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
     use windows_sys::Win32::Networking::WinSock::{
         bind as ws_bind, closesocket, getpeername, getsockname, listen as ws_listen, setsockopt, shutdown,
         WSAGetLastError, WSAIoctl, WSASocketW, IPPROTO_TCP, SD_SEND, SOCKADDR, SOCKET_ERROR, SOL_SOCKET,
-        SO_REUSEADDR, TCP_NODELAY, WSA_FLAG_OVERLAPPED,
+        SO_REUSEADDR, TCP_NODELAY, WSAEINVAL, WSA_FLAG_OVERLAPPED,
     };
 
     fn wsa_err() -> io::Error {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
+    /// Not in windows-sys 0.59's WinSock bindings; from winsock2.h.
+    pub const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+
+    /// Clear a socket's inheritable bit after the fact.
+    ///
+    /// The pre-Windows-8 fallback for `WSA_FLAG_NO_HANDLE_INHERIT`: it
+    /// leaves a window in which a concurrent CreateProcess could still
+    /// capture the handle, which is exactly why the flag is preferred.
+    pub fn clear_handle_inherit(sock: RawSocket) {
+        unsafe { SetHandleInformation(sock as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+    }
+
     pub fn create_tcp(family: i32) -> io::Result<RawSocket> {
         crate::backend::iocp::ensure_winsock();
+        // Sockets were created inheritable. A child started with handle
+        // inheritance enabled -- any subprocess the application spawns
+        // with `close_fds=False`-equivalent semantics -- therefore
+        // captured the listener and every live connection, keeping the
+        // port bound and holding peers' connections open long after the
+        // server closed its own handles.
+        let flags = WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT;
+        let s = unsafe { WSASocketW(family, 1, IPPROTO_TCP, std::ptr::null(), 0, flags) };
+        if s != !0usize {
+            return Ok(s);
+        }
+        // WSAEINVAL here means the flag itself was refused (pre-Win8, or
+        // a layered provider that does not implement it) -- not that the
+        // socket could not be made. Retry without it and clear the bit.
+        if unsafe { WSAGetLastError() } != WSAEINVAL {
+            return Err(wsa_err());
+        }
         let s = unsafe { WSASocketW(family, 1, IPPROTO_TCP, std::ptr::null(), 0, WSA_FLAG_OVERLAPPED) };
         if s == !0usize {
             return Err(wsa_err());
         }
+        clear_handle_inherit(s);
         Ok(s)
     }
 
@@ -391,6 +422,11 @@ pub use imp::{
     bind, close, create_tcp, listen, peername, peername_any, set_fastopen, set_loopback_fast_path,
     set_nodelay, set_reuse_addr, set_reuse_port, set_v6only, shutdown_send, sockname, sockname_any,
 };
+
+/// Windows-only: the IOCP/RIO backends create accept sockets themselves,
+/// so they need the same no-inherit handling `create_tcp` applies.
+#[cfg(windows)]
+pub use imp::{clear_handle_inherit, WSA_FLAG_NO_HANDLE_INHERIT};
 
 #[cfg(test)]
 mod tests {

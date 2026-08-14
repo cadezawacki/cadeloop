@@ -280,6 +280,12 @@ pub(crate) struct NetState {
     /// Python refs & buffers to drop outside the cell (see gil_boundary).
     /// Buffers owned by cancelled-but-unreaped ops, keyed by op.
     pub reap_guards: HashMap<OpId, ReapGuard>,
+    /// Close codes of recently torn-down WebSocket connections, so a
+    /// receive() arriving after teardown still reports
+    /// `websocket.disconnect` with the peer's code instead of
+    /// `http.disconnect`. Bounded: a late receive lands within a tick or
+    /// two of the teardown, never thousands of connections later.
+    pub recent_ws_closes: VecDeque<(u64, u16)>,
     /// Pipe ops cancelled during loop close. Their buffers must outlive
     /// the cancellation request; they are released when the state is
     /// dropped, after the backend (and with it the handles) has gone.
@@ -632,6 +638,14 @@ pub(crate) fn teardown_with(
         ProtoKind::Http(conn) => {
             conn.disconnected = true;
             let ws = conn.ws.is_some();
+            if let Some(wsc) = conn.ws.as_ref() {
+                // Outlives the entry so a receive() that arrives after
+                // this teardown still answers `websocket.disconnect` with
+                // the peer's code. 1006 = "closed abnormally, no close
+                // frame", the honest answer when it never sent one.
+                let code = wsc.close_code.unwrap_or(1006);
+                net.note_ws_close(tid, code);
+            }
             if let Some(fut) = conn.drain_waiter.take() {
                 // The queue will never drain now; releasing the producer
                 // lets its next send() raise properly instead of hanging.
@@ -663,6 +677,27 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
         net.graveyard_sockets.push(sock);
     }
     net.graveyard_entries.push(entry);
+}
+
+/// How many torn-down WebSocket close codes to remember. A receive() that
+/// races a teardown lands within a tick or two of it, so this only has to
+/// outlive the handful of connections closed in that window.
+const RECENT_WS_CLOSES: usize = 64;
+
+impl NetState {
+    /// Remember a WebSocket's close code as its connection goes away.
+    fn note_ws_close(&mut self, tid: u64, code: u16) {
+        if self.recent_ws_closes.len() == RECENT_WS_CLOSES {
+            self.recent_ws_closes.pop_front();
+        }
+        self.recent_ws_closes.push_back((tid, code));
+    }
+
+    /// The close code of a WebSocket connection that has already been torn
+    /// down, if it is still remembered.
+    pub(crate) fn recent_ws_close(&self, tid: u64) -> Option<u16> {
+        self.recent_ws_closes.iter().rev().find(|(t, _)| *t == tid).map(|(_, c)| *c)
+    }
 }
 
 /// Cancel the ops that belong to no transport, listener or datagram

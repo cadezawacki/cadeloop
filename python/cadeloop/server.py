@@ -361,12 +361,22 @@ def _serve_single(
         # R-075: freeze the post-startup heap out of the cyclic collector.
         if config.gc_mode == "freeze":
             gc.collect()
-            # Only ours to undo if nobody else had already frozen anything:
-            # gc.unfreeze() is all-or-nothing, so unfreezing on top of a
-            # caller's own permanent generation would silently throw their
-            # freeze away too.
-            gc_froze = gc.get_freeze_count() == 0
-            gc.freeze()
+            # gc.unfreeze() is all-or-nothing, so it cannot separate our
+            # startup heap from a permanent generation the caller built
+            # themselves. Freezing anyway and skipping the unfreeze --
+            # which is what this did when the restore was first added --
+            # just moves the leak: our objects join theirs and stay there.
+            # With no way to undo it, the honest choice is not to do it:
+            # skip the optimisation and leave the caller's policy alone.
+            if gc.get_freeze_count() == 0:
+                gc.freeze()
+                gc_froze = True
+            else:
+                logger.info(
+                    "gc_mode='freeze' skipped: %d objects were already frozen by the "
+                    "caller, and gc.unfreeze() could not later separate ours from theirs",
+                    gc.get_freeze_count(),
+                )
         elif config.gc_mode == "disable":
             gc.collect()
             gc.disable()
@@ -566,15 +576,33 @@ class _AccessLog:
 
     def close(self, timeout: float = 2.0):
         """Flush what is queued, then stop the writer."""
+        # Wait for the writer to make room rather than deleting a record
+        # to fit the sentinel: a full queue at shutdown is exactly when a
+        # slow handler has built a backlog, so discarding the oldest entry
+        # -- silently, without even counting it as dropped -- punched a
+        # hole in the access log precisely where it mattered most.
         try:
-            self._queue.put_nowait(None)
-        except queue.Full:  # pragma: no cover - drain and retry
+            self._queue.put(None, timeout=timeout)
+        except queue.Full:
+            # The writer is not draining at all. Displacing one record is
+            # now the only way to stop it; count it like any other drop so
+            # the gap is reported rather than hidden.
             try:
                 self._queue.get_nowait()
+                with self._lock:
+                    self._dropped += 1
                 self._queue.put_nowait(None)
-            except queue.Empty:
+            except (queue.Empty, queue.Full):
                 pass
         self._thread.join(timeout)
+        # The writer reports drops as it consumes records; anything
+        # counted after it read the sentinel would otherwise go unsaid.
+        with self._lock:
+            dropped, self._dropped = self._dropped, 0
+        if dropped:
+            self._logger.warning(
+                "access log fell behind: %d record(s) dropped", dropped
+            )
 
 
 def _arm_timeout_sweep(loop, config: Config):
@@ -645,9 +673,37 @@ def _make_adopter(loop, app, config: Config, lifespan, ssl_ctx):
     return adopt
 
 
+# Handoffs this worker will hold un-adopted before it starts refusing
+# them. Reaching it means the loop thread has not run a tick in the time
+# it took the supervisor to send this many connections.
+_MAX_PENDING_ADOPTIONS = 1024
+
+
 def _channel_pump(chan, loop, adopt):
     """Worker side of the spawn channel: adopt handed-over connections
-    until STOP or EOF (a dead supervisor), then stop the loop."""
+    until STOP or EOF (a dead supervisor), then stop the loop.
+
+    This thread is independent of the event loop, so nothing here is
+    paced by the loop making progress. When the loop thread is wedged in
+    synchronous application code, every frame still became an open socket
+    plus a callback on the loop's unbounded cross-thread queue, and the
+    supervisor -- which sees only a live process -- kept sending. The
+    worker grew both without limit until it ran out of handles or memory.
+
+    A connection a wedged worker is holding is not being served anyway, so
+    beyond the cap it is closed rather than queued: the client learns at
+    once and can be retried elsewhere, the worker stays bounded, and the
+    stall is logged instead of silently absorbed.
+    """
+    slots = threading.Semaphore(_MAX_PENDING_ADOPTIONS)
+    refused = 0
+
+    def adopt_and_release(sock):
+        try:
+            adopt(sock)
+        finally:
+            slots.release()
+
     try:
         while True:
             cmd, body, fd = chan.recv_frame()
@@ -660,9 +716,21 @@ def _channel_pump(chan, loop, adopt):
             except OSError:
                 logger.exception("worker could not materialise a handed-over connection")
                 continue
+            if not slots.acquire(blocking=False):
+                sock.close()
+                refused += 1
+                if refused == 1 or refused % 100 == 0:
+                    logger.warning(
+                        "worker refused %d handoff(s): %d adoptions still queued, "
+                        "the event loop is not draining them",
+                        refused,
+                        _MAX_PENDING_ADOPTIONS,
+                    )
+                continue
             try:
-                loop.call_soon_threadsafe(adopt, sock)
+                loop.call_soon_threadsafe(adopt_and_release, sock)
             except RuntimeError:
+                slots.release()
                 sock.close()
                 break  # loop already closing
     except OSError:

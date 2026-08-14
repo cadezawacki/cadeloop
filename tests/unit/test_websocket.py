@@ -8,6 +8,7 @@ import base64
 import hashlib
 import os
 import struct
+import threading
 
 import pytest
 
@@ -594,3 +595,44 @@ def test_accept_matches_an_offer_from_a_multi_value_header(loop):
     assert head.split(b"\r\n", 1)[0].endswith(b"101 Switching Protocols"), head[:80]
     assert b"sec-websocket-protocol: superchat" in head.lower(), head
     loop._core.listener_close(lid)
+
+
+def test_a_late_receive_still_reports_a_websocket_disconnect(loop):
+    """When the peer closes while the app is busy on unrelated work rather
+    than parked in receive(), the close is answered and the connection
+    torn down before the app calls receive() again. That missing-entry
+    branch returned `http.disconnect` -- the wrong event type for a
+    WebSocket scope, which a validating app rejects -- and lost the close
+    code the peer had sent. Reported by Codex on PR #1."""
+    seen = []
+    done = threading.Event()
+
+    async def app(scope, receive, send):
+        assert scope["type"] == "websocket"
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        # Busy elsewhere while the close frame arrives and is answered:
+        # by the time we ask, the connection is gone.
+        await asyncio.sleep(0.4)
+        seen.append(await receive())
+        done.set()
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        writer.write(client_frame(0x8, (4321).to_bytes(2, "big")))
+        await writer.drain()
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if done.is_set():
+                break
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+    assert seen, "the app never got its late receive"
+    assert seen[0]["type"] == "websocket.disconnect", seen[0]
+    assert seen[0]["code"] == 4321, seen[0]

@@ -11,6 +11,13 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Server | A stalled worker took unbounded connection handoffs until it ran out of handles | `` |
+> | HTTP | A non-eager spawn failure killed the worker's loop instead of failing one request | `` |
+> | WS | A receive() after teardown reported `http.disconnect` and lost the close code | `` |
+> | TLS | A failed SSL protocol build leaked the connected descriptor | `` |
+> | Windows | Native sockets were inheritable, so a child could hold the port open | `` |
+> | Server | Access-log `close()` discarded a queued record, uncounted, to fit its sentinel | `` |
+> | Server | `gc_mode='freeze'` still froze onto a caller's own permanent generation | `` |
 > | Server | `serve(host="localhost")` failed at startup: hostnames were never resolved | `b234f96` |
 > | ASGI | Awaiting a foreign loop's future hung the request instead of failing it | `b234f96` |
 > | WS | `Sec-WebSocket-Extensions` from the app was forwarded but never negotiated | `b234f96` |

@@ -334,22 +334,28 @@ class TcpSurface:
                 raise
             transport = self._core.attach_stream(fd, protocol)
             return transport, protocol
+        # Everything up to attach_stream() belongs in the rollback, not
+        # just the factory calls: `_make_ssl_context` hands back anything
+        # that is not a bool unchanged, so `ssl="bad"` reaches
+        # `_make_ssl_protocol` and raises inside wrap_bio -- and with the
+        # protocol built outside this try, that raised past the only code
+        # that would have closed the descriptor.
         try:
             sslcontext = self._make_ssl_context(ssl, server_side=server_side)
             app_protocol = protocol_factory()
+            waiter = self.create_future()
+            protocol = self._make_ssl_protocol(
+                app_protocol,
+                sslcontext,
+                waiter,
+                server_side=server_side,
+                server_hostname=server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout,
+            )
         except BaseException:
             self._core.discard_socket(fd)
             raise
-        waiter = self.create_future()
-        protocol = self._make_ssl_protocol(
-            app_protocol,
-            sslcontext,
-            waiter,
-            server_side=server_side,
-            server_hostname=server_hostname,
-            ssl_handshake_timeout=ssl_handshake_timeout,
-            ssl_shutdown_timeout=ssl_shutdown_timeout,
-        )
         transport = self._core.attach_stream(fd, protocol)
         try:
             await waiter  # handshake
