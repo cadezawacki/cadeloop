@@ -290,6 +290,8 @@ def _serve_single(
                 keepalive_idle=config.keepalive_idle,
                 tls=ssl_ctx,
             )
+        if config.immediate_flush:
+            loop._core.set_immediate_flush(True)
         if config.access_log:
             loop._core.set_access_log(_access_sink(logging.getLogger("cadeloop.access")))
         _arm_timeout_sweep(loop, config)

@@ -1766,3 +1766,65 @@ def test_shutdown_sends_a_websocket_close_frame(loop):
     assert int.from_bytes(frame[0][2:4], "big") == 1012, frame
     assert loop._core.http_connection_count() == 0
     w.close()
+
+
+# --------------------------------------------------------------------- #
+# immediate-flush latency mode (R-060 / R-035)                          #
+# --------------------------------------------------------------------- #
+
+
+def _stream_three_chunks_sends(immediate):
+    """Send a 3-chunk streaming response; report sends posted.
+
+    `HttpSend.__call__` resolves without suspending, so all three chunks
+    are produced inside one tick -- exactly the window corking coalesces
+    and immediate flush does not. The test client shares this loop, so
+    its own request write is counted too; only the difference between the
+    two modes is meaningful, which is what the caller asserts on."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        for i in range(3):
+            await send(
+                {"type": "http.response.body", "body": b"c%d" % i, "more_body": i < 2}
+            )
+
+    lp = cadeloop.new_event_loop()
+    asyncio.set_event_loop(lp)
+    try:
+        if immediate:
+            lp._core.set_immediate_flush(True)
+        lid, port = listen(lp, app)
+        before = lp._core.stats()["sends_posted"]
+        # Keep-alive stays open, so read exactly one (chunked) response
+        # rather than to EOF.
+        resp = lp.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+        assert b"c0" in resp and b"c2" in resp, resp[:160]
+        lp._core.listener_close(lid)
+        return lp._core.stats()["sends_posted"] - before
+    finally:
+        asyncio.set_event_loop(None)
+        lp.close()
+
+
+def test_immediate_flush_trades_syscalls_for_tail_latency():
+    """The mode's effect is a send count, not a wall-clock number.
+    Asserting on timing here would measure the load generator, not the
+    server -- on a 4-core box the run-to-run p99 spread swamped the
+    difference in both directions, so no latency claim is made from it."""
+    corked = _stream_three_chunks_sends(immediate=False)
+    immediate = _stream_three_chunks_sends(immediate=True)
+    assert immediate > corked, (
+        f"immediate flush posted {immediate} sends, corked {corked} -- "
+        "the corked path is supposed to coalesce the chunks and this one is not"
+    )
+
+
+def test_latency_mode_spin_selects_immediate_flush():
+    assert cadeloop.Config().immediate_flush is False
+    assert cadeloop.Config(latency_mode="throughput").immediate_flush is False
+    assert cadeloop.Config(latency_mode="spin").immediate_flush is True
+    # An explicit setting always wins over the preset.
+    assert cadeloop.Config(latency_mode="spin", immediate_flush=False).immediate_flush is False
+    assert cadeloop.Config(latency_mode="balanced", immediate_flush=True).immediate_flush is True

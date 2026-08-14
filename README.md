@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Perf | Immediate-flush latency mode: selectable, honestly unmeasured | `HEAD` |
 > | TLS | `h2` could be negotiated, then every request failed against the HTTP/1 parser | `HEAD` |
 > | Server | Shutdown truncated in-flight responses; `grace` was never applied inside a worker | `65fe5c8` |
 > | Server | Failed *replacement* fork left every surviving worker running unsupervised | `65fe5c8` |

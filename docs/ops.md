@@ -33,6 +33,29 @@ cadeloop does not configure NICs programmatically (spec §8).
 `spin` (200µs). Spinning trades CPU for tail latency; use `spin` only on
 dedicated cores.
 
+The mode also picks the write policy. By default an HTTP response is
+*corked* (R-035): it is queued and flushed at the tick's flush phase, so
+several connections' responses leave in one `writev`/`WSASend`. That is
+the throughput choice, and it is the right default — but it couples a
+response's latency to how much *other* work the same tick batched in
+front of it. `immediate_flush` (`--immediate-flush` / `--no-immediate-flush`)
+puts each response on the wire the moment it is wire-ready instead. It
+defaults to on under `latency_mode="spin"` and off otherwise; set it
+explicitly to override either way.
+
+Two caveats worth stating plainly:
+
+- It costs syscalls. A streaming response that emits N chunks in one tick
+  becomes up to N sends instead of one. A single-message response is
+  unaffected — `http.response.start` only stashes the head, so head and
+  body still leave together.
+- We have not measured a latency win from it. On a 4-core VM with a
+  single-process load generator the run-to-run p99 spread was larger than
+  any difference between the modes, in both directions. The knob exists
+  because the trade-off is real and deployment-specific; measure it on
+  your own hardware before turning it on. `stats()["sends_posted"]`, read
+  against `bytes_sent`, shows what corking is buying you.
+
 
 ## Release wheels (R-110/R-111)
 

@@ -288,11 +288,27 @@ pub(crate) struct NetState {
     pub stats_conns_accepted: u64,
     /// Times an accept pool ran dry on a transient post failure (R-032).
     pub stats_accept_starved: u64,
+    /// Sends posted to the kernel (R-035). Read against `bytes_sent`, this
+    /// is the direct measure of what corking buys: the same bytes over
+    /// fewer syscalls. It is also how the immediate-flush latency mode is
+    /// tested, since its effect is a send count, not a wall-clock number
+    /// this class of hardware can resolve.
+    pub stats_sends_posted: u64,
     /// Times a connection stopped reading because its pipeline budget was
     /// spent (R-085). Non-zero means backpressure is doing its job.
     pub stats_pipeline_pauses: u64,
     /// Cheap gate for `retry_starved_listeners` on the tick path.
     pub any_starved_listener: bool,
+    /// R-060 latency mode: put HTTP response bytes on the wire the moment
+    /// they are wire-ready instead of corking them until the tick's flush
+    /// phase. Off by default -- corking is the throughput choice and the
+    /// right default -- but it is what a latency-SLA deployment wants,
+    /// because a response that was ready first can otherwise wait behind
+    /// however many *other* connections' app dispatch the same tick
+    /// batched in front of it. Deliberately scoped to the HTTP engine:
+    /// a Python protocol issuing many small `write()`s is exactly the
+    /// case corking exists for.
+    pub flush_immediately: bool,
     /// HTTP `Date:` header cache (R-084): rebuilt when the unix second ticks.
     pub http_date_secs: u64,
     pub http_date_line: Vec<u8>,
@@ -481,6 +497,7 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
     let socket = entry.socket;
     match backend.post_send(socket, &slices[..n]) {
         Ok(op) => {
+            net.stats_sends_posted += 1;
             if let Some(entry) = net.transports.get_mut(&tid) {
                 entry.send_op = Some(op);
             }
@@ -706,7 +723,12 @@ pub(crate) fn http_enqueue_raw(
     let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
     let unscheduled = !entry.flush_scheduled;
     if no_send {
-        if big {
+        // This is the point where bytes become wire-ready, which for the
+        // common response shape is once per response: `http.response.start`
+        // only stashes the head, and the body message emits head+body as a
+        // single buffer. So latency mode still costs one send per response,
+        // not one per ASGI message.
+        if big || net.flush_immediately {
             flush_pending(py, net, backend, tid);
         } else if unscheduled {
             if let Some(e) = net.transports.get_mut(&tid) {

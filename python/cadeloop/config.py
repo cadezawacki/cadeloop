@@ -29,6 +29,14 @@ class Config:
     backend: str = "auto"  # R-020
     latency_mode: str = "balanced"  # R-060
     spin_us: int | None = None  # R-060 (None -> derived from latency_mode)
+    # R-060/R-035: put each HTTP response on the wire the moment it is
+    # wire-ready instead of corking it until the tick's flush phase.
+    # Corking is the throughput choice and stays the default; immediate
+    # flush costs syscalls and buys tail latency, because a response that
+    # was ready first otherwise waits behind however many *other*
+    # connections' app dispatch the same tick batched ahead of it.
+    # None -> derived from latency_mode (on for "spin").
+    immediate_flush: bool | None = None
     # --- kernel I/O -----------------------------------------------------
     accept_pool: int = 64  # R-032
     rio_cq_size: int = 65536  # R-041
@@ -97,6 +105,8 @@ class Config:
             )
         if self.spin_us is None:
             self.spin_us = LATENCY_PRESETS[self.latency_mode]
+        if self.immediate_flush is None:
+            self.immediate_flush = self.latency_mode == "spin"
         for field, minimum in (
             ("accept_pool", 1),
             ("rio_cq_size", 1),

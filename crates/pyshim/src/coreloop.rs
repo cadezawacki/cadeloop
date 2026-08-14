@@ -1053,6 +1053,14 @@ impl CoreLoop {
         Ok(busy)
     }
 
+    /// R-060 latency mode: when set, HTTP response bytes go on the wire
+    /// as soon as they are wire-ready rather than being corked until the
+    /// tick's flush phase. Trades syscalls for tail latency; `Config`
+    /// derives it from `latency_mode` (on for `spin`).
+    fn set_immediate_flush(&self, enabled: bool) -> PyResult<()> {
+        self.with_net(|net, _| net.flush_immediately = enabled)
+    }
+
     /// Live *native HTTP* connections -- the drain loop's convergence
     /// test. Deliberately not `transports.len()`: that also counts the
     /// Python-protocol transports an application opens for its own
@@ -1398,6 +1406,7 @@ impl CoreLoop {
                     st.net.stats_conns_accepted,
                     st.net.stats_accept_starved,
                     st.net.stats_pipeline_pauses,
+                    st.net.stats_sends_posted,
                 ),
                 st.reactor.backend_mut().diag(),
                 // Live, not the construction-time cache: RIO downgrades its
@@ -1424,6 +1433,7 @@ impl CoreLoop {
         d.set_item("connections_accepted", netstats.5)?;
         d.set_item("accept_starved", netstats.6)?;
         d.set_item("pipeline_pauses", netstats.7)?;
+        d.set_item("sends_posted", netstats.8)?;
         if let Some((notifies, reaps)) = diag {
             d.set_item("rio_notifies", notifies)?;
             d.set_item("rio_watchdog_reaps", reaps)?;
