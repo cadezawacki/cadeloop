@@ -385,6 +385,37 @@ def test_exception_handler_get_set(loop):
         loop.set_exception_handler(42)
 
 
+def test_cancelled_executor_shutdown_resolves_without_error(loop):
+    """Cancelling the task awaiting shutdown_default_executor() cancels
+    its future; when the shutdown thread then finishes, set_result on
+    the cancelled future raised InvalidStateError through the exception
+    handler. CPython schedules _set_result_unless_cancelled instead.
+    Reported on PR #1."""
+    errors = []
+    loop.set_exception_handler(lambda lp, ctx: errors.append(ctx))
+
+    async def main():
+        release = threading.Event()
+        job = loop.run_in_executor(None, release.wait)
+        t = asyncio.ensure_future(loop.shutdown_default_executor())
+        await asyncio.sleep(0.05)  # shutdown thread started, future awaited
+        # cancel() reaches the awaited future synchronously; release the
+        # executor before t resumes -- its finally join()s the shutdown
+        # thread on the loop thread, which deadlocks if the job is still
+        # holding the executor open.
+        t.cancel()
+        release.set()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.2)  # the thread's set_result callback runs
+        await job
+
+    loop.run_until_complete(main())
+    assert errors == [], errors
+
+
 def test_exception_handler_raising_system_exit_stops_the_loop(loop):
     """CPython parity: call_exception_handler deliberately re-raises
     SystemExit/KeyboardInterrupt from a custom handler, and the loop

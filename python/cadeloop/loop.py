@@ -480,7 +480,14 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         try:
             self._default_executor.shutdown(wait=True)
             if not self.is_closed():
-                self.call_soon_threadsafe(future.set_result, None)
+                # Not future.set_result: the awaiting task may have been
+                # cancelled, and resolving a cancelled future raises
+                # InvalidStateError through the exception handler for a
+                # perfectly valid cancellation (CPython schedules the
+                # same cancellation-aware setter here).
+                self.call_soon_threadsafe(
+                    futures._set_result_unless_cancelled, future, None
+                )
         except Exception as ex:
             if not self.is_closed() and not future.cancelled():
                 self.call_soon_threadsafe(future.set_exception, ex)

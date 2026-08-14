@@ -11,7 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Net | A fatal callback error dropped the rest of its dispatch batch: other connections' events were lost for good | `` |
+> | Loop | Cancelling `shutdown_default_executor()` produced a spurious `InvalidStateError` when the shutdown thread finished | `` |
+> | Net | A fatal callback error dropped the rest of its dispatch batch: other connections' events were lost for good | `4d9c231` |
 > | TCP | `create_server` failed outright when one resolved address family was unavailable instead of serving the rest | `7464cd6` |
 > | UDP | `allow_broadcast` + `remote_addr` connected the socket, so replies from any other source were silently dropped | `82426cb` |
 > | UDP | AF_UNIX datagram paths went through the Internet resolver, and a unix sender's source address was dropped on receive | `86d609f` |
