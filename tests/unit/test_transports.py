@@ -2,6 +2,7 @@
 sock_*, signals, TLS (sslproto path)."""
 
 import asyncio
+import errno
 import os
 import signal
 import socket
@@ -350,6 +351,72 @@ def test_create_connection_rejects_ssl_socket(loop):
             wrapped.close()
 
     loop.run_until_complete(main())
+
+
+def test_create_server_skips_unavailable_address_families(loop):
+    """Dual-family resolution must not fail outright because one family
+    cannot be served on this host: CPython skips address families whose
+    socket cannot be created and binds the rest. Simulated with a core
+    proxy so the behavior is testable on dual-stack CI hosts too.
+    Reported on PR #1."""
+    real_core = loop._core
+
+    class CoreProxy:
+        def __getattr__(self, name):
+            return getattr(real_core, name)
+
+        def tcp_listen(self, ip, port, *args):
+            if ":" in ip:  # simulate a host without IPv6
+                raise OSError(errno.EAFNOSUPPORT, "address family not supported")
+            return real_core.tcp_listen(ip, port, *args)
+
+    async def fake_gai(host, port, *, family=0, type=0, proto=0, flags=0):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ]
+
+    loop.getaddrinfo = fake_gai
+    loop._core = CoreProxy()
+    try:
+
+        async def main():
+            server = await loop.create_server(asyncio.Protocol, "localhost", 0)
+            socks = server.sockets
+            assert len(socks) == 1
+            assert socks[0].getsockname()[0] == "127.0.0.1"
+            server.close()
+            await server.wait_closed()
+
+        loop.run_until_complete(main())
+    finally:
+        loop._core = real_core
+
+
+def test_create_server_raises_when_no_family_is_available(loop):
+    """If EVERY resolved family is unavailable the error must surface,
+    not yield a server bound to nothing."""
+    real_core = loop._core
+
+    class CoreProxy:
+        def __getattr__(self, name):
+            return getattr(real_core, name)
+
+        def tcp_listen(self, *args):
+            raise OSError(errno.EAFNOSUPPORT, "address family not supported")
+
+    async def fake_gai(host, port, *, family=0, type=0, proto=0, flags=0):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    loop.getaddrinfo = fake_gai
+    loop._core = CoreProxy()
+    try:
+        with pytest.raises(OSError):
+            loop.run_until_complete(
+                loop.create_server(asyncio.Protocol, "localhost", 0)
+            )
+    finally:
+        loop._core = real_core
 
 
 def test_create_server_validates_reuse_port_and_ssl_shutdown(loop):

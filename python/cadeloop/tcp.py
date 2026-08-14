@@ -43,6 +43,15 @@ def _check_ssl_socket(sock):
         raise TypeError("Socket cannot be of type SSLSocket")
 
 
+# socket()-creation failures that CPython's create_server treats as
+# "skip this address family" during multi-family resolution.
+# WSAEAFNOSUPPORT rides along because the native listener surfaces raw
+# Winsock codes on Windows.
+_AF_UNAVAILABLE = frozenset(
+    {errno.EAFNOSUPPORT, getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT)}
+)
+
+
 class Server(asyncio.AbstractServer):
     """asyncio.AbstractServer implementation over native listeners."""
 
@@ -576,27 +585,43 @@ class TcpSurface:
         if not resolved:
             raise OSError(f"getaddrinfo({host!r}) returned empty list")
 
+        unavailable = None
         try:
             for entry in resolved:
                 ip, bind_port = entry[0], entry[1]
                 flowinfo, scope_id = (entry[2], entry[3]) if len(entry) == 4 else (0, 0)
-                lid, name, rawfd = self._core.tcp_listen(
-                    ip,
-                    bind_port,
-                    factory,
-                    backlog,
-                    reuse_address,
-                    bool(reuse_port),
-                    accept_pool,
-                    start_serving,
-                    flowinfo,
-                    scope_id,
-                )
+                try:
+                    lid, name, rawfd = self._core.tcp_listen(
+                        ip,
+                        bind_port,
+                        factory,
+                        backlog,
+                        reuse_address,
+                        bool(reuse_port),
+                        accept_pool,
+                        start_serving,
+                        flowinfo,
+                        scope_id,
+                    )
+                except OSError as exc:
+                    if exc.errno in _AF_UNAVAILABLE:
+                        # CPython skips families this host cannot create
+                        # a socket for -- a dual-stack resolution on a
+                        # v4-only host must still serve on v4, not fail
+                        # outright. Any OTHER error (EADDRINUSE, EACCES)
+                        # still aborts the whole call.
+                        unavailable = exc
+                        continue
+                    raise
                 entries.append((lid, name, rawfd))
         except BaseException:
             for lid, _name, _fd in entries:
                 self._core.listener_close(lid)
             raise
+        if not entries:
+            # Every resolved family was unavailable: that is an error,
+            # not an empty server.
+            raise unavailable
         return Server(self, entries, factory, accept_pool, start_serving)
 
     # -- AF_UNIX (delegates to create_connection/create_server's sock= ----
