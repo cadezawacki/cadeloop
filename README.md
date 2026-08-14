@@ -11,8 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | A connection that sent nothing never hit the head timeout | `` |
-> | WS | A ping flood from a peer that stops reading queued pongs without bound | `` |
+> | HTTP | A connection that sent nothing never hit the head timeout | `383f049` |
+> | WS | A ping flood from a peer that stops reading queued pongs without bound | `383f049` |
 > | Server | The spawn supervisor kept the old restart rule the fork one had outgrown | `7649432` |
 > | Windows | `SO_REUSEADDR` let another process bind a live listener; now exclusive | `7649432` |
 > | Core | Sub-millisecond waits truncated to zero, busy-polling a core until the timer fired | `7649432` |
