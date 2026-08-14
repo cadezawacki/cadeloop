@@ -11,10 +11,10 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Loop | `close()` never reaped the buffers of the sends it cancelled | `` |
-> | HTTP | Graceful shutdown tore down connections whose bytes were still queued | `` |
-> | Server | `close()` could not wake a `serve_forever()` it had superseded | `` |
-> | Net | Scoped IPv6 listen addresses lost their `scope_id` at bind | `` |
+> | Loop | `close()` never reaped the buffers of the sends it cancelled | `c567a0e` |
+> | HTTP | Graceful shutdown tore down connections whose bytes were still queued | `c567a0e` |
+> | Server | `close()` could not wake a `serve_forever()` it had superseded | `c567a0e` |
+> | Net | Scoped IPv6 listen addresses lost their `scope_id` at bind | `c567a0e` |
 > | Transport | `sendfile` fallback's position seek was skipped by a cancellation unwind | `a443086` |
 > | Unix | AF_UNIX peer/sock addresses were dropped, so `get_extra_info` said `None` | `a443086` |
 > | ASGI | IPv6 `client`/`server` leaked the 4-item socket form into the scope | `046d2da` |
