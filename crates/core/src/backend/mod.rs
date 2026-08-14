@@ -194,6 +194,14 @@ pub trait IoBackend {
     fn diag(&self) -> Option<(u64, u64)> {
         None
     }
+
+    /// ADR-25: completions dequeued carrying an OVERLAPPED outside our
+    /// slab, which are dropped rather than dereferenced. Should always be
+    /// zero; exposed so that a non-zero value is visible rather than a
+    /// silently swallowed completion.
+    fn foreign_completions(&self) -> u64 {
+        0
+    }
 }
 
 /// Cross-thread wakeup poster. Must be safe to call from any thread and

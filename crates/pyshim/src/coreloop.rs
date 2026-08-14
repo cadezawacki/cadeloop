@@ -274,17 +274,20 @@ impl CoreLoop {
                             st.net.listeners.values().map(|l| l.accept_ops_len()).sum(),
                             st.net.listeners.len(),
                         );
+                        let foreign = st.reactor.backend_mut().foreign_completions();
                         eprintln!(
                             "cadeloop-tick: idle x{n} listeners={listeners} accept_ops={accept_ops} \
-                             transports={} ops={} reap_guards={} events={} ready={} timers={} \
-                             starved={}",
+                             transports={} ops={} [{}] reap_guards={} events={} ready={} timers={} \
+                             starved={} foreign_completions={foreign}{}",
                             st.net.transports.len(),
                             st.net.ops.len(),
+                            net::op_target_breakdown(&st.net),
                             st.net.reap_guards.len(),
                             st.net.events.len(),
                             st.reactor.ready_len(),
                             st.reactor.timers_len(),
                             st.net.any_starved_listener,
+                            net::transport_breakdown(&st.net),
                         );
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                     }
@@ -1003,9 +1006,19 @@ impl CoreLoop {
         let res = self.with_net(|net, reactor| -> std::io::Result<()> {
             let backend = reactor.backend_mut();
             backend.register_socket(sock)?;
-            let op = backend.post_connect(sock, &sa.buf[..sa.len])?;
-            net.ops.insert(op, net::OpTarget::Connect { fut, sock });
-            Ok(())
+            match backend.post_connect(sock, &sa.buf[..sa.len]) {
+                Ok(op) => {
+                    net.ops.insert(op, net::OpTarget::Connect { fut, sock });
+                    Ok(())
+                }
+                Err(e) => {
+                    // register_socket succeeded, so this socket IS
+                    // associated; closing it without detaching would leave
+                    // a stale entry that a recycled handle inherits.
+                    backend.detach_socket(sock);
+                    Err(e)
+                }
+            }
         })?;
         if let Err(e) = res {
             netsys::close(sock);

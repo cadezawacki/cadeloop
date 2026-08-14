@@ -641,10 +641,22 @@ impl IocpBackend {
 }
 
 impl IoBackend for IocpBackend {
+    fn foreign_completions(&self) -> u64 {
+        self.foreign_completions
+    }
+
     fn register_socket(&mut self, socket: RawSocket) -> io::Result<()> {
-        if self.associated.contains(&socket) {
-            return Ok(()); // idempotent: association survives until closesocket
-        }
+        // Deliberately NOT short-circuited on `self.associated`. That set is
+        // keyed by SOCKET VALUE, and Windows recycles those aggressively:
+        // any path that closes a registered socket without calling
+        // detach_socket leaves a stale entry, and the next socket handed
+        // the same numeric value is then believed to be associated when it
+        // is not. Its completions are never queued to our port, so the op
+        // simply never completes -- an operation that hangs forever with no
+        // error anywhere. Always attempt the association; an already-bound
+        // file object answers ERROR_INVALID_PARAMETER, which is handled
+        // below and costs one cheap syscall on the only common case
+        // (attach_stream re-registering a socket tcp_connect associated).
         let handle = socket as HANDLE;
         let rc = unsafe { CreateIoCompletionPort(handle, self.port.0, KEY_IO, 0) };
         if rc.is_null() {
