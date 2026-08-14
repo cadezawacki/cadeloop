@@ -1279,7 +1279,8 @@ pub(crate) fn http_sweep(
     }
     for &tid in &expire_head {
         // 408 then close: the head never completed inside the window.
-        let resp = crate::http::error_response(ParseError { status: 408, reason: "Request Timeout" });
+        let minor = net.http_conn_mut(tid).and_then(|c| c.parser.http_version()).map(|(_, m)| m).unwrap_or(1);
+        let resp = crate::http::error_response(ParseError { status: 408, reason: "Request Timeout" }, minor);
         http_enqueue(py, net, backend, tid, resp);
         http_close_after_write(py, net, backend, tid);
     }

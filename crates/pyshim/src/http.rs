@@ -415,7 +415,8 @@ pub(crate) fn conn_parse_failed(
     if conn.deferred_error.is_some() {
         return false;
     }
-    let resp = error_response(err);
+    let minor = conn.parser.http_version().map(|(_, m)| m).unwrap_or(1);
+    let resp = error_response(err, minor);
     if conn.active || !conn.pending.is_empty() {
         let pump = !conn.active;
         conn.deferred_error = Some(resp);
@@ -428,10 +429,20 @@ pub(crate) fn conn_parse_failed(
 }
 
 /// In-cell: serialized minimal error response (400/413/414/431/500).
-pub(crate) fn error_response(err: ParseError) -> Vec<u8> {
+/// `minor` is the failing request's parsed HTTP minor version -- a strict
+/// HTTP/1.0 client can reject an HTTP/1.1 status line. Callers that
+/// cannot know it (no version ever parsed) pass 1.
+/// The common case: an error on a connection whose active request's
+/// version is already recorded.
+pub(crate) fn error_response_for(conn: &HttpConn, err: ParseError) -> Vec<u8> {
+    error_response(err, conn.active_minor)
+}
+
+pub(crate) fn error_response(err: ParseError, minor: u8) -> Vec<u8> {
     let reason = err.reason;
     format!(
-        "HTTP/1.1 {} {}\r\nserver: cadeloop\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.{} {} {}\r\nserver: cadeloop\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        minor,
         err.status,
         status_text(err.status),
         reason.len(),
@@ -2086,7 +2097,7 @@ fn ws_send(
                     wsc.accepted = true;
                     wsc.closing = true;
                     conn.log_status = 403;
-                    let body = error_response(ParseError { status: 403, reason: "forbidden" });
+                    let body = error_response_for(conn, ParseError { status: 403, reason: "forbidden" });
                     net::http_enqueue(py, net, backend, tid, body);
                 }
                 net::http_close_after_write(py, net, backend, tid);
@@ -2124,7 +2135,7 @@ pub(crate) fn ws_ingest(
             // WebSocket close frame here (which my first version of this
             // cap did) puts raw binary where a status line belongs. Answer
             // in the protocol actually in effect.
-            let resp = error_response(ParseError { status: 413, reason: "payload too large" });
+            let resp = error_response_for(conn, ParseError { status: 413, reason: "payload too large" });
             conn.ws_trailing.clear();
             net::http_enqueue(py, net, backend, tid, resp);
             net::http_close_after_write(py, net, backend, tid);
@@ -2257,7 +2268,7 @@ fn ws_app_done(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
             wsc.accepted = true;
             wsc.closing = true;
             conn.log_status = 403;
-            let body = error_response(ParseError { status: 403, reason: "forbidden" });
+            let body = error_response_for(conn, ParseError { status: 403, reason: "forbidden" });
             net::http_enqueue(py, net, backend, tid, body);
         } else if !wsc.closing {
             wsc.closing = true;
@@ -2403,7 +2414,10 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                     c.active = false;
                     c.keep_alive = false;
                 }
-                let body = error_response(ParseError { status: 400, reason: "bad websocket upgrade" });
+                let body = error_response(
+                    ParseError { status: 400, reason: "bad websocket upgrade" },
+                    req.http_minor,
+                );
                 net::http_enqueue(py, net, backend, tid, body);
                 net::http_close_after_write(py, net, backend, tid);
             })?;
@@ -2550,7 +2564,8 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
                 wsc.accepted = true;
                 wsc.closing = true;
                 conn.log_status = 500;
-                let body = error_response(ParseError { status: 500, reason: "internal server error" });
+                let body =
+                    error_response_for(conn, ParseError { status: 500, reason: "internal server error" });
                 net::http_enqueue(py, net, backend, tid, body);
             } else if !wsc.closing {
                 wsc.closing = true;
@@ -2572,13 +2587,15 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
             let log = core.with_net(|net, reactor| {
                 let now_ns = reactor.time_cached();
                 let backend = reactor.backend_mut();
+                let mut minor = 1;
                 if let Some(c) = net.http_conn_mut(tid) {
                     c.resp = RespPhase::Done;
                     c.keep_alive = false;
                     c.log_status = 500;
+                    minor = c.active_minor;
                 }
                 let log = take_access_record(py, net, tid, now_ns);
-                let body = error_response(ParseError { status: 500, reason: "internal server error" });
+                let body = error_response(ParseError { status: 500, reason: "internal server error" }, minor);
                 net::http_enqueue(py, net, backend, tid, body);
                 net::http_close_after_write(py, net, backend, tid);
                 log

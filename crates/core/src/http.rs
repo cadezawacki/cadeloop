@@ -438,6 +438,18 @@ impl HttpParser {
         Ok(None)
     }
 
+    /// The HTTP version of the request being (or last) parsed, if the
+    /// parser has seen one at all. Errors before the version is parsed
+    /// (malformed start line, an over-long URL) resolve to None; a
+    /// pipelined error early in the next request reports the previous
+    /// request's version, which the same client just spoke.
+    pub fn http_version(&self) -> Option<(u8, u8)> {
+        match (self.raw.http_major, self.raw.http_minor) {
+            (0, 0) => None,
+            v => Some(v),
+        }
+    }
+
     pub fn next_request(&mut self) -> Option<Request> {
         self.acc.completed.pop_front()
     }

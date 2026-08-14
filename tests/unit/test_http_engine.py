@@ -488,6 +488,24 @@ def test_body_limit_413(loop):
     loop._core.listener_close(lid)
 
 
+def test_error_response_matches_http10_request_version(loop):
+    """Engine-generated errors carried an HTTP/1.1 status line even when
+    the failing request was parsed as HTTP/1.0; strict 1.0 clients can
+    reject the response. The version is used when the parser saw one
+    (test_malformed_request_400 covers the 1.1 default for requests
+    whose version never parsed). Reported on PR #1."""
+    lid, port = listen(loop, echo_scope_app, max_body=8)
+    resp = loop.run_until_complete(
+        _request(
+            port,
+            b"POST / HTTP/1.0\r\nHost: h\r\nContent-Length: 100\r\n\r\n" + b"z" * 100,
+            read_all=True,
+        )
+    )
+    assert resp.startswith(b"HTTP/1.0 413 ")
+    loop._core.listener_close(lid)
+
+
 def test_app_exception_500(loop):
     async def app(scope, receive, send):
         raise ValueError("boom")
