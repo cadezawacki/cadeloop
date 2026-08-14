@@ -263,3 +263,38 @@ statement in `main()`) as a temporary bisection aid — pytest inherits
 and captures the spawned worker's stderr, so the next CI run's failure
 log should show the last stage reached before the crash. Remove the
 markers once the crash site is identified and fixed.
+
+A second Windows-only bug was found blocking the same investigation:
+`test_starlette_routes_and_streaming`'s `/bg` sub-test (a Starlette
+`BackgroundTask` response) hung past pytest-timeout's 120s ceiling on
+`build-windows`, main thread stuck inside `run_forever()` — no
+completion ever woke the reactor. It had been showing up almost as
+often as the worker crash and, on at least one run, prevented the
+suite from ever reaching the worker-crash test at all. Confirmed
+locally (after finding and deleting a stale pre-session
+`_core.cpython-311-x86_64-linux-gnu.so` that Python's import machinery
+was preferring over every fresh rebuild — the reason earlier local
+verification of this same session's Rust-level tracing attempts had
+been silently testing nothing) that the equivalent request completes
+in ONE synchronous step on Linux for a body this small — no
+suspend/resume needed at all. Added flushed `eprintln!` markers in
+`http.rs` at the request-driving choke points (initial step, every
+resume, coroutine-finished, request-finish start/end).
+
+With both sets of markers in place, the run immediately after landed
+the first-ever fully green `build-windows` on BOTH runners — every
+step, including the CPython conformance suite — and reached `stress`
+(passed) and `benchmark-regression` (new failure) for the first time,
+since both are gated on `needs: build-windows`. Neither the crash nor
+the hang reproduced. Plausible explanation, not yet confirmed: the
+added synchronization (flushing on nearly every coroutine step)
+altered timing enough to close both race windows — consistent with
+`benchmark-regression`'s failure, since EVERY cadeloop scheduling
+microbenchmark (`call_soon_chain`, `sleep0_chain`, `task_spawn`,
+`future_chain`, ...) regressed 25-69% against the stored baseline,
+exactly the class of hot-path overhead per-step stderr flushing would
+add. Until this is confirmed by the markers surviving another run
+cleanly and then being removed with the bugs still absent, treat this
+as "not yet reproduced" rather than "fixed" — the baseline itself
+should not be touched while the markers remain, since it would just
+calcify a debug-inflated number.
