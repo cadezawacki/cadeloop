@@ -55,14 +55,15 @@ dies early (rather than a step failing), grab whatever exists in
 | 00-01 | machine fingerprint, pip deps (incl. winloop) | context |
 | 02-03 | `cargo test` + clippy on real Windows | M1 |
 | 04 | build extension; construct IOCP AND RIO loops | M1/M3 |
-| 05 | full pytest suite on IOCP (112 tests) | M1 |
+| 05 | full pytest suite on IOCP | M1 |
 | 06 | full pytest suite on RIO (`CADELOOP_BACKEND=rio`) | M3 |
 | 07 | targeted backend smoke (echo, 10 MiB, 120-conn CQ growth, native HTTP, abrupt-close storm, mixed outbound, 3 s soak) x both backends | M1/M3 |
 | 08 | CPython asyncio conformance suite | R-120 |
 | 09-15 | benchmarks: sched/echo-rtt/echo-64/http for {cadeloop-IOCP, cadeloop-RIO, asyncio, winloop, uvicorn stacks, hypercorn} | R-001/002/003 preview |
 | 16 | maturin wheel + clean-venv install + serve smoke | R-110 |
 | 17 | 120 s scheduling soak (RSS growth < 5%) | R-113 |
-| 18 | workers>1 degrades to 1 with a warning (no fork) | R-090 note |
+| 18 | workers=2 spawn-model smoke: shared listener, PID-stamped responses | R-090 |
+| 19 | bare-callable app + workers>1 raises ValueError (no fork) | R-090 note |
 
 ## Deliver back
 

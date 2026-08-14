@@ -29,7 +29,7 @@ def _fileno(fd):
     return fd.fileno()
 
 
-class Server:
+class Server(asyncio.AbstractServer):
     """asyncio.AbstractServer implementation over native listeners."""
 
     def __init__(self, loop, entries, factory, accept_pool, serving):

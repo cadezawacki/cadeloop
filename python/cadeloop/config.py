@@ -60,7 +60,6 @@ class Config:
     pin: bool = True  # R-091
     grace: float = 10.0  # R-092 graceful drain seconds
     # --- misc ----------------------------------------------------------------
-    enable_subprocess: bool = False  # R-051
     access_log: bool = False  # R-140
     stats_endpoint: int | None = None  # R-141 localhost port or None
 

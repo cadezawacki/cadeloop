@@ -269,24 +269,25 @@ Step "18-workers-spawn" {
 }
 
 Step "19-workers-degrade" {
-    # Bare-callable app + workers>1 cannot cross a spawn boundary: must
-    # WARN and serve on a single worker.
-    & $PY $WD 120 -- $PY -c @"
-import logging, threading, urllib.request, time, sys
+    # Bare-callable app + workers>1 cannot cross a spawn boundary (spawned
+    # workers re-import the app): must raise ValueError, not silently
+    # degrade to 1 worker with a log warning (drop-in-completeness audit
+    # item #8 — a silent degrade there is an easy-to-miss footgun).
+    & $PY $WD 60 -- $PY -c @"
+import sys
 sys.path.insert(0, r'$repo\python')
-logging.basicConfig(level=logging.INFO)
 import cadeloop
 async def app(scope, receive, send):
-    if scope['type'] != 'http': return
-    await receive()
-    await send({'type': 'http.response.start', 'status': 200, 'headers': []})
-    await send({'type': 'http.response.body', 'body': b'ok'})
-def run():
-    cadeloop.serve(app, '127.0.0.1', 8971, workers=4)  # must WARN + run 1 worker
-t = threading.Thread(target=run, daemon=True)
-t.start()
-time.sleep(1.5)
-print(urllib.request.urlopen('http://127.0.0.1:8971/', timeout=5).read())
+    pass
+try:
+    cadeloop.serve(app, '127.0.0.1', 8971, workers=4)
+    print('FAIL: serve() did not raise for a bare callable + workers>1')
+    sys.exit(1)
+except ValueError as e:
+    if 'import string' not in str(e):
+        print(f'FAIL: wrong ValueError: {e}')
+        sys.exit(1)
+    print(f'OK: raised as expected: {e}')
 "@
 }
 

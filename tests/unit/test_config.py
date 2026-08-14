@@ -26,7 +26,6 @@ def test_defaults_match_spec():
     assert c.write_high_water == 64 * 1024  # R-122
     assert c.write_low_water == 16 * 1024
     assert c.pin is True and c.grace == 10.0  # R-091/R-092
-    assert c.enable_subprocess is False  # R-051
     assert c.access_log is False  # R-140
 
 

@@ -609,6 +609,18 @@ def test_signal_handler(loop):
     assert loop.remove_signal_handler(signal.SIGUSR1) is False
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal.valid_signals()")
+def test_signal_handler_rejects_invalid_signal(loop):
+    """add_signal_handler previously skipped unix_events._check_signal's
+    isinstance(sig, int)/valid_signals() checks, so an invalid signal
+    number surfaced whatever error signal.signal() itself happened to
+    raise instead of a clear, documented ValueError/TypeError."""
+    with pytest.raises(TypeError, match="must be an int"):
+        loop.add_signal_handler("not-a-signal", lambda: None)
+    with pytest.raises(ValueError, match="invalid signal number"):
+        loop.add_signal_handler(99999, lambda: None)
+
+
 # --------------------------------------------------------------------- #
 # TLS via sslproto (R-059 compatibility path)                           #
 # --------------------------------------------------------------------- #

@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import sys
 import threading
 import time as _time
 
@@ -56,6 +57,27 @@ def test_call_soon_returns_cancellable_handle(loop):
 def test_call_soon_non_callable_raises(loop):
     with pytest.raises(TypeError):
         loop.call_soon(42)
+
+
+def test_call_soon_rejects_coroutine_function(loop):
+    """A bare coroutine function passed to call_soon was previously
+    accepted silently (is_callable() is True for it) and, when the
+    handle ran, just created-and-dropped a coroutine object instead of
+    failing fast with the same TypeError real asyncio raises."""
+
+    async def coro_fn():
+        pass
+
+    class Obj:
+        async def coro_method(self):
+            pass
+
+    with pytest.raises(TypeError, match="coroutines cannot be used with call_soon"):
+        loop.call_soon(coro_fn)
+    with pytest.raises(TypeError, match="coroutines cannot be used with call_soon_threadsafe"):
+        loop.call_soon_threadsafe(Obj().coro_method)
+    # A sync function/method must still be accepted normally.
+    loop.call_soon(lambda: None)
 
 
 def test_call_soon_after_close_raises():
@@ -508,6 +530,35 @@ def test_debug_flag(loop):
     loop.set_debug(True)
     assert loop.get_debug() is True
     loop.set_debug(False)
+
+
+def test_debug_enables_coroutine_origin_tracking(loop):
+    """set_debug(True) previously only flipped the core loop's own debug
+    flag, missing sys.set_coroutine_origin_tracking_depth entirely (no
+    richer "Object created at" tracebacks in debug mode, unlike real
+    asyncio)."""
+    saved = sys.get_coroutine_origin_tracking_depth()
+    try:
+
+        async def toggle():
+            loop.set_debug(True)
+            await asyncio.sleep(0.01)  # let the threadsafe call_soon land
+            assert sys.get_coroutine_origin_tracking_depth() > 0
+            loop.set_debug(False)
+            await asyncio.sleep(0.01)
+            assert sys.get_coroutine_origin_tracking_depth() == saved
+
+        loop.run_until_complete(toggle())
+        # run_forever()'s own finally: also resets it even without an
+        # explicit set_debug(False) — verify the not-currently-running
+        # entry path (run_forever applies it at startup) too.
+        loop.set_debug(True)
+        assert sys.get_coroutine_origin_tracking_depth() == saved  # not running yet
+        run_briefly(loop, 0.01)
+        assert sys.get_coroutine_origin_tracking_depth() == saved  # reset in the finally
+    finally:
+        loop.set_debug(False)
+        sys.set_coroutine_origin_tracking_depth(saved)
 
 
 def test_stats_shape(loop):

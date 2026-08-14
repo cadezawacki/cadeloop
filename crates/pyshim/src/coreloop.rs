@@ -32,6 +32,7 @@ use cadeloop_core::time::{secs_f64_to_ticks, ticks_to_secs_f64, Ticks};
 use cadeloop_core::timer::TimerToken;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit, PyTypeError, PyValueError};
 use pyo3::ffi;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -172,6 +173,9 @@ impl CoreLoop {
                 "a callable object was expected by {method}(), got {}",
                 callback.repr()?
             )));
+        }
+        if is_coroutine_function(py, callback) {
+            return Err(PyTypeError::new_err(format!("coroutines cannot be used with {method}()")));
         }
         let context: Py<PyAny> = match context {
             Some(c) if !c.is_none() => c.clone().unbind(),
@@ -372,6 +376,23 @@ fn take_graveyards(st: &mut LoopState) -> Graveyards {
         std::mem::take(&mut st.net.graveyard_protos),
         st.reactor.take_graveyard(),
     )
+}
+
+/// CO_COROUTINE (stable since 3.5; this project pins CPython 3.11).
+/// Matches inspect.iscoroutinefunction's core check for `async def`
+/// functions and bound methods (both expose `__code__` transparently)
+/// without a Python-level call — call_soon/call_soon_threadsafe run
+/// this on every scheduled callback (R-050 hot path), so the cheaper
+/// attribute-chase beats round-tripping through asyncio.iscoroutine*.
+/// Doesn't unwrap functools.partial/other wrappers like the real
+/// asyncio.iscoroutinefunction does — the common mistake (passing an
+/// `async def` function or bound method directly) is what this catches.
+const CO_COROUTINE: i32 = 0x80;
+
+fn is_coroutine_function(py: Python<'_>, callback: &Bound<'_, PyAny>) -> bool {
+    let Ok(code) = callback.getattr(intern!(py, "__code__")) else { return false };
+    let Ok(flags) = code.getattr(intern!(py, "co_flags")) else { return false };
+    flags.extract::<i32>().map(|f| f & CO_COROUTINE != 0).unwrap_or(false)
 }
 
 pub(crate) fn copy_context(py: Python<'_>) -> PyResult<Py<PyAny>> {

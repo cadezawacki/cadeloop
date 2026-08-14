@@ -143,6 +143,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._dns_cache_ttl = dns_cache_ttl
         self._asyncgens = weakref.WeakSet()
         self._asyncgens_shutdown_called = False
+        self._coroutine_origin_tracking_enabled = False
+        self._coroutine_origin_tracking_saved_depth = 0
 
         # R-142: honor PYTHONASYNCIODEBUG / -X dev.
         core.set_debug(
@@ -161,6 +163,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             raise RuntimeError(
                 "Cannot run the event loop while another loop is running"
             )
+        self._set_coroutine_origin_tracking(self.get_debug())
         old_agen_hooks = sys.get_asyncgen_hooks()
         sys.set_asyncgen_hooks(
             firstiter=self._asyncgen_firstiter_hook,
@@ -174,6 +177,22 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             self._remove_signal_wakeup(wakeup)
             events._set_running_loop(None)
             sys.set_asyncgen_hooks(*old_agen_hooks)
+            self._set_coroutine_origin_tracking(False)
+
+    def _set_coroutine_origin_tracking(self, enabled):
+        """R-142: sys.set_coroutine_origin_tracking_depth ports directly
+        from base_events._set_coroutine_origin_tracking — debug mode
+        previously only flipped the core loop's own debug flag, missing
+        the richer "Object created at (most recent call last)"
+        coroutine-origin tracebacks real asyncio's debug mode adds."""
+        if bool(enabled) == bool(self._coroutine_origin_tracking_enabled):
+            return
+        if enabled:
+            self._coroutine_origin_tracking_saved_depth = sys.get_coroutine_origin_tracking_depth()
+            sys.set_coroutine_origin_tracking_depth(10)  # asyncio.constants.DEBUG_STACK_DEPTH
+        else:
+            sys.set_coroutine_origin_tracking_depth(self._coroutine_origin_tracking_saved_depth)
+        self._coroutine_origin_tracking_enabled = enabled
 
     def _install_signal_wakeup(self):
         """R-052: CPython's C-level signal handler writes one byte to the
@@ -272,6 +291,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
     def set_debug(self, enabled):
         self._core.set_debug(bool(enabled))
+        if self.is_running():
+            # Deferred to the loop's own thread (matches base_events):
+            # sys.set_coroutine_origin_tracking_depth is process-global
+            # state, so mutating it off-thread while the loop runs would
+            # race. If not running, run_forever() applies it at startup.
+            self.call_soon_threadsafe(self._set_coroutine_origin_tracking, enabled)
 
     def __repr__(self):
         return (
@@ -709,6 +734,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         manager controls, which that mechanism does not reach."""
         import signal as signal_module
 
+        if not isinstance(sig, int):
+            raise TypeError(f"sig must be an int, not {sig!r}")
         if sys.platform == "win32":
             allowed = {signal_module.SIGINT, signal_module.SIGTERM}
             if hasattr(signal_module, "SIGBREAK"):
@@ -716,6 +743,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             if sig not in allowed:
                 raise ValueError(f"signal {sig!r} not supported on this platform")
             self._install_console_ctrl_handler()
+        elif sig not in signal_module.valid_signals():
+            raise ValueError(f"invalid signal number {sig}")
         if (
             asyncio.iscoroutine(callback)
             or asyncio.iscoroutinefunction(callback)
