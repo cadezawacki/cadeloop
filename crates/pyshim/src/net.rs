@@ -744,7 +744,23 @@ pub(crate) fn udp_wire(
             conn_lost: false,
         },
     );
-    dgram_post_recv(net, backend, did)?;
+    if let Err(e) = dgram_post_recv(net, backend, did) {
+        // The socket is registered and the endpoint is in the map, but no
+        // id reaches the caller -- so nothing could ever close it. Roll the
+        // whole thing back before reporting the failure.
+        if let Some(mut entry) = net.datagrams.remove(&did) {
+            cancel_dgram_ops(net, backend, &mut entry);
+            backend.detach_socket(entry.socket);
+            netsys::close(entry.socket);
+            if let Some(slot) = entry.recv_slot.take() {
+                net.buffers.release(slot);
+            }
+            net.graveyard_py.push(entry.datagram_received);
+            net.graveyard_py.push(entry.error_received);
+            net.graveyard_py.push(entry.connection_lost);
+        }
+        return Err(e);
+    }
     Ok(did)
 }
 
@@ -1517,8 +1533,20 @@ pub(crate) fn resume_reading_after_backpressure(
 }
 
 /// Queued write bytes and the high-water mark for a transport (R-084).
+///
+/// TLS connections stage PLAINTEXT in `TlsState.staged` and only move it
+/// to the wire queue on a later TlsFlush, so `queued_bytes` alone reads
+/// as zero for HTTPS/WSS however much the producer has written -- the
+/// backpressure would have been inert on exactly the connections whose
+/// encryption makes them slowest. Count both.
 pub(crate) fn write_pressure(net: &NetState, tid: u64) -> Option<(usize, usize)> {
-    net.transports.get(&tid).map(|e| (e.queued_bytes, e.high_water))
+    net.transports.get(&tid).map(|e| {
+        let staged = match &e.proto {
+            ProtoKind::Http(conn) => conn.tls.as_ref().map(|t| t.staged.len()).unwrap_or(0),
+            ProtoKind::Py(_) => 0,
+        };
+        (e.queued_bytes + staged, e.high_water)
+    })
 }
 
 /// Park an ASGI producer on this connection until the queue drains.
@@ -1580,9 +1608,12 @@ fn on_send_done(
             consumed = 0;
         }
     }
-    // R-084: release an ASGI producer parked on the high-water mark.
-    if entry.queued_bytes <= entry.low_water {
-        if let ProtoKind::Http(conn) = &mut entry.proto {
+    // R-084: release an ASGI producer parked on the high-water mark --
+    // counting staged plaintext, exactly as write_pressure does, so a
+    // waiter is not woken while the TLS staging buffer is still full.
+    if let ProtoKind::Http(conn) = &mut entry.proto {
+        let staged = conn.tls.as_ref().map(|t| t.staged.len()).unwrap_or(0);
+        if entry.queued_bytes + staged <= entry.low_water {
             if let Some(fut) = conn.drain_waiter.take() {
                 net.events.push(NetEvent::HttpDrained { fut });
             }
@@ -2000,9 +2031,12 @@ pub(crate) fn wire_http(
     let peer = addr_tuple(py, netsys::peername(sock).ok());
     let name = addr_tuple(py, netsys::sockname(sock).ok());
     let (high, low) = core.water_marks();
+    // OWNERSHIP: the CALLER owns `sock` until this returns Ok. Closing it
+    // here as well as in the caller's error path meant a failed adoption
+    // closed the same descriptor number twice -- and if another thread had
+    // been handed that number meanwhile, it closed an unrelated socket.
     let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
     if let Err(e) = reg {
-        netsys::close(sock);
         return Err(e.into());
     }
     let tls_state = match &tls {

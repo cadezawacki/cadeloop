@@ -1305,7 +1305,14 @@ impl CoreLoop {
             reactor.backend_mut().register_socket(sock)?;
             let lid = net::listener_create(net, sock, kind, accept_pool);
             if start {
-                net::listener_start(net, reactor.backend_mut(), lid)?;
+                if let Err(e) = net::listener_start(net, reactor.backend_mut(), lid) {
+                    // listener_create already inserted it and the socket is
+                    // registered, but no lid reaches the caller -- so the
+                    // port would stay bound (and a retry hit EADDRINUSE)
+                    // until the whole loop closed. Undo both.
+                    net::listener_teardown(net, reactor.backend_mut(), lid);
+                    return Err(e);
+                }
             }
             Ok(lid)
         })??;

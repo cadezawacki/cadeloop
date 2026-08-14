@@ -851,6 +851,13 @@ fn status_forbids_body(status: u16) -> bool {
     (100..200).contains(&status) || status == 204 || status == 304
 }
 
+/// Narrower than `status_forbids_body`: 304 carries no body but MAY
+/// carry `Content-Length` describing the representation a 200 would have
+/// returned (RFC 7232 4.1), so that header is preserved there.
+fn status_forbids_content_length(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204
+}
+
 /// RFC 7230 `tchar`.
 fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric()
@@ -937,12 +944,18 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         "ASGI application sent an invalid response header: {why}"
                     )));
                 }
-                if name.eq_ignore_ascii_case(b"content-length") && status_forbids_body(status) {
-                    // HTTP forbids Content-Length on a 204. Suppressing
-                    // only the GENERATED framing was not enough: an
-                    // app-supplied header was still copied through, and a
-                    // client honouring it reads the next keep-alive
-                    // response's bytes as this one's body.
+                if name.eq_ignore_ascii_case(b"content-length") && status_forbids_content_length(status) {
+                    // HTTP forbids Content-Length on a 204 (and on 1xx).
+                    // Suppressing only the GENERATED framing was not
+                    // enough: an app-supplied header was still copied
+                    // through, and a client honouring it reads the next
+                    // keep-alive response's bytes as this one's body.
+                    //
+                    // NOT 304: RFC 7232 4.1 explicitly PERMITS
+                    // Content-Length there, reporting the size of the
+                    // representation a 200 would have carried. Stripping
+                    // it discards valid cache metadata, which my first
+                    // pass at this did.
                     continue;
                 }
                 if name.eq_ignore_ascii_case(b"content-length") {

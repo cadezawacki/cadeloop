@@ -1541,3 +1541,36 @@ def test_server_sockets_is_empty_after_close(loop):
         return server.sockets
 
     assert loop.run_until_complete(main()) == ()
+
+
+def test_304_keeps_application_content_length(loop):
+    """RFC 7232 4.1 explicitly PERMITS Content-Length on a 304, reporting
+    the size the representation would have had. My first pass at stripping
+    it from bodyless statuses discarded that valid cache metadata; only
+    204 (and 1xx) actually forbid the header. Reported by Codex review on
+    PR #1."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 304,
+            "headers": [(b"content-length", b"1234"), (b"etag", b'"abc"')],
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"304" in head.split(b"\r\n", 1)[0]
+    assert b"content-length: 1234" in head.lower(), head
+    assert b'etag: "abc"' in head.lower()
+    loop._core.listener_close(lid)
