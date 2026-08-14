@@ -38,8 +38,6 @@ _MILESTONES = {
     "tls": "the native TLS engine arrives in milestone M4 (R-059)",
     "readiness": "add_reader/add_writer readiness emulation arrives in "
     "milestone M1 and is hardened in M4 (R-057)",
-    "subprocess": "Windows subprocess/pipe support needs IOCP named-pipe "
-    "ops and arrives in milestone M5-Windows (R-051; POSIX works)",
     "sendfile": "loop.sendfile (TransmitFile, R-036) arrives in milestone M1",
 }
 
@@ -702,8 +700,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # POSIX rides the stdlib 3.11 machinery (this project pins CPython
     # 3.11): the _Unix*PipeTransport / _UnixSubprocessTransport classes
     # drive readiness through the selector-loop-private _add_reader
-    # family, which maps 1:1 onto our public watch surface. Windows needs
-    # IOCP named-pipe ops (overlapped ReadFile/WriteFile) — M5-Windows.
+    # family, which maps 1:1 onto our public watch surface. Windows rides
+    # its own _winpipes transports over overlapped ReadFile/WriteFile
+    # (IOCP backend) — see connect_read_pipe/connect_write_pipe/
+    # _make_subprocess_transport below.
 
     def _add_reader(self, fd, callback, *args):
         return self.add_reader(fd, callback, *args)
@@ -718,13 +718,16 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return self.remove_writer(fd)
 
     async def connect_read_pipe(self, protocol_factory, pipe):
-        if sys.platform == "win32":
-            _not_yet("connect_read_pipe()", "subprocess")
-        from asyncio import unix_events
-
         protocol = protocol_factory()
         waiter = self.create_future()
-        transport = unix_events._UnixReadPipeTransport(self, pipe, protocol, waiter)
+        if sys.platform == "win32":
+            from . import _winpipes
+
+            transport = _winpipes.ReadPipeTransport(self, pipe, protocol, waiter)
+        else:
+            from asyncio import unix_events
+
+            transport = unix_events._UnixReadPipeTransport(self, pipe, protocol, waiter)
         try:
             await waiter
         except BaseException:
@@ -733,13 +736,16 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return transport, protocol
 
     async def connect_write_pipe(self, protocol_factory, pipe):
-        if sys.platform == "win32":
-            _not_yet("connect_write_pipe()", "subprocess")
-        from asyncio import unix_events
-
         protocol = protocol_factory()
         waiter = self.create_future()
-        transport = unix_events._UnixWritePipeTransport(self, pipe, protocol, waiter)
+        if sys.platform == "win32":
+            from . import _winpipes
+
+            transport = _winpipes.WritePipeTransport(self, pipe, protocol, waiter)
+        else:
+            from asyncio import unix_events
+
+            transport = unix_events._UnixWritePipeTransport(self, pipe, protocol, waiter)
         try:
             await waiter
         except BaseException:
@@ -750,6 +756,24 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     async def _make_subprocess_transport(
         self, protocol, args, shell, stdin, stdout, stderr, bufsize, extra=None, **kwargs
     ):
+        if sys.platform == "win32":
+            from . import _winpipes
+
+            waiter = self.create_future()
+            transp = _winpipes.SubprocessTransport(
+                self, protocol, args, shell, stdin, stdout, stderr, bufsize,
+                waiter=waiter, extra=extra, **kwargs,
+            )
+            try:
+                await waiter
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException:
+                transp.close()
+                await transp._wait()
+                raise
+            return transp
+
         from asyncio import events as _events
         from asyncio import unix_events
 
@@ -806,8 +830,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         text=None,
         **kwargs,
     ):
-        if sys.platform == "win32":
-            _not_yet("subprocess_shell()", "subprocess")
         if not isinstance(cmd, (bytes, str)):
             raise ValueError("cmd must be a string")
         if universal_newlines or text or encoding is not None or errors is not None:
@@ -838,8 +860,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         text=None,
         **kwargs,
     ):
-        if sys.platform == "win32":
-            _not_yet("subprocess_exec()", "subprocess")
         if universal_newlines or text or encoding is not None or errors is not None:
             raise ValueError("text mode is not supported")
         if shell:

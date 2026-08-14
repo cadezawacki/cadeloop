@@ -172,9 +172,23 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
 - [x] Subprocess + pipes, POSIX (R-051): connect_read_pipe /
       connect_write_pipe + the stdlib 3.11 subprocess machinery running
       on cadeloop (readiness aliases; ThreadedChildWatcher reaping) —
-      asyncio.create_subprocess_exec/shell work unmodified. Windows
-      needs IOCP named-pipe ops (overlapped ReadFile/WriteFile):
-      M5-Windows remainder
+      asyncio.create_subprocess_exec/shell work unmodified.
+- [x] Subprocess + pipes, Windows (R-051): overlapped ReadFile/WriteFile
+      on named-pipe HANDLEs, riding the same IOCP port as socket ops
+      (`IoBackend::register_pipe/post_pipe_read/post_pipe_write`,
+      backend/iocp.rs — `GetOverlappedResult`, not the socket-only
+      `WSAGetOverlappedResult`, for the result fetch). Python side
+      (`cadeloop/_winpipes.py`) ports stdlib's `_Proactor*PipeTransport`
+      / `_WindowsSubprocessTransport` structure onto these primitives —
+      `base_subprocess.BaseSubprocessTransport` and `windows_utils.Popen`
+      /`pipe()` are reused unmodified (pure Python, loop-agnostic), so
+      `asyncio.create_subprocess_exec/shell` work the same way on both
+      platforms. Process-exit reaping uses a dedicated
+      `WaitForSingleObject` thread (mirrors the POSIX
+      ThreadedChildWatcher precedent) rather than adding a second
+      wait-for-handle mechanism to the backend. Compile+link verified via
+      the mingw Windows cross-build; behavioral validation is
+      tests/unit/test_subprocess_windows.py, pending a Windows run
 - [x] PGO wheel pipeline (R-111) + -v3 variant (R-110): release.yml
       builds instrumented, runs the repo's scheduling + native-HTTP
       workload, merges via llvm-profdata, rebuilds with profile-use;
@@ -185,9 +199,9 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       suites); Windows CI's suite-shipping interpreter adjudicates the
       CPython tests, re-adding any failure with a fresh justification.
       Docs current through M4 + the Windows validation campaign
-- [ ] M5-Windows remainder: subprocess/pipes need overlapped named-pipe
-      ops in the IOCP backend (pipes are not sockets); TransmitFile
-      sendfile refinement rides along
+- [ ] M5-Windows remainder: TransmitFile sendfile refinement (the
+      chunked fallback already works; native zero-copy is a perf-only
+      gap, item #16 of the drop-in-completeness audit)
 
 ## Explicit non-goals (v1, §15)
 

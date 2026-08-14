@@ -480,6 +480,20 @@ impl IoBackend for RioBackend {
         self.inner.post_accept(listener)
     }
 
+    // R-051: named pipes are never RQ-capable (WSA_FLAG_REGISTERED_IO is
+    // socket-only) — always the inner IOCP path, same as datagrams below.
+    fn register_pipe(&mut self, handle: RawSocket) -> io::Result<()> {
+        self.inner.register_pipe(handle)
+    }
+
+    fn post_pipe_read(&mut self, handle: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
+        self.inner.post_pipe_read(handle, buf, len)
+    }
+
+    fn post_pipe_write(&mut self, handle: RawSocket, data: &[u8]) -> io::Result<OpId> {
+        self.inner.post_pipe_write(handle, data)
+    }
+
     fn post_recv(&mut self, socket: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
         let Some(&(rq, _)) = self.rqs.get(&socket) else {
             return self.inner.post_recv(socket, buf, len);

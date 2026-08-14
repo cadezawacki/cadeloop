@@ -123,6 +123,28 @@ pub trait IoBackend {
         Err(io::Error::new(io::ErrorKind::Unsupported, "datagrams unsupported on this backend"))
     }
 
+    // ---- named pipes (R-051 Windows subprocess/pipe support) ----------
+    // Unsupported by default: POSIX rides stdlib's unix_events pipe
+    // transports directly (no backend involvement needed there).
+
+    /// Associate a pipe HANDLE with the completion mechanism, mirroring
+    /// `register_socket` for sockets.
+    fn register_pipe(&mut self, _handle: RawSocket) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "named pipes unsupported on this backend"))
+    }
+
+    fn post_pipe_read(&mut self, _handle: RawSocket, _buf: *mut u8, _len: u32) -> io::Result<OpId> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "named pipes unsupported on this backend"))
+    }
+
+    /// `data` follows the same pinning discipline as `post_send`'s gather
+    /// list: the kernel reads it until the completion is reaped, so the
+    /// caller must keep it alive (the pyshim layer parks an owned
+    /// `Vec<u8>` inside the pending-op bookkeeping for exactly this).
+    fn post_pipe_write(&mut self, _handle: RawSocket, _data: &[u8]) -> io::Result<OpId> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "named pipes unsupported on this backend"))
+    }
+
     /// Request cancellation of an in-flight op. MUST tolerate the op having
     /// already completed (ERROR_NOT_FOUND) — the completion is still
     /// delivered via `poll` either way (R-037).

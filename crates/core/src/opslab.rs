@@ -46,6 +46,11 @@ pub enum OpKind {
     Wakeup,
     RecvFrom,
     SendTo,
+    /// Overlapped ReadFile/WriteFile on a named-pipe HANDLE (R-051
+    /// Windows: subprocess stdio pipes ride the same IOCP port as socket
+    /// ops, distinguished only by which Win32 result-fetch call applies).
+    PipeRead,
+    PipeWrite,
 }
 
 /// Stable identifier for an in-flight op: slot index + generation.

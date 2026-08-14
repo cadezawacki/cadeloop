@@ -877,6 +877,50 @@ impl CoreLoop {
         net::wire_stream(py, slf, sock as RawSocket, protocol)
     }
 
+    // ---- named pipes (R-051 Windows subprocess/pipe support) -------------
+    // Mechanical primitives only: post an overlapped op, resolve `fut` on
+    // completion. All Transport/Protocol semantics (EOF, backpressure,
+    // pause/resume) live in Python, mirroring stdlib's own proactor pipe
+    // transports (python/cadeloop/_winpipes.py) — pipes are not the hot
+    // path, so there is no native-transport machinery here.
+
+    /// Associate a pipe HANDLE with the backend's completion port.
+    fn pipe_register(&self, handle: u64) -> PyResult<()> {
+        self.check_closed()?;
+        self.with_net(|_, reactor| reactor.backend_mut().register_pipe(handle as RawSocket))??;
+        Ok(())
+    }
+
+    /// Begin an overlapped read; `fut` resolves to the bytes read (empty
+    /// = EOF) or an OSError.
+    fn pipe_read(&self, handle: u64, nbytes: usize, fut: Bound<'_, PyAny>) -> PyResult<()> {
+        self.check_closed()?;
+        let mut buf = vec![0u8; nbytes];
+        let ptr = buf.as_mut_ptr();
+        let fut: Py<PyAny> = fut.unbind();
+        let res = self.with_net(|net, reactor| -> std::io::Result<()> {
+            let op = reactor.backend_mut().post_pipe_read(handle as RawSocket, ptr, nbytes as u32)?;
+            net.ops.insert(op, net::OpTarget::PipeRead { fut, buf });
+            Ok(())
+        })?;
+        res.map_err(PyErr::from)
+    }
+
+    /// Begin an overlapped write; `fut` resolves to the byte count
+    /// written or an OSError. `data` is copied (pipe writes are not the
+    /// hot path — see `IoBackend::post_pipe_write`).
+    fn pipe_write(&self, handle: u64, data: &[u8], fut: Bound<'_, PyAny>) -> PyResult<()> {
+        self.check_closed()?;
+        let buf = data.to_vec();
+        let fut: Py<PyAny> = fut.unbind();
+        let res = self.with_net(|net, reactor| -> std::io::Result<()> {
+            let op = reactor.backend_mut().post_pipe_write(handle as RawSocket, &buf)?;
+            net.ops.insert(op, net::OpTarget::PipeWrite { fut, _buf: buf });
+            Ok(())
+        })?;
+        res.map_err(PyErr::from)
+    }
+
     // ---- readiness watches (R-057) ---------------------------------------
 
     #[pyo3(signature = (fd, callback, *args))]

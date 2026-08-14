@@ -61,6 +61,14 @@ pub(crate) enum OpTarget {
     /// R-058 datagram endpoint ops (did keys `NetState.datagrams`).
     DgramRecv(u64),
     DgramSend(u64),
+    /// R-051 Windows named-pipe ops: `fut` resolves with the bytes read
+    /// (sliced from `buf`, which the backend wrote into via a raw
+    /// pointer — kept alive here until the completion is reaped).
+    PipeRead { fut: Py<PyAny>, buf: Vec<u8> },
+    /// `buf` is never read back — its only job is keeping the write data
+    /// alive (pinned) until WriteFile's completion (same discipline as
+    /// `WriteBuf::Bytes`'s `_keep`).
+    PipeWrite { fut: Py<PyAny>, _buf: Vec<u8> },
 }
 
 pub(crate) enum WriteBuf {
@@ -357,6 +365,20 @@ pub(crate) enum NetEvent {
     HttpDisconnect {
         fut: Py<PyAny>,
         ws: bool,
+    },
+    /// R-051: a pipe ReadFile completed — `buf[..bytes]` is the data (0
+    /// bytes = EOF, matching stdlib's proactor `recv()` convention).
+    PipeReadDone {
+        fut: Py<PyAny>,
+        buf: Vec<u8>,
+        bytes: u32,
+        err: u32,
+    },
+    /// R-051: a pipe WriteFile completed.
+    PipeWriteDone {
+        fut: Py<PyAny>,
+        bytes: u32,
+        err: u32,
     },
 }
 
@@ -1011,6 +1033,12 @@ pub(crate) fn translate(
                     OpTarget::DgramSend(did) => {
                         on_dgram_send_done(py, net, backend, did, op, os_error);
                     }
+                    OpTarget::PipeRead { fut, buf } => {
+                        net.events.push(NetEvent::PipeReadDone { fut, buf, bytes, err: os_error });
+                    }
+                    OpTarget::PipeWrite { fut, _buf } => {
+                        net.events.push(NetEvent::PipeWriteDone { fut, bytes, err: os_error });
+                    }
                 }
             }
         }
@@ -1392,10 +1420,41 @@ pub(crate) fn dispatch_events(
                     let _ = fut.call_method1("set_result", (sock as u64,));
                 }
             }
+            NetEvent::PipeReadDone { fut, buf, bytes, err } => {
+                let fut = fut.bind(py);
+                let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
+                if cancelled {
+                    // nothing to deliver; the transport already moved on
+                } else if err != 0 && err != ERROR_BROKEN_PIPE {
+                    let _ = fut.call_method1("set_exception", (os_err(py, err),));
+                } else {
+                    // ERROR_BROKEN_PIPE (the writer closed) is EOF, same
+                    // convention as a genuine 0-byte successful read —
+                    // matches stdlib's IocpProactor.recv() precisely.
+                    let data = PyBytes::new(py, &buf[..bytes as usize]);
+                    let _ = fut.call_method1("set_result", (data,));
+                }
+            }
+            NetEvent::PipeWriteDone { fut, bytes, err } => {
+                let fut = fut.bind(py);
+                let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
+                if cancelled {
+                    // nothing to deliver
+                } else if err != 0 {
+                    let _ = fut.call_method1("set_exception", (os_err(py, err),));
+                } else {
+                    let _ = fut.call_method1("set_result", (bytes,));
+                }
+            }
         }
     }
     Ok(())
 }
+
+/// Win32 ERROR_BROKEN_PIPE: ReadFile on a pipe whose write end closed can
+/// fail with this instead of returning a 0-byte success — stdlib's own
+/// proactor treats it identically to EOF (R-051).
+const ERROR_BROKEN_PIPE: u32 = 109;
 
 /// BufferedProtocol receive: get_buffer -> memcpy -> buffer_updated.
 fn fill_app_buffer(

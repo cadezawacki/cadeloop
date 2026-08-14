@@ -47,10 +47,10 @@ use windows_sys::Win32::Networking::WinSock::{
     WSADATA, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
     WSA_IO_PENDING, XP1_IFS_HANDLES,
 };
-use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, SetFileCompletionNotificationModes, WriteFile};
 use windows_sys::Win32::System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus, OVERLAPPED,
-    OVERLAPPED_ENTRY,
+    CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatusEx,
+    PostQueuedCompletionStatus, OVERLAPPED, OVERLAPPED_ENTRY,
 };
 
 use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup, MAX_GATHER};
@@ -529,15 +529,30 @@ impl IocpBackend {
         let Some((kind, _was_cancelled)) = self.slab.complete(id) else {
             return; // stale/duplicate completion; debug_assert'ed in slab
         };
-        let (bytes, os_error) = unsafe {
-            let socket = (*op_ptr).socket;
-            let mut bytes: u32 = 0;
-            let mut flags: u32 = 0;
-            let ok = WSAGetOverlappedResult(socket, entry.lpOverlapped, &mut bytes, 0, &mut flags);
-            if ok != 0 {
-                (bytes, 0u32)
-            } else {
-                (0, WSAGetLastError() as u32)
+        // Pipe ops use plain Win32 HANDLEs, not Winsock SOCKETs —
+        // WSAGetOverlappedResult only works on the latter (R-051).
+        let (bytes, os_error) = if matches!(kind, OpKind::PipeRead | OpKind::PipeWrite) {
+            unsafe {
+                let handle = (*op_ptr).socket as HANDLE;
+                let mut bytes: u32 = 0;
+                let ok = GetOverlappedResult(handle, entry.lpOverlapped, &mut bytes, 0);
+                if ok != 0 {
+                    (bytes, 0u32)
+                } else {
+                    (0, GetLastError())
+                }
+            }
+        } else {
+            unsafe {
+                let socket = (*op_ptr).socket;
+                let mut bytes: u32 = 0;
+                let mut flags: u32 = 0;
+                let ok = WSAGetOverlappedResult(socket, entry.lpOverlapped, &mut bytes, 0, &mut flags);
+                if ok != 0 {
+                    (bytes, 0u32)
+                } else {
+                    (0, WSAGetLastError() as u32)
+                }
             }
         };
         match kind {
@@ -627,6 +642,52 @@ impl IoBackend for IocpBackend {
         self.associated.insert(socket);
         self.apply_skip_modes(socket);
         Ok(())
+    }
+
+    /// R-051: associate a named-pipe HANDLE with the same port sockets
+    /// use. No skip-modes here — every pipe completion (sync or async)
+    /// still posts to the port, which keeps post_pipe_read/write simple
+    /// (no inline fast path to reason about; pipes are not the hot path).
+    fn register_pipe(&mut self, handle: RawSocket) -> io::Result<()> {
+        if self.associated.contains(&handle) {
+            return Ok(());
+        }
+        let rc = unsafe { CreateIoCompletionPort(handle as HANDLE, self.port.0, KEY_IO, 0) };
+        if rc.is_null() {
+            return Err(win_error());
+        }
+        self.associated.insert(handle);
+        Ok(())
+    }
+
+    fn post_pipe_read(&mut self, handle: RawSocket, buf: *mut u8, len: u32) -> io::Result<OpId> {
+        let id = self.new_op(OpKind::PipeRead, handle);
+        let ov = self.overlapped_ptr(id);
+        let mut read: u32 = 0;
+        let ok = unsafe { ReadFile(handle as HANDLE, buf, len, &mut read, ov) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(self.fail_post(id, io::Error::from_raw_os_error(err as i32)));
+            }
+        }
+        // Synchronous success (ok != 0) still posts a completion packet
+        // (no skip-modes on pipe handles) — same code path as pending.
+        Ok(id)
+    }
+
+    fn post_pipe_write(&mut self, handle: RawSocket, data: &[u8]) -> io::Result<OpId> {
+        let id = self.new_op(OpKind::PipeWrite, handle);
+        let ov = self.overlapped_ptr(id);
+        let mut written: u32 = 0;
+        let ok = unsafe { WriteFile(handle as HANDLE, data.as_ptr(), data.len() as u32, &mut written, ov) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(self.fail_post(id, io::Error::from_raw_os_error(err as i32)));
+            }
+        }
+        Ok(id)
     }
 
     fn post_accept(&mut self, listener: RawSocket) -> io::Result<OpId> {
