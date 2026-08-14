@@ -2230,3 +2230,76 @@ def test_asgi_client_is_two_item_for_ipv6(loop):
     assert len(seen["server"]) == 2, f"IPv6 server leaked its socket form: {seen['server']!r}"
     host, prt = seen["client"]
     assert isinstance(prt, int)
+
+
+def test_shutdown_drains_a_response_whose_bytes_are_still_queued():
+    """The application has finished and the engine holds the bytes, but
+    they have not all reached the peer. The drain classified that
+    connection idle and tore it down immediately, truncating exactly the
+    response `grace` exists to protect -- the same gap the idle sweep had,
+    in the one place that kept its own copy of the predicate.
+
+    Reaching that state needs two things the obvious test does not do, and
+    without either it passes against the unfixed build:
+
+    * a tiny client receive buffer, or default loopback buffers absorb the
+      whole body before shutdown and nothing is left queued;
+    * a write high-water above the body, or `send()` suspends and the app
+      is still RUNNING -- which makes every predicate say busy, for the
+      wrong reason.
+
+    Measured against the unfixed build: 2,807,709 of 4,194,304 bytes.
+    """
+    from cadeloop.server import _drain_connections
+
+    body = b"y" * (4 * 1024 * 1024)
+
+    async def big_app(scope, receive, send):
+        await receive()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", str(len(body)).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    lp = cadeloop.Loop(high_water=64 * 1024 * 1024, low_water=16 * 1024 * 1024)
+    asyncio.set_event_loop(lp)
+    got = []
+    try:
+        lid, bound, _fd = lp._core.http_listen("127.0.0.1", 0, big_app, lp)
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client_sock.connect(("127.0.0.1", bound[1]))
+        client_sock.setblocking(False)
+
+        async def slow_client():
+            r, w = await asyncio.open_connection(sock=client_sock)
+            w.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+            await w.drain()
+            head = await r.readuntil(b"\r\n\r\n")
+            lp.call_soon(lp.stop)
+            return r, w, head
+
+        r, w, head = lp.run_until_complete(slow_client())
+        assert head.startswith(b"HTTP/1.1 200"), head[:40]
+        lp._core.listener_close(lid)
+
+        async def finish():
+            got.append(await r.readexactly(len(body)))
+
+        task = lp.create_task(finish())
+        _drain_connections(lp, 30.0)
+        # The drain may return before the CLIENT has consumed its own
+        # receive buffer, so finish reading here. What matters is that the
+        # server did not tear the connection down mid-body: without the
+        # fix this raises IncompleteReadError.
+        lp.run_until_complete(asyncio.wait_for(task, 30.0))
+        w.close()
+    finally:
+        asyncio.set_event_loop(None)
+        if not lp.is_closed():
+            lp.close()
+    assert len(got[0]) == len(body), f"{len(got[0])} of {len(body)} bytes"

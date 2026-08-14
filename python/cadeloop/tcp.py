@@ -56,6 +56,8 @@ class Server(asyncio.AbstractServer):
         self._closed = False
         self._close_waiters = []
         self._sockets = None
+        # The future serve_forever() parks on, so close() can wake it.
+        self._serving_forever = None
 
     # -- introspection ----------------------------------------------------
 
@@ -103,10 +105,20 @@ class Server(asyncio.AbstractServer):
                 self._loop._core.listener_start(lid)
 
     async def serve_forever(self):
+        if self._closed:
+            raise RuntimeError("server is closed")
+        if self._serving_forever is not None:
+            raise RuntimeError("server is already being awaited on serve_forever()")
         await self.start_serving()
+        # Held, not anonymous. An anonymous future is unreachable from
+        # close(), so a server closed by another task left this coroutine
+        # parked for good -- even after wait_closed() returned -- and the
+        # caller had to separately cancel a server it had already closed.
+        self._serving_forever = self._loop.create_future()
         try:
-            await self._loop.create_future()  # until cancelled
+            await self._serving_forever
         finally:
+            self._serving_forever = None
             self.close()
 
     def close(self):
@@ -124,6 +136,11 @@ class Server(asyncio.AbstractServer):
                 s.close()
         self._sockets = ()
         self._entries = []  # the raw descriptors are gone; do not reuse them
+        # Cancelled rather than resolved, matching the stdlib: serve_forever
+        # raises CancelledError when its server is closed underneath it.
+        fut, self._serving_forever = self._serving_forever, None
+        if fut is not None and not fut.done():
+            fut.cancel()
         for waiter in self._close_waiters:
             if not waiter.done():
                 waiter.set_result(None)
@@ -528,14 +545,21 @@ class TcpSurface:
             for af, _st, _pr, _cname, address in infos:
                 if af not in (socket.AF_INET, socket.AF_INET6):
                     continue
-                key = (address[0], address[1])
+                # Keep the flow info and interface scope an IPv6 sockaddr
+                # carries: a scoped bind address (fe80::1%eth0) resolves
+                # with a scope_id naming the interface, and dropping it
+                # bound with scope zero -- the wrong interface, or nothing
+                # at all, despite a clean resolution.
+                key = (address[0], address[1]) + tuple(address[2:4])
                 if key not in resolved:
                     resolved.append(key)
         if not resolved:
             raise OSError(f"getaddrinfo({host!r}) returned empty list")
 
         try:
-            for ip, bind_port in resolved:
+            for entry in resolved:
+                ip, bind_port = entry[0], entry[1]
+                flowinfo, scope_id = (entry[2], entry[3]) if len(entry) == 4 else (0, 0)
                 lid, name, rawfd = self._core.tcp_listen(
                     ip,
                     bind_port,
@@ -545,6 +569,8 @@ class TcpSurface:
                     bool(reuse_port),
                     accept_pool,
                     start_serving,
+                    flowinfo,
+                    scope_id,
                 )
                 entries.append((lid, name, rawfd))
         except BaseException:

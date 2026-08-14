@@ -629,6 +629,14 @@ impl CoreLoop {
             // lifetime.
             let mut dropped: Vec<Py<PyAny>> =
                 net::cancel_standalone_ops(&mut st.net, st.reactor.backend_mut());
+            // R-073 reap guards: the sweeps above could not free the
+            // buffers of the ops they cancelled, because the kernel may
+            // still own them until each op's completion is dequeued -- and
+            // a closed loop never polls again. Pump the backend here so
+            // those completions are reaped now instead of the buffers
+            // (queued response bodies, up to high_water per connection)
+            // living as long as anything still references the dead loop.
+            net::reap_at_close(py, &mut st.net, st.reactor.backend_mut());
             dropped.extend(st.reactor.clear_pending());
             dropped.extend(std::mem::take(&mut st.net.ready_scratch));
             for (_, h) in st.net.readers.drain() {
@@ -722,7 +730,8 @@ impl CoreLoop {
 
     /// Bind + listen (+ start the accept pool unless `start=false`).
     /// Returns (listener id, (ip, port) bound name, raw fd).
-    #[pyo3(signature = (ip, port, factory, backlog=1024, reuse_addr=true, reuse_port=false, accept_pool=64, start=true))]
+    #[pyo3(signature = (ip, port, factory, backlog=1024, reuse_addr=true, reuse_port=false,
+                        accept_pool=64, start=true, flowinfo=0, scope_id=0))]
     #[allow(clippy::too_many_arguments)]
     fn tcp_listen(
         &self,
@@ -735,9 +744,12 @@ impl CoreLoop {
         reuse_port: bool,
         accept_pool: usize,
         start: bool,
+        flowinfo: u32,
+        scope_id: u32,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
-        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port, self.tfo)?;
+        let spec = ListenSpec { backlog, reuse_addr, reuse_port, tfo: self.tfo, flowinfo, scope_id };
+        let sock = bind_listen_socket(ip, port, &spec)?;
         self.listen_socket(py, sock, net::ListenerKind::Factory(factory.unbind()), accept_pool, start)
     }
 
@@ -747,7 +759,8 @@ impl CoreLoop {
     #[pyo3(signature = (ip, port, app, pyloop, state=None, backlog=1024, reuse_addr=true,
                         reuse_port=false, accept_pool=64, eager=true, max_header_bytes=65536,
                         max_headers=100, max_url=8192, max_body=None,
-                        request_line_timeout=5.0, keepalive_idle=75.0, tls=None))]
+                        request_line_timeout=5.0, keepalive_idle=75.0, tls=None,
+                        flowinfo=0, scope_id=0))]
     #[allow(clippy::too_many_arguments)]
     fn http_listen(
         &self,
@@ -769,6 +782,8 @@ impl CoreLoop {
         request_line_timeout: f64,
         keepalive_idle: f64,
         tls: Option<Bound<'_, PyAny>>,
+        flowinfo: u32,
+        scope_id: u32,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         self.check_closed()?;
         if !app.is_callable() {
@@ -779,7 +794,8 @@ impl CoreLoop {
             _ => PyDict::new(py).into_any().unbind(),
         };
         let secs_to_ns = |s: f64| if s > 0.0 { (s * 1e9) as u64 } else { 0 };
-        let sock = bind_listen_socket(ip, port, backlog, reuse_addr, reuse_port, self.tfo)?;
+        let spec = ListenSpec { backlog, reuse_addr, reuse_port, tfo: self.tfo, flowinfo, scope_id };
+        let sock = bind_listen_socket(ip, port, &spec)?;
         let kind = net::ListenerKind::Http {
             app: app.unbind(),
             pyloop: pyloop.unbind(),
@@ -1494,6 +1510,7 @@ impl CoreLoop {
                     st.net.stats_sends_posted,
                     st.net.accept_ops_outstanding(),
                     st.net.buffers.stale_rejections(),
+                    st.net.reap_guards.len(),
                 ),
                 net::op_breakdown(&st.net),
                 st.reactor.backend_mut().diag(),
@@ -1527,6 +1544,11 @@ impl CoreLoop {
         // means something held a slot past its release; the pool refused,
         // so no memory was corrupted, but the ownership bug is real.
         d.set_item("stale_buffer_ids", netstats.10)?;
+        // Buffers a cancelled op may still own (R-073), awaiting its
+        // completion. Non-zero after close() means the kernel had not
+        // released them inside the close reap budget, so they are held
+        // until the state drops -- correct, but worth seeing.
+        d.set_item("unreaped_ops", netstats.11)?;
         // What the live kernel ops are, by target. A stuck loop looks
         // healthy on every other counter; this is the one that says where
         // -- `connect` non-zero with nothing connecting, or `recv` with no
@@ -1643,19 +1665,37 @@ fn parse_addr_tuple(addr: Bound<'_, PyAny>) -> PyResult<std::net::SocketAddr> {
     }
 }
 
-/// Create, bind, and listen a TCP socket (shared by tcp_listen /
-/// http_listen).
-fn bind_listen_socket(
-    ip: &str,
-    port: u16,
+/// Everything `bind_listen_socket` needs beyond the address itself.
+///
+/// A struct rather than more positional parameters: three adjacent bools
+/// (`reuse_addr`, `reuse_port`, `tfo`) at a call site are a transposition
+/// waiting to happen, and the compiler cannot tell them apart.
+struct ListenSpec {
     backlog: i32,
     reuse_addr: bool,
     reuse_port: bool,
     tfo: bool,
-) -> PyResult<RawSocket> {
+    /// IPv6 sockaddr fields; both zero for IPv4 and unscoped IPv6.
+    flowinfo: u32,
+    scope_id: u32,
+}
+
+/// Create, bind, and listen a TCP socket (shared by tcp_listen /
+/// http_listen).
+fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> PyResult<RawSocket> {
+    let ListenSpec { backlog, reuse_addr, reuse_port, tfo, flowinfo, scope_id } = *spec;
     let addr: std::net::IpAddr =
         ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
-    let sockaddr = std::net::SocketAddr::new(addr, port);
+    // A scoped IPv6 bind address (fe80::1%eth0) resolves to a sockaddr
+    // whose scope_id names the interface. Dropping it bound with scope
+    // zero, so a server aimed at a link-local interface bound the wrong
+    // thing or failed outright, despite resolving cleanly.
+    let sockaddr = match addr {
+        std::net::IpAddr::V6(v6) => {
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(v6, port, flowinfo, scope_id))
+        }
+        std::net::IpAddr::V4(_) => std::net::SocketAddr::new(addr, port),
+    };
     let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
     let sock = netsys::create_tcp(family)?;
     let setup = (|| -> std::io::Result<()> {

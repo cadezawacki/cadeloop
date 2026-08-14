@@ -1785,3 +1785,67 @@ def test_sendfile_fallback_reports_position_after_a_failed_write(loop):
     assert fh.tell() == t.written, (
         f"tell() reports {fh.tell()} but only {t.written} bytes reached the transport"
     )
+
+
+def test_close_wakes_serve_forever(loop):
+    """The future serve_forever parked on was anonymous, so close() could
+    not reach it: a server closed by another task left the coroutine
+    pending for good, even after wait_closed() had returned, and the
+    caller had to separately cancel a server it had already closed."""
+
+    async def main():
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        task = loop.create_task(server.serve_forever())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        server.close()
+        await server.wait_closed()
+        # The point: no explicit task.cancel() here.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5.0)
+
+    loop.run_until_complete(main())
+
+
+def test_close_reaps_the_buffers_of_the_sends_it_cancels(loop):
+    """close() cancels every in-flight send, and R-073 forbids freeing a
+    cancelled op's buffers until its completion comes back -- the kernel
+    may still be reading them. So teardown parks them in `reap_guards` and
+    leaves the release to the next dispatch. A closed loop has no next
+    dispatch: without a reap at close the whole queued response body stayed
+    resident for as long as anything referenced the dead loop."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # A small receive buffer is what makes the send block with a remainder
+    # still queued; on a default-sized loopback socket the whole payload is
+    # absorbed and there is nothing left in flight to cancel.
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    peer = None
+    transport = None
+    try:
+
+        async def main():
+            nonlocal peer, transport
+            transport, _ = await loop.create_connection(asyncio.Protocol, *srv.getsockname())
+            peer, _ = srv.accept()
+            transport.write(b"x" * (8 * 1024 * 1024))
+            # Let the flush post, complete partially, and re-post until the
+            # socket buffer is full and the send parks with a remainder.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                if transport.get_write_buffer_size() > 0 and loop.stats()["ops_by_target"]["send"]:
+                    return
+            pytest.fail("no send parked with a queued remainder; test is not exercising the guard")
+
+        loop.run_until_complete(main())
+        assert transport.get_write_buffer_size() > 0
+        loop.close()
+        assert loop.stats()["unreaped_ops"] == 0, (
+            "close() left write buffers pinned to cancelled ops it never reaped"
+        )
+    finally:
+        if peer is not None:
+            peer.close()
+        srv.close()

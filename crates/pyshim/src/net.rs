@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::time::{Duration, Instant};
 
 use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
@@ -664,12 +665,18 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     net.graveyard_entries.push(entry);
 }
 
-/// Cancel and reap the ops that belong to no transport, listener or
-/// datagram endpoint: an outstanding `connect()`, or a Windows named-pipe
+/// Cancel the ops that belong to no transport, listener or datagram
+/// endpoint: an outstanding `connect()`, or a Windows named-pipe
 /// read/write (R-051). Loop close walks the three maps, so these were
 /// simply left behind -- their futures stayed pending, their pinned
 /// buffers stayed alive, and a connect target kept an open socket, for as
 /// long as the closed core existed.
+///
+/// Connect ops are settled here: their socket must be closed by someone,
+/// and phase 2 (which normally does it) never runs again during close.
+/// Pipe ops are only *requested* cancelled and deliberately left in
+/// `net.ops`, so `reap_at_close` can release them properly when their
+/// completion arrives; `sweep_unreaped_pipe_ops` handles the remainder.
 ///
 /// Returns the Python references to drop OUTSIDE the cell (ADR-5).
 pub(crate) fn cancel_standalone_ops(net: &mut NetState, backend: Backend<'_>) -> Vec<Py<PyAny>> {
@@ -684,29 +691,94 @@ pub(crate) fn cancel_standalone_ops(net: &mut NetState, backend: Backend<'_>) ->
     let mut dropped = Vec::with_capacity(standalone.len());
     for op in standalone {
         let _ = backend.cancel(op);
-        // The core is closing, so no further poll will reap these; the
-        // whole backend (and with it every OVERLAPPED) goes away next.
-        match net.ops.remove(&op) {
-            Some(OpTarget::Connect { fut, sock }) => {
-                backend.detach_socket(sock);
-                netsys::close(sock);
-                dropped.push(fut);
-            }
-            Some(t @ (OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. })) => {
-                // CancelIoEx only REQUESTS cancellation, and a pending
-                // ReadFile/WriteFile keeps using its buffer until the
-                // completion is dequeued. Dropping the Vec here -- which
-                // is what this function did when I first wrote it -- is
-                // the same use-after-free the transport paths were fixed
-                // for. Hand the whole target to the reaper instead: it
-                // outlives this call, and its Python future is released
-                // with it, out of the cell.
-                net.closed_pipe_ops.push(t);
-            }
-            _ => {}
+        if matches!(net.ops.get(&op), Some(OpTarget::Connect { .. })) {
+            let Some(OpTarget::Connect { fut, sock }) = net.ops.remove(&op) else { unreachable!() };
+            backend.detach_socket(sock);
+            netsys::close(sock);
+            dropped.push(fut);
         }
     }
     dropped
+}
+
+/// Pipe ops whose cancellation completion never arrived within the close
+/// reap budget.
+///
+/// CancelIoEx only REQUESTS cancellation, and a pending ReadFile/WriteFile
+/// keeps using its buffer until the completion is dequeued. Dropping the
+/// Vec here -- which is what `cancel_standalone_ops` did when I first
+/// wrote it -- is the same use-after-free the transport paths were fixed
+/// for. Hand the whole target to the reaper instead: it outlives this
+/// call, and its Python future is released with it, out of the cell.
+fn sweep_unreaped_pipe_ops(net: &mut NetState) {
+    let unreaped: Vec<OpId> = net
+        .ops
+        .iter()
+        .filter(|(_, t)| matches!(t, OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. }))
+        .map(|(&op, _)| op)
+        .collect();
+    for op in unreaped {
+        if let Some(t) = net.ops.remove(&op) {
+            net.closed_pipe_ops.push(t);
+        }
+    }
+}
+
+/// How long `reap_at_close` will wait for cancellation completions that
+/// have not landed on the port yet.
+///
+/// Zero on the readiness backends, which push their ECANCELED completion
+/// inline from `cancel()`/`detach_socket` -- one `try_poll` collects the
+/// lot. IOCP posts the ABORTED packet asynchronously, so a short bounded
+/// spin is the difference between releasing the buffers now and holding
+/// them for the closed loop's whole remaining lifetime.
+const CLOSE_REAP_BUDGET: Duration = Duration::from_millis(5);
+
+/// Release the resources cancelled teardown handed to `reap_guards`.
+///
+/// Teardown cannot free a cancelled op's buffers (R-073: the kernel may
+/// still be reading a send buffer or writing a recv slot until the op's
+/// completion is dequeued), so it parks them in `reap_guards` and lets the
+/// next `dispatch_completions` release them. A CLOSED loop never polls
+/// again -- so without this, every queued response body a close cancelled
+/// stayed resident for as long as anything referenced the dead loop. That
+/// is up to `high_water` bytes per connection.
+///
+/// The discipline is unchanged, only the pump: poll the backend directly
+/// and run the ordinary `translate`, so a guard is released on exactly the
+/// same evidence as during a tick -- its completion came back. Guards
+/// whose completion does not arrive inside the budget stay put and are
+/// freed when the state (and with it the backend) drops, which is the
+/// pre-existing behaviour. Nothing is freed early on any path.
+///
+/// In-cell, and Python-free: `translate` only moves refs into `events` /
+/// the graveyards, which close drains afterwards.
+pub(crate) fn reap_at_close(py: Python<'_>, net: &mut NetState, backend: Backend<'_>) {
+    let mut comps: Vec<Completion> = Vec::new();
+    let deadline = Instant::now() + CLOSE_REAP_BUDGET;
+    loop {
+        let pipes_left =
+            net.ops.values().any(|t| matches!(t, OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. }));
+        if net.reap_guards.is_empty() && !pipes_left {
+            break;
+        }
+        comps.clear();
+        let n = backend.try_poll(&mut comps).unwrap_or(0);
+        if n > 0 {
+            translate(py, net, backend, &comps);
+        }
+        // Checked on EVERY iteration, including the ones that translated
+        // something: a stream of unrelated packets (a cross-thread Wakeup
+        // being the easy one) must not keep this loop alive past its
+        // budget while the guard it is waiting for never arrives.
+        if Instant::now() >= deadline {
+            break;
+        }
+        if n == 0 {
+            std::thread::yield_now();
+        }
+    }
+    sweep_unreaped_pipe_ops(net);
 }
 
 /// Queue native HTTP response bytes on a transport's corked write queue
@@ -1087,6 +1159,28 @@ fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u
 /// whenever activity moved between sweeps). Busy connections (app
 /// running, queued pipeline, response streaming) are never timed out
 /// here. Returns (head_timeouts, idle_closes).
+/// Work that a shutdown or an idle sweep must not interrupt.
+///
+/// ONE definition, deliberately. `http_begin_shutdown` used to carry its
+/// own copy under a comment claiming it matched this one -- and when the
+/// draining case was added here it was not added there, so the graceful
+/// drain tore down connections whose response bytes were still queued,
+/// truncating exactly the responses it exists to protect. A comment is
+/// not a mechanism; a shared function is.
+fn http_conn_busy(entry: &TransportEntry) -> bool {
+    // Bytes queued or in flight: the application is finished but the
+    // response is not.
+    if !entry.wq.is_empty() || entry.send_op.is_some() {
+        return true;
+    }
+    let ProtoKind::Http(conn) = &entry.proto else { return false };
+    // Done/Idle are between-requests states, so only a live app, a queued
+    // pipeline, or a mid-flight response counts.
+    conn.active
+        || !conn.pending.is_empty()
+        || matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming)
+}
+
 pub(crate) fn http_sweep(
     py: Python<'_>,
     net: &mut NetState,
@@ -1104,14 +1198,8 @@ pub(crate) fn http_sweep(
         // that connection idle started the keep-alive clock while the
         // response was still going out, so a large body to a slow client
         // could be torn down mid-transmission by the idle sweep.
-        let draining = !entry.wq.is_empty() || entry.send_op.is_some();
+        let busy = http_conn_busy(entry);
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
-        // Done/Idle are between-requests states; only a live app, queued
-        // pipeline, a mid-flight response, or bytes still on the way out
-        // counts as busy.
-        let mid_response =
-            matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming);
-        let busy = conn.active || !conn.pending.is_empty() || mid_response || draining;
         let phase: u8 = if busy {
             2
         } else if conn.parser.in_head() {
@@ -1172,13 +1260,9 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
         if entry.conn_lost || entry.closing {
             continue;
         }
+        let busy_http = http_conn_busy(entry);
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
-        // Same predicate http_sweep uses to decide a connection is busy:
-        // Done/Idle are between-requests states, so only a live app, a
-        // queued pipeline, or a mid-flight response counts.
         conn.keep_alive = false;
-        let mid_response =
-            matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming);
         match conn.ws.as_ref() {
             // A WebSocket never finishes by itself -- it has to be told.
             // 1012 (service restart) is what the close frame carries.
@@ -1187,7 +1271,7 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
                 busy += 1;
             }
             Some(_) => busy += 1,
-            None if conn.active || !conn.pending.is_empty() || mid_response => busy += 1,
+            None if busy_http => busy += 1,
             None => idle.push(tid),
         }
     }
