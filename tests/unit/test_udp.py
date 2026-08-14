@@ -127,6 +127,45 @@ def test_unix_datagram_endpoint(loop, tmp_path):
     loop.run_until_complete(main())
 
 
+def test_allow_broadcast_remote_addr_does_not_filter_sources(loop):
+    """allow_broadcast + remote_addr must not connect() the socket
+    (CPython skips connect for exactly this case): a connected UDP
+    socket only receives from its peer, which drops the unicast replies
+    broadcast discovery exists to collect. Reported on PR #1."""
+
+    async def main():
+        recv_tr, recv_p = await loop.create_datagram_endpoint(
+            Client, local_addr=("127.0.0.1", 0)
+        )
+        target = recv_tr.get_extra_info("sockname")[:2]
+        disc_tr, disc_p = await loop.create_datagram_endpoint(
+            Client,
+            local_addr=("127.0.0.1", 0),
+            remote_addr=target,
+            allow_broadcast=True,
+        )
+        disc_addr = disc_tr.get_extra_info("sockname")[:2]
+        # The default send still goes to remote_addr...
+        recv_p.got = loop.create_future()
+        disc_tr.sendto(b"probe")
+        await asyncio.wait_for(recv_p.got, 5)
+        assert recv_p.received[0][0] == b"probe"
+        # ...and a reply from a DIFFERENT source must be delivered.
+        third_tr, _third = await loop.create_datagram_endpoint(
+            Client, local_addr=("127.0.0.1", 0)
+        )
+        disc_p.got = loop.create_future()
+        third_tr.sendto(b"reply", disc_addr)
+        await asyncio.wait_for(disc_p.got, 5)
+        data, addr = disc_p.received[0]
+        assert data == b"reply"
+        assert addr[:2] == third_tr.get_extra_info("sockname")[:2]
+        for tr in (recv_tr, disc_tr, third_tr):
+            tr.close()
+
+    loop.run_until_complete(main())
+
+
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX only")
 def test_unix_datagram_stale_socket_file_is_replaced(loop, tmp_path):
     """CPython parity: a leftover socket file at local_addr is removed

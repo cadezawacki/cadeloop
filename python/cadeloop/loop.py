@@ -747,7 +747,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     # The already-resolved sockaddr, not the original
                     # tuple: no second (blocking) lookup.
                     udp_sock.bind(local_res[4])
-                if remote_addr:
+                if remote_addr and not allow_broadcast:
+                    # CPython skips connect() under allow_broadcast: a
+                    # connected UDP socket only receives from its peer,
+                    # which drops the unicast replies broadcast discovery
+                    # exists to collect. The transport still targets
+                    # remote_addr on default sends (see sendto).
                     udp_sock.connect(remote_res[4])
             except BaseException:
                 udp_sock.close()

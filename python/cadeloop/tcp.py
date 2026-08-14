@@ -1195,8 +1195,15 @@ class _DatagramTransport(asyncio.DatagramTransport):
     def sendto(self, data, addr=None):
         if self._closing:
             return
-        if self._remote_addr is not None and addr not in (None, self._remote_addr):
-            raise ValueError(f"Invalid address: must be None or {self._remote_addr}")
+        if self._remote_addr is not None:
+            if addr not in (None, self._remote_addr):
+                raise ValueError(f"Invalid address: must be None or {self._remote_addr}")
+            if addr is None and self._extra.get("peername") is None:
+                # remote_addr without connect() (allow_broadcast): the
+                # default destination still has to reach the wire as an
+                # explicit sendto address -- a plain send() on an
+                # unconnected socket is EDESTADDRREQ.
+                addr = self._remote_addr
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__}")
         self._loop._core.udp_sendto(self._did, bytes(data), addr)
