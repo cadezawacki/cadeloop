@@ -30,6 +30,13 @@ jobs:
       - run: cargo clippy -p cadeloop-core --all-targets -- -D warnings
       - name: clippy (windows target)
         run: |
+          # pyo3-ffi's PYO3_CROSS build script generates python3.dll's
+          # import lib via the python3-dll-a crate, which shells out to a
+          # plain `llvm-dlltool` on PATH. rustup's llvm-tools/llvm-tools-
+          # preview component does NOT ship it (only llvm-{ar,nm,objcopy,
+          # ...} — verified against its actual installed file list); it
+          # comes from the OS's own llvm package instead.
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends llvm
           cargo clippy -p cadeloop-core --target x86_64-pc-windows-msvc -- -D warnings
           PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.11 \
             cargo clippy -p cadeloop-pyshim --no-default-features \

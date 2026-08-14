@@ -27,6 +27,13 @@ def _pin_to_cpu(cpu: int) -> None:
             handle = ctypes.c_void_p(-1)  # GetCurrentProcess() pseudo handle
             k32 = ctypes.windll.kernel32
             k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k32.SetProcessAffinityMask.restype = ctypes.c_int  # BOOL — was
+            # previously left to ctypes' default-int assumption; declaring
+            # it explicitly matches loop.py's SetConsoleCtrlHandler call
+            # (the codebase's other kernel32 FFI site) rather than leaving
+            # this one call implicit. Pinning stays best-effort — a
+            # nonzero-vs-zero result isn't acted on — but the return type
+            # itself is no longer left to inference.
             k32.SetProcessAffinityMask(handle, 1 << cpu)
     except OSError:
         pass  # pinning is best-effort (R-091)
