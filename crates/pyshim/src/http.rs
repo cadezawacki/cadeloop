@@ -75,6 +75,10 @@ pub(crate) struct HttpConn {
     pub(crate) raw_stream: bool,
     /// Active request is HEAD: body bytes are suppressed on the wire.
     pub(crate) active_head: bool,
+    /// Response status forbids a body (RFC 7230 3.3.2: 1xx, 204, 304).
+    /// Like `active_head` this suppresses body bytes, and additionally
+    /// suppresses the framing headers themselves.
+    pub(crate) resp_bodyless: bool,
     /// Active request's HTTP minor version (0 => chunked is unavailable).
     pub(crate) active_minor: u8,
     /// Body of the ACTIVE request, taken by the first `receive()`.
@@ -176,6 +180,7 @@ impl HttpConn {
             resp_started_with_length: false,
             raw_stream: false,
             active_head: false,
+            resp_bodyless: false,
             active_minor: 1,
             req_body: None,
             disconnected: false,
@@ -417,12 +422,18 @@ fn build_scope<'py>(
     )?;
 
     // Split path / query, decode path (R-081: percent-decoded, UTF-8 with
-    // latin-1 fallback).
-    let q = req.url.iter().position(|&b| b == b'?');
+    // latin-1 fallback). RFC 7230 5.3.2: a server MUST accept absolute-form
+    // request targets (proxies always send them, and any client may), so
+    // strip scheme://authority first — otherwise `path` becomes
+    // "http://host/x" and every route misses.
+    let target = origin_form(&req.url);
+    let q = target.iter().position(|&b| b == b'?');
     let (raw_path, query) = match q {
-        Some(i) => (&req.url[..i], &req.url[i + 1..]),
-        None => (&req.url[..], &b""[..]),
+        Some(i) => (&target[..i], &target[i + 1..]),
+        None => (target, &b""[..]),
     };
+    // absolute-form with an empty path ("http://host?q") means "/".
+    let raw_path = if raw_path.is_empty() { &b"/"[..] } else { raw_path };
     let decoded = percent_decode(raw_path);
     let path_str = match String::from_utf8(decoded) {
         Ok(s) => s,
@@ -575,10 +586,15 @@ impl HttpReceive {
                 }
             }
             Some(conn) => {
-                if conn.disconnected {
-                    R::Disconnect
-                } else if let Some(b) = conn.req_body.take() {
+                // Buffered body first, even when the peer has already gone:
+                // the request was received in full, so the app is entitled
+                // to its body. Reporting http.disconnect ahead of it loses
+                // data the client did send (common with half-close after a
+                // complete POST).
+                if let Some(b) = conn.req_body.take() {
                     R::Body(b)
+                } else if conn.disconnected {
+                    R::Disconnect
                 } else {
                     // Body already delivered: resolve on disconnect (or when
                     // this request finishes) — Starlette's disconnect
@@ -697,6 +713,40 @@ fn validate_response_header(name: &[u8], value: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Reduce a request target to its origin-form (path + query).
+///
+/// absolute-form (`http://host/p?q`) is stripped to `/p?q`; asterisk-form
+/// (`*`) and authority-form (`host:port`, CONNECT) have no path and map to
+/// `/`. Anything already in origin-form is returned unchanged.
+fn origin_form(url: &[u8]) -> &[u8] {
+    if url.first() == Some(&b'/') {
+        return url;
+    }
+    // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+    let scheme_len = url
+        .iter()
+        .position(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+        .unwrap_or(url.len());
+    let is_absolute =
+        scheme_len > 0 && url[0].is_ascii_alphabetic() && url.get(scheme_len..scheme_len + 3) == Some(b"://");
+    if !is_absolute {
+        // asterisk-form or authority-form: no path component.
+        return b"/";
+    }
+    let after_authority = scheme_len + 3;
+    match url[after_authority..].iter().position(|&b| matches!(b, b'/' | b'?' | b'#')) {
+        Some(i) => &url[after_authority + i..],
+        None => b"/",
+    }
+}
+
+/// RFC 7230 3.3.2 / RFC 7231: responses with these statuses are defined
+/// to carry no message body, and no `Content-Length`/`Transfer-Encoding`
+/// framing of one.
+fn status_forbids_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
+}
+
 /// RFC 7230 `tchar`.
 fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric()
@@ -793,6 +843,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             }
             conn.resp_head = std::mem::take(&mut head);
             conn.resp_started_with_length = saw_length;
+            conn.resp_bodyless = status_forbids_body(status);
             if saw_close {
                 conn.keep_alive = false;
             }
@@ -823,10 +874,16 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // First body chunk decides the framing (R-084).
                     let mut out = std::mem::take(&mut conn.resp_head);
                     let saw_length = conn.resp_started_with_length;
-                    let head_req = conn.active_head;
+                    // A bodyless status must not carry body bytes AND must
+                    // not carry framing headers: a client reading a 204/304
+                    // starts the next response immediately, so a stray
+                    // content-length/chunked header (or body) desynchronises
+                    // the keep-alive stream.
+                    let bodyless = conn.resp_bodyless;
+                    let head_req = conn.active_head || bodyless;
                     let minor = conn.active_minor;
                     if !more {
-                        if !saw_length {
+                        if !saw_length && !bodyless {
                             out.extend_from_slice(b"content-length: ");
                             out.extend_from_slice(body.len().to_string().as_bytes());
                             out.extend_from_slice(b"\r\n");
@@ -844,7 +901,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         if !head_req {
                             out.extend_from_slice(&body);
                         }
-                        if minor == 0 && !saw_length {
+                        if minor == 0 && !saw_length && !head_req {
+                            // Close-delimited only when the body length is
+                            // genuinely implicit; HEAD and bodyless statuses
+                            // are self-framing, so the connection survives.
                             conn.keep_alive = false;
                         }
                         conn.raw_stream = true;
@@ -862,7 +922,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 }
                 RespPhase::Streaming => {
                     let raw = conn.raw_stream;
-                    let head_req = conn.active_head;
+                    let head_req = conn.active_head || conn.resp_bodyless;
                     let mut out = Vec::with_capacity(body.len() + 16);
                     if head_req {
                         // body bytes suppressed
@@ -1118,11 +1178,30 @@ fn ws_send(
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
             };
+            // The 101 is a real HTTP response head, so it needs the same
+            // response-splitting guard as http.response.start: a CR/LF in a
+            // subprotocol or extra header would forge frames on the wire.
+            // Validate before touching the connection, so a rejected accept
+            // leaves `wsc.accepted` clear and the app can retry.
+            if let Some(sp) = &subprotocol {
+                if let Err(why) = validate_response_header(b"sec-websocket-protocol", sp.as_bytes()) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "websocket.accept sent an invalid subprotocol: {why}"
+                    )));
+                }
+            }
             let mut extra: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             if let Some(headers) = message.get_item(intern!(py, "headers"))? {
                 for item in headers.try_iter()? {
                     let pair = item?;
-                    extra.push((pair.get_item(0)?.extract()?, pair.get_item(1)?.extract()?));
+                    let name: Vec<u8> = pair.get_item(0)?.extract()?;
+                    let value: Vec<u8> = pair.get_item(1)?.extract()?;
+                    if let Err(why) = validate_response_header(&name, &value) {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "websocket.accept sent an invalid response header: {why}"
+                        )));
+                    }
+                    extra.push((name, value));
                 }
             }
             let trailing = core
@@ -1351,9 +1430,19 @@ fn ws_validate(req: &Request) -> WsVerdict {
         }
     }
     match (upgrade_ws, version_13, key, req.method) {
-        (true, true, Some(k), "GET") => WsVerdict::Ok(k),
+        (true, true, Some(k), "GET") if is_ws_key(&k) => WsVerdict::Ok(k),
         _ => WsVerdict::Bad,
     }
+}
+
+/// RFC 6455 §4.1: `Sec-WebSocket-Key` is a 16-byte nonce, base64-encoded —
+/// so exactly 24 characters ending in "==". Accepting anything else lets a
+/// non-WebSocket client (or a cache-poisoning probe) drive the handshake to
+/// a 101 whose accept-key it can predict.
+fn is_ws_key(k: &[u8]) -> bool {
+    k.len() == 24
+        && k[22..] == *b"=="
+        && k[..22].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 /// Phase 2: start queued requests until the queue is empty or one
@@ -1378,6 +1467,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 conn.resp_started_with_length = false;
                 conn.raw_stream = false;
                 conn.active_head = req.method == "HEAD";
+                conn.resp_bodyless = false;
                 conn.active_minor = req.http_minor;
                 if logging {
                     // R-140: retained only while a sink is installed.

@@ -1104,3 +1104,111 @@ def test_valid_response_headers_still_pass(loop):
     assert b" 200 " in resp.split(b"\r\n", 1)[0], resp[:120]
     assert b"x-obs-text" in resp.lower()
     loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize("status", [204, 304])
+def test_bodyless_status_suppresses_body_and_framing(loop, status):
+    """RFC 7230 3.3.2: a 204/304 response carries no body and no framing
+    headers. Emitting either desynchronises a keep-alive stream, because
+    the client starts reading the NEXT response immediately. Reported by
+    Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        await receive()
+        if scope["path"] == "/empty":
+            await send({"type": "http.response.start", "status": status, "headers": []})
+            # An app that sends a body anyway must still not put it on the
+            # wire — that is exactly what corrupts the stream.
+            await send({"type": "http.response.body", "body": b"junk"})
+        else:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"second"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /empty HTTP/1.1\r\nHost: h\r\n\r\n"
+            b"GET /next HTTP/1.1\r\nHost: h\r\n\r\n"
+        )
+        await writer.drain()
+        first = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        second = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        body = await asyncio.wait_for(reader.readexactly(6), 5)
+        writer.close()
+        return first, second, body
+
+    first, second, body = loop.run_until_complete(main())
+    assert str(status).encode() in first.split(b"\r\n", 1)[0]
+    assert b"content-length" not in first.lower()
+    assert b"transfer-encoding" not in first.lower()
+    assert b"junk" not in first
+    # The second response is intact, i.e. the stream never desynchronised.
+    assert b"200" in second.split(b"\r\n", 1)[0]
+    assert body == b"second"
+    loop._core.listener_close(lid)
+
+
+def test_absolute_form_request_target_is_stripped(loop):
+    """RFC 7230 5.3.2: servers MUST accept absolute-form targets (proxies
+    always send them). Leaving the scheme+authority in `path` misses every
+    route. Reported by Codex review on PR #1."""
+    lid, port = listen(loop, echo_scope_app)
+    resp = loop.run_until_complete(
+        _request(port, b"GET http://example.com/deep/path?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")
+    )
+    payload = json.loads(resp.split(b"\r\n\r\n", 1)[1])
+    assert payload["path"] == "/deep/path"
+    assert payload["raw_path"] == "/deep/path"
+    assert payload["query_string"] == "x=1"
+    loop._core.listener_close(lid)
+
+
+def test_absolute_form_with_empty_path_becomes_root(loop):
+    lid, port = listen(loop, echo_scope_app)
+    resp = loop.run_until_complete(
+        _request(port, b"GET http://example.com HTTP/1.1\r\nHost: h\r\n\r\n")
+    )
+    payload = json.loads(resp.split(b"\r\n\r\n", 1)[1])
+    assert payload["path"] == "/"
+    loop._core.listener_close(lid)
+
+
+def test_buffered_body_survives_client_half_close(loop):
+    """A fully-received request's body must reach the app even if the peer
+    half-closed before the app called receive(); reporting http.disconnect
+    first silently drops data the client did send. Reported by Codex review
+    on PR #1."""
+    entered = asyncio.Event()
+    may_receive = asyncio.Event()
+    seen = {}
+
+    async def app(scope, receive, send):
+        entered.set()
+        await may_receive.wait()
+        msg = await receive()
+        seen["type"] = msg["type"]
+        seen["body"] = msg.get("body", b"")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"POST / HTTP/1.1\r\nHost: h\r\ncontent-length: 5\r\n\r\nhello")
+        await writer.drain()
+        await asyncio.wait_for(entered.wait(), 5)
+        # Half-close: the request is complete, but the peer is done sending.
+        writer.write_eof()
+        await asyncio.sleep(0.1)  # let the EOF land in the engine
+        may_receive.set()
+        data = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        return data
+
+    loop.run_until_complete(main())
+    assert seen["type"] == "http.request"
+    assert seen["body"] == b"hello"
+    loop._core.listener_close(lid)

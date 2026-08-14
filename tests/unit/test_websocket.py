@@ -227,3 +227,105 @@ def test_starlette_websocket_route(loop):
 
     loop.run_until_complete(main())
     loop._core.listener_close(lid)
+
+
+def test_upgrade_headers_reject_crlf_injection(loop):
+    """The 101 head is a real HTTP response: a CRLF smuggled through
+    websocket.accept's `headers` or `subprotocol` must not forge frames.
+    Reported by Codex review on PR #1 (the http.response.start guard did
+    not cover this second serialization path)."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({
+            "type": "websocket.accept",
+            "headers": [(b"x-echo", b"a\r\nx-injected: yes")],
+        })
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(port)
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"x-injected" not in head.lower(), "header injection reached the wire"
+    assert b"101" not in head.split(b"\r\n", 1)[0]
+    loop._core.listener_close(lid)
+
+
+def test_upgrade_subprotocol_rejects_crlf_injection(loop):
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept", "subprotocol": "chat\r\nx-injected: yes"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(port)
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"x-injected" not in head.lower()
+    assert b"101" not in head.split(b"\r\n", 1)[0]
+    loop._core.listener_close(lid)
+
+
+def test_valid_upgrade_headers_still_pass(loop):
+    """The guard must not reject a legitimate accept with extras."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({
+            "type": "websocket.accept",
+            "subprotocol": "chat",
+            "headers": [(b"x-app", b"cadeloop")],
+        })
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(port, extra="sec-websocket-protocol: chat\r\n")
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"101" in head.split(b"\r\n", 1)[0]
+    assert b"sec-websocket-protocol: chat" in head.lower()
+    assert b"x-app: cadeloop" in head.lower()
+    loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "",                          # empty
+        "short",                     # not 24 chars
+        "AAAAAAAAAAAAAAAAAAAAAAAA",  # 24 chars but no "==" terminator
+        "not-base64-at-all!!!!!==",  # 24 chars, illegal alphabet
+        base64.b64encode(os.urandom(8)).decode(),  # 8-byte nonce, not 16
+    ],
+)
+def test_invalid_sec_websocket_key_is_rejected(loop, key):
+    """RFC 6455 §4.1: the key is a base64-encoded 16-byte nonce. Accepting
+    anything else hands out a 101 to a non-WebSocket client. Reported by
+    Codex review on PR #1."""
+    lid, port = listen(loop, ws_echo_app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            f"GET /ws HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\n"
+            f"connection: Upgrade\r\nsec-websocket-version: 13\r\n"
+            f"sec-websocket-key: {key}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    assert b"101" not in head.split(b"\r\n", 1)[0], f"bad key {key!r} was upgraded"
+    loop._core.listener_close(lid)
