@@ -318,6 +318,82 @@ def test_connection_refused(loop):
     loop.run_until_complete(main())
 
 
+def test_create_connection_validates_ssl_shutdown_timeout(loop):
+    """ssl_shutdown_timeout without ssl= was previously accepted
+    silently, unlike the already-present ssl_handshake_timeout check
+    right next to it."""
+
+    async def main():
+        with pytest.raises(ValueError, match="ssl_shutdown_timeout"):
+            await loop.create_connection(
+                asyncio.Protocol, "127.0.0.1", 1, ssl_shutdown_timeout=5.0
+            )
+
+    loop.run_until_complete(main())
+
+
+def test_create_connection_rejects_ssl_socket(loop):
+    """An already-wrapped ssl.SSLSocket passed via sock= previously
+    reached _wrap_outgoing unchecked."""
+    ssl_mod = pytest.importorskip("ssl")
+
+    async def main():
+        raw = socket.socket()
+        raw.setblocking(False)
+        ctx = ssl_mod.SSLContext(ssl_mod.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl_mod.CERT_NONE
+        wrapped = ctx.wrap_socket(raw, server_hostname=None, do_handshake_on_connect=False)
+        try:
+            with pytest.raises(TypeError, match="SSLSocket"):
+                await loop.create_connection(asyncio.Protocol, sock=wrapped)
+        finally:
+            wrapped.close()
+
+    loop.run_until_complete(main())
+
+
+def test_create_server_validates_reuse_port_and_ssl_shutdown(loop):
+    async def main():
+        with pytest.raises(ValueError, match="ssl_shutdown_timeout"):
+            await loop.create_server(
+                asyncio.Protocol, "127.0.0.1", 0, ssl_shutdown_timeout=5.0
+            )
+
+    loop.run_until_complete(main())
+
+    if not hasattr(socket, "SO_REUSEPORT"):
+        # Can only exercise the "not supported" branch when it's true —
+        # a platform where SO_REUSEPORT is missing entirely.
+        async def main_unsupported():
+            with pytest.raises(ValueError, match="reuse_port"):
+                await loop.create_server(
+                    asyncio.Protocol, "127.0.0.1", 0, reuse_port=True
+                )
+
+        loop.run_until_complete(main_unsupported())
+
+
+def test_create_connection_resolves_local_addr_by_family(loop):
+    """local_addr was previously used as-is without going through
+    getaddrinfo, unlike the remote address right next to it — a
+    hostname (rather than a literal IP) as local_addr, or a family
+    mismatch against the chosen remote candidate, behaved differently
+    than stdlib. This exercises the resolved, family-matched path."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        transport, _proto = await loop.create_connection(
+            asyncio.Protocol, addr[0], addr[1], local_addr=("127.0.0.1", 0)
+        )
+        assert transport.get_extra_info("sockname")[0] == "127.0.0.1"
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 def test_happy_eyeballs_delay_invokes_staggered_race(loop, monkeypatch):
     """happy_eyeballs_delay/interleave were previously accepted but
     silently ignored -- connection attempts stayed strictly sequential
@@ -588,6 +664,92 @@ def test_sock_sendfile_validates_params(loop, tmp_path):
         finally:
             for s in (client, server_side, listener):
                 s.close()
+
+    loop.run_until_complete(main())
+
+
+def test_sock_recvfrom_and_sendto(loop):
+    """sock_recvfrom/sock_recvfrom_into/sock_sendto were previously
+    unimplemented (fell through to AbstractEventLoop's abstract
+    NotImplementedError)."""
+
+    async def main():
+        a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        a.bind(("127.0.0.1", 0))
+        b.bind(("127.0.0.1", 0))
+        a.setblocking(False)
+        b.setblocking(False)
+        try:
+            await loop.sock_sendto(a, b"hello", b.getsockname())
+            data, addr = await loop.sock_recvfrom(b, 1024)
+            assert data == b"hello"
+            assert addr == a.getsockname()
+
+            await loop.sock_sendto(a, b"into-buf", b.getsockname())
+            buf = bytearray(64)
+            n, addr2 = await loop.sock_recvfrom_into(b, buf)
+            assert bytes(buf[:n]) == b"into-buf"
+            assert addr2 == a.getsockname()
+        finally:
+            a.close()
+            b.close()
+
+    loop.run_until_complete(main())
+
+
+def test_connect_accepted_socket(loop):
+    """connect_accepted_socket previously fell through to
+    AbstractEventLoop's abstract NotImplementedError — the generic
+    counterpart to this project's own multi-worker socket handoff."""
+
+    async def main():
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.setblocking(False)
+        addr = listener.getsockname()
+
+        client_raw = socket.socket()
+        client_raw.setblocking(False)
+        await loop.sock_connect(client_raw, addr)
+        server_raw, _peer = await loop.sock_accept(listener)
+
+        server_done = loop.create_future()
+
+        class Echo(asyncio.Protocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def data_received(self, data):
+                self.transport.write(data)
+
+            def connection_lost(self, exc):
+                if not server_done.done():
+                    server_done.set_result(None)
+
+        transport, _proto = await loop.connect_accepted_socket(Echo, server_raw)
+        assert transport is not None
+
+        client_reader, client_writer = await asyncio.open_connection(sock=client_raw)
+        client_writer.write(b"ping")
+        got = await asyncio.wait_for(client_reader.readexactly(4), 5)
+        assert got == b"ping"
+        client_writer.close()
+        transport.close()
+        listener.close()
+
+    loop.run_until_complete(main())
+
+
+def test_connect_accepted_socket_rejects_dgram(loop):
+    async def main():
+        dgram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            with pytest.raises(ValueError, match="Stream Socket"):
+                await loop.connect_accepted_socket(asyncio.Protocol, dgram)
+        finally:
+            dgram.close()
 
     loop.run_until_complete(main())
 

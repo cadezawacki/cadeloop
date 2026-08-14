@@ -29,6 +29,16 @@ def _fileno(fd):
     return fd.fileno()
 
 
+def _check_ssl_socket(sock):
+    """base_events._check_ssl_socket: a sock= passed to
+    create_connection/create_server/connect_accepted_socket must be a
+    plain socket cadeloop can wrap in its own transport — an
+    already-wrapped ssl.SSLSocket has its own I/O semantics that would
+    silently double-wrap or misbehave."""
+    if ssl_module is not None and isinstance(sock, ssl_module.SSLSocket):
+        raise TypeError("Socket cannot be of type SSLSocket")
+
+
 class Server(asyncio.AbstractServer):
     """asyncio.AbstractServer implementation over native listeners."""
 
@@ -158,10 +168,13 @@ class TcpSurface:
                 server_hostname = host
         if ssl_handshake_timeout is not None and not ssl:
             raise ValueError("ssl_handshake_timeout is only meaningful with ssl")
+        if ssl_shutdown_timeout is not None and not ssl:
+            raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
 
         if sock is not None:
             if host is not None or port is not None:
                 raise ValueError("host/port and sock can not be specified at the same time")
+            _check_ssl_socket(sock)
             fd = sock.detach()
             return await self._wrap_outgoing(
                 fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
@@ -180,15 +193,30 @@ class TcpSurface:
         )
         if not infos:
             raise OSError(f"getaddrinfo({host!r}) returned empty list")
-        local_ip, local_port = None, 0
+        laddr_infos = None
         if local_addr is not None:
-            local_ip, local_port = local_addr[0], local_addr[1]
+            laddr_infos = await self.getaddrinfo(
+                local_addr[0], local_addr[1], family=family, type=socket.SOCK_STREAM,
+                proto=proto, flags=flags,
+            )
+            if not laddr_infos:
+                raise OSError("getaddrinfo() returned empty list for local_addr")
         if interleave:
             infos = _interleave_addrinfos(infos, interleave)
 
         errors = []
 
-        async def attempt(address):
+        async def attempt(address, af):
+            local_ip, local_port = None, 0
+            if laddr_infos is not None:
+                for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
+                    if lfamily == af:
+                        local_ip, local_port = laddr[0], laddr[1]
+                        break
+                else:
+                    exc = OSError(f"no matching local address with family={af!r} found")
+                    errors.append(exc)
+                    raise exc
             fut = self.create_future()
             try:
                 self._core.tcp_connect(address[0], address[1], fut, local_ip, local_port)
@@ -199,9 +227,9 @@ class TcpSurface:
 
         if happy_eyeballs_delay is None:
             fd = None
-            for _af, _st, _pr, _cname, address in infos:
+            for af, _st, _pr, _cname, address in infos:
                 try:
-                    fd = await attempt(address)
+                    fd = await attempt(address, af)
                     break
                 except OSError:
                     continue
@@ -212,8 +240,8 @@ class TcpSurface:
             # the native tcp_connect fast path instead of a plain socket.
             fd, _, _ = await staggered.staggered_race(
                 (
-                    functools.partial(attempt, address)
-                    for _af, _st, _pr, _cname, address in infos
+                    functools.partial(attempt, address, af)
+                    for af, _st, _pr, _cname, address in infos
                 ),
                 happy_eyeballs_delay,
                 loop=self,
@@ -229,20 +257,28 @@ class TcpSurface:
         )
 
     async def _wrap_outgoing(
-        self, fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
+        self,
+        fd,
+        protocol_factory,
+        ssl,
+        server_hostname,
+        ssl_handshake_timeout,
+        ssl_shutdown_timeout,
+        *,
+        server_side=False,
     ):
         if not ssl:
             protocol = protocol_factory()
             transport = self._core.attach_stream(fd, protocol)
             return transport, protocol
-        sslcontext = self._make_ssl_context(ssl, server_side=False)
+        sslcontext = self._make_ssl_context(ssl, server_side=server_side)
         app_protocol = protocol_factory()
         waiter = self.create_future()
         protocol = self._make_ssl_protocol(
             app_protocol,
             sslcontext,
             waiter,
-            server_side=False,
+            server_side=server_side,
             server_hostname=server_hostname,
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
@@ -250,6 +286,32 @@ class TcpSurface:
         self._core.attach_stream(fd, protocol)
         await waiter  # handshake
         return protocol._app_transport, app_protocol
+
+    async def connect_accepted_socket(
+        self,
+        protocol_factory,
+        sock,
+        *,
+        ssl=None,
+        ssl_handshake_timeout=None,
+        ssl_shutdown_timeout=None,
+    ):
+        """Wrap an already-connected, externally-accepted socket (e.g.
+        handed off between processes) in a transport/protocol pair —
+        the generic counterpart to this project's own multi-worker
+        socket.share/fromshare handoff (server.py), at the public
+        AbstractEventLoop level."""
+        if sock.type != socket.SOCK_STREAM:
+            raise ValueError(f"A Stream Socket was expected, got {sock!r}")
+        if ssl_handshake_timeout is not None and not ssl:
+            raise ValueError("ssl_handshake_timeout is only meaningful with ssl")
+        if ssl_shutdown_timeout is not None and not ssl:
+            raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
+        _check_ssl_socket(sock)
+        fd = sock.detach()
+        return await self._wrap_outgoing(
+            fd, protocol_factory, ssl, None, ssl_handshake_timeout, ssl_shutdown_timeout, server_side=True
+        )
 
     async def start_tls(
         self,
@@ -331,6 +393,12 @@ class TcpSurface:
             raise TypeError("ssl argument must be an SSLContext or None")
         if ssl_handshake_timeout is not None and ssl is None:
             raise ValueError("ssl_handshake_timeout is only meaningful with ssl")
+        if ssl_shutdown_timeout is not None and ssl is None:
+            raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
+        if sock is not None:
+            _check_ssl_socket(sock)
+        if reuse_port and not hasattr(socket, "SO_REUSEPORT"):
+            raise ValueError("reuse_port not supported by socket module")
 
         factory = protocol_factory
         if ssl is not None:
@@ -581,6 +649,92 @@ class TcpSurface:
             return await fut
         finally:
             self._core.remove_reader(fd)
+
+    async def sock_recvfrom(self, sock, bufsize):
+        try:
+            return sock.recvfrom(bufsize)
+        except (BlockingIOError, InterruptedError):
+            pass
+        fut = self.create_future()
+        fd = sock.fileno()
+
+        def on_readable():
+            if fut.done():
+                return
+            try:
+                result = sock.recvfrom(bufsize)
+            except (BlockingIOError, InterruptedError):
+                return
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+
+        self._core.add_reader(fd, on_readable)
+        try:
+            return await fut
+        finally:
+            self._core.remove_reader(fd)
+
+    async def sock_recvfrom_into(self, sock, buf, nbytes=0):
+        if not nbytes:
+            nbytes = len(buf)
+        try:
+            return sock.recvfrom_into(buf, nbytes)
+        except (BlockingIOError, InterruptedError):
+            pass
+        fut = self.create_future()
+        fd = sock.fileno()
+
+        def on_readable():
+            if fut.done():
+                return
+            try:
+                result = sock.recvfrom_into(buf, nbytes)
+            except (BlockingIOError, InterruptedError):
+                return
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+
+        self._core.add_reader(fd, on_readable)
+        try:
+            return await fut
+        finally:
+            self._core.remove_reader(fd)
+
+    async def sock_sendto(self, sock, data, address):
+        try:
+            return sock.sendto(data, address)
+        except (BlockingIOError, InterruptedError):
+            pass
+        fut = self.create_future()
+        fd = sock.fileno()
+
+        def on_writable():
+            if fut.done():
+                return
+            try:
+                sock.sendto(data, address)
+            except (BlockingIOError, InterruptedError):
+                return
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(None)
+
+        self._core.add_writer(fd, on_writable)
+        try:
+            return await fut
+        finally:
+            self._core.remove_writer(fd)
 
     async def sock_sendfile(self, sock, file, offset=0, count=None, *, fallback=True):
         """Native os.sendfile first (TransmitFile is the remaining R-036
