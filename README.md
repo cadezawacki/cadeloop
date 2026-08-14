@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Transport | `sendfile` fallback's position seek was skipped by a cancellation unwind | `HEAD` |
 > | Unix | AF_UNIX peer/sock addresses were dropped, so `get_extra_info` said `None` | `HEAD` |
 > | ASGI | IPv6 `client`/`server` leaked the 4-item socket form into the scope | `046d2da` |
 > | HTTP | Absolute-form target: authority now overrides a conflicting `Host` | `046d2da` |

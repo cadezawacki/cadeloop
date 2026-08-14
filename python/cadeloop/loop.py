@@ -804,7 +804,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     await tasks.sleep(0.001)
             return total
         finally:
-            await self.run_in_executor(None, file.seek, offset + total)
+            # Synchronous, unlike the reads above: awaiting here would
+            # re-raise during a cancellation unwind and the position would
+            # never be corrected. One lseek is not worth an executor hop.
+            file.seek(offset + total)
 
     def add_signal_handler(self, sig, callback, *args):
         """R-052. The Python-level handler runs on the main thread once

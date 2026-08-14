@@ -1059,7 +1059,9 @@ class TcpSurface:
                 total += len(data)
             return total
         finally:
-            await self.run_in_executor(None, file.seek, offset + total)
+            # Synchronous for the same reason as Loop._sendfile_fallback:
+            # an await here is skipped when unwinding a cancellation.
+            file.seek(offset + total)
 
 
 class _DatagramTransport(asyncio.DatagramTransport):

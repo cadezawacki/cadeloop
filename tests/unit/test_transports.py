@@ -1670,6 +1670,10 @@ def test_create_connection_rejects_a_datagram_socket(loop):
         udp.close()
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "sendfile"),
+    reason="the native sendfile path is only reachable where os.sendfile exists",
+)
 def test_sendfile_reports_position_after_an_interrupted_transfer(loop, monkeypatch):
     """sendfile leaves the file positioned after the bytes actually sent.
     `os.sendfile` takes an explicit offset and does NOT advance the file
@@ -1748,3 +1752,36 @@ def test_unix_transport_reports_its_addresses(loop, tmp_path):
             await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+def test_sendfile_fallback_reports_position_after_a_failed_write(loop):
+    """The same contract on the path Windows and every SSL transport
+    actually take. Here the reads advance the position on their own, so
+    it only diverges when the transfer stops between a read and its
+    write -- and then tell() is ahead of what reached the peer, which is
+    the direction that makes a retrying caller SKIP bytes."""
+    import io
+
+    payload = b"abcdefghij" * 4096
+    fh = io.BytesIO(payload)
+
+    class FailingTransport:
+        def __init__(self):
+            self.written = 0
+            self.writes = 0
+
+        def write(self, data):
+            self.writes += 1
+            if self.writes > 1:
+                raise ConnectionResetError("peer went away")
+            self.written += len(data)
+
+        def get_write_buffer_size(self):
+            return 0
+
+    t = FailingTransport()
+    with pytest.raises(ConnectionResetError):
+        loop.run_until_complete(loop._sendfile_fallback(t, fh, 0, None))
+    assert fh.tell() == t.written, (
+        f"tell() reports {fh.tell()} but only {t.written} bytes reached the transport"
+    )
