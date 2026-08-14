@@ -11,9 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Server | `serve(host="localhost")` failed at startup: hostnames were never resolved | `` |
-> | ASGI | Awaiting a foreign loop's future hung the request instead of failing it | `` |
-> | WS | `Sec-WebSocket-Extensions` from the app was forwarded but never negotiated | `` |
+> | Server | `serve(host="localhost")` failed at startup: hostnames were never resolved | `b234f96` |
+> | ASGI | Awaiting a foreign loop's future hung the request instead of failing it | `b234f96` |
+> | WS | `Sec-WebSocket-Extensions` from the app was forwarded but never negotiated | `b234f96` |
 > | Server | `serve()` never restored the collector it reconfigured | `e114bb1` |
 > | Loop | `close()` never reaped the buffers of the sends it cancelled | `c567a0e` |
 > | HTTP | Graceful shutdown tore down connections whose bytes were still queued | `c567a0e` |
