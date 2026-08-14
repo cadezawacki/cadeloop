@@ -66,13 +66,26 @@ jobs:
               await send({"type": "http.response.body", "body": b"pgo"})
           lp = cadeloop.new_event_loop()
           lid, bound, _ = lp._core.http_listen("127.0.0.1", 0, app, lp)
+          failure = []
           def hammer():
-              time.sleep(0.3)
-              for _ in range(3000):
-                  urllib.request.urlopen(f"http://127.0.0.1:{bound[1]}/", timeout=5).read()
-              lp.call_soon_threadsafe(lp.stop)
-          threading.Thread(target=hammer).start()
-          lp.run_forever(); lp.close()
+              # The stop MUST be in a finally: if any request raises (the
+              # listener not ready, a timeout, the instrumented server
+              # dying mid-run) the thread used to exit while the main
+              # thread stayed in run_forever() forever, stalling both
+              # matrix release jobs until the workflow timeout.
+              try:
+                  time.sleep(0.3)
+                  for _ in range(3000):
+                      urllib.request.urlopen(f"http://127.0.0.1:{bound[1]}/", timeout=5).read()
+              except BaseException as exc:
+                  failure.append(exc)
+              finally:
+                  lp.call_soon_threadsafe(lp.stop)
+          t = threading.Thread(target=hammer)
+          t.start()
+          lp.run_forever(); t.join(); lp.close()
+          if failure:
+              raise SystemExit(f"PGO training workload failed: {failure[0]!r}")
           EOF
       - name: merge profiles
         shell: bash

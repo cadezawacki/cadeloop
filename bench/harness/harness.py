@@ -94,16 +94,29 @@ class ServerProc:
         )
         self.port = port
         deadline = time.monotonic() + 10
-        ready = False
-        while time.monotonic() < deadline:
-            line = self.proc.stdout.readline()
-            if not line:
-                break
-            if line.startswith("READY"):
-                ready = True
-                break
-        if not ready:
+        # readline() has no timeout of its own, so a server that starts,
+        # stays alive and never prints READY blocked here forever and the
+        # deadline above was never re-evaluated -- defeating the timeout
+        # for exactly the startup hang it exists to catch. Read on a
+        # helper thread and join with the remaining budget instead.
+        import threading
+
+        result: dict[str, bool] = {}
+
+        def _wait_ready():
+            for line in self.proc.stdout:
+                if line.startswith("READY"):
+                    result["ready"] = True
+                    return
+            result["ready"] = False
+
+        reader = threading.Thread(target=_wait_ready, daemon=True)
+        reader.start()
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if not result.get("ready"):
             self.stop()
+            if reader.is_alive():
+                raise RuntimeError(f"server never printed READY within 10s: {cmd}")
             raise RuntimeError(f"server failed to start: {cmd}")
         while time.monotonic() < deadline:
             # A server that printed READY and then died (e.g. backend

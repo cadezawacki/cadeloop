@@ -97,3 +97,28 @@ def test_cli_accepts_platform_backend(monkeypatch):
     name = "iocp" if sys.platform == "win32" else "epoll"
     assert cli.main(["os.path:join", "--backend", name]) == 0
     assert calls["backend"] == name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="child watchers are POSIX-only")
+def test_installed_policy_keeps_the_posix_child_watcher():
+    """asyncio.create_subprocess_* goes through the policy's child
+    watcher, which lives in the Unix policy rather than in
+    BaseDefaultEventLoopPolicy. Deriving from the base class produced an
+    installed policy whose loops could not spawn subprocesses at all.
+    Reported by Codex review on PR #1."""
+    import asyncio
+
+    import cadeloop
+
+    previous = asyncio.get_event_loop_policy()
+    try:
+        cadeloop.install()
+        policy = asyncio.get_event_loop_policy()
+        assert isinstance(policy, cadeloop.EventLoopPolicy)
+        # The method exists AND returns a functional watcher.
+        with contextlib.suppress(DeprecationWarning):
+            watcher = policy.get_child_watcher()
+        assert watcher is not None
+        assert hasattr(watcher, "add_child_handler")
+    finally:
+        asyncio.set_event_loop_policy(previous)

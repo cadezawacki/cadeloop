@@ -277,6 +277,19 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # that itself raised.
         if self.is_running():
             raise RuntimeError("Cannot close a running event loop")
+        # Restore process-level signal disposition before tearing the core
+        # down. Leaving handlers installed pointed the signal module at a
+        # _dispatch that returns immediately once the loop is closed, so
+        # SIGINT/SIGTERM were silently swallowed for the rest of the
+        # process instead of resuming default behaviour -- and the closed
+        # loop stayed referenced from the signal module. Matches what the
+        # stdlib Unix loop does in its own close().
+        for sig in list(self._signal_handlers):
+            try:
+                self.remove_signal_handler(sig)
+            except (OSError, ValueError, RuntimeError):
+                self._signal_handlers.pop(sig, None)
+        self._remove_console_ctrl_handler()
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None
@@ -782,6 +795,20 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     _CTRL_LOGOFF_EVENT = 5
     _CTRL_SHUTDOWN_EVENT = 6
     _STOP_CTRL_EVENTS = frozenset((_CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT, _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT))
+
+    def _remove_console_ctrl_handler(self):
+        """R-052 (win32 only): unregister the console-control callback so a
+        closed loop stops intercepting CTRL_BREAK/CLOSE/LOGOFF/SHUTDOWN."""
+        if self._console_ctrl_handler_ref is None:
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(self._console_ctrl_handler_ref, False)
+        except (AttributeError, OSError):
+            pass  # not Windows, or the console is already gone
+        finally:
+            self._console_ctrl_handler_ref = None
 
     def _install_console_ctrl_handler(self):
         """R-052 (win32 only, idempotent). See add_signal_handler's

@@ -9,8 +9,22 @@ from .loop import Loop
 __all__ = ["EventLoopPolicy", "install", "new_event_loop", "run"]
 
 
-class EventLoopPolicy(asyncio.events.BaseDefaultEventLoopPolicy):
-    """``asyncio.set_event_loop_policy(cadeloop.EventLoopPolicy())``."""
+# On POSIX the child-watcher machinery that asyncio.create_subprocess_*
+# depends on lives in the Unix policy, not in BaseDefaultEventLoopPolicy.
+# Deriving from the base class there produced a policy whose loops could
+# not spawn subprocesses at all once install() was called -- direct-loop
+# tests kept passing only because they ran under the process's original
+# Unix policy.
+_BasePolicy = getattr(asyncio, "DefaultEventLoopPolicy", asyncio.events.BaseDefaultEventLoopPolicy)
+
+
+class EventLoopPolicy(_BasePolicy):  # type: ignore[misc,valid-type]
+    """``asyncio.set_event_loop_policy(cadeloop.EventLoopPolicy())``.
+
+    Inherits the platform default policy so POSIX keeps its child-watcher
+    implementation (`get_child_watcher`/`set_child_watcher`), and only the
+    loop factory is replaced.
+    """
 
     _loop_factory = Loop
 

@@ -1224,3 +1224,22 @@ def test_close_with_a_pending_connect_releases_it():
         asyncio.set_event_loop(None)
         lp.close()  # must not hang, leak the socket, or leave the op live
     assert lp.is_closed()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal disposition")
+def test_close_restores_signal_disposition():
+    """A handler left installed by close() points the signal module at a
+    _dispatch that returns immediately once the loop is closed, so the
+    signal is silently swallowed for the rest of the process instead of
+    resuming default behaviour. Reported by Codex review on PR #1 (twice)."""
+    import signal as signal_module
+
+    before = signal_module.getsignal(signal_module.SIGUSR1)
+    lp = cadeloop.new_event_loop()
+    try:
+        lp.add_signal_handler(signal_module.SIGUSR1, lambda: None)
+        assert signal_module.getsignal(signal_module.SIGUSR1) is not before
+    finally:
+        lp.close()
+    assert signal_module.getsignal(signal_module.SIGUSR1) is signal_module.SIG_DFL
+    signal_module.signal(signal_module.SIGUSR1, before)
