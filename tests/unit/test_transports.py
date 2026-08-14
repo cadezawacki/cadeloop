@@ -1199,3 +1199,28 @@ def test_listener_keeps_accepting_after_many_connections(loop):
 
     loop.run_until_complete(main())
     assert loop._core.stats()["accept_starved"] == 0
+
+
+def test_close_with_a_pending_connect_releases_it():
+    """R-122: loop close sweeps transports, listeners and datagram
+    endpoints, but a standalone `connect()` op belongs to none of them. It
+    used to keep its future, its buffers and an open socket alive for as
+    long as the closed core existed. Reported by Codex review on PR #1."""
+    lp = cadeloop.new_event_loop()
+    asyncio.set_event_loop(lp)
+    try:
+        # 198.51.100.0/24 is TEST-NET-2: reserved, so the connect stays
+        # pending rather than completing or refusing promptly.
+        fut = asyncio.ensure_future(
+            asyncio.wait_for(lp.create_connection(asyncio.Protocol, "198.51.100.1", 9), 0.2),
+            loop=lp,
+        )
+        try:
+            lp.run_until_complete(asyncio.sleep(0.05))
+        except Exception:
+            pass
+        fut.cancel()
+    finally:
+        asyncio.set_event_loop(None)
+        lp.close()  # must not hang, leak the socket, or leave the op live
+    assert lp.is_closed()

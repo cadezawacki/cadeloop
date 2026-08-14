@@ -75,20 +75,22 @@ def main() -> int:
         "--slack-bytes",
         type=int,
         default=4 * 1024 * 1024,
-        help="absolute allocator-noise floor: fail only if growth exceeds "
-        "max(max-growth * baseline, this). This micro-soak's baseline RSS "
-        "(~25 MB) is small enough that arena/fragmentation creep (~2.5 MB "
-        "plateau, measured flat across 30s vs 75s runs) breaches a bare 5%%; "
-        "a real per-op leak at soak scale exceeds this floor within seconds. "
-        "The R-122 10k-connection soak (M1) applies the strict 5%% on its "
-        "much larger baseline.",
+        help="absolute allocator-noise floor: fail only if SECOND-HALF "
+        "growth exceeds max(max-growth * midpoint RSS, this). See the "
+        "second-half rationale below; the floor covers the residual "
+        "arena/fragmentation creep on this micro-soak's small (~25 MB) "
+        "baseline. The R-122 10k-connection soak (M1) applies the strict "
+        "5%% on its much larger baseline.",
     )
     args = parser.parse_args()
 
     import cadeloop
 
     loop = cadeloop.new_event_loop()
-    deadline = time.monotonic() + args.seconds
+    # Set for real after warmup: initialising it here made warmup eat into
+    # the requested duration (a 30s run measured 20s, a 600s nightly 540s,
+    # and anything under the 3s warmup floor measured nothing at all).
+    deadline = float("inf")
     rng = random.Random(1337)
     stats = {"cb": 0, "timers": 0, "cancelled": 0, "xthread": 0}
     stop_producer = threading.Event()
@@ -131,6 +133,20 @@ def main() -> int:
     base_rss = rss_bytes()
     print(f"warmed up; baseline RSS {base_rss / 1e6:.1f} MB", flush=True)
 
+    # Two equal halves, so the SHAPE of the growth is visible rather than
+    # just its total. A real per-op leak grows linearly, so its second
+    # half matches its first; allocator arena and fragmentation creep
+    # decelerates sharply once the working set is touched. Gating on the
+    # second half alone therefore separates the two, instead of picking a
+    # slack figure large enough to hide a slow leak.
+    half = args.seconds / 2
+    deadline = time.monotonic() + half
+    loop.call_soon(churn)
+    loop.run_forever()
+    gc.collect()
+    mid_rss = rss_bytes()
+
+    deadline = time.monotonic() + half
     loop.call_soon(churn)
     loop.run_forever()
     stop_producer.set()
@@ -139,18 +155,21 @@ def main() -> int:
     final_rss = rss_bytes()
     loop.close()
 
-    growth_bytes = final_rss - base_rss
-    growth = growth_bytes / base_rss
-    allowance = max(args.max_growth * base_rss, args.slack_bytes)
+    first_half = mid_rss - base_rss
+    second_half = final_rss - mid_rss
+    allowance = max(args.max_growth * mid_rss, args.slack_bytes)
     print(
-        f"done: {stats} | RSS {base_rss / 1e6:.1f} -> {final_rss / 1e6:.1f} MB "
-        f"({growth * 100:+.2f}%, allowance {allowance / 1e6:.1f} MB)",
+        f"done: {stats} | RSS {base_rss / 1e6:.1f} -> {mid_rss / 1e6:.1f} -> "
+        f"{final_rss / 1e6:.1f} MB (1st half {first_half / 1e6:+.1f} MB, "
+        f"2nd half {second_half / 1e6:+.1f} MB, allowance {allowance / 1e6:.1f} MB)",
         flush=True,
     )
-    if growth_bytes > allowance:
+    if second_half > allowance:
         print(
-            f"FAIL: RSS growth {growth_bytes / 1e6:.1f} MB exceeds "
-            f"max({args.max_growth * 100:.0f}%, {args.slack_bytes / 1e6:.0f} MB)"
+            f"FAIL: second-half RSS growth {second_half / 1e6:.1f} MB exceeds "
+            f"max({args.max_growth * 100:.0f}%, {args.slack_bytes / 1e6:.0f} MB). "
+            "Sustained growth after warmup plus a full half-soak is a leak, "
+            "not arena creep."
         )
         return 1
     print("PASS")

@@ -588,6 +588,43 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     net.graveyard_entries.push(entry);
 }
 
+/// Cancel and reap the ops that belong to no transport, listener or
+/// datagram endpoint: an outstanding `connect()`, or a Windows named-pipe
+/// read/write (R-051). Loop close walks the three maps, so these were
+/// simply left behind -- their futures stayed pending, their pinned
+/// buffers stayed alive, and a connect target kept an open socket, for as
+/// long as the closed core existed.
+///
+/// Returns the Python references to drop OUTSIDE the cell (ADR-5).
+pub(crate) fn cancel_standalone_ops(net: &mut NetState, backend: Backend<'_>) -> Vec<Py<PyAny>> {
+    let standalone: Vec<OpId> = net
+        .ops
+        .iter()
+        .filter(|(_, t)| {
+            matches!(t, OpTarget::Connect { .. } | OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. })
+        })
+        .map(|(&op, _)| op)
+        .collect();
+    let mut dropped = Vec::with_capacity(standalone.len());
+    for op in standalone {
+        let _ = backend.cancel(op);
+        // The core is closing, so no further poll will reap these; the
+        // whole backend (and with it every OVERLAPPED) goes away next.
+        match net.ops.remove(&op) {
+            Some(OpTarget::Connect { fut, sock }) => {
+                backend.detach_socket(sock);
+                netsys::close(sock);
+                dropped.push(fut);
+            }
+            Some(OpTarget::PipeRead { fut, .. }) | Some(OpTarget::PipeWrite { fut, .. }) => {
+                dropped.push(fut);
+            }
+            _ => {}
+        }
+    }
+    dropped
+}
+
 /// Queue native HTTP response bytes on a transport's corked write queue
 /// (R-035/R-084: same-tick flush via flush_list). In-cell.
 pub(crate) fn http_enqueue(

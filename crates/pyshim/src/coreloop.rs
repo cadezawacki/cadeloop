@@ -562,7 +562,15 @@ impl CoreLoop {
             for did in dids {
                 net::udp_teardown_at_close(&mut st.net, st.reactor.backend_mut(), did);
             }
-            let mut dropped: Vec<Py<PyAny>> = st.reactor.clear_pending();
+            // R-051/R-122: ops owned by no transport, listener or
+            // datagram endpoint (a pending connect, a Windows pipe
+            // read/write) are not reached by any of the three sweeps
+            // above, so they would keep their futures, buffers and (for
+            // connect) an open socket alive for the closed core's
+            // lifetime.
+            let mut dropped: Vec<Py<PyAny>> =
+                net::cancel_standalone_ops(&mut st.net, st.reactor.backend_mut());
+            dropped.extend(st.reactor.clear_pending());
             dropped.extend(std::mem::take(&mut st.net.ready_scratch));
             for (_, h) in st.net.readers.drain() {
                 dropped.push(h);
