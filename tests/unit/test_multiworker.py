@@ -184,3 +184,102 @@ def test_spawn_worker_pool_serves_and_stops(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_spawn_supervisor_binds_the_requested_family(monkeypatch):
+    """The spawn supervisor hardcoded AF_INET, so an IPv6 host failed at
+    bind even though the single-worker and fork paths accept it. Reported
+    by Codex review on PR #1 (UC-009)."""
+    from cadeloop import server
+
+    if not socket.has_ipv6:
+        pytest.skip("no IPv6 on this host")
+    try:  # has_ipv6 only reports build support; containers often lack it
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+    except OSError:
+        pytest.skip("IPv6 unavailable in this environment")
+
+    seen = {}
+    real_socket = socket.socket
+
+    class _Boom(RuntimeError):
+        pass
+
+    def fake_spawn(*a, **kw):
+        raise _Boom("stop right after the bind")
+
+    def spy(family, type_, proto=0, *a, **kw):
+        seen.setdefault("family", family)
+        return real_socket(family, type_, proto, *a, **kw)
+
+    monkeypatch.setattr(server._socket, "socket", spy)
+    monkeypatch.setattr(server, "_spawn_shared_worker", fake_spawn)
+    with pytest.raises(_Boom):
+        server._serve_multi_spawn(
+            "test_multiworker:_reject_port_zero_app", "::1", 8123, server.Config(workers=2), 2
+        )
+    assert seen["family"] == socket.AF_INET6
+
+
+def test_spawn_startup_failure_cleans_up_started_workers(monkeypatch):
+    """A failure partway through startup used to leave the children
+    already spawned running and the listener bound, because the cleanup
+    block had not been entered yet. Reported by Codex review on PR #1
+    (UC-008)."""
+    from cadeloop import server
+
+    stopped = []
+    spawned = []
+
+    class FakeProc:
+        returncode = None
+
+        def __init__(self, idx):
+            self.idx = idx
+
+        def wait(self, timeout=None):
+            stopped.append(self.idx)
+            return 0
+
+        def kill(self):
+            stopped.append(("kill", self.idx))
+
+    class FakeWorker:
+        def __init__(self, idx):
+            self.idx = idx
+            self.proc = FakeProc(idx)
+            self.spawned = time.monotonic()
+
+        def alive(self):
+            return True
+
+        def close(self):
+            pass
+
+    def fake_spawn(spec, config, idx, ncpu):
+        if idx == 1:
+            raise RuntimeError("second spawn failed")
+        w = FakeWorker(idx)
+        spawned.append(w)
+        return w
+
+    monkeypatch.setattr(server, "_spawn_shared_worker", fake_spawn)
+    monkeypatch.setattr(server, "_send_frame", lambda w, *a, **k: None)
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    with pytest.raises(RuntimeError, match="second spawn failed"):
+        server._serve_multi_spawn(
+            "test_multiworker:_reject_port_zero_app",
+            "127.0.0.1",
+            port,
+            server.Config(workers=2),
+            2,
+        )
+    assert [w.idx for w in spawned] == [0]
+    assert 0 in stopped, "worker 0 was left running after the startup failure"
+    # And the listener is gone, so the port is immediately rebindable.
+    with socket.socket() as s2:
+        s2.bind(("127.0.0.1", port))

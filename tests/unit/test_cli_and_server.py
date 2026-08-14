@@ -63,10 +63,21 @@ def test_cli_maps_flags_to_serve(monkeypatch):
 
     monkeypatch.setattr(cli, "serve", fake_serve)
     assert cli.main(["os.path:join", "--workers", "3", "--port", "9001", "--no-pin"]) == 0
-    assert calls["app"] is load_app("os.path:join")
+    # The SPEC is forwarded, not a resolved callable: serve() needs the
+    # string for the fork-free worker model, and passing a callable made
+    # `--workers > 1` fail as though a bare callable had been supplied.
+    # Reported by Codex review on PR #1.
+    assert calls["app"] == "os.path:join"
     assert calls["port"] == 9001
     assert calls["workers"] == 3
     assert calls["pin"] is False
+
+
+def test_cli_still_validates_the_app_spec_eagerly(monkeypatch):
+    """Forwarding the string must not defer a typo until after binding."""
+    monkeypatch.setattr(cli, "serve", lambda *a, **k: None)
+    with pytest.raises(AttributeError, match="no attribute"):
+        cli.main(["os:not_a_real_attr"])
 
 
 def test_cli_rejects_bad_backend():

@@ -64,9 +64,13 @@ def main(argv: list[str] | None = None) -> int:
         for name in cfg_fields
         if getattr(ns, name) is not None
     }
-    app = load_app(ns.app)
+    # Validate the spec now so a typo fails before we bind anything, but
+    # hand serve() the STRING: the fork-free (Windows) worker model needs
+    # it to re-import the app in each child, and a resolved callable makes
+    # serve() reject --workers > 1 as though a bare callable were passed.
+    load_app(ns.app)
     serve(
-        app,
+        ns.app,
         ns.host,
         ns.port,
         workers=ns.workers,

@@ -375,6 +375,7 @@ def _make_adopter(loop, app, config: Config, lifespan, ssl_ctx):
 
     def adopt(sock):
         fd = sock.detach()  # the engine owns the handle from here
+        adopted = False
         try:
             loop._core.http_adopt(
                 fd,
@@ -390,8 +391,19 @@ def _make_adopter(loop, app, config: Config, lifespan, ssl_ctx):
                 keepalive_idle=config.keepalive_idle,
                 tls=ssl_ctx,
             )
+            adopted = True
         except Exception:  # noqa: BLE001 — one bad handoff must not kill the worker
             logger.exception("worker %s could not adopt a connection", os.getpid())
+        finally:
+            if not adopted:
+                # detach() gave up Python's ownership and the engine never
+                # took it, so nothing would ever close this handle.
+                # Re-wrapping is the portable close (closesocket on
+                # Windows, close(2) elsewhere).
+                try:
+                    _socket.socket(fileno=fd).close()
+                except OSError:
+                    pass
 
     return adopt
 
@@ -677,19 +689,68 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
             "workers > 1 requires an explicit port (the supervisor binds "
             "one listener; port 0 would be unknowable to callers)"
         )
-    lsock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    # Resolve first: hardcoding AF_INET made every IPv6 host ("::1", an
+    # IPv6-only deployment) fail at bind, even though the single-worker
+    # and fork paths accept them.
+    infos = _socket.getaddrinfo(
+        host, port, type=_socket.SOCK_STREAM, flags=_socket.AI_PASSIVE
+    )
+    if not infos:
+        raise OSError(f"getaddrinfo returned nothing for {host!r}:{port}")
+    family, socktype, proto, _canon, sockaddr = infos[0]
+    lsock = _socket.socket(family, socktype, proto)
     try:
-        lsock.bind((host, port))
+        if family == _socket.AF_INET6 and hasattr(_socket, "IPV6_V6ONLY"):
+            # Keep a wildcard IPv6 listener off the IPv4 port, matching
+            # create_server's per-family listeners.
+            lsock.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
+        lsock.bind(sockaddr)
         lsock.listen(1024)
     except OSError:
         lsock.close()
         raise
     ncpu = os.cpu_count() or 1
     logger.info("cadeloop supervisor: %d workers on http://%s:%s (accept+handoff)", n, host, port)
-    workers = [_spawn_shared_worker(spec, config, idx, ncpu) for idx in range(n)]
 
+    # `workers` is read by the accept thread and mutated by the
+    # supervision loop, so every access goes through this lock. Without it
+    # the accept thread could evaluate len(workers), lose the race to a
+    # removal, and index out of range — killing the only thread that
+    # distributes connections.
+    workers_lock = threading.Lock()
+    workers = []
     stopping = False
     exit_code = 0
+
+    def _live_workers():
+        with workers_lock:
+            return list(workers)
+
+    try:
+        for idx in range(n):
+            w = _spawn_shared_worker(spec, config, idx, ncpu)
+            with workers_lock:
+                workers.append(w)
+    except BaseException:
+        # A failure partway through startup used to leave the children
+        # already spawned running and the listener bound, because the
+        # cleanup below had not been entered yet.
+        for w in _live_workers():
+            try:
+                _send_frame(w, b"STOP")
+            except (OSError, ValueError):
+                pass
+        for w in _live_workers():
+            try:
+                w.proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                w.proc.kill()
+            w.close()
+        try:
+            lsock.close()
+        except OSError:
+            pass
+        raise
 
     def _stop_all():
         nonlocal stopping
@@ -698,7 +759,7 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
             lsock.close()  # unblocks the accept loop
         except OSError:
             pass
-        for w in workers:
+        for w in _live_workers():
             try:
                 _send_frame(w, b"STOP")
             except (OSError, ValueError):
@@ -713,8 +774,11 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
             except OSError:
                 return  # listener closed: shutting down
             try:
-                for _ in range(len(workers)):
-                    w = workers[turn % len(workers)] if workers else None
+                # One snapshot per connection: the supervision loop may
+                # add or remove workers at any moment.
+                live = _live_workers()
+                for _ in range(len(live)):
+                    w = live[turn % len(live)] if live else None
                     turn += 1
                     if w is None or not w.alive():
                         continue
@@ -723,9 +787,7 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
                         break
                     except (OSError, ValueError):
                         continue  # worker died mid-handoff; try the next
-                else:
-                    # Every worker is down. Dropping beats hanging the peer;
-                    # the supervision loop below is already restarting them.
+                if not live:
                     logger.warning("no live worker to accept a connection; dropping it")
             finally:
                 conn.close()  # our handle; the worker holds its own now
@@ -735,10 +797,12 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
 
     crash_streak = 0
     try:
-        while workers:
+        while _live_workers():
             time.sleep(0.2)
-            for w in [w for w in workers if not w.alive()]:
-                workers.remove(w)
+            for w in [w for w in _live_workers() if not w.alive()]:
+                with workers_lock:
+                    if w in workers:
+                        workers.remove(w)
                 w.close()
                 if stopping:
                     continue
@@ -760,14 +824,16 @@ def _serve_multi_spawn(spec: str, host, port, config: Config, n: int):
                     _stop_all()
                     continue
                 logger.warning("worker %d died (status %s) — restarting", w.idx, w.proc.returncode)
-                workers.append(_spawn_shared_worker(spec, config, w.idx, ncpu))
+                replacement = _spawn_shared_worker(spec, config, w.idx, ncpu)
+                with workers_lock:
+                    workers.append(replacement)
     except KeyboardInterrupt:
         _stop_all()
     finally:
         if not stopping:
             _stop_all()
         deadline = time.monotonic() + config.grace
-        for w in list(workers):
+        for w in _live_workers():
             budget = max(0.0, deadline - time.monotonic())
             try:
                 w.proc.wait(timeout=budget)
