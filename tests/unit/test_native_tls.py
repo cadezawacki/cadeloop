@@ -146,3 +146,57 @@ def test_plaintext_to_tls_port_is_dropped(loop, certs):
 def test_serve_rejects_non_context():
     with pytest.raises(TypeError, match="SSLContext"):
         cadeloop.serve(scope_echo_app, ssl="not-a-context")
+
+
+def test_large_https_response_is_not_truncated(loop, certs):
+    """R-059: the staged plaintext is handed to SSLObject.write, whose
+    return value says how much it actually consumed. Discarding that count
+    (and treating a retryable SSLWantRead/WriteError as fatal) truncated or
+    dropped responses with no error raised anywhere. Reported in the
+    consolidated review on PR #1.
+
+    A multi-megabyte body with a deliberately slow reader is the shape that
+    puts back-pressure on the BIO."""
+    server_ctx, client_ctx = certs
+    payload = bytes((i * 7 + 11) % 251 for i in range(4096)) * 512  # 2 MiB, checkable
+
+    async def big_app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        # Stream it in chunks so several SSL_write calls are involved.
+        for off in range(0, len(payload), 64 * 1024):
+            await send({
+                "type": "http.response.body",
+                "body": payload[off:off + 64 * 1024],
+                "more_body": off + 64 * 1024 < len(payload),
+            })
+
+    lid, port = listen_tls(loop, big_app, server_ctx)
+
+    async def main():
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", port, ssl=client_ctx, server_hostname="localhost"
+        )
+        writer.write(b"GET /big HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
+        assert b"200" in head.split(b"\r\n", 1)[0]
+        assert b"transfer-encoding: chunked" in head.lower()
+        body = b""
+        while True:
+            line = await asyncio.wait_for(reader.readuntil(b"\r\n"), 15)
+            size = int(line.strip(), 16)
+            chunk = await asyncio.wait_for(reader.readexactly(size + 2), 15)
+            if size == 0:
+                break
+            body += chunk[:size]
+            await asyncio.sleep(0)  # slow reader
+        writer.close()
+        return body
+
+    body = loop.run_until_complete(main())
+    assert len(body) == len(payload), f"truncated: {len(body)} of {len(payload)}"
+    assert body == payload, "corrupted"
+    loop._core.listener_close(lid)

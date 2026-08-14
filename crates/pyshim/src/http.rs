@@ -1085,6 +1085,16 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
         }
     }
     tls_pump_out(py, core, tid, &outbio)?;
+    // Peer bytes are exactly what a WANT_READ from SSL_write was waiting
+    // for, so retry any plaintext `tls_flush_conn` had to re-stage.
+    // Without this the response would sit staged forever: the TlsFlush
+    // event only fires on the empty -> non-empty transition.
+    let restaged = core.with_net(|net, _| {
+        net.http_conn_mut(tid).and_then(|c| c.tls.as_ref()).map(|t| !t.staged.is_empty()).unwrap_or(false)
+    })?;
+    if restaged {
+        tls_flush_conn(py, slf, tid)?;
+    }
     if plaintext.is_empty() {
         return Ok(());
     }
@@ -1142,16 +1152,64 @@ pub(crate) fn tls_flush_conn(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64
         })?;
         return Ok(());
     }
-    if !staged.is_empty()
-        && sslobj.call_method1(py, intern!(py, "write"), (PyBytes::new(py, &staged),)).is_err()
-    {
-        core.with_net(|net, reactor| {
-            net::teardown_with(py, net, reactor.backend_mut(), tid, None);
+    // Plaintext SSL_write has not consumed yet. Anything left here is
+    // re-staged and retried; it must never be dropped, and `close_after`
+    // must not fire while it is outstanding, or the response is silently
+    // truncated on the wire with no error raised anywhere.
+    let mut remaining: &[u8] = &staged;
+    while !remaining.is_empty() {
+        match sslobj.call_method1(py, intern!(py, "write"), (PyBytes::new(py, remaining),)) {
+            Ok(n) => {
+                // SSLObject.write returns the plaintext bytes consumed.
+                // With an unbounded MemoryBIO that is normally all of them,
+                // but the contract permits fewer and dropping the tail
+                // would corrupt the body silently.
+                let written: usize = n.extract(py).unwrap_or(remaining.len()).min(remaining.len());
+                if written == 0 {
+                    break; // no progress; wait for the peer
+                }
+                remaining = &remaining[written..];
+                // Drain between chunks so the out BIO cannot be the thing
+                // holding up the next write.
+                tls_pump_out(py, core, tid, &outbio)?;
+            }
+            Err(e) => {
+                // WANT_READ/WANT_WRITE are retryable states, not failures:
+                // a renegotiation needs peer bytes before more plaintext
+                // can be encrypted. Tearing the connection down here (and
+                // discarding the plaintext taken above) turned an ordinary
+                // TLS state transition into a lost response.
+                let want_read = ssl_exc(py, &SSL_WANT_READ, "SSLWantReadError")?;
+                let want_write = ssl_exc(py, &SSL_WANT_WRITE, "SSLWantWriteError")?;
+                if !(e.is_instance(py, want_read.bind(py)) || e.is_instance(py, want_write.bind(py))) {
+                    core.with_net(|net, reactor| {
+                        net::teardown_with(py, net, reactor.backend_mut(), tid, None);
+                    })?;
+                    core.drain_graveyards(py)?;
+                    return Ok(());
+                }
+                break;
+            }
+        }
+    }
+    // Push out whatever ciphertext this produced: a retryable state
+    // usually needs those records to reach the peer before it can make
+    // progress, and the peer's reply re-enters through `tls_ingest`,
+    // which re-flushes anything still staged.
+    tls_pump_out(py, core, tid, &outbio)?;
+    if !remaining.is_empty() {
+        // Re-stage in front of anything queued while we were outside the
+        // cell, preserving stream order, and hold off the close.
+        let rest = remaining.to_vec();
+        core.with_net(|net, _| {
+            if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
+                let mut back = rest;
+                back.extend_from_slice(&t.staged);
+                t.staged = back;
+            }
         })?;
-        core.drain_graveyards(py)?;
         return Ok(());
     }
-    tls_pump_out(py, core, tid, &outbio)?;
     if close_after {
         core.with_net(|net, reactor| {
             if let Some(t) = net.http_conn_mut(tid).and_then(|c| c.tls.as_mut()) {
