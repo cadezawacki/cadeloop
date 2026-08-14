@@ -269,6 +269,10 @@ pub(crate) struct NetState {
     /// Python refs & buffers to drop outside the cell (see gil_boundary).
     /// Buffers owned by cancelled-but-unreaped ops, keyed by op.
     pub reap_guards: HashMap<OpId, ReapGuard>,
+    /// Pipe ops cancelled during loop close. Their buffers must outlive
+    /// the cancellation request; they are released when the state is
+    /// dropped, after the backend (and with it the handles) has gone.
+    pub closed_pipe_ops: Vec<OpTarget>,
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
@@ -367,6 +371,13 @@ pub(crate) enum NetEvent {
         err: Option<u32>,
     },
     /// R-087: a WS receive() waiter has a queued event to consume.
+    /// R-084 ASGI write backpressure: the native `send()` returned a
+    /// pending awaitable because the write queue was over its high-water
+    /// mark; resolve it now that it has drained (or the connection died,
+    /// which must also release the app rather than hang it forever).
+    HttpDrained {
+        fut: Py<PyAny>,
+    },
     WsWake {
         tid: u64,
         fut: Py<PyAny>,
@@ -569,6 +580,11 @@ pub(crate) fn teardown_with(
         ProtoKind::Http(conn) => {
             conn.disconnected = true;
             let ws = conn.ws.is_some();
+            if let Some(fut) = conn.drain_waiter.take() {
+                // The queue will never drain now; releasing the producer
+                // lets its next send() raise properly instead of hanging.
+                net.events.push(NetEvent::HttpDrained { fut });
+            }
             if let Some(fut) = conn.take_recv_waiter() {
                 net.events.push(NetEvent::HttpDisconnect { fut, ws });
             }
@@ -619,8 +635,16 @@ pub(crate) fn cancel_standalone_ops(net: &mut NetState, backend: Backend<'_>) ->
                 netsys::close(sock);
                 dropped.push(fut);
             }
-            Some(OpTarget::PipeRead { fut, .. }) | Some(OpTarget::PipeWrite { fut, .. }) => {
-                dropped.push(fut);
+            Some(t @ (OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. })) => {
+                // CancelIoEx only REQUESTS cancellation, and a pending
+                // ReadFile/WriteFile keeps using its buffer until the
+                // completion is dequeued. Dropping the Vec here -- which
+                // is what this function did when I first wrote it -- is
+                // the same use-after-free the transport paths were fixed
+                // for. Hand the whole target to the reaper instead: it
+                // outlives this call, and its Python future is released
+                // with it, out of the cell.
+                net.closed_pipe_ops.push(t);
             }
             _ => {}
         }
@@ -1064,6 +1088,15 @@ fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64)
     if entry.recv_op.is_some() || entry.reading_paused || entry.closing || entry.conn_lost {
         return;
     }
+    // Engine-level backpressure is checked HERE rather than at each call
+    // site: the TLS path reposts from its own branch, so a flag consulted
+    // only by the plaintext caller left HTTPS connections pipelining
+    // without any bound at all (R-085/R-087).
+    if let ProtoKind::Http(conn) = &entry.proto {
+        if conn.pipeline_paused || conn.ws.as_ref().is_some_and(|w| w.inbox_paused) {
+            return;
+        }
+    }
     let slot = match entry.recv_slot {
         Some(s) => s,
         None => {
@@ -1483,6 +1516,19 @@ pub(crate) fn resume_reading_after_backpressure(
     post_recv(py, net, backend, tid);
 }
 
+/// Queued write bytes and the high-water mark for a transport (R-084).
+pub(crate) fn write_pressure(net: &NetState, tid: u64) -> Option<(usize, usize)> {
+    net.transports.get(&tid).map(|e| (e.queued_bytes, e.high_water))
+}
+
+/// Park an ASGI producer on this connection until the queue drains.
+pub(crate) fn set_drain_waiter(net: &mut NetState, tid: u64, fut: Py<PyAny>) -> Option<Py<PyAny>> {
+    match net.transports.get_mut(&tid).map(|e| &mut e.proto) {
+        Some(ProtoKind::Http(conn)) => conn.drain_waiter.replace(fut),
+        _ => Some(fut), // no connection: hand it straight back
+    }
+}
+
 /// R-085: re-post the recv a spent pipeline budget suppressed, once the
 /// queue has drained far enough. In-cell.
 pub(crate) fn http_resume_reading(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
@@ -1532,6 +1578,14 @@ fn on_send_done(
         } else {
             front.advance(consumed);
             consumed = 0;
+        }
+    }
+    // R-084: release an ASGI producer parked on the high-water mark.
+    if entry.queued_bytes <= entry.low_water {
+        if let ProtoKind::Http(conn) = &mut entry.proto {
+            if let Some(fut) = conn.drain_waiter.take() {
+                net.events.push(NetEvent::HttpDrained { fut });
+            }
         }
     }
     if entry.proto_paused && entry.queued_bytes <= entry.low_water {
@@ -1701,6 +1755,13 @@ pub(crate) fn dispatch_events(
                         crate::http::disconnect_message(py)?
                     };
                     let _ = fut.call_method1("set_result", (msg,));
+                }
+            }
+            NetEvent::HttpDrained { fut } => {
+                let fut = fut.bind(py);
+                let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                if !done {
+                    let _ = fut.call_method1("set_result", (py.None(),));
                 }
             }
             NetEvent::WsWake { tid, fut } => {

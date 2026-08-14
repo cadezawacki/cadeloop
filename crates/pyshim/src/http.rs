@@ -94,6 +94,10 @@ pub(crate) struct HttpConn {
     pub(crate) disconnected: bool,
     /// Pending receive() waiter, resolved with http.disconnect.
     pub(crate) recv_waiter: Option<Py<PyAny>>,
+    /// R-084: an ASGI producer parked because the write queue crossed its
+    /// high-water mark; resolved when it drains below the low-water mark
+    /// (or when the connection dies).
+    pub(crate) drain_waiter: Option<Py<PyAny>>,
     /// Cached per-connection ASGI callables (R-083).
     pub(crate) recv_obj: Option<Py<HttpReceive>>,
     pub(crate) send_obj: Option<Py<HttpSend>>,
@@ -218,6 +222,7 @@ impl HttpConn {
             req_body: None,
             disconnected: false,
             recv_waiter: None,
+            drain_waiter: None,
             recv_obj: None,
             send_obj: None,
             driver: None,
@@ -723,10 +728,37 @@ pub struct HttpSend {
 
 #[pymethods]
 impl HttpSend {
-    fn __call__(&self, py: Python<'_>, message: Bound<'_, PyDict>) -> PyResult<Py<CompletedAwaitable>> {
+    fn __call__(&self, py: Python<'_>, message: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let core = self.core.bind(py).get();
         process_send(py, core, self.tid, &message)?;
-        Ok(completed(py).clone_ref(py))
+
+        // R-084 write backpressure. Returning an already-completed
+        // awaitable unconditionally meant a streaming app whose only
+        // suspension point is `await send(...)` could enqueue its entire
+        // stream against a slow client -- the loop monopolised, the queue
+        // unbounded, and the configured watermarks never applied to the
+        // ASGI producer the way they apply to a Python protocol.
+        let over = core.with_net(|net, _| {
+            net::write_pressure(net, self.tid).map(|(queued, high)| queued > high).unwrap_or(false)
+        })?;
+        if !over {
+            return Ok(completed(py).clone_ref(py).into_any());
+        }
+        let pyloop = core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.pyloop.clone_ref(py)))?;
+        let Some(pyloop) = pyloop else {
+            return Ok(completed(py).clone_ref(py).into_any());
+        };
+        let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
+        let stored = fut.clone().unbind();
+        // A previous waiter would only exist if the app called send()
+        // concurrently from two tasks, which ASGI forbids; drop it via the
+        // graveyard rather than in-cell (ADR-5).
+        let displaced = core.with_net(|net, _| net::set_drain_waiter(net, self.tid, stored))?;
+        if let Some(old) = displaced {
+            core.with_net(|net, _| net.graveyard_py.push(old))?;
+            core.drain_graveyards(py)?;
+        }
+        Ok(fut.unbind())
     }
 }
 

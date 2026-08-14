@@ -1421,3 +1421,48 @@ def test_unlimited_body_is_still_available_explicitly(loop):
     )
     assert _body(resp) == b"200000"
     loop._core.listener_close(lid)
+
+
+def test_asgi_send_applies_write_backpressure(loop):
+    """R-084: `send()` returned an already-completed awaitable no matter
+    how deep the write queue was, so a streaming app whose only suspension
+    point is `await send(...)` could enqueue its whole stream against a
+    slow client — the configured watermarks never reached the ASGI
+    producer. Reported by Codex review on PR #1 (twice).
+
+    A client that stops reading must eventually make `send()` block."""
+    import threading
+
+    chunk = b"q" * 65536
+    sends_completed = []
+    stop_app = threading.Event()
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        for i in range(400):
+            if stop_app.is_set():
+                break
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            sends_completed.append(i)
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        # Connect, ask, then never read: the queue must back up.
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /stream HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await asyncio.sleep(0.6)  # let the app run as far as it can
+        n = len(sends_completed)
+        stop_app.set()
+        writer.close()
+        return n
+
+    n = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    # Without backpressure the app runs all 400 sends straight through,
+    # buffering ~26 MB. With it, it parks once the queue passes the
+    # high-water mark and only the socket's own capacity gets through.
+    assert n < 400, f"app completed all {n} sends — send() never blocked"

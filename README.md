@@ -1,5 +1,54 @@
 # cadeloop
 
+> ### Hardening log — review backlog
+>
+> An external review pass (Codex on PR #1, plus a consolidated engineering
+> audit) raised ~90 findings. This is the running record; it is updated as
+> items land. Newest first.
+>
+> **Fixed and on `claude/new-session-bq3hp6`**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | HTTP | ASGI `send()` now applies write backpressure at the watermarks | *pending* |
+> | HTTP/TLS | Pipeline bound never applied to HTTPS (repost ignored the flag) | *pending* |
+> | Loop | Close freed pipe buffers the kernel could still be writing | *pending* |
+> | epoll | Accept pool overwrote one parked slot 64x, stranding 63 slab entries | `57e0b7d` |
+> | Transport | `sock_accept` fast path returned a *blocking* socket (froze the loop) | `57e0b7d` |
+> | WebSocket | Post-accept inbox unbounded; now budgeted with read backpressure | `57e0b7d` |
+> | Transport | `sock_sendto` returned `None` after a would-block retry | `57e0b7d` |
+> | sendfile | Both fallbacks skipped the seek for `offset=0` | `57e0b7d` |
+> | CI | Every commit ran twice; superseded runs never cancelled | `2b67add` |
+> | HTTP | `max_body` now defaults to 16 MiB (was unbounded) → 413 | `39b73ee` |
+> | Packaging | Wheels are build artifacts only; docs no longer claim otherwise | `39b73ee` |
+> | IOCP | Stale `associated` set let a recycled handle skip IOCP association | `5d96fcb` |
+> | HTTP | Pipelined-request queue bounded with read backpressure | `b770126` |
+> | Loop | POSIX child watcher; signal disposition restored on `close()` | `3a4a764` |
+> | CI | Benchmark harness and PGO training could hang forever | `3a4a764` |
+> | Soak | Measured the requested duration; gates on second-half growth | `1420158` |
+> | Loop | Standalone connect/pipe ops cancelled at close | `8d11d75` |
+> | Server | Spawn-worker startup, address family, accept race, adoption leak | `99cde61` |
+> | UDP | Send queue bounded + reported; recv recovers; queue drains on close | `a50f3d6` |
+> | Net | Listener could end up with an empty accept pool and go deaf | `2b86ee9` |
+> | HTTP/WS | `Transfer-Encoding` stripped, `Content-Length` enforced, status + close codes validated, pre-accept WS bytes bounded | `98f660e` |
+> | TLS | Short/retryable `SSL_write` silently truncated responses | `a9961a9` |
+> | Net | Cancelled ops' buffers freed while the kernel still owned them | `02c9414` |
+> | HTTP/WS | WS upgrade header injection, 204/304 bodies, buffered body on half-close, absolute-form targets, `Sec-WebSocket-Key` | `df9484b` |
+>
+> **Open** — ASGI `send()` backpressure, grace-drain ordering, loop↔hook
+> cycle leak, TLS `close_notify`, ALPN `h2` rejection, `Host` validation,
+> IPv6 flow/scope fields, `get_extra_info("socket")`, `_winpipes`
+> `data_received` guard, UDP `set_protocol` rewiring, config validation,
+> Ruff/typing in CI.
+>
+> **Known issue** — an intermittent Windows hang in
+> `test_starlette_routes_and_streaming` (`/bg`). The request never reaches
+> the app; the loop parks with one transport and an op belonging to none.
+> `5d96fcb` addresses one mechanism with that signature and was green on
+> both Windows runners, but this is not yet confirmed closed. The
+> `CADELOOP_TRACE_TICK` / `CADELOOP_TRACE_APP` instrumentation stays until
+> it is.
+
 A maximum-performance asyncio event loop + ASGI stack with a Rust core.
 Windows (IOCP, with a Registered I/O backend implemented and awaiting
 hardware validation) is the production performance target; Linux runs the same transport layer over epoll, making cadeloop a
