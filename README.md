@@ -11,7 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | `OPTIONS *` was normalized to `/` in the ASGI scope, indistinguishable from an OPTIONS on the root resource | `` |
+> | HTTP | `OPTIONS *` was normalized to `/` in the ASGI scope, indistinguishable from an OPTIONS on the root resource | `2a97321` |
 > | Unix | Abstract-namespace socket addresses were reported as lossy strings instead of bytes; non-UTF-8 paths were mangled | `afb64a8` |
 > | Loop | Cancelling `shutdown_default_executor()` produced a spurious `InvalidStateError` when the shutdown thread finished | `5c096bb` |
 > | Net | A fatal callback error dropped the rest of its dispatch batch: other connections' events were lost for good | `4d9c231` |
