@@ -139,6 +139,7 @@ def test_spawn_worker_pool_serves_and_stops(tmp_path):
     # explicit env=), so setting this once here reaches the worker
     # process the crash actually happens in.
     env["CADELOOP_TRACE_TICK"] = "1"
+    env["CADELOOP_TRACE_ASSOC"] = "1"
     driver = (
         "from cadeloop.server import _serve_multi_spawn\n"
         "from cadeloop.config import Config\n"

@@ -325,3 +325,54 @@ pytest/CI captures it. They have been removed; the /bg hang had not
 recurred in the runs after they landed, so they were costing ~40% of
 request throughput while yielding no new signal. If that hang returns,
 re-add them env-gated like the tick tracing rather than unconditional.
+
+## ADR-25: R-090's shared-listener worker model is unsound on Windows
+The spawn-worker `STATUS_ACCESS_VIOLATION` (ADR-24) is not a stray bug —
+it is the shared-listener design meeting a Windows invariant. Traced to
+ground with `CADELOOP_TRACE_TICK` markers in `CoreLoop::tick`: the last
+line before every crash is `about to poll` with no matching `poll
+returned`, so the fault is inside `reactor.poll()`; and every tick up to
+that point reports `drained 0 completions`, so the crashing worker never
+reaped a single completion of its own.
+
+Mechanism. `_serve_multi_spawn` binds ONE listener and hands it to N
+workers via `WSADuplicateSocketW`. Every duplicate names the same
+underlying file object, and on Windows a file object binds to exactly
+one completion port for life. So worker A's `CreateIoCompletionPort`
+succeeds and worker B's fails with `ERROR_INVALID_PARAMETER` (87) —
+where `iocp.rs::register_socket` swallows it as "already associated,
+treat as success". That heuristic was written for the legitimate
+same-process R-033 socket-recycling case and cannot distinguish
+"already associated with MY port" from "already associated with ANOTHER
+PROCESS's port". B is waved through, posts `AcceptEx`, and its
+completions are delivered to A's port carrying an `lpOverlapped` valid
+only in B's address space. A's `translate_entry` casts it to `*IocpOp`
+and reads `(*op_ptr).id` — the access violation. Every observed symptom
+follows: the crash sits inside `poll` (which calls `translate_entry`);
+the non-owning worker drains nothing forever; which worker dies flips
+run to run with the association race; only the spawn model is affected,
+because it is the only place a socket crosses a process boundary; and
+runs go green whenever no connection lands before the test's timeout,
+so no foreign completion is ever dequeued.
+
+`CADELOOP_TRACE_ASSOC` now reports the 87-swallow when it happens, to
+confirm this end-to-end on CI hardware rather than by inference alone.
+
+Consequences, once confirmed:
+
+* `register_socket` must stop treating 87 as success for a socket it did
+  not itself associate. Swallowing it converts an unfixable
+  misconfiguration into a memory-safety violation; failing loudly at
+  listener setup turns the same condition into an actionable Python
+  exception.
+* `translate_entry` should not blindly trust `lpOverlapped`. The slab's
+  generation check already rejects stale ids, but only AFTER the
+  dereference that faults. Validating the pointer against the slab's own
+  allocation range before casting makes a foreign completion survivable.
+* R-090 itself needs a different Windows design. Duplicating a listener
+  into N IOCP-owning processes cannot work. The workable shape is the
+  supervisor owning the accept loop and handing each ACCEPTED socket to
+  a worker (`WSADuplicateSocketW` per connection, before that socket is
+  associated anywhere), which costs a handoff per connection but obeys
+  the one-object-one-port rule. Until then, `workers > 1` on Windows is
+  not safe to advertise.

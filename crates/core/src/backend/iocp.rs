@@ -624,7 +624,22 @@ impl IoBackend for IocpBackend {
             // ERROR_INVALID_PARAMETER on a VALID socket means "already
             // associated" (e.g. an R-033 recycled socket whose association
             // outlived our bookkeeping): treat as success.
+            //
+            // DANGEROUS when the socket crossed a PROCESS boundary: a file
+            // object binds to exactly one IOCP for life, so a listener
+            // duplicated into N workers (R-090) can only ever be associated
+            // by whichever worker got there first. The losers land here and
+            // this heuristic — which cannot tell "already mine" from
+            // "already someone else's" — waves them through. They then post
+            // AcceptEx whose completions are delivered to the WINNER's port,
+            // carrying an lpOverlapped that is only valid in the loser's
+            // address space; translate_entry dereferences it and takes an
+            // access violation. See ADR-24.
             if err.raw_os_error() == Some(87) {
+                if trace_assoc_enabled() {
+                    eprintln!("cadeloop-iocp: register_socket({socket}) got ERROR_INVALID_PARAMETER — already associated with SOME completion port (possibly another process's)");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
                 let mut t: i32 = 0;
                 let mut len = size_of::<i32>() as i32;
                 let ok = unsafe {
@@ -1065,6 +1080,14 @@ impl IoBackend for IocpBackend {
     fn name(&self) -> &'static str {
         "iocp"
     }
+}
+
+/// ADR-24 diagnostic gate (CADELOOP_TRACE_ASSOC): reports when a socket is
+/// already bound to a completion port we did not bind it to. Cached once
+/// per process — register_socket runs per connection.
+fn trace_assoc_enabled() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("CADELOOP_TRACE_ASSOC").is_some())
 }
 
 /// R-038: per-connection socket options. SND/RCVBUF stay at OS defaults
