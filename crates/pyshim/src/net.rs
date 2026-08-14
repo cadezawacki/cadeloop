@@ -329,6 +329,12 @@ impl NetState {
     /// The native HTTP connection behind `tid`, if that transport is one.
     /// NOTE: borrows the whole NetState — take what you need out of the
     /// returned `&mut HttpConn` before touching other NetState fields.
+    /// How many live connections are native HTTP ones (as opposed to the
+    /// Python-protocol transports an application opens for itself).
+    pub(crate) fn http_conn_count(&self) -> usize {
+        self.transports.values().filter(|e| matches!(e.proto, ProtoKind::Http(_))).count()
+    }
+
     pub(crate) fn http_conn_mut(&mut self, tid: u64) -> Option<&mut HttpConn> {
         match self.transports.get_mut(&tid) {
             Some(TransportEntry { proto: ProtoKind::Http(conn), .. }) => Some(conn),
@@ -1078,6 +1084,64 @@ pub(crate) fn http_sweep(
         teardown_with(py, net, backend, tid, None);
     }
     (expire_head.len() as u32, expire_idle.len() as u32)
+}
+
+/// Graceful shutdown, phase 1 (R-092): end keep-alive everywhere, close
+/// what is idle right now, start the closing handshake on live
+/// WebSockets, and report how many connections still have work in
+/// flight. In-cell.
+///
+/// The listener is already closed by the time this runs, so no connection
+/// arrives after it. What remains either finishes on its own -- with
+/// `keep_alive` cleared, `finish_request` closes each one as its response
+/// completes -- or is still open when the caller's grace deadline expires
+/// and gets torn down with everything else.
+///
+/// Without this, shutdown went straight to `CoreLoop::close()`, which
+/// cancels every in-flight operation: a response half-written to the wire
+/// was simply truncated, and a WebSocket peer saw a bare TCP close instead
+/// of a close frame.
+pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>) -> usize {
+    let mut idle: Vec<u64> = Vec::new();
+    let mut ws_closing: Vec<u64> = Vec::new();
+    let mut busy = 0usize;
+    for (&tid, entry) in net.transports.iter_mut() {
+        if entry.conn_lost || entry.closing {
+            continue;
+        }
+        let ProtoKind::Http(conn) = &mut entry.proto else { continue };
+        // Same predicate http_sweep uses to decide a connection is busy:
+        // Done/Idle are between-requests states, so only a live app, a
+        // queued pipeline, or a mid-flight response counts.
+        conn.keep_alive = false;
+        let mid_response =
+            matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming);
+        match conn.ws.as_ref() {
+            // A WebSocket never finishes by itself -- it has to be told.
+            // 1012 (service restart) is what the close frame carries.
+            Some(wsc) if wsc.accepted && !wsc.closing => {
+                ws_closing.push(tid);
+                busy += 1;
+            }
+            Some(_) => busy += 1,
+            None if conn.active || !conn.pending.is_empty() || mid_response => busy += 1,
+            None => idle.push(tid),
+        }
+    }
+    for tid in ws_closing {
+        if let Some(conn) = net.http_conn_mut(tid) {
+            if let Some(wsc) = conn.ws.as_mut() {
+                wsc.closing = true;
+                wsc.inbox.push_back(crate::http::WsMsg::Disconnect(1012));
+            }
+        }
+        http_enqueue(py, net, backend, tid, cadeloop_core::ws::close_frame(1012, "server shutdown"));
+        http_close_after_write(py, net, backend, tid);
+    }
+    for tid in idle {
+        teardown_with(py, net, backend, tid, None);
+    }
+    busy
 }
 
 /// Mark a native HTTP connection to close once its write queue drains

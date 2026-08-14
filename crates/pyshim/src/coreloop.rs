@@ -1041,6 +1041,28 @@ impl CoreLoop {
         self.drain_graveyards(py)
     }
 
+    /// Graceful shutdown, phase 1 (R-092). Call after the listener is
+    /// closed and before `close()`: ends keep-alive on every live HTTP
+    /// connection, closes the idle ones, starts the WebSocket closing
+    /// handshake, and returns how many connections still have a request
+    /// in flight. The caller keeps ticking the loop until that reaches
+    /// zero or its grace deadline expires.
+    fn http_begin_shutdown(&self, py: Python<'_>) -> PyResult<usize> {
+        let busy = self.with_net(|net, reactor| net::http_begin_shutdown(py, net, reactor.backend_mut()))?;
+        self.drain_graveyards(py)?;
+        Ok(busy)
+    }
+
+    /// Live *native HTTP* connections -- the drain loop's convergence
+    /// test. Deliberately not `transports.len()`: that also counts the
+    /// Python-protocol transports an application opens for its own
+    /// outbound work (a database client, an upstream HTTP call), and
+    /// those need not close for the server to be drained. Counting them
+    /// would make every such deployment wait out the whole grace period.
+    fn http_connection_count(&self) -> PyResult<usize> {
+        self.with_net(|net, _| net.http_conn_count())
+    }
+
     /// Count of live connections spawned by any listener (facade
     /// wait_closed support is in Python; this is for stats).
     fn listener_count(&self) -> PyResult<usize> {

@@ -14,6 +14,8 @@ import urllib.request
 
 import pytest
 
+import cadeloop
+
 APP = """\
 import os
 async def app(scope, receive, send):
@@ -283,3 +285,48 @@ def test_spawn_startup_failure_cleans_up_started_workers(monkeypatch):
     # And the listener is gone, so the port is immediately rebindable.
     with socket.socket() as s2:
         s2.bind(("127.0.0.1", port))
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork supervisor is POSIX-only")
+def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
+    """A worker dies, the replacement fork fails (a process or memory
+    limit), and the exception unwound through a `finally` that only
+    restored signal dispositions -- leaving every surviving worker
+    running, listening and unsupervised while the caller was told the
+    server had failed."""
+    from cadeloop import server as srv
+
+    spawned = []
+    killed = []
+
+    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None):
+        if len(spawned) >= 2:
+            raise OSError(11, "Resource temporarily unavailable")
+        pid = 101 + len(spawned)
+        spawned.append(pid)
+        return pid
+
+    reaped = [False]
+
+    def fake_waitpid(pid, flags=0):
+        if pid == -1:
+            if reaped[0]:
+                raise ChildProcessError
+            reaped[0] = True
+            return (101, 256)  # non-zero exit -> restart path
+        return (pid, 0)
+
+    monkeypatch.setattr(srv, "_spawn_worker", fake_spawn)
+    monkeypatch.setattr(srv.os, "waitpid", fake_waitpid)
+    monkeypatch.setattr(srv.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    with pytest.raises(OSError):
+        srv._serve_multi(_noop_app, "127.0.0.1", 8123, cadeloop.Config(), 2)
+
+    assert (102, signal.SIGKILL) in killed, (
+        f"surviving worker 102 was left running; kills seen: {killed}"
+    )
+
+
+async def _noop_app(scope, receive, send):  # pragma: no cover - never run
+    pass

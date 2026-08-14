@@ -1637,3 +1637,132 @@ def test_http10_without_host_is_still_accepted(loop):
     resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.0\r\n\r\n", read_all=True))
     assert resp.startswith(b"HTTP/1.0 200"), resp[:40]
     loop._core.listener_close(lid)
+
+
+# --------------------------------------------------------------------- #
+# graceful shutdown drain (R-092)                                       #
+# --------------------------------------------------------------------- #
+
+
+def test_shutdown_drains_the_in_flight_response(loop):
+    """SIGTERM stops run_forever; going straight from there to
+    loop.close() cancelled the in-flight write, so a client that had
+    already been promised a content-length got a truncated body. The
+    configured grace was honoured between workers but never inside one."""
+    from cadeloop.server import _drain_connections
+
+    body = b"x" * 5000
+    reached = []
+
+    async def slow_app(scope, receive, send):
+        await receive()
+        reached.append(1)
+        loop.call_soon(loop.stop)  # the "SIGTERM" lands mid-request
+        await asyncio.sleep(0.15)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", str(len(body)).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, slow_app)
+    got = []
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        await w.drain()
+        got.append(await r.read())
+        w.close()
+
+    task = loop.create_task(client())
+    loop.run_forever()
+    assert reached, "the request never reached the app"
+    loop._core.listener_close(lid)
+    _drain_connections(loop, 5.0)
+    assert task.done(), "client did not finish inside the grace window"
+    task.result()
+    assert got[0].endswith(body), f"truncated response: ...{got[0][-40:]!r}"
+    assert loop._core.http_connection_count() == 0
+
+
+def test_shutdown_closes_idle_keepalive_connections_at_once(loop):
+    """An idle keep-alive client must not hold the drain open for the
+    whole grace period -- only in-flight work should."""
+    from cadeloop.server import _drain_connections
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        await w.drain()
+        await r.readuntil(b"ok")  # response read; connection now idle
+        return r, w
+
+    r, w = loop.run_until_complete(client())
+    assert loop._core.http_connection_count() == 1
+    loop._core.listener_close(lid)
+    t0 = loop.time()
+    _drain_connections(loop, 30.0)
+    assert loop._core.http_connection_count() == 0
+    assert loop.time() - t0 < 5.0, "idle connection waited out the grace period"
+    w.close()
+
+
+def test_shutdown_sends_a_websocket_close_frame(loop):
+    """A WebSocket never finishes on its own, so shutdown has to tell it.
+    Without a close frame the peer just saw the TCP connection vanish."""
+    import base64
+
+    from cadeloop.server import _drain_connections
+
+    async def ws_app(scope, receive, send):
+        assert scope["type"] == "websocket"
+        await receive()
+        await send({"type": "websocket.accept"})
+        while True:
+            msg = await receive()
+            if msg["type"] == "websocket.disconnect":
+                return
+
+    lid, port = listen(loop, ws_app)
+    key = base64.b64encode(b"0123456789abcdef")
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+            b"Sec-WebSocket-Key: " + key + b"\r\n\r\n"
+        )
+        await w.drain()
+        head = await r.readuntil(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.1 101"), head[:40]
+        return r, w
+
+    r, w = loop.run_until_complete(client())
+    assert loop._core.http_connection_count() == 1
+    loop._core.listener_close(lid)
+
+    frame = []
+
+    async def read_close():
+        frame.append(await r.read(4))
+
+    loop.create_task(read_close())
+    _drain_connections(loop, 5.0)
+    # 0x88 = FIN | opcode 8 (close); payload is the 2-byte status code
+    # plus the reason, unmasked from a server.
+    assert frame and frame[0][0] == 0x88, frame
+    assert int.from_bytes(frame[0][2:4], "big") == 1012, frame
+    assert loop._core.http_connection_count() == 0
+    w.close()

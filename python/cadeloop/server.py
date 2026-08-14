@@ -246,6 +246,7 @@ def _serve_single(
     lifespan = _Lifespan(app, loop)
     lid = None
     installed_signals = []
+    served = False
     try:
         _trace("about to run lifespan.startup")
         lifespan.startup()
@@ -303,6 +304,7 @@ def _serve_single(
         who = f"worker {worker_id} " if worker_id is not None else ""
         logger.info("cadeloop %sserving on http://%s:%s", who, shown[0], shown[1])
         _trace("about to call run_forever")
+        served = True
         try:
             loop.run_forever()
         except KeyboardInterrupt:
@@ -317,9 +319,50 @@ def _serve_single(
                 pass
         if lid is not None:
             loop._core.listener_close(lid)
+        if served:
+            _drain_connections(loop, config.grace)
         lifespan.shutdown()
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def _drain_connections(loop, grace):
+    """R-092: let in-flight requests finish before the loop is closed.
+
+    ``loop.close()`` cancels every pending operation, so going straight
+    there from ``run_forever()`` truncated whatever was mid-response --
+    ``grace`` was honoured between *workers* but never inside one. The
+    listener is already closed when this runs, so the connection set only
+    shrinks: the native side ends keep-alive on every connection (each
+    then closes as its response completes), closes the ones that are idle
+    right now, and sends a 1012 close frame to live WebSockets, which is
+    what keeps them from waiting out the whole deadline.
+    """
+    if grace <= 0 or loop.is_closed():
+        return
+    busy = loop._core.http_begin_shutdown()
+    if not busy:
+        return
+    logger.info("cadeloop: draining %d connection(s), grace=%ss", busy, grace)
+    deadline = loop.time() + grace
+
+    def poll():
+        if loop._core.http_connection_count() == 0 or loop.time() >= deadline:
+            loop.stop()
+        else:
+            loop.call_later(0.02, poll)
+
+    loop.call_soon(poll)
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        # A second interrupt during the drain means "now", not "later".
+        return
+    left = loop._core.http_connection_count()
+    if left:
+        logger.warning(
+            "cadeloop: %d connection(s) still open after grace=%ss - closing", left, grace
+        )
 
 
 def _access_sink(access_logger):
@@ -472,6 +515,22 @@ def _spawn_worker(app, host, port, config: Config, idx: int, ncpu: int, ssl_ctx=
     return 0  # unreachable
 
 
+def _kill_children(children) -> None:
+    """SIGKILL and reap every supervised worker, then forget them.
+
+    Used on any supervisor-side failure: a half-started fleet with no
+    supervisor left to signal it would otherwise keep the port bound and
+    the application's resources held for the life of the machine.
+    """
+    for pid in list(children):
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+    children.clear()
+
+
 def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
     """Supervisor: fork N workers each binding with SO_REUSEPORT (the
     kernel load-balances accepts), restart crashed ones (R-092), forward
@@ -494,12 +553,7 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
         # below, so every worker already started kept serving while the
         # caller saw startup fail -- holding the port and the application's
         # resources with no supervisor left to stop them.
-        for pid in children:
-            try:
-                os.kill(pid, _signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
+        _kill_children(children)
         raise
 
     stopping = False
@@ -558,7 +612,17 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
                 _forward(None, None)
                 continue
             logger.warning("worker %d died (status %d) — restarting", idx, status)
-            npid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+            try:
+                npid = _spawn_worker(app, host, port, config, idx, ncpu, ssl_ctx=ssl_ctx)
+            except BaseException:
+                # A replacement fork can fail for the same reasons the
+                # initial ones can, and this one raised straight through
+                # the `finally` below -- which only restores signal
+                # dispositions. Every surviving worker was left running,
+                # listening and unsupervised while the caller was told the
+                # server had failed. Same cleanup as the startup path.
+                _kill_children(children)
+                raise
             children[npid] = (idx, time.monotonic())
         # Drain: give survivors `grace` seconds, then SIGKILL (R-092).
         deadline = time.monotonic() + config.grace
