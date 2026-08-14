@@ -825,25 +825,6 @@ fn send_err(e: SendErr) -> PyErr {
 }
 
 /// Handle one ASGI send() message: validate, serialize, enqueue (R-084;
-/// ADR-24 diagnostic gate (CADELOOP_TRACE_APP) for the Windows-only /bg
-/// hang. Cached once per process: these sit on the request hot path, and
-/// an unconditional version of exactly this tracing cost ~40% of request
-/// throughput before it was removed. Off by default; CI turns it on for
-/// the Windows unit-test step only.
-fn trace_app_enabled() -> bool {
-    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("CADELOOP_TRACE_APP").is_some())
-}
-
-macro_rules! trace_app {
-    ($($arg:tt)*) => {
-        if trace_app_enabled() {
-            eprintln!($($arg)*);
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-        }
-    };
-}
-
 /// R-086: reject response header fields that could forge the message frame.
 ///
 /// An ASGI application reflecting unsanitized request data into a header
@@ -2257,7 +2238,6 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
             // R-056: step inline; only a suspension allocates a driver.
             let task = AppTask::spawn(py, slf, tid, coro.unbind(), pyloop)?;
             let initial = AppTask::step(task.bind(py), py, None)?;
-            trace_app!("cadeloop-app: initial step tid={tid} out={initial:?}");
             match initial {
                 StepOutcome::Suspended => {
                     core.with_net(|net, _| {
@@ -2284,7 +2264,6 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
 /// The app coroutine returned: verify the response completed (R-086) and
 /// finish the request cycle.
 fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    trace_app!("cadeloop-app: coro finished tid={tid}");
     let (complete, is_ws, disconnected) = core.with_net(|net, _| {
         net.http_conn_mut(tid)
             .map(|c| (c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected))
@@ -2417,7 +2396,6 @@ fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
 }
 
 pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    trace_app!("cadeloop-app: finish_request tid={tid}");
     let (waiter, log) = core.with_net(|net, reactor| {
         let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
@@ -2556,7 +2534,6 @@ pub struct AppTask {
 impl AppTask {
     /// Future done-callback: resume the coroutine (Task.__wakeup mirror).
     fn _wake(slf: Bound<'_, Self>, py: Python<'_>, fut: Bound<'_, PyAny>) -> PyResult<()> {
-        trace_app!("cadeloop-app: _wake tid={}", slf.borrow().tid);
         let throw = fut.call_method0(intern!(py, "result")).err();
         let out = AppTask::step(&slf, py, throw)?;
         AppTask::after_step(&slf, py, out)
@@ -2881,7 +2858,6 @@ impl AppTask {
     /// _resume_bare). The initial eager step in pump_requests handles its
     /// outcomes inline instead.
     fn after_step(slf: &Bound<'_, Self>, py: Python<'_>, out: StepOutcome) -> PyResult<()> {
-        trace_app!("cadeloop-app: after_step tid={} out={out:?}", slf.borrow().tid);
         if matches!(out, StepOutcome::Suspended) {
             return Ok(());
         }

@@ -11,6 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | ADR-24 | `/bg` trace markers removed; op-target breakdown kept in `stats()` | `HEAD` |
+> | CI | Soak + benchmark gates moved to `slow.yml`, where they are not cancelled | `48e584c` |
 > | Net | A starved listener stayed deaf: the retry only ran when other I/O arrived | `999eab8` |
 > | Net | Wildcard IPv6 listeners need `IPV6_V6ONLY`; `host=None` failed `EADDRINUSE` | `999eab8` |
 > | Transport | `pause_reading()` still delivered the in-flight read, defeating backpressure | `999eab8` |
@@ -105,14 +107,21 @@
 >
 > **Watching** — the intermittent Windows hang in
 > `test_starlette_routes_and_streaming` (`/bg`) has not reproduced since
-> `5d96fcb`, across two clean runs on both Windows runners (and the first
-> fully-green pipeline, `stress` and `benchmark-regression` included).
-> `5d96fcb` fixes a real bug matching its signature — a recycled SOCKET
+> `5d96fcb`, across every Windows run since — three confirmed clean runs
+> on both runners, each including the full CPython asyncio conformance
+> suite and `test_spawn_worker_pool_serves_and_stops`, which is the
+> end-to-end `workers > 1` check ADR-24 was waiting on.
+>
+> `5d96fcb` fixes a real bug matching the signature — a recycled SOCKET
 > value letting a socket skip IOCP association, so its connect completion
-> was never delivered — but the mechanism was never confirmed from a trace,
-> so this is empirically settled rather than proven. CI tracing is off; the
-> `CADELOOP_TRACE_TICK` / `CADELOOP_TRACE_APP` instrumentation stays in the
-> tree, costing nothing unset, in case it returns.
+> was never delivered — but **the mechanism was never confirmed from a
+> trace**, so this is empirically settled, not proven. The
+> `CADELOOP_TRACE_TICK` / `CADELOOP_TRACE_APP` instrumentation has been
+> removed now that the bar is met; `git show 999eab8~1 -- crates/pyshim`
+> brings it back if it ever returns. What survives it is the op-target
+> breakdown, promoted from that trace into `stats()["ops_by_target"]`:
+> a stuck loop looks healthy on every other counter, and this is the one
+> that says where.
 
 A maximum-performance asyncio event loop + ASGI stack with a Rust core.
 Windows (IOCP, with a Registered I/O backend implemented and awaiting

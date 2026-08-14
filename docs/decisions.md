@@ -416,6 +416,17 @@ nothing for this.
 Cost: one handoff per connection on the fork-free path. That buys
 correctness on Windows, where the alternative does not work at all.
 
-Still to confirm on Windows hardware: that `workers > 1` now serves
-end-to-end there. The ADR-24 trace markers stay in place until that
-lands, then come out.
+Confirmed on Windows CI: `test_spawn_worker_pool_serves_and_stops`
+exercises the whole supervisor/worker/control-pipe path (8 connections
+distributed across 2 workers, then supervisor death cascading to both)
+and has passed on windows-2022 and windows-2025 across every run since.
+Together with the /bg hang not reproducing, that met the bar the markers
+were waiting on, and they have been removed.
+
+Removed, not vindicated: the mechanism behind the /bg hang was never
+captured from a trace. `5d96fcb` fixes a real bug matching its signature
+and the hang stopped, which is empirical settlement rather than proof.
+The one piece kept is the op-target breakdown, now permanent as
+`stats()["ops_by_target"]` — it is what distinguishes "a connect
+completion was never delivered" from "a recv was orphaned", and a loop
+stuck either way looks healthy on every other counter.

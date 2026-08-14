@@ -246,15 +246,6 @@ def _serve_single(
     own completion port. b"STOP" (or EOF, a dead supervisor) drains it.
     See ADR-25 for why the listener cannot simply be shared instead.
     """
-    # TEMPORARY (ADR-24): bisecting a Windows-only STATUS_ACCESS_VIOLATION
-    # in the spawned worker model. worker_id is only set from
-    # _winworker.main(), so this stays silent for every other caller.
-    _trace = (
-        (lambda stage: print(f"cadeloop._serve_single: {stage}", file=sys.stderr, flush=True))
-        if worker_id is not None
-        else (lambda stage: None)
-    )
-    _trace("start")
     loop = Loop(
         backend=config.backend,
         spin_us=config.spin_us,
@@ -269,7 +260,6 @@ def _serve_single(
         tfo=config.tfo,
         loopback_fast_path=config.loopback_fast_path,
     )
-    _trace("loop constructed")
     asyncio.set_event_loop(loop)
     lifespan = _Lifespan(app, loop)
     lid = None
@@ -278,20 +268,16 @@ def _serve_single(
     access_log = None
     stats_lid = None
     try:
-        _trace("about to run lifespan.startup")
         lifespan.startup()
-        _trace("lifespan.startup returned")
         if control_channel is not None:
             # Spawn-model worker: nothing to bind. Connections arrive over
             # the channel already accepted (R-090 / ADR-25).
             bound = None
-            _trace("starting channel pump")
             threading.Thread(
                 target=_channel_pump,
                 args=(control_channel, loop, _make_adopter(loop, app, config, lifespan, ssl_ctx)),
                 daemon=True,
             ).start()
-            _trace("channel pump started")
         else:
             lid, bound, _fd = loop._core.http_listen(
                 host,
@@ -325,7 +311,6 @@ def _serve_single(
         elif config.gc_mode == "disable":
             gc.collect()
             gc.disable()
-        _trace("about to install signal handlers")
         stop_signals = [_signal.SIGINT, _signal.SIGTERM]
         if hasattr(_signal, "SIGBREAK"):
             stop_signals.append(_signal.SIGBREAK)  # CTRL+BREAK (R-052)
@@ -338,7 +323,6 @@ def _serve_single(
         shown = bound if bound else (host, port)
         who = f"worker {worker_id} " if worker_id is not None else ""
         logger.info("cadeloop %sserving on http://%s:%s", who, shown[0], shown[1])
-        _trace("about to call run_forever")
         served = True
         try:
             loop.run_forever()

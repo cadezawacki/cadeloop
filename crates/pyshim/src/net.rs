@@ -1301,51 +1301,44 @@ fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64)
     }
 }
 
-/// ADR-24 diagnostic: what the live ops actually are. `ops=66` on its own
-/// cannot distinguish "a connect never completed" from "a recv was
-/// orphaned", which is exactly the fork the /bg hang sits on.
-pub(crate) fn op_target_breakdown(net: &NetState) -> String {
-    let (mut recv, mut send, mut accept, mut connect, mut dgram, mut pipe) = (0, 0, 0, 0, 0, 0);
+/// What the live kernel operations actually are, by target kind.
+///
+/// A bare `ops=66` cannot distinguish "a connect completion was never
+/// delivered" from "a recv was orphaned on a dead transport", and that
+/// distinction is what made the R-073 class of hang diagnosable at all.
+/// Written for a temporary trace (ADR-24); kept and promoted to
+/// `stats()` because a loop that is stuck looks completely healthy on
+/// every other counter, and this is the one that says where.
+pub(crate) fn op_breakdown(net: &NetState) -> OpBreakdown {
+    let mut b = OpBreakdown::default();
     for t in net.ops.values() {
         match t {
-            OpTarget::Recv { .. } => recv += 1,
-            OpTarget::Send(_) => send += 1,
-            OpTarget::Accept(_) => accept += 1,
-            OpTarget::Connect { .. } => connect += 1,
-            OpTarget::DgramRecv(_) | OpTarget::DgramSend(_) => dgram += 1,
-            OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. } => pipe += 1,
+            OpTarget::Recv { .. } => b.recv += 1,
+            OpTarget::Send(_) => b.send += 1,
+            OpTarget::Accept(_) => b.accept += 1,
+            OpTarget::Connect { .. } => b.connect += 1,
+            OpTarget::DgramRecv(_) | OpTarget::DgramSend(_) => b.dgram += 1,
+            OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. } => b.pipe += 1,
         }
     }
-    format!("recv={recv} send={send} accept={accept} connect={connect} dgram={dgram} pipe={pipe}")
+    b
 }
 
-/// ADR-24 diagnostic: per-transport state, so a stalled connection is
-/// distinguishable from a healthy idle one.
-pub(crate) fn transport_breakdown(net: &NetState) -> String {
-    let mut out = String::new();
-    for (tid, e) in net.transports.iter() {
-        let kind = match &e.proto {
-            ProtoKind::Py(_) => "py",
-            ProtoKind::Http(_) => "http",
-        };
-        out.push_str(&format!(
-            " [tid={tid} {kind} recv_op={} send_op={} qbytes={} rpaused={} ppaused={} closing={} lost={}]",
-            e.recv_op.is_some(),
-            e.send_op.is_some(),
-            e.queued_bytes,
-            e.reading_paused,
-            e.proto_paused,
-            e.closing,
-            e.conn_lost,
-        ));
-    }
-    out
+#[derive(Default)]
+pub(crate) struct OpBreakdown {
+    pub recv: usize,
+    pub send: usize,
+    pub accept: usize,
+    pub connect: usize,
+    pub dgram: usize,
+    pub pipe: usize,
 }
 
-impl ListenerEntry {
-    /// Outstanding AcceptEx count — read by the ADR-24 idle-state trace.
-    pub(crate) fn accept_ops_len(&self) -> usize {
-        self.accept_ops.len()
+impl NetState {
+    /// Outstanding `AcceptEx`/`accept4` operations across all listeners.
+    /// Zero with a live listener means the listener is deaf.
+    pub(crate) fn accept_ops_outstanding(&self) -> usize {
+        self.listeners.values().map(|l| l.accept_ops.len()).sum()
     }
 }
 

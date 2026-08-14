@@ -63,8 +63,6 @@ pub struct CoreLoop {
     cached_time_ns: AtomicU64,
     /// Tick counter for the throttled signal check.
     tick_no: AtomicU64,
-    /// Consecutive idle ticks, for the ADR-24 idle-state trace only.
-    idle_ticks: AtomicU64,
     /// Facade hook: `(handle, exception) -> None` for callback errors.
     error_hook: OnceLock<Py<PyAny>>,
     /// Facade hook: `(message, exception) -> None` for protocol/net errors.
@@ -277,15 +275,6 @@ impl CoreLoop {
     /// anatomy showed the per-tick claim/release rounds are what a
     /// queue-depth-1 chain actually benchmarks.
     fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>) -> PyResult<()> {
-        // TEMPORARY (ADR-24): bisecting a Windows-only worker-model crash.
-        // Prior tracing (server.py, _winworker.py) proved every setup stage
-        // through "about to call run_forever" succeeds; further tracing
-        // directly in iocp.rs proved take_accept_socket is never reached
-        // (no accept ever completes before the crash) — so the crash is in
-        // this tick's poll/translate machinery itself, on the very first
-        // call. Env-gated (CADELOOP_TRACE_TICK) since this is a genuine
-        // hot path exercised by every test, not just the worker model.
-        let trace_tick = trace_tick_enabled();
         let stopping = self.stopping.load(Ordering::Acquire);
         DISPATCH_BUF.with_borrow_mut(|batch| -> PyResult<()> {
             debug_assert!(batch.is_empty());
@@ -339,41 +328,6 @@ impl CoreLoop {
                 }
                 let mut comps = std::mem::take(&mut st.completions_scratch);
                 st.reactor.drain_completions(&mut comps);
-                // ADR-24: a per-tick log of "drained 0 completions" told us
-                // only that the loop was idle, which we already knew. What
-                // the /bg hang needs is the STATE it is idle in: whether an
-                // accept is outstanding, whether the connection exists,
-                // whether anything is queued. Printed only while idle and
-                // only every IDLE_TRACE_EVERY ticks, so a healthy run pays
-                // nothing and a hung one produces a readable trace instead
-                // of thousands of identical lines.
-                if trace_tick && parked && comps.is_empty() {
-                    let n = self.idle_ticks.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n.is_multiple_of(IDLE_TRACE_EVERY) {
-                        let (accept_ops, listeners): (usize, usize) = (
-                            st.net.listeners.values().map(|l| l.accept_ops_len()).sum(),
-                            st.net.listeners.len(),
-                        );
-                        let foreign = st.reactor.backend_mut().foreign_completions();
-                        eprintln!(
-                            "cadeloop-tick: idle x{n} listeners={listeners} accept_ops={accept_ops} \
-                             transports={} ops={} [{}] reap_guards={} events={} ready={} timers={} \
-                             starved={} foreign_completions={foreign}{}",
-                            st.net.transports.len(),
-                            st.net.ops.len(),
-                            net::op_target_breakdown(&st.net),
-                            st.net.reap_guards.len(),
-                            st.net.events.len(),
-                            st.reactor.ready_len(),
-                            st.reactor.timers_len(),
-                            st.net.any_starved_listener,
-                            net::transport_breakdown(&st.net),
-                        );
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
-                    }
-                } else if trace_tick {
-                    self.idle_ticks.store(0, Ordering::Relaxed);
-                }
                 if !comps.is_empty() {
                     net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
                     comps.clear();
@@ -528,26 +482,12 @@ fn take_graveyards(st: &mut LoopState) -> Graveyards {
 /// `async def` function or bound method directly) is what this catches.
 const CO_COROUTINE: i32 = 0x80;
 
-/// TEMPORARY (ADR-24): CADELOOP_TRACE_TICK-gated tick tracing for the
-/// Windows worker-model crash bisection. Checked once per process via a
-/// cached OnceLock (a plain per-tick env var read would itself be a
-/// measurable hot-path cost). Remove alongside the eprintln! call sites
-/// in `CoreLoop::tick` once the crash site is found.
-/// How many consecutive idle ticks between ADR-24 state dumps. At the
-/// 100ms park this is roughly one line every two seconds.
-const IDLE_TRACE_EVERY: u64 = 20;
-
 /// R-032: upper bound on the park while a listener or datagram endpoint
 /// is starved. Nothing is outstanding to complete and wake us -- that is
 /// what starved means -- so the retry needs a tick of its own. 50ms is
 /// short enough that recovery is prompt and long enough that a starved
 /// resource that cannot recover does not spin the CPU.
 const STARVED_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
-fn trace_tick_enabled() -> bool {
-    static TRACE_TICK: OnceLock<bool> = OnceLock::new();
-    *TRACE_TICK.get_or_init(|| std::env::var_os("CADELOOP_TRACE_TICK").is_some())
-}
 
 fn is_coroutine_function(py: Python<'_>, callback: &Bound<'_, PyAny>) -> bool {
     let Ok(code) = callback.getattr(intern!(py, "__code__")) else { return false };
@@ -611,7 +551,6 @@ impl CoreLoop {
             debug: AtomicBool::new(false),
             cached_time_ns: AtomicU64::new(0),
             tick_no: AtomicU64::new(0),
-            idle_ticks: AtomicU64::new(0),
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
             slow_callback_hook: OnceLock::new(),
@@ -1538,7 +1477,7 @@ impl CoreLoop {
     // ---- introspection (R-103) --------------------------------------------
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (stats, ready, timers, netstats, diag, live_name) = self.state.with(|st| {
+        let (stats, ready, timers, netstats, ops, diag, live_name) = self.state.with(|st| {
             (
                 st.reactor.stats.clone(),
                 st.reactor.ready_len(),
@@ -1553,7 +1492,9 @@ impl CoreLoop {
                     st.net.stats_accept_starved,
                     st.net.stats_pipeline_pauses,
                     st.net.stats_sends_posted,
+                    st.net.accept_ops_outstanding(),
                 ),
+                net::op_breakdown(&st.net),
                 st.reactor.backend_mut().diag(),
                 // Live, not the construction-time cache: RIO downgrades its
                 // name to "rio-polling" if RIONotify starts failing mid-run.
@@ -1580,6 +1521,19 @@ impl CoreLoop {
         d.set_item("accept_starved", netstats.6)?;
         d.set_item("pipeline_pauses", netstats.7)?;
         d.set_item("sends_posted", netstats.8)?;
+        d.set_item("accept_ops", netstats.9)?;
+        // What the live kernel ops are, by target. A stuck loop looks
+        // healthy on every other counter; this is the one that says where
+        // -- `connect` non-zero with nothing connecting, or `recv` with no
+        // live transport, each point at a different failure.
+        let by_target = PyDict::new(py);
+        by_target.set_item("recv", ops.recv)?;
+        by_target.set_item("send", ops.send)?;
+        by_target.set_item("accept", ops.accept)?;
+        by_target.set_item("connect", ops.connect)?;
+        by_target.set_item("dgram", ops.dgram)?;
+        by_target.set_item("pipe", ops.pipe)?;
+        d.set_item("ops_by_target", by_target)?;
         if let Some((notifies, reaps)) = diag {
             d.set_item("rio_notifies", notifies)?;
             d.set_item("rio_watchdog_reaps", reaps)?;

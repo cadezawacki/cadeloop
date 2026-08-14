@@ -98,12 +98,6 @@ jobs:
       - name: copy extension into source tree (subprocess tests import from repo PYTHONPATH)
         run: copy target\release\_core.dll python\cadeloop\_core.pyd
       - name: unit + conformance subset
-        # The ADR-24 tracing that used to be enabled here is off again: the
-        # /bg hang has not reproduced since 5d96fcb, over two clean runs on
-        # both Windows runners. The instrumentation itself stays in the
-        # tree behind CADELOOP_TRACE_TICK / CADELOOP_TRACE_APP, because the
-        # mechanism was never directly confirmed — it costs nothing unset,
-        # and it is exactly what a recurrence would need.
         run: python -m pytest tests/unit tests/conformance -q --timeout=120
       - name: CPython asyncio conformance suite (R-120)
         run: python tests/conformance/run_cpython_suite.py
