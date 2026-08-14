@@ -325,6 +325,7 @@ def _serve_single(
     # can put it back exactly -- and only what WE changed.
     gc_was_enabled = gc.isenabled()
     gc_froze = False
+    prior_handlers: dict = {}
     try:
         lifespan.startup()
         if control_channel is not None:
@@ -404,10 +405,17 @@ def _serve_single(
             stop_signals.append(_signal.SIGBREAK)  # CTRL+BREAK (R-052)
         for sig in stop_signals:
             try:
+                # An embedding process may already have its own handler.
+                # remove_signal_handler() in the cleanup resets the
+                # disposition to DEFAULT rather than putting theirs back,
+                # and serve() returns while the process carries on -- so
+                # every later signal bypassed the application's handler.
+                # Remember what was there and restore it below.
+                prior_handlers[sig] = _signal.getsignal(sig)
                 loop.add_signal_handler(sig, loop.stop)
                 installed_signals.append(sig)
             except (NotImplementedError, RuntimeError, ValueError):
-                pass
+                prior_handlers.pop(sig, None)
         shown = bound if bound else (host, port)
         who = f"worker {worker_id} " if worker_id is not None else ""
         logger.info("cadeloop %sserving on http://%s:%s", who, shown[0], shown[1])
@@ -442,6 +450,14 @@ def _serve_single(
                 loop.remove_signal_handler(sig)
             except (NotImplementedError, RuntimeError, ValueError):
                 pass
+            # remove_signal_handler() leaves SIG_DFL; put back whatever the
+            # caller had, so an embedder's handler survives serve().
+            prior = prior_handlers.get(sig)
+            if prior is not None:
+                try:
+                    _signal.signal(sig, prior)
+                except (OSError, ValueError, TypeError):
+                    pass
         if lid is not None:
             loop._core.listener_close(lid)
         if stats_lid is not None:

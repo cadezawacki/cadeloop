@@ -199,13 +199,27 @@ impl Acc {
     }
 
     fn commit_header(&mut self) {
-        if self.in_value {
-            let mut field = std::mem::take(&mut self.field);
-            field.make_ascii_lowercase();
-            let value = std::mem::take(&mut self.value);
-            self.headers.push((field, value));
-            self.in_value = false;
+        if !self.in_value {
+            return;
         }
+        self.in_value = false;
+        let mut field = std::mem::take(&mut self.field);
+        let value = std::mem::take(&mut self.value);
+        // llhttp drives these same callbacks for the TRAILER section of a
+        // chunked request, and `on_headers_complete` -- with it the
+        // one-Host check -- has already run by then. Committing a trailer
+        // as an ordinary header therefore let a client smuggle a second
+        // `Host:` (verified reaching scope["headers"] as `host=attacker`
+        // past a legitimate `Host: legit`), or an `Authorization:`, into
+        // the very fields routing and auth are decided from. ASGI has no
+        // request-trailer mechanism to deliver them through, so they are
+        // dropped rather than filtered: there is no set of names for
+        // which merging them here is correct.
+        if !self.in_head {
+            return;
+        }
+        field.make_ascii_lowercase();
+        self.headers.push((field, value));
     }
 }
 

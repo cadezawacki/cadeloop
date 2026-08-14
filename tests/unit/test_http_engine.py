@@ -2378,3 +2378,45 @@ def test_a_non_eager_spawn_failure_is_a_500_not_a_dead_worker(loop):
     assert first.startswith(b"HTTP/1.1 500"), first[:80]
     # The point: the loop survived the first failure and served again.
     assert second.startswith(b"HTTP/1.1 500"), second[:80]
+
+
+def test_request_trailers_do_not_reach_the_asgi_headers(loop):
+    """llhttp drives the same header callbacks for the TRAILER section of
+    a chunked request, and on_headers_complete -- with it the one-Host
+    check -- has already run by then. So a trailer was committed as an
+    ordinary header: `Host: attacker` reached scope["headers"] past a
+    legitimate `Host: legit`, in the very field routing is decided from.
+    ASGI has no request-trailer mechanism, so they are dropped. Reported
+    by Codex on PR #1."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        while True:
+            if not (await receive()).get("more_body"):
+                break
+        seen["headers"] = [(k.decode(), v.decode()) for k, v in scope["headers"]]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"POST / HTTP/1.1\r\nHost: legit\r\nTransfer-Encoding: chunked\r\n"
+            b"Trailer: Host\r\n\r\n"
+            b"4\r\nbody\r\n0\r\n"
+            b"Host: attacker\r\nX-Injected: yes\r\n\r\n"
+        )
+        await w.drain()
+        head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5.0)
+        w.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert head.startswith(b"HTTP/1.1 200"), head[:60]
+    names = [k for k, _ in seen["headers"]]
+    assert names.count("host") == 1, seen["headers"]
+    assert ("host", "attacker") not in seen["headers"], seen["headers"]
+    assert "x-injected" not in names, seen["headers"]

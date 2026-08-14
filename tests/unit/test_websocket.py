@@ -635,3 +635,122 @@ def test_a_late_receive_still_reports_a_websocket_disconnect(loop):
     assert seen, "the app never got its late receive"
     assert seen[0]["type"] == "websocket.disconnect", seen[0]
     assert seen[0]["code"] == 4321, seen[0]
+
+
+def test_empty_frames_still_count_against_the_inbox_budget(loop):
+    """WS_MAX_INBOX charged payload bytes only. Zero-length text and
+    binary frames are perfectly valid and cost nothing under a byte-only
+    budget, so an endpoint whose app is slow to call receive() could be
+    fed an unlimited stream of them -- the read pause never engaged and
+    the queue grew until the worker died. Each message now carries a fixed
+    charge, bounding the queue by depth as well as bytes. Reported by
+    Codex on PR #1."""
+    accepted = threading.Event()
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        accepted.set()
+        # Never drains the inbox: this is the slow-app case.
+        await asyncio.sleep(30)
+
+    lid, port = listen(loop, app)
+    paused = []
+
+    async def main():
+        _reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        # Both ends of this connection live in THIS loop, so a recv op is
+        # outstanding for each; the server's going away is the signal, not
+        # the count reaching zero.
+        baseline = loop.stats()["ops_by_target"]["recv"]
+        assert baseline >= 2, baseline
+        empty = client_frame(0x1, b"")
+        # 4 MiB budget / 256-byte charge = 16384 messages; send well past
+        # it in batches, checking whether the engine stopped reading.
+        for _ in range(80):
+            writer.write(empty * 500)
+            await writer.drain()
+            await asyncio.sleep(0.01)
+            if loop.stats()["ops_by_target"]["recv"] < baseline:
+                paused.append(True)
+                break
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert accepted.is_set()
+    assert paused, (
+        "40000 empty frames did not engage the inbox read pause; the queue is "
+        "bounded by payload bytes alone"
+    )
+
+
+@pytest.mark.parametrize(
+    "extra, expect_101",
+    [
+        # RFC 7230 6.7: Upgrade is a comma-separated token list, and may
+        # arrive split across repeated fields. Comparing the whole value
+        # for equality rejected both shapes, so any client or intermediary
+        # offering a second upgrade option got a 400. Reported by Codex.
+        (b"upgrade: websocket\r\n", True),
+        (b"upgrade: h2c, websocket\r\n", True),
+        (b"upgrade: websocket, h2c\r\n", True),
+        # This order is the one that caught the overwrite: the later
+        # field used to replace an earlier matching one outright.
+        (b"upgrade: websocket\r\nupgrade: h2c\r\n", True),
+        (b"upgrade: h2c\r\n", False),
+    ],
+)
+def test_upgrade_is_parsed_as_a_token_list(loop, extra, expect_101):
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        key = base64.b64encode(os.urandom(16))
+        writer.write(
+            b"GET /ws HTTP/1.1\r\nhost: x\r\nconnection: Upgrade\r\n"
+            b"sec-websocket-version: 13\r\nsec-websocket-key: " + key + b"\r\n"
+            + extra + b"\r\n"
+        )
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    got_101 = b"101" in head.split(b"\r\n", 1)[0]
+    assert got_101 is expect_101, head[:80]
+
+
+def test_subprotocol_offers_are_trimmed_of_tabs_not_just_spaces(loop):
+    """RFC 7230 OWS is SP or HTAB. Filtering only spaces turned
+    `chat,\\tsuperchat` into "\\tsuperchat", so the app saw a name it could
+    not select -- echoing it emits an invalid negotiation header, and
+    selecting the real one is rejected as unoffered. Reported by Codex."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["offers"] = list(scope["subprotocols"])
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept", "subprotocol": "superchat"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        _reader, writer, _key, head = await handshake(
+            port, extra="sec-websocket-protocol: chat,\tsuperchat\r\n"
+        )
+        writer.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert seen["offers"] == ["chat", "superchat"], seen["offers"]
+    assert b"101" in head.split(b"\r\n", 1)[0], head[:80]
+    assert b"sec-websocket-protocol: superchat" in head.lower(), head

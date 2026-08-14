@@ -254,6 +254,12 @@ pub(crate) struct DatagramEntry {
 /// stream, there is nothing to be gained by growing without bound.
 pub(crate) const DGRAM_SEND_QUEUE_MAX: usize = 1 << 20;
 
+/// Charged against `DGRAM_SEND_QUEUE_MAX` on top of the payload, so the
+/// queue is bounded by depth as well as bytes. Covers what a queued
+/// datagram actually costs: a Vec header, an optional SocketAddr, and the
+/// VecDeque slot -- none of which is zero for an empty packet.
+pub(crate) const DGRAM_PER_PACKET: usize = 128;
+
 /// Reported to `error_received` when a datagram is dropped for queue
 /// overflow. WSAENOBUFS on Windows, ENOBUFS on Linux -- the same errno an
 /// oversubscribed kernel socket buffer raises, which is what callers
@@ -1040,7 +1046,9 @@ fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did
             return; // a send is in flight; its completion resumes us
         }
         let Some((data, addr)) = entry.send_queue.pop_front() else { break };
-        entry.queued_bytes = entry.queued_bytes.saturating_sub(data.len());
+        // Mirrors the charge on the way in; the two must move together or
+        // the cap drifts.
+        entry.queued_bytes = entry.queued_bytes.saturating_sub(data.len() + DGRAM_PER_PACKET);
         dgram_send_now(py, net, backend, did, &data, addr.as_ref());
     }
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
@@ -1094,7 +1102,12 @@ pub(crate) fn udp_sendto(
         return Err(io::Error::new(io::ErrorKind::NotFound, "datagram endpoint closing"));
     }
     if entry.send_op.is_some() {
-        if entry.queued_bytes + data.len() > DGRAM_SEND_QUEUE_MAX {
+        // Charged per datagram as well as per byte: zero-length sends are
+        // valid, cost nothing under a byte-only cap, and every one still
+        // appends a Vec and an address to the queue -- so a synchronous
+        // producer could grow the supposedly bounded queue without limit
+        // before the loop ever saw the first completion.
+        if entry.queued_bytes + data.len() + DGRAM_PER_PACKET > DGRAM_SEND_QUEUE_MAX {
             // Deterministic overflow policy: drop and report. Growing
             // without bound is the alternative, and a producer that can
             // outrun the socket would take the process down with it.
@@ -1102,7 +1115,7 @@ pub(crate) fn udp_sendto(
             net.events.push(NetEvent::DgramError { error_received, err: ENOBUFS });
             return Ok(());
         }
-        entry.queued_bytes += data.len();
+        entry.queued_bytes += data.len() + DGRAM_PER_PACKET;
         entry.send_queue.push_back((data.to_vec(), addr));
         return Ok(());
     }
@@ -2173,7 +2186,7 @@ pub(crate) fn dispatch_events(
                         net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()).and_then(|w| w.inbox.pop_front());
                     if let Some(m) = m.as_ref() {
                         if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-                            w.inbox_bytes = w.inbox_bytes.saturating_sub(m.byte_len());
+                            w.inbox_bytes = w.inbox_bytes.saturating_sub(m.charge());
                         }
                     }
                     m
@@ -2209,7 +2222,7 @@ pub(crate) fn dispatch_events(
                         // pause never engaging.
                         core.with_net(|net, _| {
                             if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-                                w.inbox_bytes = w.inbox_bytes.saturating_add(m.byte_len());
+                                w.inbox_bytes = w.inbox_bytes.saturating_add(m.charge());
                                 w.inbox.push_front(m);
                             }
                         })?;

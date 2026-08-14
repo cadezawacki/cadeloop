@@ -210,12 +210,28 @@ pub(crate) enum WsMsg {
 
 impl WsMsg {
     /// Payload bytes this message holds, for the inbox budget.
-    pub(crate) fn byte_len(&self) -> usize {
-        match self {
+    /// What this message costs against `WS_MAX_INBOX`.
+    ///
+    /// Payload PLUS a fixed per-message charge, so the budget bounds the
+    /// queue by depth as well as by bytes. Charging payload alone left a
+    /// hole the size of the whole queue: zero-length text and binary
+    /// frames are perfectly valid, cost nothing under a byte-only budget,
+    /// and an endpoint whose app is slow to call receive() would accept
+    /// an unlimited stream of them until the worker died. The charge also
+    /// covers what a message really occupies -- a String/Vec header, a
+    /// VecDeque slot, and the Python dict receive() builds from it --
+    /// none of which is zero for an empty frame.
+    ///
+    /// Push and pop both go through here; when they did not, the two
+    /// sides could drift.
+    pub(crate) fn charge(&self) -> usize {
+        const PER_MESSAGE: usize = 256;
+        let payload = match self {
             WsMsg::Text(s) => s.len(),
             WsMsg::Binary(b) => b.len(),
             WsMsg::Disconnect(_) => 0,
-        }
+        };
+        payload + PER_MESSAGE
     }
 }
 
@@ -739,7 +755,7 @@ impl HttpReceive {
                     ws.connect_sent = true;
                     R::WsConnect
                 } else if let Some(m) = ws.inbox.pop_front() {
-                    ws.inbox_bytes = ws.inbox_bytes.saturating_sub(m.byte_len());
+                    ws.inbox_bytes = ws.inbox_bytes.saturating_sub(m.charge());
                     R::Ws(m)
                 } else if disconnected {
                     R::Ws(WsMsg::Disconnect(1006))
@@ -974,9 +990,19 @@ fn offered_subprotocols(req: &cadeloop_core::http::Request) -> Vec<String> {
             continue;
         }
         for part in value.split(|&b| b == b',') {
-            let t: Vec<u8> = part.iter().copied().filter(|&b| b != b' ').collect();
+            // RFC 7230 OWS is SP *or* HTAB, and it is only legal at the
+            // token's edges. Filtering spaces anywhere -- which is what
+            // this did -- turned `chat,\tsuperchat` into "\tsuperchat",
+            // so the app saw a name it could not select: echoing it back
+            // emits an invalid negotiation header, and selecting the real
+            // one is rejected as unoffered.
+            let t: &[u8] = {
+                let start = part.iter().position(|b| !matches!(b, b' ' | b'\t')).unwrap_or(part.len());
+                let end = part.iter().rposition(|b| !matches!(b, b' ' | b'\t')).map_or(start, |i| i + 1);
+                &part[start..end]
+            };
             if !t.is_empty() {
-                out.push(String::from_utf8_lossy(&t).into_owned());
+                out.push(String::from_utf8_lossy(t).into_owned());
             }
         }
     }
@@ -2040,13 +2066,15 @@ pub(crate) fn ws_ingest(
         let wsc = conn.ws.as_mut().unwrap();
         match ev {
             WsEvent::Text(s) => {
-                wsc.inbox_bytes += s.len();
-                wsc.inbox.push_back(WsMsg::Text(s));
+                let m = WsMsg::Text(s);
+                wsc.inbox_bytes += m.charge();
+                wsc.inbox.push_back(m);
                 wake = true;
             }
             WsEvent::Binary(b) => {
-                wsc.inbox_bytes += b.len();
-                wsc.inbox.push_back(WsMsg::Binary(b));
+                let m = WsMsg::Binary(b);
+                wsc.inbox_bytes += m.charge();
+                wsc.inbox.push_back(m);
                 wake = true;
             }
             WsEvent::Ping(p) => enqueues.push(ws::frame(ws::OP_PONG, &p)),
@@ -2155,7 +2183,20 @@ fn ws_validate(req: &Request) -> WsVerdict {
     let mut key: Option<Vec<u8>> = None;
     for (name, value) in &req.headers {
         match name.as_slice() {
-            b"upgrade" => upgrade_ws = value.eq_ignore_ascii_case(b"websocket"),
+            // RFC 7230 6.7: Upgrade is a comma-separated list of
+            // protocols, and may be split across repeated fields. Testing
+            // the whole value for equality rejected `Upgrade: h2c,
+            // websocket` outright, and a later repeated field overwrote an
+            // earlier matching one -- so any client or intermediary that
+            // offered a second upgrade option got a 400.
+            b"upgrade" => {
+                upgrade_ws = upgrade_ws
+                    || value.split(|&b| b == b',').any(|t| {
+                        let start = t.iter().position(|b| !matches!(b, b' ' | b'\t')).unwrap_or(t.len());
+                        let end = t.iter().rposition(|b| !matches!(b, b' ' | b'\t')).map_or(start, |i| i + 1);
+                        t[start..end].eq_ignore_ascii_case(b"websocket")
+                    });
+            }
             b"sec-websocket-version" => version_13 = value == b"13",
             b"sec-websocket-key" => key = Some(value.clone()),
             _ => {}

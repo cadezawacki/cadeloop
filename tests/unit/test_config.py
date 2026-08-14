@@ -105,3 +105,19 @@ def test_non_finite_durations_are_rejected():
         for bad in (float("nan"), float("inf"), float("-inf")):
             with pytest.raises(ValueError, match="finite"):
                 Config(**{field: bad})
+
+
+def test_negative_watermarks_are_rejected_not_deferred_to_an_overflow():
+    """`write_low_water=-1, write_high_water=0` is ordered, so the
+    ordering comparison alone let it through; the negative value then
+    reached CoreLoop's usize argument and failed at startup with an
+    OverflowError instead of being rejected as the configuration error it
+    is. Reported by Codex on PR #1."""
+    with pytest.raises(ValueError, match="write_low_water must be >= 0"):
+        Config(write_low_water=-1, write_high_water=0)
+    with pytest.raises(ValueError, match="write_high_water must be >= 0"):
+        Config(write_low_water=0, write_high_water=-1)
+    # Still ordered-checked, and the valid case still builds.
+    with pytest.raises(ValueError, match="write_low_water must be <="):
+        Config(write_low_water=100, write_high_water=10)
+    assert Config(write_low_water=0, write_high_water=0)

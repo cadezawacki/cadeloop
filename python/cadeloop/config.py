@@ -142,6 +142,19 @@ class Config:
             raise ValueError("max_body must be None or >= 0")
         if self.stats_endpoint is not None and not 1 <= self.stats_endpoint <= 65535:
             raise ValueError("stats_endpoint must be None or a port in 1..65535")
+        # Non-negative BEFORE ordering: `write_low_water=-1,
+        # write_high_water=0` is ordered, so the comparison alone let it
+        # through, and the negative value then reached CoreLoop's usize
+        # argument and blew up at startup with an OverflowError instead of
+        # being rejected as the configuration error it is.
+        # Non-negative BEFORE ordering: `write_low_water=-1,
+        # write_high_water=0` is ordered, so the comparison alone let it
+        # through, and the negative value then reached CoreLoop's usize
+        # argument and blew up at startup with an OverflowError instead of
+        # being rejected as the configuration error it is.
+        for field in ("write_low_water", "write_high_water"):
+            if getattr(self, field) < 0:
+                raise ValueError(f"{field} must be >= 0")
         if self.write_low_water > self.write_high_water:
             raise ValueError("write_low_water must be <= write_high_water")
 
