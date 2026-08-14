@@ -31,9 +31,9 @@ jobs:
     # 10-minute soak with RSS-growth assertion (<5%).
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - run: |
@@ -49,9 +49,9 @@ jobs:
     # records results as artifacts and passes.
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - run: |
@@ -72,7 +72,7 @@ jobs:
         # Until this file is seeded from a green run's uploaded artifact,
         # check_regression.py passes with a notice, per its own contract.
         run: python bench/harness/check_regression.py bench-results.json bench/baselines/windows-sched-ci.json --threshold 0.05
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-results
           path: bench-results.json

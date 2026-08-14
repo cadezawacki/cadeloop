@@ -147,11 +147,6 @@ class Config:
         # through, and the negative value then reached CoreLoop's usize
         # argument and blew up at startup with an OverflowError instead of
         # being rejected as the configuration error it is.
-        # Non-negative BEFORE ordering: `write_low_water=-1,
-        # write_high_water=0` is ordered, so the comparison alone let it
-        # through, and the negative value then reached CoreLoop's usize
-        # argument and blew up at startup with an OverflowError instead of
-        # being rejected as the configuration error it is.
         for field in ("write_low_water", "write_high_water"):
             if getattr(self, field) < 0:
                 raise ValueError(f"{field} must be >= 0")
