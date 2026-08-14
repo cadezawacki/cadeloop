@@ -317,7 +317,7 @@ impl WsRx {
     }
 }
 
-fn valid_close_code(code: u16) -> bool {
+pub fn valid_close_code(code: u16) -> bool {
     matches!(code, 1000..=1014 | 3000..=4999) && !matches!(code, 1004..=1006 | 1015)
 }
 

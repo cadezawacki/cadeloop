@@ -71,6 +71,10 @@ pub(crate) struct HttpConn {
     pub(crate) resp_head: Vec<u8>,
     /// http.response.start carried a content-length header.
     pub(crate) resp_started_with_length: bool,
+    /// Its parsed value, enforced across every body message.
+    pub(crate) resp_declared_length: Option<u64>,
+    /// Body bytes handed to the wire so far for the active response.
+    pub(crate) resp_body_sent: u64,
     /// Streaming without chunked framing (caller CL or close-delimited).
     pub(crate) raw_stream: bool,
     /// Active request is HEAD: body bytes are suppressed on the wire.
@@ -178,6 +182,8 @@ impl HttpConn {
             resp: RespPhase::Idle,
             resp_head: Vec::new(),
             resp_started_with_length: false,
+            resp_declared_length: None,
+            resp_body_sent: 0,
             raw_stream: false,
             active_head: false,
             resp_bodyless: false,
@@ -793,6 +799,14 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             .get_item(intern!(py, "status"))?
             .ok_or_else(|| PyRuntimeError::new_err("http.response.start missing 'status'"))?
             .extract()?;
+        // A status line is three digits by grammar; anything else puts a
+        // malformed start-line on the wire that clients may discard along
+        // with the connection.
+        if !(100..=999).contains(&status) {
+            return Err(PyRuntimeError::new_err(format!(
+                "ASGI application sent an invalid response status: {status}"
+            )));
+        }
         // Serialize caller headers OUTSIDE the cell (arbitrary Python
         // objects), then commit in-cell.
         let mut head: Vec<u8> = Vec::with_capacity(256);
@@ -801,7 +815,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         head.push(b' ');
         head.extend_from_slice(status_text(status).as_bytes());
         head.extend_from_slice(b"\r\n");
-        let mut saw_length = false;
+        let mut declared_length: Option<u64> = None;
         let mut saw_close = false;
         if let Some(headers) = message.get_item(intern!(py, "headers"))? {
             for item in headers.try_iter()? {
@@ -814,7 +828,27 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     )));
                 }
                 if name.eq_ignore_ascii_case(b"content-length") {
-                    saw_length = true;
+                    // Parsed, not merely noted: the body path enforces it,
+                    // and a duplicate that disagrees is ambiguous framing.
+                    let parsed = std::str::from_utf8(&value).ok().and_then(|v| v.trim().parse::<u64>().ok());
+                    let Some(n) = parsed else {
+                        return Err(PyRuntimeError::new_err(
+                            "ASGI application sent a non-numeric content-length",
+                        ));
+                    };
+                    if declared_length.is_some_and(|prev| prev != n) {
+                        return Err(PyRuntimeError::new_err(
+                            "ASGI application sent conflicting content-length headers",
+                        ));
+                    }
+                    declared_length = Some(n);
+                }
+                if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                    // Framing is the server's job (R-084). Passing an
+                    // app-supplied `chunked` through would either pair it
+                    // with our content-length or duplicate our own header,
+                    // and the body bytes are not chunk-framed either way.
+                    continue;
                 }
                 if name.eq_ignore_ascii_case(b"connection")
                     && value.to_ascii_lowercase().windows(5).any(|w| w == b"close")
@@ -842,7 +876,9 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 return Err(SendErr::Proto("http.response.start sent twice"));
             }
             conn.resp_head = std::mem::take(&mut head);
-            conn.resp_started_with_length = saw_length;
+            conn.resp_started_with_length = declared_length.is_some();
+            conn.resp_declared_length = declared_length;
+            conn.resp_body_sent = 0;
             conn.resp_bodyless = status_forbids_body(status);
             if saw_close {
                 conn.keep_alive = false;
@@ -892,6 +928,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         if !head_req {
                             out.extend_from_slice(&body);
                         }
+                        conn.resp_body_sent = body.len() as u64;
+                        if let Some(e) = length_mismatch(conn, true) {
+                            return Err(e);
+                        }
                         conn.resp = RespPhase::Done;
                     } else if saw_length || head_req || minor == 0 {
                         // Raw streaming: caller-framed (their CL), a HEAD
@@ -906,6 +946,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                             // genuinely implicit; HEAD and bodyless statuses
                             // are self-framing, so the connection survives.
                             conn.keep_alive = false;
+                        }
+                        conn.resp_body_sent = body.len() as u64;
+                        if let Some(e) = length_mismatch(conn, false) {
+                            return Err(e);
                         }
                         conn.raw_stream = true;
                         conn.resp = RespPhase::Streaming;
@@ -931,6 +975,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     } else if !body.is_empty() {
                         push_chunk(&mut out, &body);
                     }
+                    conn.resp_body_sent = conn.resp_body_sent.saturating_add(body.len() as u64);
+                    if let Some(e) = length_mismatch(conn, !more) {
+                        return Err(e);
+                    }
                     if !more {
                         if !raw && !head_req {
                             out.extend_from_slice(b"0\r\n\r\n");
@@ -947,6 +995,30 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
     }
 
     Err(PyRuntimeError::new_err(format!("unsupported ASGI message type: {mtype}")))
+}
+
+/// Enforce a declared `content-length` (R-084). Getting this wrong is not
+/// a cosmetic error: on a keep-alive connection a short body makes the
+/// client read the start of the NEXT response as this one's body, and a
+/// long one makes the surplus look like a new response. Either way the
+/// stream is desynchronised, which is the request-smuggling shape.
+fn length_mismatch(conn: &HttpConn, final_message: bool) -> Option<SendErr> {
+    if conn.active_head || conn.resp_bodyless {
+        // No body goes on the wire, and for these the declared length
+        // legitimately describes a body that is not being sent: a HEAD
+        // response carries the would-be GET length (RFC 7231 4.3.2) and a
+        // 304 the would-be 200's (RFC 7232 4.1).
+        return None;
+    }
+    let declared = conn.resp_declared_length?;
+    let sent = conn.resp_body_sent;
+    if sent > declared {
+        return Some(SendErr::Proto("response body exceeded the declared content-length"));
+    }
+    if final_message && sent < declared {
+        return Some(SendErr::Proto("response body was shorter than the declared content-length"));
+    }
+    None
 }
 
 fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
@@ -1342,6 +1414,15 @@ fn ws_send(
                 Some(v) if !v.is_none() => v.extract()?,
                 _ => String::new(),
             };
+            // RFC 6455 §7.4: 1005/1006/1015 are "not present on the wire"
+            // codes and 1004 is reserved, so a peer must treat a close
+            // frame carrying one as a protocol error rather than the
+            // shutdown the application asked for.
+            if !ws::valid_close_code(code) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "websocket.close sent a reserved or invalid close code: {code}"
+                )));
+            }
             core.with_net(|net, reactor| {
                 let backend = reactor.backend_mut();
                 let Some(conn) = net.http_conn_mut(tid) else { return };
@@ -1384,7 +1465,17 @@ pub(crate) fn ws_ingest(
     let Some(conn) = net.http_conn_mut(tid) else { return };
     let Some(wsc) = conn.ws.as_mut() else { return };
     if !wsc.accepted {
-        // Pre-accept client frames wait for the handshake to finish.
+        // Pre-accept client frames wait for the handshake to finish. The
+        // app may be doing arbitrary work before it accepts (auth, a
+        // database round-trip), and a client is free to stream during that
+        // window, so this needs the same cap the accepted path enforces --
+        // otherwise one connection can grow it until the worker dies.
+        if conn.ws_trailing.len() + data.len() > WS_MAX_MESSAGE {
+            let f = ws::close_frame(1009, "pre-accept buffer limit exceeded");
+            net::http_enqueue(py, net, backend, tid, f);
+            net::http_close_after_write(py, net, backend, tid);
+            return;
+        }
         conn.ws_trailing.extend_from_slice(data);
         return;
     }
@@ -1523,6 +1614,8 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 conn.resp = RespPhase::Idle;
                 conn.resp_head = Vec::new();
                 conn.resp_started_with_length = false;
+                conn.resp_declared_length = None;
+                conn.resp_body_sent = 0;
                 conn.raw_stream = false;
                 conn.active_head = req.method == "HEAD";
                 conn.resp_bodyless = false;

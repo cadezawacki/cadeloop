@@ -329,3 +329,107 @@ def test_invalid_sec_websocket_key_is_rejected(loop, key):
     head = loop.run_until_complete(main())
     assert b"101" not in head.split(b"\r\n", 1)[0], f"bad key {key!r} was upgraded"
     loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize("code", [1004, 1005, 1006, 1015, 999, 5000, 0])
+def test_reserved_close_codes_are_rejected(loop, code):
+    """RFC 6455 §7.4: 1005/1006/1015 never appear on the wire and 1004 is
+    reserved, so a peer must treat a close frame carrying one as a
+    protocol error rather than the shutdown the app asked for. Reported by
+    Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.close", "code": code})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        frames = []
+        try:
+            while True:
+                frames.append(await asyncio.wait_for(read_server_frame(reader), 5))
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
+            pass
+        writer.close()
+        return frames
+
+    frames = loop.run_until_complete(main())
+    for _fin, op, payload in frames:
+        if op == 0x8 and len(payload) >= 2:
+            got = struct.unpack(">H", payload[:2])[0]
+            assert got != code, f"reserved code {code} reached the wire"
+    loop._core.listener_close(lid)
+
+
+def test_valid_close_code_still_passes(loop):
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.close", "code": 1001, "reason": "going away"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        _fin, op, payload = await asyncio.wait_for(read_server_frame(reader), 5)
+        writer.close()
+        return op, payload
+
+    op, payload = loop.run_until_complete(main())
+    assert op == 0x8
+    assert struct.unpack(">H", payload[:2])[0] == 1001
+    assert payload[2:] == b"going away"
+    loop._core.listener_close(lid)
+
+
+def test_pre_accept_flood_is_bounded(loop):
+    """An app may do arbitrary work before websocket.accept (auth, a
+    database round-trip) and a client is free to stream during that
+    window. Buffering it without a cap lets one connection grow
+    ws_trailing until the worker dies. Reported by Codex review on PR #1.
+
+    Note the client cannot use handshake() here: the 101 is not sent until
+    the app accepts, which is exactly the window under test."""
+    release = asyncio.Event()
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await release.wait()  # never accepts while the client floods
+        await send({"type": "websocket.accept"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        key = base64.b64encode(os.urandom(16))
+        writer.write(
+            f"GET /ws HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\n"
+            f"connection: Upgrade\r\nsec-websocket-version: 13\r\n"
+            f"sec-websocket-key: {key.decode()}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        blob = client_frame(0x2, b"z" * 60000)
+        try:
+            for _ in range(40):  # ~2.4 MiB, well past the 1 MiB cap
+                writer.write(blob)
+                await writer.drain()
+                await asyncio.sleep(0)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        # The cap must have closed the connection rather than buffering on.
+        try:
+            rest = await asyncio.wait_for(reader.read(), 5)
+        except (OSError, asyncio.IncompleteReadError):
+            rest = b""  # server dropped us, which is the point
+        release.set()
+        await asyncio.sleep(0.05)
+        writer.close()
+        return rest
+
+    rest = loop.run_until_complete(main())
+    assert b"101 Switching Protocols" not in rest, "flood was accepted, not capped"
+    loop._core.listener_close(lid)

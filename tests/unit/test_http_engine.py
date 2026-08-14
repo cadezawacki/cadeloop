@@ -1212,3 +1212,106 @@ def test_buffered_body_survives_client_half_close(loop):
     assert seen["type"] == "http.request"
     assert seen["body"] == b"hello"
     loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize("status", [0, 1, 99, 1000, 65535])
+def test_invalid_response_status_is_rejected(loop, status):
+    """A status line is three digits by grammar; anything else is a
+    malformed start-line. Reported by Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": status, "headers": []})
+        await send({"type": "http.response.body", "body": b"x"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert resp.startswith(b"HTTP/1.1 500"), resp[:40]
+    loop._core.listener_close(lid)
+
+
+def test_app_supplied_transfer_encoding_is_stripped(loop):
+    """Response framing is the server's job (R-084). Echoing an app's
+    `Transfer-Encoding: chunked` would pair it with our own content-length
+    (or duplicate our chunked header) while the body bytes are not chunk-
+    framed, leaving the client to parse payload as chunk headers. Reported
+    by Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"transfer-encoding", b"chunked")],
+        })
+        await send({"type": "http.response.body", "body": b"hello"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    head = resp.split(b"\r\n\r\n", 1)[0].lower()
+    assert head.count(b"transfer-encoding") == 0
+    assert b"content-length: 5" in head
+    assert _body(resp) == b"hello"
+    loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize(
+    "chunks,label",
+    [([b"short"], "underflow"), ([b"way too many bytes here"], "overflow")],
+)
+def test_declared_content_length_is_enforced(loop, chunks, label):
+    """R-084: a body that disagrees with the declared content-length
+    desynchronises a keep-alive stream — the client reads into the next
+    response or treats the surplus as one. Reported by Codex review on
+    PR #1."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-length", b"10")],
+        })
+        for c in chunks:
+            await send({"type": "http.response.body", "body": c})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", read_all=True))
+    # The mismatch is refused rather than put on the wire: either a 500
+    # (caught before the head was committed) or a truncated/closed stream.
+    assert b"way too many bytes here" not in resp, f"{label}: surplus reached the wire"
+    loop._core.listener_close(lid)
+
+
+def test_conflicting_content_length_headers_are_rejected(loop):
+    async def app(scope, receive, send):
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-length", b"5"), (b"content-length", b"9")],
+        })
+        await send({"type": "http.response.body", "body": b"hello"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert resp.startswith(b"HTTP/1.1 500")
+    loop._core.listener_close(lid)
+
+
+def test_matching_content_length_still_passes(loop):
+    async def app(scope, receive, send):
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-length", b"5")],
+        })
+        await send({"type": "http.response.body", "body": b"hel", "more_body": True})
+        await send({"type": "http.response.body", "body": b"lo"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert resp.startswith(b"HTTP/1.1 200")
+    assert _body(resp) == b"hello"
+    loop._core.listener_close(lid)
