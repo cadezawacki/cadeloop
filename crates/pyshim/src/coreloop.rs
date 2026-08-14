@@ -275,6 +275,9 @@ impl CoreLoop {
                 }
                 if !comps.is_empty() {
                     net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
+                    // A listener whose accept pool ran dry on a transient
+                    // failure has no completion left to retry it (R-032).
+                    net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut());
                     comps.clear();
                 }
                 if trace_tick {
@@ -921,7 +924,8 @@ impl CoreLoop {
 
     /// Start (or restart) accepting on a listener created with start=false.
     fn listener_start(&self, lid: u64) -> PyResult<()> {
-        self.with_net(|net, reactor| net::listener_start(net, reactor.backend_mut(), lid))
+        self.with_net(|net, reactor| net::listener_start(net, reactor.backend_mut(), lid))??;
+        Ok(())
     }
 
     fn listener_close(&self, py: Python<'_>, lid: u64) -> PyResult<()> {
@@ -1177,6 +1181,7 @@ impl CoreLoop {
                     st.net.stats_bytes_rx,
                     st.net.stats_bytes_tx,
                     st.net.stats_conns_accepted,
+                    st.net.stats_accept_starved,
                 ),
                 st.reactor.backend_mut().diag(),
                 // Live, not the construction-time cache: RIO downgrades its
@@ -1201,6 +1206,7 @@ impl CoreLoop {
         d.set_item("bytes_received", netstats.3)?;
         d.set_item("bytes_sent", netstats.4)?;
         d.set_item("connections_accepted", netstats.5)?;
+        d.set_item("accept_starved", netstats.6)?;
         if let Some((notifies, reaps)) = diag {
             d.set_item("rio_notifies", notifies)?;
             d.set_item("rio_watchdog_reaps", reaps)?;
@@ -1252,7 +1258,7 @@ impl CoreLoop {
             reactor.backend_mut().register_socket(sock)?;
             let lid = net::listener_create(net, sock, kind, accept_pool);
             if start {
-                net::listener_start(net, reactor.backend_mut(), lid);
+                net::listener_start(net, reactor.backend_mut(), lid)?;
             }
             Ok(lid)
         })??;

@@ -208,6 +208,10 @@ pub(crate) struct ListenerEntry {
     accept_ops: Vec<OpId>,
     target: usize,
     closing: bool,
+    /// The pool ran dry and `post_accept` refused (transiently, e.g. a
+    /// descriptor limit). Nothing is outstanding, so no completion can
+    /// wake this listener again -- the next tick retries instead.
+    starved: bool,
 }
 
 /// R-058 datagram endpoint state (cached protocol callbacks, one
@@ -257,6 +261,10 @@ pub(crate) struct NetState {
     pub stats_bytes_rx: u64,
     pub stats_bytes_tx: u64,
     pub stats_conns_accepted: u64,
+    /// Times an accept pool ran dry on a transient post failure (R-032).
+    pub stats_accept_starved: u64,
+    /// Cheap gate for `retry_starved_listeners` on the tick path.
+    pub any_starved_listener: bool,
     /// HTTP `Date:` header cache (R-084): rebuilt when the unix second ticks.
     pub http_date_secs: u64,
     pub http_date_line: Vec<u8>,
@@ -979,13 +987,44 @@ pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: Listene
     let lid = net.next_id();
     net.listeners.insert(
         lid,
-        ListenerEntry { socket: sock, kind, accept_ops: Vec::new(), target: target.max(1), closing: false },
+        ListenerEntry {
+            socket: sock,
+            kind,
+            accept_ops: Vec::new(),
+            target: target.max(1),
+            closing: false,
+            starved: false,
+        },
     );
     lid
 }
 
-pub(crate) fn listener_start(net: &mut NetState, backend: Backend<'_>, lid: u64) {
+/// Arm a listener's accept pool. Fails loudly when not a single accept
+/// could be posted: a listener with nothing outstanding accepts nothing,
+/// ever, and returning "serving" for it hides the outage completely.
+pub(crate) fn listener_start(net: &mut NetState, backend: Backend<'_>, lid: u64) -> io::Result<()> {
     post_accepts(net, backend, lid);
+    match net.listeners.get(&lid) {
+        Some(l) if l.accept_ops.is_empty() => {
+            Err(io::Error::other("listener could not post its first accept"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Re-arm listeners whose accept pool ran dry on a transient failure.
+/// Driven from the tick, because a starved listener has no outstanding
+/// operation left to deliver the completion that would otherwise retry.
+pub(crate) fn retry_starved_listeners(net: &mut NetState, backend: Backend<'_>) {
+    if !net.any_starved_listener {
+        return;
+    }
+    let starved: Vec<u64> =
+        net.listeners.iter().filter(|(_, l)| l.starved && !l.closing).map(|(&lid, _)| lid).collect();
+    net.any_starved_listener = false;
+    for lid in starved {
+        post_accepts(net, backend, lid);
+    }
 }
 
 pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u64) {
@@ -1013,15 +1052,31 @@ fn post_accepts(net: &mut NetState, backend: Backend<'_>, lid: u64) {
     loop {
         let Some(listener) = net.listeners.get_mut(&lid) else { return };
         if listener.closing || listener.accept_ops.len() >= listener.target {
+            listener.starved = false;
             return;
         }
         let socket = listener.socket;
         match backend.post_accept(socket) {
             Ok(op) => {
-                net.listeners.get_mut(&lid).unwrap().accept_ops.push(op);
+                let l = net.listeners.get_mut(&lid).unwrap();
+                l.accept_ops.push(op);
+                l.starved = false;
                 net.ops.insert(op, OpTarget::Accept(lid));
             }
-            Err(_) => return, // transient (e.g. fd limit): retried on next completion
+            Err(_) => {
+                // Transient (a descriptor limit, say). With at least one
+                // accept still outstanding its completion retries this.
+                // With none, nothing ever would -- the listener would go
+                // permanently deaf while still reporting itself as
+                // serving -- so flag it for the tick to re-arm.
+                let l = net.listeners.get_mut(&lid).unwrap();
+                if l.accept_ops.is_empty() {
+                    l.starved = true;
+                    net.any_starved_listener = true;
+                    net.stats_accept_starved += 1;
+                }
+                return;
+            }
         }
     }
 }
@@ -1273,8 +1328,13 @@ fn on_accept_done(net: &mut NetState, backend: Backend<'_>, lid: u64, op: OpId, 
     listener.accept_ops.retain(|&o| o != op);
     let closing = listener.closing;
     if os_error != 0 {
-        if !is_cancelled_error(os_error) && !closing {
-            net.events.push(NetEvent::AcceptError { err: os_error });
+        if !closing {
+            if !is_cancelled_error(os_error) {
+                net.events.push(NetEvent::AcceptError { err: os_error });
+            }
+            // Re-arm even for an ABORTED completion: this op has left the
+            // pool either way, and if it was the last one the listener
+            // would otherwise stop accepting for good.
             post_accepts(net, backend, lid);
         }
         return;

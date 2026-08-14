@@ -1177,3 +1177,25 @@ def test_datagram_close_releases_its_recv_slot(loop):
 
     loop.run_until_complete(main())
     assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_listener_keeps_accepting_after_many_connections(loop):
+    """R-032: the accept pool must never end up empty on a live listener.
+    Every path that removes an accept op — including one that completes
+    with a cancellation error — has to re-arm, or the listener goes
+    permanently deaf while still reporting itself as serving. Reported by
+    Codex review on PR #1 (raised twice)."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        for i in range(60):
+            reader, writer = await asyncio.open_connection(*addr)
+            writer.write(b"ping")
+            await writer.drain()
+            assert await asyncio.wait_for(reader.readexactly(4), 5) == b"ping", f"stalled at {i}"
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["accept_starved"] == 0
