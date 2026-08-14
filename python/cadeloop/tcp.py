@@ -187,6 +187,14 @@ class TcpSurface:
             if host is not None or port is not None:
                 raise ValueError("host/port and sock can not be specified at the same time")
             _check_ssl_socket(sock)
+            # Checked before ownership transfers, as create_server() and
+            # connect_accepted_socket() already do. A datagram socket here
+            # got the native STREAM transport, which applies byte-stream
+            # flow control and EOF semantics to packet I/O -- and an
+            # unconnected UDP socket then fails on the first write with no
+            # destination.
+            if sock.type != socket.SOCK_STREAM:
+                raise ValueError(f"a stream socket was expected, got {sock!r}")
             fd = sock.detach()
             return await self._wrap_outgoing(
                 fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
@@ -989,55 +997,69 @@ class TcpSurface:
         fd = sock.fileno()
         in_fd = file.fileno()
         total = 0
-        while True:
-            blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
-            if blocksize <= 0:
-                break
-            try:
-                sent = os.sendfile(fd, in_fd, offset + total, blocksize)
-            except BlockingIOError:
-                sent = None
-            except InterruptedError:
-                continue
-            if sent == 0:
-                break  # end of file
-            if sent is not None:
-                total += sent
-                continue
-            # Socket buffer full: wait for writability.
-            fut = self.create_future()
+        # Position restored in a finally, as in Loop._sendfile_native_fd:
+        # an interrupted transfer whose bytes already went out must not
+        # leave tell() at the original offset, or a caller retrying from
+        # the reported position sends them twice.
+        try:
+            while True:
+                blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
+                if blocksize <= 0:
+                    break
+                try:
+                    sent = os.sendfile(fd, in_fd, offset + total, blocksize)
+                except BlockingIOError:
+                    sent = None
+                except InterruptedError:
+                    continue
+                if sent == 0:
+                    break  # end of file
+                if sent is not None:
+                    total += sent
+                    continue
+                # Socket buffer full: wait for writability.
+                fut = self.create_future()
 
-            def on_writable():
-                if not fut.done():
-                    fut.set_result(None)
+                def on_writable():
+                    if not fut.done():
+                        fut.set_result(None)
 
-            self._core.add_writer(fd, on_writable)
-            try:
-                await fut
-            finally:
-                self._core.remove_writer(fd)
-        file.seek(offset + total)  # stdlib convention
-        return total
+                self._core.add_writer(fd, on_writable)
+                try:
+                    await fut
+                finally:
+                    self._core.remove_writer(fd)
+            return total
+        finally:
+            file.seek(offset + total)  # stdlib convention
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
         # Unconditional, matching Loop._sendfile_fallback: the old guard
         # skipped the seek for the default offset=0, so this path sent from
         # the file's current position while the native path sent from byte
         # zero.
-        file.seek(offset)
+        #
+        # Reads go through the executor and the position is restored in a
+        # finally, for the same reasons as Loop._sendfile_fallback: a
+        # blocking read here stalls every connection on the loop, and a
+        # transfer interrupted part-way must still report how far it got.
         blocksize = min(count, 16384) if count else 16384
         total = 0
-        while True:
-            if count:
-                blocksize = min(count - total, blocksize)
-                if blocksize <= 0:
+        try:
+            await self.run_in_executor(None, file.seek, offset)
+            while True:
+                if count:
+                    blocksize = min(count - total, blocksize)
+                    if blocksize <= 0:
+                        break
+                data = await self.run_in_executor(None, file.read, blocksize)
+                if not data:
                     break
-            data = file.read(blocksize)
-            if not data:
-                break
-            await self.sock_sendall(sock, data)
-            total += len(data)
-        return total
+                await self.sock_sendall(sock, data)
+                total += len(data)
+            return total
+        finally:
+            await self.run_in_executor(None, file.seek, offset + total)
 
 
 class _DatagramTransport(asyncio.DatagramTransport):

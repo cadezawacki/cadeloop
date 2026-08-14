@@ -1918,7 +1918,15 @@ pub(crate) fn dispatch_events(
                         transport.bind(py).get().close(py)?;
                     }
                 }
-                Err(e) => core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?,
+                Err(e) => {
+                    // Fatal, as it is in the stdlib. The receive side has
+                    // reached EOF and will never be posted again, so a
+                    // transport left open here is half-open forever unless
+                    // the application happens to close it -- and it has
+                    // just told us it cannot handle the event.
+                    core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
+                    transport.bind(py).get().close(py)?;
+                }
             },
             NetEvent::ConnLost { connection_lost, err } => {
                 let exc_obj = match err {
@@ -2249,21 +2257,42 @@ pub(crate) fn wire_stream(
     protocol: Bound<'_, PyAny>,
 ) -> PyResult<Py<Transport>> {
     let core = slf.get();
+    // Everything up to the transport insert is transactional: on any
+    // failure the socket has no owner (the caller detached it, or it came
+    // back from tcp_connect), so it must be released here or it leaks.
+    // Detach-then-close, never bare close: tcp_connect registered it, and
+    // closing a registered socket leaves the backend listing a handle
+    // value the OS will reissue, so the next socket to reuse it looks
+    // already-associated and its completions are never queued (ADR-25).
+    let discard = |core: &CoreLoop| {
+        let _ = core.with_net(|_net, reactor| reactor.backend_mut().detach_socket(sock));
+        netsys::close(sock);
+    };
     let proto = match cache_proto(py, &protocol) {
         Ok(p) => p,
         Err(e) => {
-            netsys::close(sock);
+            discard(core);
             return Err(e);
         }
     };
     let _ = netsys::set_nodelay(sock, true); // R-038
     let peer = addr_tuple(py, netsys::peername(sock).ok());
     let name = addr_tuple(py, netsys::sockname(sock).ok());
-    let connection_made = protocol.getattr("connection_made")?;
+    // A protocol without connection_made reaches here with the descriptor
+    // still unowned; `?` alone would have dropped it on the floor.
+    let connection_made = match protocol.getattr("connection_made") {
+        Ok(cb) => cb,
+        Err(e) => {
+            discard(core);
+            return Err(e);
+        }
+    };
 
     let (high, low) = core.water_marks();
     let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
     if let Err(e) = reg {
+        // register_socket failed, so it is NOT associated: a bare close is
+        // right here and a detach would be meaningless.
         netsys::close(sock);
         return Err(e.into());
     }

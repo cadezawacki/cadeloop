@@ -46,12 +46,22 @@ def _pin_to_cpu(cpu: int) -> None:
         if sys.platform == "win32":
             import ctypes
 
+            # A single affinity mask addresses at most one processor
+            # group, i.e. 64 logical CPUs. Above that `1 << cpu` overflows
+            # c_size_t and ctypes raises OverflowError -- which is not an
+            # OSError, so it escaped this best-effort helper and crashed
+            # every worker with an index >= 64 at startup, on exactly the
+            # large machines the pinning exists for. Group-aware pinning
+            # needs SetThreadGroupAffinity; until then, leaving those
+            # workers unpinned is the correct degradation.
+            if cpu >= 64:
+                return
             handle = ctypes.c_void_p(-1)  # GetCurrentProcess() pseudo handle
             k32 = ctypes.windll.kernel32
             k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
             k32.SetProcessAffinityMask.restype = ctypes.c_int
             k32.SetProcessAffinityMask(handle, 1 << cpu)
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         pass  # pinning is best-effort (R-091)
 
 

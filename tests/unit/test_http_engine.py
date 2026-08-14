@@ -60,8 +60,8 @@ async def echo_scope_app(scope, receive, send):
     await send({"type": "http.response.body", "body": body})
 
 
-async def _request(port, raw, read_all=False, timeout=5.0):
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+async def _request(port, raw, read_all=False, timeout=5.0, host="127.0.0.1"):
+    reader, writer = await asyncio.open_connection(host, port)
     writer.write(raw)
     await writer.drain()
     if read_all:
@@ -2111,3 +2111,122 @@ def test_trailers_reject_fields_that_change_framing(loop):
     loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
     assert errors and "not allowed in trailers" in errors[0], errors
     loop._core.listener_close(lid)
+
+
+# --------------------------------------------------------------------- #
+# scope correctness: ASGI address shape, absolute-form authority         #
+# --------------------------------------------------------------------- #
+
+
+def test_asgi_client_and_server_are_two_item(loop):
+    """Pins the ASGI contract on the ordinary path. Note this does NOT
+    discriminate the IPv6 truncation on its own -- an IPv4 sockaddr is
+    already two-item -- which is what the IPv6 test below is for."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["client"] = scope["client"]
+        seen["server"] = scope["server"]
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    host, prt = seen["client"]  # exactly the unpacking apps do
+    assert isinstance(prt, int)
+    assert len(seen["client"]) == 2, seen["client"]
+    assert len(seen["server"]) == 2, seen["server"]
+
+
+def test_absolute_form_authority_overrides_a_conflicting_host(loop):
+    """RFC 7230 5.4: a recipient of an absolute-form target uses THAT
+    authority and ignores Host. Otherwise an intermediary routes on the
+    request-target while this server's host routing, trusted-host checks
+    or cache key read an attacker-controlled header."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = dict(scope["headers"])
+        seen["path"] = scope["path"]
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(
+        _request(
+            port,
+            b"GET http://target.example/x HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+        )
+    )
+    loop._core.listener_close(lid)
+    assert seen["path"] == "/x", seen["path"]
+    assert seen["headers"][b"host"] == b"target.example", seen["headers"]
+
+
+def test_absolute_form_supplies_host_when_absent(loop):
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = dict(scope["headers"])
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    # HTTP/1.0 has no mandatory Host, so the authority is the only source.
+    loop.run_until_complete(
+        _request(port, b"GET http://target.example/y HTTP/1.0\r\n\r\n", read_all=True)
+    )
+    loop._core.listener_close(lid)
+    assert seen["headers"].get(b"host") == b"target.example", seen["headers"]
+
+
+def test_ordinary_host_header_is_untouched(loop):
+    """The rewrite must apply ONLY to absolute-form targets."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["headers"] = dict(scope["headers"])
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(_request(port, b"GET /z HTTP/1.1\r\nHost: normal.example\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert seen["headers"][b"host"] == b"normal.example", seen["headers"]
+
+
+def test_asgi_client_is_two_item_for_ipv6(loop):
+    """The regression this guards: the transport keeps IPv6 addresses in
+    their full (host, port, flowinfo, scope_id) form -- correct, since
+    that is what the socket APIs take and return -- but ASGI defines
+    client/server as two-item [host, port], so passing the socket form
+    straight through breaks the near-universal
+    `host, port = scope["client"]` on IPv6 requests and nowhere else."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["client"] = scope["client"]
+        seen["server"] = scope["server"]
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    try:
+        lid, bound, _fd = loop._core.http_listen("::1", 0, app, loop)
+    except OSError as exc:
+        pytest.skip(f"IPv6 unavailable: {exc}")
+    try:
+        loop.run_until_complete(
+            _request(bound[1], b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", host="::1")
+        )
+    finally:
+        loop._core.listener_close(lid)
+    assert len(seen["client"]) == 2, f"IPv6 client leaked its socket form: {seen['client']!r}"
+    assert len(seen["server"]) == 2, f"IPv6 server leaked its socket form: {seen['server']!r}"
+    host, prt = seen["client"]
+    assert isinstance(prt, int)

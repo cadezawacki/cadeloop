@@ -1655,3 +1655,58 @@ def test_tfo_and_loopback_fast_path_reach_the_core(loop_factory=None):
         lp.close()
     cfg = cadeloop.Config(tfo=True, loopback_fast_path=False)
     assert cfg.tfo is True and cfg.loopback_fast_path is False
+
+
+def test_create_connection_rejects_a_datagram_socket(loop):
+    """A datagram sock= got the native STREAM transport, which applies
+    byte-stream flow control and EOF semantics to packet I/O."""
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", 0))
+    try:
+        with pytest.raises(ValueError, match="stream socket"):
+            loop.run_until_complete(loop.create_connection(asyncio.Protocol, sock=udp))
+        assert udp.fileno() != -1, "rejected before ownership transferred"
+    finally:
+        udp.close()
+
+
+def test_sendfile_reports_position_after_an_interrupted_transfer(loop, monkeypatch):
+    """sendfile leaves the file positioned after the bytes actually sent.
+    `os.sendfile` takes an explicit offset and does NOT advance the file
+    position itself, so the seek is the only thing that establishes it --
+    and doing it solely on the success path left tell() at the original
+    offset after a transfer that had already put bytes on the wire, so a
+    caller retrying from the reported position sent them twice.
+
+    The failure is injected rather than raced: a cancel loses to loopback
+    every time, and a test that cannot reach the path it names proves
+    nothing."""
+    import tempfile
+
+    payload = b"abcdefghij" * 4096
+    sent_before_failure = 1024
+
+    with tempfile.TemporaryFile() as fh:
+        fh.write(payload)
+        fh.flush()
+        fh.seek(0)
+        a, b = socket.socketpair()
+        real_sendfile = os.sendfile
+        calls = []
+
+        def flaky(out_fd, in_fd, offset, blocksize, *args):
+            calls.append(1)
+            if len(calls) > 1:
+                raise BrokenPipeError(32, "peer went away mid-transfer")
+            return real_sendfile(out_fd, in_fd, offset, sent_before_failure)
+
+        monkeypatch.setattr(os, "sendfile", flaky)
+        try:
+            with pytest.raises(BrokenPipeError):
+                loop.run_until_complete(loop._sendfile_native_fd(a.fileno(), fh, 0, None))
+            assert fh.tell() == sent_before_failure, (
+                f"tell() reports {fh.tell()} after {sent_before_failure} bytes were sent"
+            )
+        finally:
+            a.close()
+            b.close()

@@ -631,7 +631,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             # serving -- and the second lookup can return a different
             # family than the socket was created with.
             if local_addr or remote_addr:
-                resolved = {}
+                candidates = {}
                 for key, addr in (("local", local_addr), ("remote", remote_addr)):
                     if not addr:
                         continue
@@ -645,19 +645,28 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     )
                     if not infos:
                         raise OSError(f"getaddrinfo({addr!r}) returned empty list")
-                    resolved[key] = infos[0]
-                first = resolved.get("local") or resolved["remote"]
-                fam = first[0]
-                # Both ends must live in the same address family; the
-                # socket has exactly one.
-                for key, info in resolved.items():
-                    if info[0] != fam:
-                        raise ValueError(
-                            "local_addr and remote_addr resolved to different "
-                            f"address families ({fam} vs {info[0]})"
-                        )
-                local_res = resolved.get("local")
-                remote_res = resolved.get("remote")
+                    candidates[key] = infos
+                # A family both ends can speak, not merely the family the
+                # first result of one of them happens to have. With
+                # AF_UNSPEC an IPv4 local_addr and a dual-stack remote that
+                # lists IPv6 first are perfectly compatible, and comparing
+                # only infos[0] rejected exactly that pair.
+                families = [
+                    dict.fromkeys(i[0] for i in infos) for infos in candidates.values()
+                ]
+                common = [f for f in families[0] if all(f in fs for fs in families[1:])]
+                if not common:
+                    raise ValueError(
+                        "local_addr and remote_addr have no address family in common "
+                        f"({[list(fs) for fs in families]})"
+                    )
+                fam = common[0]
+                local_res = next(
+                    (i for i in candidates.get("local", ()) if i[0] == fam), None
+                )
+                remote_res = next(
+                    (i for i in candidates.get("remote", ()) if i[0] == fam), None
+                )
             udp_sock = socket_module.socket(fam, socket_module.SOCK_DGRAM, proto)
             try:
                 if reuse_port:
@@ -726,37 +735,46 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     async def _sendfile_native_fd(self, fd, file, offset, count):
         in_fd = file.fileno()
         total = 0
-        while True:
-            blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
-            if blocksize <= 0:
-                break
-            try:
-                sent = os.sendfile(fd, in_fd, offset + total, blocksize)
-            except BlockingIOError:
-                sent = None
-            except InterruptedError:
-                continue
-            if sent == 0:
-                break  # end of file
-            if sent is not None:
-                total += sent
-                continue
-            # Socket buffer full: wait for writability.
-            fut = self.create_future()
+        # The file position must reflect what actually reached the peer
+        # even when this raises or is cancelled part-way. Advancing it only
+        # on the success path left tell() at the original offset after an
+        # interrupted transfer whose bytes had already gone out, so a
+        # caller retrying from the reported position duplicated them.
+        # `total` is a local of this frame, so the finally sees whatever
+        # the loop reached and concurrent sendfiles stay independent.
+        try:
+            while True:
+                blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
+                if blocksize <= 0:
+                    break
+                try:
+                    sent = os.sendfile(fd, in_fd, offset + total, blocksize)
+                except BlockingIOError:
+                    sent = None
+                except InterruptedError:
+                    continue
+                if sent == 0:
+                    break  # end of file
+                if sent is not None:
+                    total += sent
+                    continue
+                # Socket buffer full: wait for writability.
+                fut = self.create_future()
 
-            def on_writable():
-                if not fut.done():
-                    fut.set_result(None)
+                def on_writable():
+                    if not fut.done():
+                        fut.set_result(None)
 
-            self._core.add_writer(fd, on_writable)
-            try:
-                await fut
-            finally:
-                self._core.remove_writer(fd)
-        # stdlib convention: leave the file object positioned after the
-        # bytes sent.
-        file.seek(offset + total)
-        return total
+                self._core.add_writer(fd, on_writable)
+                try:
+                    await fut
+                finally:
+                    self._core.remove_writer(fd)
+            return total
+        finally:
+            # stdlib convention: leave the file positioned after the bytes
+            # actually sent.
+            file.seek(offset + total)
 
     async def _sendfile_fallback(self, transport, file, offset, count):
         # Seek unconditionally: with the default offset=0 the old guard
@@ -764,33 +782,29 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # sent from the file's CURRENT position while the native path sent
         # from byte zero — the same call returning different bytes
         # depending on which path was taken.
-        file.seek(offset)
+        #
+        # File I/O goes through the executor. This path serves EVERY
+        # Windows transport and every SSL one, so a disk (or network-
+        # backed file) that is slow to read would otherwise stall every
+        # connection the loop is serving for the duration of each read.
+        # asyncio's own fallback does the same.
         total = 0
-        while True:
-            blocksize = 16384 if count is None else min(count - total, 16384)
-            if blocksize <= 0:
-                break
-            data = file.read(blocksize)
-            if not data:
-                break
-            transport.write(data)
-            total += len(data)
-            while transport.get_write_buffer_size() > 64 * 1024:
-                await tasks.sleep(0.001)
-        return total
-
-
-
-
-
-
-
-
-
-
-
-
-
+        try:
+            await self.run_in_executor(None, file.seek, offset)
+            while True:
+                blocksize = 16384 if count is None else min(count - total, 16384)
+                if blocksize <= 0:
+                    break
+                data = await self.run_in_executor(None, file.read, blocksize)
+                if not data:
+                    break
+                transport.write(data)
+                total += len(data)
+                while transport.get_write_buffer_size() > 64 * 1024:
+                    await tasks.sleep(0.001)
+            return total
+        finally:
+            await self.run_in_executor(None, file.seek, offset + total)
 
     def add_signal_handler(self, sig, callback, *args):
         """R-052. The Python-level handler runs on the main thread once

@@ -481,6 +481,16 @@ fn percent_decode(path: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The ASGI two-item form of a transport address (see `build_scope`).
+fn asgi_addr(py: Python<'_>, addr: Option<&Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    let Some(addr) = addr else { return Ok(py.None()) };
+    let bound = addr.bind(py);
+    match bound.len() {
+        Ok(n) if n > 2 => Ok((bound.get_item(0)?, bound.get_item(1)?).into_pyobject(py)?.into_any().unbind()),
+        _ => Ok(addr.clone_ref(py)),
+    }
+}
+
 fn build_scope<'py>(
     py: Python<'py>,
     req: &Request,
@@ -543,7 +553,7 @@ fn build_scope<'py>(
     // request targets (proxies always send them, and any client may), so
     // strip scheme://authority first — otherwise `path` becomes
     // "http://host/x" and every route misses.
-    let target = origin_form(&req.url);
+    let (authority, target) = absolute_form_parts(&req.url);
     let q = target.iter().position(|&b| b == b'?');
     let (raw_path, query) = match q {
         Some(i) => (&target[..i], &target[i + 1..]),
@@ -563,17 +573,31 @@ fn build_scope<'py>(
 
     let headers = PyList::empty(py);
     for (name, value) in &req.headers {
+        // RFC 7230 5.4: for an absolute-form target the AUTHORITY is
+        // definitive and any Host header is to be ignored. Rewriting it
+        // here rather than appending keeps the scope self-consistent --
+        // an application that reads Host must not see a value an
+        // intermediary already declined to route on.
+        let value: &[u8] = match authority {
+            Some(a) if name.as_slice() == b"host" => a,
+            _ => value,
+        };
         headers.append(PyTuple::new(py, [PyBytes::new(py, name), PyBytes::new(py, value)])?)?;
     }
+    if let Some(a) = authority {
+        if !req.headers.iter().any(|(n, _)| n.as_slice() == b"host") {
+            headers.append(PyTuple::new(py, [PyBytes::new(py, b"host"), PyBytes::new(py, a)])?)?;
+        }
+    }
     scope.set_item(intern!(py, "headers"), headers)?;
-    match peer {
-        Some(p) => scope.set_item(intern!(py, "client"), p)?,
-        None => scope.set_item(intern!(py, "client"), py.None())?,
-    }
-    match local {
-        Some(p) => scope.set_item(intern!(py, "server"), p)?,
-        None => scope.set_item(intern!(py, "server"), py.None())?,
-    }
+    // ASGI defines `client` and `server` as two-item [host, port]
+    // iterables. The transport keeps the full socket form, which for IPv6
+    // is (host, port, flowinfo, scope_id) -- correct there, since that is
+    // what the socket APIs take and return, but handing it to an
+    // application breaks the near-universal `host, port = scope["client"]`
+    // on IPv6 requests only.
+    scope.set_item(intern!(py, "client"), asgi_addr(py, peer)?)?;
+    scope.set_item(intern!(py, "server"), asgi_addr(py, local)?)?;
     // R-081: lifespan state, shallow-copied per request (ASGI spec).
     let state_copy = match state.bind(py).cast::<PyDict>() {
         Ok(d) if !d.is_empty() => d.copy()?,
@@ -846,14 +870,23 @@ fn validate_response_header(name: &[u8], value: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Reduce a request target to its origin-form (path + query).
+/// Split a request target into `(authority, origin-form)`.
 ///
-/// absolute-form (`http://host/p?q`) is stripped to `/p?q`; asterisk-form
-/// (`*`) and authority-form (`host:port`, CONNECT) have no path and map to
-/// `/`. Anything already in origin-form is returned unchanged.
-fn origin_form(url: &[u8]) -> &[u8] {
+/// absolute-form (`http://host/p?q`) yields `(Some("host"), "/p?q")`;
+/// asterisk-form (`*`) and authority-form (`host:port`, CONNECT) have no
+/// path and map to `/`; anything already in origin-form passes through
+/// with no authority.
+///
+/// The authority matters, not just the path: RFC 7230 5.4 requires a
+/// recipient of an absolute-form request to use THAT authority and ignore
+/// any Host header -- and the difference is not academic. An intermediary
+/// routing on the request-target while this server's host routing,
+/// trusted-host middleware or cache key reads a conflicting header is a
+/// routing-confusion primitive, and the header is entirely
+/// attacker-controlled.
+fn absolute_form_parts(url: &[u8]) -> (Option<&[u8]>, &[u8]) {
     if url.first() == Some(&b'/') {
-        return url;
+        return (None, url);
     }
     // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
     let scheme_len = url
@@ -864,12 +897,12 @@ fn origin_form(url: &[u8]) -> &[u8] {
         scheme_len > 0 && url[0].is_ascii_alphabetic() && url.get(scheme_len..scheme_len + 3) == Some(b"://");
     if !is_absolute {
         // asterisk-form or authority-form: no path component.
-        return b"/";
+        return (None, b"/");
     }
-    let after_authority = scheme_len + 3;
-    match url[after_authority..].iter().position(|&b| matches!(b, b'/' | b'?' | b'#')) {
-        Some(i) => &url[after_authority + i..],
-        None => b"/",
+    let start = scheme_len + 3;
+    match url[start..].iter().position(|&b| matches!(b, b'/' | b'?' | b'#')) {
+        Some(i) => (Some(&url[start..start + i]), &url[start + i..]),
+        None => (Some(&url[start..]), b"/"),
     }
 }
 
@@ -1526,7 +1559,19 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
                 }
                 plaintext.extend_from_slice(&chunk);
             }
-            Err(e) if e.matches(py, want_read).unwrap_or(false) => break,
+            // WANT_WRITE is retryable here too, not just on the write
+            // path: after the handshake, a TLS state transition (a
+            // renegotiation or a key update) can require records to go
+            // OUT before decryption can continue. Treating it as fatal
+            // tore down a perfectly valid session; the pump below flushes
+            // whatever the transition produced and the peer's answer
+            // re-enters through tls_ingest.
+            Err(e)
+                if e.matches(py, want_read).unwrap_or(false)
+                    || e.matches(py, want_write).unwrap_or(false) =>
+            {
+                break
+            }
             Err(_) => {
                 core.with_net(|net, reactor| {
                     net::teardown_with(py, net, reactor.backend_mut(), tid, None);

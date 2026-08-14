@@ -11,6 +11,16 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | ASGI | IPv6 `client`/`server` leaked the 4-item socket form into the scope | `HEAD` |
+> | HTTP | Absolute-form target: authority now overrides a conflicting `Host` | `HEAD` |
+> | TLS | `SSLWantWrite` while decrypting tore down a valid session | `HEAD` |
+> | Transport | `eof_received` raising left the connection half-open forever | `HEAD` |
+> | Transport | `wire_stream` leaked the socket when protocol discovery failed | `HEAD` |
+> | Transport | `create_connection(sock=)` accepted a datagram socket | `HEAD` |
+> | Transport | `sendfile` misreported the file position after a failed transfer | `HEAD` |
+> | Transport | `sendfile` fallback read files on the loop thread | `HEAD` |
+> | UDP | Datagram family match compared only the first `getaddrinfo` result | `HEAD` |
+> | Windows | Affinity mask overflowed above 64 CPUs, crashing those workers | `HEAD` |
 > | Buffers | `SlotId` had no generation: a stale id could free a live buffer | `cd90483` |
 > | OpSlab | An out-of-range `OpId` panicked before the generation check ran | `cd90483` |
 > | ADR-24 | `/bg` trace markers removed; op-target breakdown kept in `stats()` | `d4cfe3e` |
