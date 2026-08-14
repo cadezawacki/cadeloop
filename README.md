@@ -11,10 +11,10 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP/TLS | Staged plaintext now counted in ASGI backpressure (was inert on HTTPS) | `HEAD` |
-> | HTTP | 304 keeps its `Content-Length` (my 204 strip was too broad) | `HEAD` |
-> | Worker | Failed `http_adopt` no longer double-closes the descriptor | `HEAD` |
-> | Net | `udp_wire` / `listener_start` roll back a half-created endpoint or listener | `HEAD` |
+> | HTTP/TLS | Staged plaintext now counted in ASGI backpressure (was inert on HTTPS) | `ee37f02` |
+> | HTTP | 304 keeps its `Content-Length` (my 204 strip was too broad) | `ee37f02` |
+> | Worker | Failed `http_adopt` no longer double-closes the descriptor | `ee37f02` |
+> | Net | `udp_wire` / `listener_start` roll back a half-created endpoint or listener | `ee37f02` |
 > | Server | Grace deadline now entered as soon as shutdown begins | `d1f471f` |
 > | UDP | Endpoint torn down when `connection_made` raises | `d1f471f` |
 > | HTTP | 1xx rejected on the final-response path; `Content-Length` stripped from 204 | `38cdbd9` |
