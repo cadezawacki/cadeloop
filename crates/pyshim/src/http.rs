@@ -891,13 +891,36 @@ impl HttpReceive {
             }
             R::Wait(pyloop) => {
                 let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
+                // Prune waiters a cancelled receive() left behind BEFORE
+                // parking the new one: the heartbeat pattern
+                // (wait_for(receive(), t) in a loop) cancels one future
+                // per poll, and retaining them grew the queue without
+                // bound on an idle connection. done() is a Python call,
+                // so the queue is taken out of the cell, filtered here,
+                // and put back in one uninterrupted stretch of loop-thread
+                // code.
+                let parked =
+                    core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.take_recv_waiters()))?;
+                let live: VecDeque<Py<PyAny>> = parked
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|w| {
+                        let done: bool = w
+                            .bind(py)
+                            .call_method0(intern!(py, "done"))
+                            .and_then(|v| v.extract())
+                            .unwrap_or(true);
+                        !done
+                    })
+                    .collect();
                 let store = fut.clone().unbind();
-                // Parked, never displacing: an earlier waiter still gets
-                // resolved (disconnect resolves every one; a WS wake
+                // Parked, never displacing: an earlier live waiter still
+                // gets resolved (disconnect resolves every one; a WS wake
                 // hands out one message per waiter). The unstored clone
                 // in the None arm drops out-of-cell, here.
                 let unstored = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
                     Some(conn) => {
+                        conn.recv_waiters = live;
                         conn.recv_waiters.push_back(store);
                         None
                     }

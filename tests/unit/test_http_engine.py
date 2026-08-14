@@ -396,6 +396,39 @@ def test_net_error_hook_raising_fatal_stops_the_loop(loop):
     loop._core.listener_close(lid)
 
 
+def test_cancelled_receive_waiters_are_pruned(loop):
+    """A cancelled receive() future must not stay parked forever: the
+    heartbeat pattern (wait_for(receive(), t) in a loop) would grow the
+    waiter queue without bound on an idle connection. Parking a new
+    waiter prunes the dead ones. Reported by Codex on PR #4 against the
+    waiter-queue fix."""
+    import gc
+    import weakref
+
+    results = {}
+
+    async def app(scope, receive, send):
+        await receive()  # body
+        refs = []
+        for _ in range(10):
+            f = receive()  # parks a waiter
+            refs.append(weakref.ref(f))
+            f.cancel()
+            del f
+        f = receive()  # parking this one prunes the ten cancelled
+        f.cancel()
+        del f
+        gc.collect()
+        results["alive"] = sum(1 for r in refs if r() is not None)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert results["alive"] == 0, f"{results['alive']} cancelled waiters retained"
+    loop._core.listener_close(lid)
+
+
 def test_concurrent_receive_waiters_all_resolve_on_disconnect(loop):
     """Two receive() calls awaiting concurrently must BOTH resolve when
     the client disconnects. Parking the second waiter used to displace
