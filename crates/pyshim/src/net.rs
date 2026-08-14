@@ -2046,13 +2046,38 @@ fn on_accept_done(net: &mut NetState, backend: Backend<'_>, lid: u64, op: OpId, 
 
 /// Dispatch translated events. Fatal (KeyboardInterrupt/SystemExit) errors
 /// propagate; protocol exceptions route to the loop's exception handler.
+///
+/// A fatal error must not take the rest of the batch with it: the
+/// undispatched tail carries waiter futures, buffer slots, and lifecycle
+/// callbacks that would otherwise be lost for good. It goes back to the
+/// FRONT of the pending-event queue (ahead of anything pushed while this
+/// batch ran), so the next tick dispatches it in the original order --
+/// the same unwind contract the ready-callback batch keeps.
 pub(crate) fn dispatch_events(
     py: Python<'_>,
     slf: &Bound<'_, CoreLoop>,
     events: Vec<NetEvent>,
 ) -> PyResult<()> {
+    let mut events = events.into_iter();
+    while let Some(event) = events.next() {
+        if let Err(e) = dispatch_one_event(py, slf, event) {
+            let rest: Vec<NetEvent> = events.collect();
+            if !rest.is_empty() {
+                slf.get().with_net(|net, _| {
+                    let mut later = std::mem::take(&mut net.events);
+                    net.events = rest;
+                    net.events.append(&mut later);
+                })?;
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent) -> PyResult<()> {
     let core = slf.get();
-    for event in events {
+    {
         match event {
             NetEvent::Data { tid, data_received, payload } => {
                 let res = data_received.call1(py, (payload,));

@@ -419,6 +419,51 @@ def test_create_server_raises_when_no_family_is_available(loop):
         loop._core = real_core
 
 
+def test_undispatched_events_survive_a_fatal_callback(loop):
+    """A KeyboardInterrupt from one protocol callback unwinds the tick,
+    but the rest of that dispatch batch must be reclaimed, not dropped:
+    the tail carries other connections' data and lifecycle events.
+    Both parked sends below arrive in one batch; each delivery raises,
+    and both must have been delivered once the loop is resumed twice.
+    Reported on PR #1."""
+    protos = []
+    seen = []
+
+    class P(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.transport = transport
+            protos.append(self)
+
+        def data_received(self, data):
+            seen.append(data)
+            raise KeyboardInterrupt
+
+    async def setup():
+        server = await loop.create_server(P, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        c1 = socket.create_connection(("127.0.0.1", port))
+        c2 = socket.create_connection(("127.0.0.1", port))
+        for _ in range(200):
+            if len(protos) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(protos) == 2
+        return server, c1, c2
+
+    server, c1, c2 = loop.run_until_complete(setup())
+    # The loop is parked: both sends queue in the kernel, so the two
+    # receive completions are reaped into a single dispatch batch.
+    c1.sendall(b"a")
+    c2.sendall(b"b")
+    for _ in range(2):
+        with pytest.raises(KeyboardInterrupt):
+            loop.run_until_complete(asyncio.sleep(0.5))
+    assert sorted(seen) == [b"a", b"b"]
+    c1.close()
+    c2.close()
+    server.close()
+
+
 def test_create_server_validates_reuse_port_and_ssl_shutdown(loop):
     async def main():
         with pytest.raises(ValueError, match="ssl_shutdown_timeout"):

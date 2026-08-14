@@ -11,7 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | TCP | `create_server` failed outright when one resolved address family was unavailable instead of serving the rest | `` |
+> | Net | A fatal callback error dropped the rest of its dispatch batch: other connections' events were lost for good | `` |
+> | TCP | `create_server` failed outright when one resolved address family was unavailable instead of serving the rest | `7464cd6` |
 > | UDP | `allow_broadcast` + `remote_addr` connected the socket, so replies from any other source were silently dropped | `82426cb` |
 > | UDP | AF_UNIX datagram paths went through the Internet resolver, and a unix sender's source address was dropped on receive | `86d609f` |
 > | Loop | An exception handler raising `KeyboardInterrupt`/`SystemExit` was demoted to an unraisable warning; the loop kept running | `2813bb9` |
