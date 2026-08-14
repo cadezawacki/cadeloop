@@ -11,11 +11,11 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | HTTP | `Expect: 100-continue` ignored; oversized declared bodies now refused early | `HEAD` |
-> | HTTP | 205 sent no framing at all, desynchronising the keep-alive stream | `HEAD` |
-> | Transport | `get_extra_info("socket")` dup kept the connection alive past close | `HEAD` |
-> | Server | Supervisor's blocking `waitpid` never reached the grace deadline | `HEAD` |
-> | Transport | `create_server(sock=)` accepted a datagram socket | `HEAD` |
+> | HTTP | `Expect: 100-continue` ignored; oversized declared bodies now refused early | `91a5c74` |
+> | HTTP | 205 sent no framing at all, desynchronising the keep-alive stream | `91a5c74` |
+> | Transport | `get_extra_info("socket")` dup kept the connection alive past close | `91a5c74` |
+> | Server | Supervisor's blocking `waitpid` never reached the grace deadline | `91a5c74` |
+> | Transport | `create_server(sock=)` accepted a datagram socket | `91a5c74` |
 > | TLS | Close sent no `close_notify`: strict clients got `SSLEOFError` and lost the response | `7bc7486` |
 > | Transport | `get_extra_info("socket")` answered (non-owning dup, built once) | `2b579c7` |
 > | Net | IPv6 addresses lost flowinfo/scope_id; `sendto` now takes the 4-tuple | `2b579c7` |
