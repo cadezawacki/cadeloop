@@ -657,6 +657,55 @@ fn send_err(e: SendErr) -> PyErr {
 }
 
 /// Handle one ASGI send() message: validate, serialize, enqueue (R-084;
+/// R-086: reject response header fields that could forge the message frame.
+///
+/// An ASGI application reflecting unsanitized request data into a header
+/// must not be able to smuggle CRLF and split the response (or inject
+/// headers into it). Names are RFC 7230 tokens; values may not carry CR,
+/// LF, NUL or other C0 controls. Rejecting is safe here because nothing
+/// has been committed yet — the caller turns this into the R-086
+/// RuntimeError path, which answers 500 since the response never started.
+fn validate_response_header(name: &[u8], value: &[u8]) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty header name".to_string());
+    }
+    if let Some(&b) = name.iter().find(|&&b| !is_tchar(b)) {
+        return Err(format!("invalid byte {b:#04x} in header name"));
+    }
+    if let Some(&b) = value.iter().find(|&&b| !is_field_vchar(b)) {
+        return Err(format!("invalid byte {b:#04x} in header value"));
+    }
+    Ok(())
+}
+
+/// RFC 7230 `tchar`.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Legal inside a field value: HTAB, SP, VCHAR, and obs-text. Notably NOT
+/// CR/LF/NUL (frame forgery) or the remaining C0 controls / DEL.
+fn is_field_vchar(b: u8) -> bool {
+    b == b'\t' || (0x20..=0x7e).contains(&b) || b >= 0x80
+}
+
 /// R-086 protocol violations raise RuntimeError).
 fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, PyDict>) -> PyResult<()> {
     let mtype: Bound<'_, PyAny> = message
@@ -690,6 +739,11 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 let pair = item?;
                 let name: Vec<u8> = pair.get_item(0)?.extract()?;
                 let value: Vec<u8> = pair.get_item(1)?.extract()?;
+                if let Err(why) = validate_response_header(&name, &value) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "ASGI application sent an invalid response header: {why}"
+                    )));
+                }
                 if name.eq_ignore_ascii_case(b"content-length") {
                     saw_length = true;
                 }

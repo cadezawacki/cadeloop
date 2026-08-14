@@ -32,7 +32,14 @@ def main() -> int:
         for loop, base_entry in per_loop.items():
             if base_entry is None:
                 continue
-            cur_entry = current.get(bench, {}).get(loop)
+            cur_bench = current.get(bench, {})
+            if loop in cur_bench and cur_bench[loop] is None:
+                # Present but null: the harness ran this benchmark and it
+                # crashed or timed out. That is a hard failure — skipping it
+                # would let every benchmark die and still report PASS.
+                failures.append(f"{bench}/{loop}: failed to produce a result")
+                continue
+            cur_entry = cur_bench.get(loop)
             if cur_entry is None:
                 # A loop the baseline measured but this run did not is NOT a
                 # regression — the run simply covered a narrower --loops set

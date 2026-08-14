@@ -1052,3 +1052,55 @@ def test_http_listen_fd_adopts_existing_listener(loop):
 
     loop.run_until_complete(main())
     loop._core.listener_close(lid)
+
+
+def test_response_header_injection_is_rejected(loop):
+    """R-086: an app reflecting unsanitized input into a header must not be
+    able to forge the response frame (CRLF injection / response splitting).
+    Reported by Codex review on PR #1."""
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            # The classic shape: attacker-controlled value smuggling a
+            # header terminator plus a whole second response.
+            "headers": [(b"x-echo", b"a\r\nx-injected: yes\r\n\r\nHTTP/1.1 200 OK")],
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert b"x-injected" not in resp.lower(), "header injection reached the wire"
+    assert resp.count(b"HTTP/1.1") == 1, "response was split"
+    assert b"500" in resp.split(b"\r\n", 1)[0]
+    loop._core.listener_close(lid)
+
+
+def test_valid_response_headers_still_pass(loop):
+    """The injection guard must not reject ordinary headers — including
+    obs-text (>=0x80) bytes, which RFC 7230 permits in field values."""
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"x-token-name_123", b"plain value"),
+                (b"x-tabbed", b"has\tinternal tab"),
+                (b"x-obs-text", "café".encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert b" 200 " in resp.split(b"\r\n", 1)[0], resp[:120]
+    assert b"x-obs-text" in resp.lower()
+    loop._core.listener_close(lid)
