@@ -2236,6 +2236,24 @@ fn cache_proto(py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<ProtoRef
 /// application can no longer be passed back to `sendto()`, because
 /// without the interface scope the reply is unroutable or leaves through
 /// the wrong interface.
+/// The Python form of a socket address of any family.
+///
+/// AF_UNIX is a plain path string (or `""` for an unnamed socket), which
+/// is what the socket module and asyncio both use. Before this, an
+/// AF_UNIX address failed to parse as an Internet one and was dropped, so
+/// `get_extra_info("peername"/"sockname")` returned None on a live Unix
+/// connection.
+fn any_addr_tuple(py: Python<'_>, addr: Option<netsys::Addr>) -> Option<Py<PyAny>> {
+    match addr {
+        Some(netsys::Addr::Inet(a)) => addr_tuple(py, Some(a)),
+        Some(netsys::Addr::Unix(path)) => {
+            let s = String::from_utf8_lossy(&path).into_owned();
+            Some(s.into_pyobject(py).ok()?.into_any().unbind())
+        }
+        None => None,
+    }
+}
+
 fn addr_tuple(py: Python<'_>, addr: Option<std::net::SocketAddr>) -> Option<Py<PyAny>> {
     addr.map(|a| match a {
         std::net::SocketAddr::V4(v4) => {
@@ -2276,8 +2294,8 @@ pub(crate) fn wire_stream(
         }
     };
     let _ = netsys::set_nodelay(sock, true); // R-038
-    let peer = addr_tuple(py, netsys::peername(sock).ok());
-    let name = addr_tuple(py, netsys::sockname(sock).ok());
+    let peer = any_addr_tuple(py, netsys::peername_any(sock).ok());
+    let name = any_addr_tuple(py, netsys::sockname_any(sock).ok());
     // A protocol without connection_made reaches here with the descriptor
     // still unowned; `?` alone would have dropped it on the floor.
     let connection_made = match protocol.getattr("connection_made") {
@@ -2353,8 +2371,8 @@ pub(crate) fn wire_http(
 ) -> PyResult<()> {
     let core = slf.get();
     let _ = netsys::set_nodelay(sock, true); // R-038
-    let peer = addr_tuple(py, netsys::peername(sock).ok());
-    let name = addr_tuple(py, netsys::sockname(sock).ok());
+    let peer = any_addr_tuple(py, netsys::peername_any(sock).ok());
+    let name = any_addr_tuple(py, netsys::sockname_any(sock).ok());
     let (high, low) = core.water_marks();
     // OWNERSHIP: the CALLER owns `sock` until this returns Ok. Closing it
     // here as well as in the caller's error path meant a failed adoption

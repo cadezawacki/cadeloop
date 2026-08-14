@@ -1710,3 +1710,41 @@ def test_sendfile_reports_position_after_an_interrupted_transfer(loop, monkeypat
         finally:
             a.close()
             b.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX transports are POSIX-only (R-057)")
+def test_unix_transport_reports_its_addresses(loop, tmp_path):
+    """netsys::peername/sockname only parsed Internet sockaddrs, so an
+    AF_UNIX connection's addresses failed to parse and were dropped:
+    get_extra_info returned None on a live transport, leaving no way to
+    learn the socket path."""
+    path = str(tmp_path / "s.sock")
+    got = {}
+
+    class P(asyncio.Protocol):
+        def connection_made(self, transport):
+            got["server_peer"] = transport.get_extra_info("peername")
+            got["server_sock"] = transport.get_extra_info("sockname")
+
+    async def main():
+        server = await loop.create_unix_server(P, path)
+        try:
+            transport, _ = await loop.create_unix_connection(asyncio.Protocol, path)
+            try:
+                assert transport.get_extra_info("sockname") is not None
+                assert transport.get_extra_info("peername") == path, (
+                    transport.get_extra_info("peername")
+                )
+                for _ in range(50):
+                    await asyncio.sleep(0.02)
+                    if got:
+                        break
+                assert got.get("server_sock") == path, got
+            finally:
+                transport.close()
+                await asyncio.sleep(0.05)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())

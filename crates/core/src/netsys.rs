@@ -51,6 +51,39 @@ pub fn build_sockaddr(addr: SocketAddr) -> SockAddrBuf {
     out
 }
 
+/// A socket address in the forms this engine has to carry.
+///
+/// `SocketAddr` cannot represent an AF_UNIX path, so a Unix connection's
+/// peer and local addresses were simply dropped -- `get_extra_info`
+/// returned None on a live `create_unix_connection` /
+/// `create_unix_server` transport, leaving no way to learn the peer or
+/// the socket path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Addr {
+    Inet(SocketAddr),
+    /// Filesystem path, or a leading NUL for the Linux abstract namespace.
+    /// Empty for an unnamed socket, which is what asyncio reports too.
+    Unix(Vec<u8>),
+}
+
+/// AF_UNIX sockaddr -> path bytes. `sun_path` starts at offset 2 and is
+/// NUL-terminated for a filesystem socket; in Linux's abstract namespace
+/// the FIRST byte is NUL and the rest is significant, so it cannot simply
+/// be truncated at the first NUL.
+pub fn parse_unix_sockaddr(buf: &[u8]) -> Option<Vec<u8>> {
+    const AF_UNIX_FAMILY: i32 = 1;
+    if buf.len() < 2 || u16::from_ne_bytes([buf[0], buf[1]]) as i32 != AF_UNIX_FAMILY {
+        return None;
+    }
+    let path = &buf[2..];
+    if path.first() == Some(&0) {
+        let end = path.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        return Some(path[..end].to_vec());
+    }
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    Some(path[..end].to_vec())
+}
+
 pub fn parse_sockaddr(buf: &[u8]) -> Option<SocketAddr> {
     if buf.len() < 8 {
         return None;
@@ -160,11 +193,35 @@ mod imp {
         sock: RawSocket,
         f: unsafe extern "C" fn(i32, *mut libc::sockaddr, *mut libc::socklen_t) -> i32,
     ) -> io::Result<SocketAddr> {
+        match any_name_of(sock, f)? {
+            Addr::Inet(a) => Ok(a),
+            Addr::Unix(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "not an internet address")),
+        }
+    }
+
+    fn any_name_of(
+        sock: RawSocket,
+        f: unsafe extern "C" fn(i32, *mut libc::sockaddr, *mut libc::socklen_t) -> i32,
+    ) -> io::Result<Addr> {
         let mut buf = [0u8; 128];
         let mut len = buf.len() as libc::socklen_t;
         cvt(unsafe { f(sock as i32, buf.as_mut_ptr().cast(), &mut len) })?;
-        parse_sockaddr(&buf[..len as usize])
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unparseable sockaddr"))
+        let raw = &buf[..len as usize];
+        if let Some(a) = parse_sockaddr(raw) {
+            return Ok(Addr::Inet(a));
+        }
+        if let Some(p) = parse_unix_sockaddr(raw) {
+            return Ok(Addr::Unix(p));
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData, "unparseable sockaddr"))
+    }
+
+    pub fn peername_any(sock: RawSocket) -> io::Result<Addr> {
+        any_name_of(sock, libc::getpeername)
+    }
+
+    pub fn sockname_any(sock: RawSocket) -> io::Result<Addr> {
+        any_name_of(sock, libc::getsockname)
     }
 
     pub fn peername(sock: RawSocket) -> io::Result<SocketAddr> {
@@ -297,6 +354,16 @@ mod imp {
         unsafe { closesocket(sock) };
     }
 
+    /// AF_UNIX transports are POSIX-only here (R-057), so on Windows the
+    /// "any" forms are just the Internet ones.
+    pub fn peername_any(sock: RawSocket) -> io::Result<Addr> {
+        peername(sock).map(Addr::Inet)
+    }
+
+    pub fn sockname_any(sock: RawSocket) -> io::Result<Addr> {
+        sockname(sock).map(Addr::Inet)
+    }
+
     pub fn peername(sock: RawSocket) -> io::Result<SocketAddr> {
         let mut buf = [0u8; 128];
         let mut len = buf.len() as i32;
@@ -321,8 +388,8 @@ mod imp {
 }
 
 pub use imp::{
-    bind, close, create_tcp, listen, peername, set_fastopen, set_loopback_fast_path, set_nodelay,
-    set_reuse_addr, set_reuse_port, set_v6only, shutdown_send, sockname,
+    bind, close, create_tcp, listen, peername, peername_any, set_fastopen, set_loopback_fast_path,
+    set_nodelay, set_reuse_addr, set_reuse_port, set_v6only, shutdown_send, sockname, sockname_any,
 };
 
 #[cfg(test)]
