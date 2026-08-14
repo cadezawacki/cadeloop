@@ -2303,3 +2303,40 @@ def test_shutdown_drains_a_response_whose_bytes_are_still_queued():
         if not lp.is_closed():
             lp.close()
     assert len(got[0]) == len(body), f"{len(got[0])} of {len(body)} bytes"
+
+
+def test_awaiting_a_foreign_loops_future_fails_the_request(loop):
+    """An eager ASGI app that awaits a Future belonging to another event
+    loop used to have `_wake` registered on it with no check. If that loop
+    is not running the request hangs for good; if it runs on another
+    thread, `_wake` fires there and StateCell rejects the cross-thread
+    access, wedging the request behind a logged exception. asyncio.Task
+    raises RuntimeError into the coroutine instead, which reaches the
+    app-failure path and ends the request. Reported by Codex on PR #1."""
+    other = asyncio.new_event_loop()
+    try:
+        foreign = other.create_future()
+
+        async def app(scope, receive, send):
+            if scope["type"] == "lifespan":  # pragma: no cover
+                return
+            await foreign  # never resolves, and not ours anyway
+
+        lid, port = listen(loop, app)
+
+        async def main():
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(), 5.0)
+            writer.close()
+            return data
+
+        resp = loop.run_until_complete(main())
+        loop._core.listener_close(lid)
+    finally:
+        other.close()
+
+    # The point is that the request TERMINATES rather than hanging until
+    # the read times out; a 500 is the app-failure path doing its job.
+    assert resp.startswith(b"HTTP/1.1 500"), resp[:80]

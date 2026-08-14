@@ -1841,6 +1841,20 @@ fn ws_send(
                             String::from_utf8_lossy(&name)
                         )));
                     }
+                    // Extensions are negotiated, not declared, and this
+                    // engine negotiates none -- `WsRx` fails any frame
+                    // with an RSV bit set (RFC 6455 5.2). Forwarding an
+                    // app's `permessage-deflate` therefore told the client
+                    // to compress and then killed the connection with 1002
+                    // on its first data frame, which reads as a client
+                    // bug. Refuse at accept time instead.
+                    if name.eq_ignore_ascii_case(b"sec-websocket-extensions") {
+                        return Err(PyRuntimeError::new_err(
+                            "websocket.accept may not set 'sec-websocket-extensions'; this \
+                             engine negotiates no extensions, and a client that honoured the \
+                             header would be disconnected for setting a reserved bit",
+                        ));
+                    }
                     extra.push((name, value));
                 }
             }
@@ -2727,6 +2741,16 @@ impl AppTask {
     }
 }
 
+/// The loop a future is attached to, mirroring `asyncio.futures._get_loop`:
+/// `get_loop()` when it exists, else the `_loop` attribute. `None` when
+/// neither is available -- an awaitable too exotic to judge, left alone.
+fn future_loop<'py>(py: Python<'py>, fut: &Bound<'py, PyAny>) -> Option<Bound<'py, PyAny>> {
+    if let Ok(get_loop) = fut.getattr(intern!(py, "get_loop")) {
+        return get_loop.call0().ok();
+    }
+    fut.getattr(intern!(py, "_loop")).ok()
+}
+
 impl AppTask {
     pub(crate) fn spawn(
         py: Python<'_>,
@@ -2879,6 +2903,25 @@ impl AppTask {
                     // asyncio future protocol (Task.__step semantics).
                     match y.getattr(intern!(py, "_asyncio_future_blocking")) {
                         Ok(flag) if !flag.is_none() => {
+                            // A Future belonging to another loop must not
+                            // simply be subscribed to. If that loop is not
+                            // running the request hangs for good; if it is
+                            // running on another thread, `_wake` fires
+                            // there and StateCell rejects the cross-thread
+                            // access, leaving the request wedged behind a
+                            // logged exception. asyncio.Task raises into
+                            // the coroutine instead, which reaches the
+                            // app-failure path and ends the request --
+                            // match it (Task.__step_run_and_handle).
+                            if let (Some(fut_loop), Ok(owner)) = (future_loop(py, y), core.require_owner()) {
+                                if !fut_loop.is(owner.bind(py)) {
+                                    throw = Some(PyRuntimeError::new_err(format!(
+                                        "Task got Future {} attached to a different loop",
+                                        y.repr()?
+                                    )));
+                                    continue;
+                                }
+                            }
                             y.setattr(intern!(py, "_asyncio_future_blocking"), false)?;
                             let wake = slf.getattr(intern!(py, "_wake"))?;
                             y.call_method1(intern!(py, "add_done_callback"), (wake,))?;

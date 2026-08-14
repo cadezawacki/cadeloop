@@ -311,3 +311,53 @@ def test_serve_restores_the_collector_it_reconfigured():
         )
     finally:
         _gc.enable()
+
+
+def test_serve_accepts_a_hostname_not_just_an_ip_literal():
+    """`http_listen` parses its host with Rust's IpAddr, so a NAME --
+    `localhost`, or any DNS host -- was rejected outright with
+    `ValueError: invalid IP address`. Only the spawn supervisor resolved
+    anything, so `serve(app, host="localhost")` and the equivalent CLI
+    invocation failed at startup on every other worker model."""
+    import socket as _socket
+
+    from cadeloop.server import _bind_candidates
+
+    cands = _bind_candidates("localhost", 8000)
+    assert cands, "localhost resolved to nothing"
+    for ip, _flowinfo, _scope in cands:
+        # Every candidate must be something the native listener can parse.
+        _socket.inet_pton(
+            _socket.AF_INET6 if ":" in ip else _socket.AF_INET, ip
+        )
+
+    # None means "every interface", the way asyncio spells it.
+    assert _bind_candidates(None, 8000) == [("0.0.0.0", 0, 0)]
+
+    started = threading.Event()
+
+    async def app(scope, receive, send):
+        if scope["type"] != "lifespan":
+            return  # pragma: no cover
+        await receive()
+        await send({"type": "lifespan.startup.complete"})
+        lp = asyncio.get_running_loop()
+        lp.call_later(0.2, lp.stop)
+        started.set()
+
+    result = {}
+
+    def run():
+        try:
+            from cadeloop.server import _serve_single
+
+            _serve_single(app, "localhost", 0, cadeloop.Config(grace=0.0))
+        except BaseException as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    assert started.wait(20)
+    t.join(timeout=20)
+    assert not t.is_alive()
+    assert not result, f"serve(host='localhost') failed: {result.get('error')!r}"

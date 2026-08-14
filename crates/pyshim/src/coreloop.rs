@@ -92,7 +92,7 @@ impl CoreLoop {
         }
     }
 
-    fn require_owner(&self) -> PyResult<&Py<PyAny>> {
+    pub(crate) fn require_owner(&self) -> PyResult<&Py<PyAny>> {
         self.owner.get().ok_or_else(|| {
             PyRuntimeError::new_err("cadeloop: core has no owning Loop (set_owner was never called)")
         })

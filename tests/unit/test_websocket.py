@@ -438,7 +438,19 @@ def test_pre_accept_flood_is_bounded(loop):
 
 
 @pytest.mark.parametrize(
-    "header", [b"sec-websocket-accept", b"sec-websocket-protocol", b"upgrade", b"connection"]
+    "header",
+    [
+        b"sec-websocket-accept",
+        b"sec-websocket-protocol",
+        b"upgrade",
+        b"connection",
+        # Extensions are negotiated, not declared, and this engine
+        # negotiates none: WsRx fails any frame with an RSV bit set. An
+        # app advertising permessage-deflate therefore told the client to
+        # compress and then killed the connection with 1002 on its first
+        # data frame, which reads as a client bug. Reported by Codex.
+        b"sec-websocket-extensions",
+    ],
 )
 def test_reserved_upgrade_headers_are_rejected(loop, header):
     """The server generates the handshake fields itself; an app adding its
@@ -447,7 +459,8 @@ def test_reserved_upgrade_headers_are_rejected(loop, header):
 
     async def app(scope, receive, send):
         assert (await receive())["type"] == "websocket.connect"
-        await send({"type": "websocket.accept", "headers": [(header, b"x")]})
+        value = b"permessage-deflate" if header == b"sec-websocket-extensions" else b"x"
+        await send({"type": "websocket.accept", "headers": [(header, value)]})
 
     lid, port = listen(loop, app)
 

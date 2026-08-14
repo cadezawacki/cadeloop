@@ -227,6 +227,41 @@ def serve(
     return _serve_single(app, host, port, config, ssl_ctx=ssl)
 
 
+
+def _bind_candidates(host, port):
+    """Bind addresses the native listener will accept, in preference order.
+
+    ``http_listen`` parses its host with Rust's ``IpAddr``, so a name --
+    ``localhost``, or any DNS host -- was rejected outright with
+    ``ValueError: invalid IP address``. Only the spawn supervisor resolved
+    anything, so ``serve(app, host="localhost")`` and the equivalent CLI
+    invocation failed at startup on every other worker model.
+
+    Returns ``(ip, flowinfo, scope_id)`` triples: getaddrinfo is also what
+    carries the scope of a link-local address (``fe80::1%eth0``), which
+    the listener needs as separate sockaddr fields.
+    """
+    if host is None or host == "":
+        # asyncio spells "every interface" as None; the native listener
+        # binds one socket, so name the family explicitly.
+        host = "0.0.0.0"
+    infos = _socket.getaddrinfo(host, port, type=_socket.SOCK_STREAM, flags=_socket.AI_PASSIVE)
+    out = []
+    for family, _t, _p, _canon, sockaddr in infos:
+        if family == _socket.AF_INET:
+            cand = (sockaddr[0], 0, 0)
+        elif family == _socket.AF_INET6:
+            cand = (sockaddr[0], sockaddr[2] if len(sockaddr) > 2 else 0,
+                    sockaddr[3] if len(sockaddr) > 3 else 0)
+        else:
+            continue
+        if cand not in out:
+            out.append(cand)
+    if not out:
+        raise OSError(f"getaddrinfo returned no bindable address for {host!r}:{port}")
+    return out
+
+
 def _serve_single(
     app,
     host,
@@ -283,23 +318,38 @@ def _serve_single(
                 daemon=True,
             ).start()
         else:
-            lid, bound, _fd = loop._core.http_listen(
-                host,
-                port,
-                app,
-                loop,
-                state=lifespan.state,
-                reuse_port=reuse_port,
-                accept_pool=config.accept_pool,
-                eager=config.eager_tasks,
-                max_header_bytes=config.max_header_bytes,
-                max_headers=config.max_headers,
-                max_url=config.max_url,
-                max_body=config.max_body,
-                request_line_timeout=config.request_line_timeout,
-                keepalive_idle=config.keepalive_idle,
-                tls=ssl_ctx,
-            )
+            # Try every resolved address in turn: `localhost` resolves to
+            # ::1 first on most systems, and binding that fails outright
+            # on a host with IPv6 disabled even though 127.0.0.1 -- the
+            # next candidate -- would have worked.
+            candidates = _bind_candidates(host, port)
+            last_error = None
+            for ip, flowinfo, scope_id in candidates:
+                try:
+                    lid, bound, _fd = loop._core.http_listen(
+                        ip,
+                        port,
+                        app,
+                        loop,
+                        state=lifespan.state,
+                        reuse_port=reuse_port,
+                        accept_pool=config.accept_pool,
+                        eager=config.eager_tasks,
+                        max_header_bytes=config.max_header_bytes,
+                        max_headers=config.max_headers,
+                        max_url=config.max_url,
+                        max_body=config.max_body,
+                        request_line_timeout=config.request_line_timeout,
+                        keepalive_idle=config.keepalive_idle,
+                        tls=ssl_ctx,
+                        flowinfo=flowinfo,
+                        scope_id=scope_id,
+                    )
+                    break
+                except OSError as exc:
+                    last_error = exc
+            else:
+                raise last_error
         if config.immediate_flush:
             loop._core.set_immediate_flush(True)
         if config.access_log:
