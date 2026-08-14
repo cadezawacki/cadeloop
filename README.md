@@ -11,6 +11,7 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Server | `serve()` never restored the collector it reconfigured | `` |
 > | Loop | `close()` never reaped the buffers of the sends it cancelled | `c567a0e` |
 > | HTTP | Graceful shutdown tore down connections whose bytes were still queued | `c567a0e` |
 > | Server | `close()` could not wake a `serve_forever()` it had superseded | `c567a0e` |

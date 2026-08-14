@@ -1,9 +1,11 @@
 """CLI (R-101) and serve() validation. End-to-end serving is covered in
 test_http_engine.py; here we check config validation and flag mapping."""
 
+import asyncio
 import contextlib
 import io
 import sys
+import threading
 
 import pytest
 
@@ -235,3 +237,77 @@ def test_lifespan_crash_after_startup_stops_the_worker():
     assert crashed.is_set()
     assert isinstance(result.get("error"), RuntimeError), result
     assert "lifespan task crashed" in str(result["error"])
+
+
+def _serve_briefly(cfg):
+    """Run a worker to the serving point, sample the collector from inside
+    the loop, then stop it -- all in this process, so the restore that
+    serve()'s finally performs is observable here."""
+    import gc as _gc
+    from cadeloop.server import _serve_single
+
+    started = threading.Event()
+    inside = {}
+
+    async def app(scope, receive, send):
+        if scope["type"] != "lifespan":
+            return  # pragma: no cover
+        await receive()
+        await send({"type": "lifespan.startup.complete"})
+        lp = asyncio.get_running_loop()
+
+        def sample():
+            # Runs after serve() has reconfigured the collector: if this
+            # shows no change, the test below proves nothing.
+            inside["freeze"] = _gc.get_freeze_count()
+            inside["enabled"] = _gc.isenabled()
+
+        lp.call_later(0.2, sample)
+        lp.call_later(0.4, lp.stop)
+        started.set()
+
+    result = {}
+
+    def run():
+        try:
+            _serve_single(app, "127.0.0.1", 0, cfg)
+        except BaseException as exc:  # pragma: no cover
+            result["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    assert started.wait(20), "worker never reached the serving state"
+    t.join(timeout=20)
+    assert not t.is_alive(), "worker did not stop"
+    assert not result, result
+    assert inside, "never sampled the collector from inside the loop"
+    return inside
+
+
+def test_serve_restores_the_collector_it_reconfigured():
+    """serve() is an ordinary callable: it returns and the process carries
+    on. gc_mode='freeze' -- the DEFAULT -- moved the whole startup heap
+    into the permanent generation and never moved it back, so every cycle
+    created before serve() and dropped after it stayed uncollectable for
+    the rest of the process. gc_mode='disable' had the mirror-image bug:
+    its finally called gc.enable() unconditionally, switching the
+    collector ON for a caller who had deliberately turned it off."""
+    import gc as _gc
+
+    assert _gc.get_freeze_count() == 0, "test needs a clean permanent generation"
+
+    inside = _serve_briefly(cadeloop.Config(grace=0.0, gc_mode="freeze"))
+    assert inside["freeze"] > 0, "gc_mode='freeze' did not actually freeze anything"
+    assert _gc.get_freeze_count() == 0, (
+        "serve() left the startup heap permanently frozen after returning"
+    )
+
+    _gc.disable()
+    try:
+        inside = _serve_briefly(cadeloop.Config(grace=0.0, gc_mode="disable"))
+        assert inside["enabled"] is False
+        assert not _gc.isenabled(), (
+            "serve() switched on a collector the caller had deliberately disabled"
+        )
+    finally:
+        _gc.enable()

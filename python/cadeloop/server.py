@@ -267,6 +267,10 @@ def _serve_single(
     served = False
     access_log = None
     stats_lid = None
+    # What the collector looked like before we touched it, so the finally
+    # can put it back exactly -- and only what WE changed.
+    gc_was_enabled = gc.isenabled()
+    gc_froze = False
     try:
         lifespan.startup()
         if control_channel is not None:
@@ -307,6 +311,11 @@ def _serve_single(
         # R-075: freeze the post-startup heap out of the cyclic collector.
         if config.gc_mode == "freeze":
             gc.collect()
+            # Only ours to undo if nobody else had already frozen anything:
+            # gc.unfreeze() is all-or-nothing, so unfreezing on top of a
+            # caller's own permanent generation would silently throw their
+            # freeze away too.
+            gc_froze = gc.get_freeze_count() == 0
             gc.freeze()
         elif config.gc_mode == "disable":
             gc.collect()
@@ -337,8 +346,18 @@ def _serve_single(
                 "lifespan task crashed; worker stopped serving"
             ) from lifespan.crashed
     finally:
-        if config.gc_mode == "disable":
+        # serve() is an ordinary callable: it returns, and the process
+        # carries on. Leaving the collector as we reconfigured it made
+        # every object alive at startup permanently uncollectable for the
+        # rest of that process -- including the caller's, and including
+        # cycles created before serve() and dropped after it. `disable`
+        # was already restored here; `freeze`, the DEFAULT mode, was not.
+        if gc_froze:
+            gc.unfreeze()
+        if gc_was_enabled and not gc.isenabled():
             gc.enable()
+        elif not gc_was_enabled and gc.isenabled():
+            gc.disable()
         for sig in installed_signals:
             try:
                 loop.remove_signal_handler(sig)

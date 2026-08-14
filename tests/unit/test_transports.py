@@ -1807,40 +1807,71 @@ def test_close_wakes_serve_forever(loop):
     loop.run_until_complete(main())
 
 
-def test_close_reaps_the_buffers_of_the_sends_it_cancels(loop):
-    """close() cancels every in-flight send, and R-073 forbids freeing a
+def test_close_reaps_the_ops_it_cancels(loop):
+    """close() cancels every in-flight op, and R-073 forbids freeing a
     cancelled op's buffers until its completion comes back -- the kernel
-    may still be reading them. So teardown parks them in `reap_guards` and
-    leaves the release to the next dispatch. A closed loop has no next
-    dispatch: without a reap at close the whole queued response body stayed
-    resident for as long as anything referenced the dead loop."""
+    may still be writing into a receive slot or reading from a send
+    buffer. So teardown parks them in `reap_guards` and leaves the release
+    to the next dispatch. A closed loop has no next dispatch: without a
+    reap at close, whatever those ops held stayed resident for as long as
+    anything referenced the dead loop.
+
+    The datagram endpoint is the portable case -- a UDP endpoint always
+    has a receive posted, so closing the loop always cancels one and
+    always parks its slot. The queued-send case below only arises where
+    the platform actually parks a partial write.
+    """
+
+    async def main():
+        await loop.create_datagram_endpoint(asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0))
+        await asyncio.sleep(0)
+
+    loop.run_until_complete(main())
+    assert loop.stats()["ops_by_target"]["dgram"] >= 1, (
+        "no datagram op outstanding; the test is not exercising the guard"
+    )
+    loop.close()
+    assert loop.stats()["unreaped_ops"] == 0, (
+        "close() left a receive slot pinned to a cancelled op it never reaped"
+    )
+
+
+def test_close_reaps_the_buffers_of_the_sends_it_cancels(loop):
+    """The stream half of the same discipline: a send cancelled at close
+    still owns its write queue until the completion is dequeued.
+
+    Whether a send can be made to park with a remainder is a platform
+    property -- IOCP takes a large WSASend whole where writev on a socket
+    with a small peer receive buffer stops short -- so the precondition is
+    a skip, not a failure. The guard itself is covered portably above.
+    """
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # A small receive buffer is what makes the send block with a remainder
-    # still queued; on a default-sized loopback socket the whole payload is
-    # absorbed and there is nothing left in flight to cancel.
+    # A small receive buffer is what makes the send stop short with a
+    # remainder still queued; on a default-sized loopback socket the whole
+    # payload is absorbed and there is nothing left in flight to cancel.
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     peer = None
     transport = None
+    parked = False
     try:
 
         async def main():
-            nonlocal peer, transport
+            nonlocal peer, transport, parked
             transport, _ = await loop.create_connection(asyncio.Protocol, *srv.getsockname())
             peer, _ = srv.accept()
             transport.write(b"x" * (8 * 1024 * 1024))
-            # Let the flush post, complete partially, and re-post until the
-            # socket buffer is full and the send parks with a remainder.
             for _ in range(20):
                 await asyncio.sleep(0.01)
                 if transport.get_write_buffer_size() > 0 and loop.stats()["ops_by_target"]["send"]:
+                    parked = True
                     return
-            pytest.fail("no send parked with a queued remainder; test is not exercising the guard")
 
         loop.run_until_complete(main())
-        assert transport.get_write_buffer_size() > 0
+        if not parked:
+            pytest.skip("this platform did not park a send with a queued remainder")
         loop.close()
         assert loop.stats()["unreaped_ops"] == 0, (
             "close() left write buffers pinned to cancelled ops it never reaped"
