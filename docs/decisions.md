@@ -228,3 +228,38 @@ validation flips it (the recorded M3 gate). One side effect: the local
 msvc cross-check had silently broken when M2 vendored llhttp (no MSVC C
 compiler on Linux); build.rs now skips the C build for cross-CHECKS
 (which never link) and real Windows builds compile it natively.
+
+## ADR-24: first real Windows CI results — open investigation, worker crash
+CI's `.github/workflows/ci.yml` had a YAML syntax error (an unquoted
+`name:` containing `: `) that silently produced zero jobs on every run
+since before this repo's CI history begins — every prior "tests pass"
+claim was validated only by local runs, never by GitHub Actions. Fixing
+it (and a follow-on `cargo fmt` drift + a `not_unsafe_ptr_arg_deref`
+clippy finding on the new pipe ops) let real Windows jobs execute for
+the first time. Two more real, CI-only findings surfaced and were fixed
+straightforwardly: `build-windows` never copied the built extension
+into the source tree (unlike `test-linux`), breaking subprocess-spawning
+tests that point PYTHONPATH at the repo; and the lint job's Windows
+clippy cross-check needs `llvm-dlltool` (via `python3-dll-a`, a
+`pyo3-ffi` build dependency for `PYO3_CROSS`) which isn't on
+`ubuntu-latest` by default — confirmed by inspecting the actual
+installed file list that rustup's `llvm-tools`/`llvm-tools-preview`
+component does NOT ship it (only `llvm-ar`/`nm`/`objcopy`/etc); it comes
+from the OS's own `llvm` package.
+
+Still open: `test_spawn_worker_pool_serves_and_stops` (the WSADuplicate-
+SocketW fork-free spawn model, R-090) crashes a freshly spawned worker
+with `STATUS_ACCESS_VIOLATION` (0xC0000005) — seen on windows-2025 alone
+in one run, then on BOTH windows-2022 and windows-2025 in the next,
+which rules out a single-runner fluke. No stack trace or crash dump is
+obtainable from a remote CI log, so static auditing (pipe-read framing
+via `BufferedReader.read()` — confirmed correct by direct simulation off
+this repo; `_pin_to_cpu`'s `SetProcessAffinityMask` ctypes call — missing
+`restype`, hardened, did not stop the recurrence; `SetConsoleCtrlHandler`'s
+callback-trampoline lifetime in loop.py — looks correctly kept alive via
+a persistent `self` attribute) has not found a conclusive root cause.
+`_winworker.py` now has `_trace()` stderr markers (flushed after every
+statement in `main()`) as a temporary bisection aid — pytest inherits
+and captures the spawned worker's stderr, so the next CI run's failure
+log should show the last stage reached before the crash. Remove the
+markers once the crash site is identified and fixed.

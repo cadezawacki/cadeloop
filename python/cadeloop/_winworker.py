@@ -39,23 +39,39 @@ def _pin_to_cpu(cpu: int) -> None:
         pass  # pinning is best-effort (R-091)
 
 
+def _trace(stage: str) -> None:
+    # TEMPORARY (see docs/decisions.md): bisecting a Windows-only
+    # STATUS_ACCESS_VIOLATION on worker startup that a remote CI run
+    # can't hand back a stack trace for. Each line is flushed
+    # immediately so it survives a hard crash on the *next* statement.
+    print(f"cadeloop._winworker: {stage}", file=sys.stderr, flush=True)
+
+
 def main() -> int:
+    _trace("start")
     raw = sys.stdin.buffer
     header = json.loads(raw.readline())
+    _trace("header parsed")
     if header["share_len"]:
         share = raw.read(header["share_len"])
+        _trace(f"share bytes read ({len(share)})")
         lsock = socket.fromshare(share)  # WSADuplicateSocketW (win32)
+        _trace("fromshare returned")
     else:
         # POSIX: the listener fd was inherited via pass_fds.
         lsock = socket.socket(fileno=header["listen_fd"])
     if header.get("pin") is not None:
         _pin_to_cpu(header["pin"])
+        _trace("pinned")
 
     from .config import Config
     from .server import _serve_single, load_app
 
+    _trace("imports done")
     app = load_app(header["spec"])
+    _trace("app loaded")
     config = Config(**header["config"])
+    _trace("about to call _serve_single")
     _serve_single(
         app,
         "-",  # host/port unused: the listener is adopted
