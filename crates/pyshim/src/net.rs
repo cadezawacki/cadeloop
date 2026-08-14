@@ -1248,13 +1248,14 @@ pub(crate) fn http_sweep(
         // could be torn down mid-transmission by the idle sweep.
         let busy = http_conn_busy(entry);
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
-        // `!saw_request` is the head phase too: a connection that has
-        // sent nothing at all reports `in_head() == false`, and calling
-        // that keep-alive idle exempted it from the head deadline it has
-        // never yet satisfied.
+        // `!saw_bytes` is the head phase too: a connection that has sent
+        // nothing at all reports `in_head() == false`, and calling that
+        // keep-alive idle exempted it from the head deadline it has never
+        // yet satisfied. It must be BYTES rather than a finished request,
+        // or a body upload counts as a head that never completes.
         let phase: u8 = if busy {
             2
-        } else if conn.parser.in_head() || !conn.saw_request {
+        } else if conn.parser.in_head() || !conn.saw_bytes {
             1
         } else {
             0
@@ -1984,6 +1985,14 @@ fn on_send_done(
             net.events.push(NetEvent::ResumeWriting { resume_writing });
         }
     }
+    // A WebSocket paused for WRITE pressure has no other way back: the
+    // inbox path only re-evaluates when the app calls receive(), and a
+    // connection paused because we owed the peer output may have no
+    // inbox message for it to consume. Without this the pause added for
+    // the ping-flood bound was permanent -- a peer that resumed reading
+    // was never read from again, turning a bounded queue into a stalled
+    // connection.
+    crate::http::ws_sync_read_pause(py, net, backend, tid);
     let entry = net.transports.get_mut(&tid).unwrap();
     if !entry.wq.is_empty() {
         flush_pending(py, net, backend, tid);

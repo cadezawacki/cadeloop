@@ -2507,3 +2507,59 @@ def test_a_trailer_does_not_leak_into_the_next_pipelined_request(loop):
     names = [k for k, _ in seen[1]]
     assert "authorization" not in names, seen[1]
     assert names == ["host", "x-real"], seen[1]
+
+
+def test_a_slow_body_upload_is_not_killed_by_the_head_deadline(loop):
+    """The head-phase flag was first set when a whole REQUEST had been
+    parsed -- which for a request with a body means after the upload
+    finishes. So the connection stayed in the head phase for the entire
+    upload, and since body activity deliberately does not re-anchor that
+    phase (the slowloris rule), every upload longer than
+    request_line_timeout was 408ed while it was actively sending.
+    Reported by Codex on PR #1; a regression from the fix one round
+    earlier."""
+    got = []
+
+    async def app(scope, receive, send):
+        body = b""
+        while True:
+            m = await receive()
+            body += m.get("body", b"")
+            if not m.get("more_body"):
+                break
+        got.append(len(body))
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"2")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app, request_line_timeout=0.3, keepalive_idle=0.0)
+
+    async def main():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        chunks = 8
+        size = 100
+        w.write(
+            b"POST / HTTP/1.1\r\nHost: h\r\n"
+            b"Content-Length: " + str(chunks * size).encode() + b"\r\n\r\n"
+        )
+        await w.drain()
+        # Each chunk is well inside the head window, but the upload as a
+        # whole runs several times past it.
+        for _ in range(chunks):
+            loop._core.http_sweep()
+            await asyncio.sleep(0.1)
+            w.write(b"u" * size)
+            await w.drain()
+        head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5.0)
+        w.close()
+        return head
+
+    head = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert head.startswith(b"HTTP/1.1 200"), head[:60]
+    assert got == [800], got

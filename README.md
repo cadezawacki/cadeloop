@@ -11,6 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | HTTP | The head deadline killed body uploads that ran past it while actively sending | `` |
+> | WS | A read pause taken for write pressure was never released | `` |
 > | HTTP | A trailer leaked into the next pipelined request as its first header | `a0f02cd` |
 > | Server | The stats endpoint inherited `max_body=None`, buffering any body sent to it | `a0f02cd` |
 > | Net | `create_server(sock=...)` accepted a connected socket and span on failing accepts | `a0f02cd` |

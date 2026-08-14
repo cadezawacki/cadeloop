@@ -131,17 +131,23 @@ pub(crate) struct HttpConn {
     pub(crate) sweep_phase: u8,
     pub(crate) sweep_seen: u32,
     pub(crate) sweep_anchor_ns: u64,
-    /// A request has been parsed on this connection at least once.
+    /// Any byte at all has arrived on this connection.
     ///
-    /// Until then the connection owes us a request head, even though the
-    /// parser reports `in_head() == false` because not one byte has
-    /// arrived. Treating that as keep-alive IDLE meant a client could
-    /// connect and send nothing: with `keepalive_idle=0` the connection
-    /// never expired at all, and with the defaults it sat for 75s instead
-    /// of the 5s the slow-request limit is there to enforce -- so a
-    /// no-byte flood held sockets and per-connection state for as long as
-    /// it liked.
-    pub(crate) saw_request: bool,
+    /// Before the first one the parser reports `in_head() == false`
+    /// simply because no message has started, and treating that as
+    /// keep-alive IDLE let a client connect and send nothing: with
+    /// `keepalive_idle=0` the connection never expired, and with the
+    /// defaults it sat for 75s rather than the 5s the slow-request limit
+    /// exists to enforce.
+    ///
+    /// BYTES, not a completed request. The first version of this flag was
+    /// set when a whole request had been parsed -- which for a request
+    /// with a BODY means after the upload finishes -- so the connection
+    /// stayed in the head phase for the whole upload, and since body
+    /// activity deliberately does not re-anchor that phase (the slowloris
+    /// rule), every upload longer than `request_line_timeout` was 408ed
+    /// while it was actively sending.
+    pub(crate) saw_bytes: bool,
     // --- R-140 access log (populated only while a sink is installed) ---
     pub(crate) log_method: &'static str,
     pub(crate) log_target: Vec<u8>,
@@ -292,7 +298,7 @@ impl HttpConn {
             sweep_phase: 0,
             sweep_seen: 0,
             sweep_anchor_ns: 0,
-            saw_request: false,
+            saw_bytes: false,
             log_method: "",
             log_target: Vec::new(),
             log_status: 0,
@@ -346,6 +352,7 @@ pub(crate) struct FeedOutcome {
 
 pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome, ParseError> {
     conn.activity = conn.activity.wrapping_add(1);
+    conn.saw_bytes = true;
     if let Some(offset) = conn.parser.feed(data)? {
         // Upgrade head complete (R-087): bytes past it are NOT HTTP —
         // they belong to the upgraded protocol (early client WS frames).
@@ -353,7 +360,6 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
     }
     while let Some(req) = conn.parser.next_request() {
         conn.pending_bytes += req.queued_size();
-        conn.saw_request = true;
         conn.pending.push_back(req);
     }
     Ok(FeedOutcome {
