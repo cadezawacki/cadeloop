@@ -11,8 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Net | A WS read-pause re-check could remove the transport an `unwrap()` then assumed | `` |
-> | Server | Each forked worker inherited every earlier worker's readiness pipe | `` |
+> | Net | A WS read-pause re-check could remove the transport an `unwrap()` then assumed | `17aefb3` |
+> | Server | Each forked worker inherited every earlier worker's readiness pipe | `17aefb3` |
 > | HTTP | The head deadline killed body uploads that ran past it while actively sending | `e4e2a70` |
 > | WS | A read pause taken for write pressure was never released | `e4e2a70` |
 > | HTTP | A trailer leaked into the next pipelined request as its first header | `a0f02cd` |
