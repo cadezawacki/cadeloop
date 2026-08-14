@@ -11,9 +11,9 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Server | A lifespan that returned after `startup.complete` left the worker serving without it | `` |
-> | Transport | `sendfile` fallback counted writes a closing transport had discarded | `` |
-> | Transport | `loop.sendfile` validated none of its parameters, unlike `sock_sendfile` | `` |
+> | Server | A lifespan that returned after `startup.complete` left the worker serving without it | `b0c2632` |
+> | Transport | `sendfile` fallback counted writes a closing transport had discarded | `b0c2632` |
+> | Transport | `loop.sendfile` validated none of its parameters, unlike `sock_sendfile` | `b0c2632` |
 > | CI | Python was never linted: `[tool.ruff]` existed, no workflow ran it | `d096b8b` |
 > | Loop | A Context that could not be entered stopped the loop instead of one callback | `1269e7c` |
 > | Server | A stalled worker took unbounded connection handoffs until it ran out of handles | `14e50ec` |
