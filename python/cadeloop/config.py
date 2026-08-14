@@ -16,7 +16,10 @@ __all__ = ["Config", "LATENCY_PRESETS"]
 # R-060: latency_mode presets -> spin window (µs).
 LATENCY_PRESETS = {"throughput": 0, "balanced": 20, "spin": 200}
 
-_BACKENDS = ("auto", "iocp", "rio")  # R-020
+# R-020. "epoll" is the Linux dev backend the CLI offers on
+# non-Windows platforms; rejecting it here made that flag always
+# raise before binding (Codex review, PR #1).
+_BACKENDS = ("auto", "iocp", "rio", "epoll")
 _GC_MODES = ("default", "freeze", "disable")  # R-075
 
 

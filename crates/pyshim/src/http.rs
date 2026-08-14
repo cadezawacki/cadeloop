@@ -1791,10 +1791,21 @@ impl AppTask {
         if let Some(fut) = waiting {
             // Task.cancel semantics: cancel the awaited future; the
             // CancelledError arrives through _wake.
-            match msg {
+            let forwarded: bool = match msg {
                 Some(m) => fut.call_method1(py, intern!(py, "cancel"), (m,))?,
                 None => fut.call_method0(py, intern!(py, "cancel"))?,
-            };
+            }
+            .extract(py)
+            .unwrap_or(false);
+            if !forwarded {
+                // The awaited future completed first, so cancelling it was a
+                // no-op and no CancelledError will arrive through _wake —
+                // the queued wake would otherwise resume the coroutine with
+                // the successful result and silently swallow the cancel.
+                // asyncio.Task latches the request instead; mirror that so
+                // request timeouts and anyio cancel scopes still fire.
+                slf.borrow_mut().must_cancel = true;
+            }
         }
         Ok(true)
     }

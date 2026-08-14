@@ -544,7 +544,7 @@ impl CoreLoop {
         // R-122 "close with pending ops": tear down every live connection
         // and listener (cancels in-flight kernel ops), then drop all
         // pending work outside the cell.
-        let pending = self.state.with(|st| {
+        let (pending, events) = self.state.with(|st| {
             let tids: Vec<u64> = st.net.transports.keys().copied().collect();
             for tid in tids {
                 net::teardown(&mut st.net, st.reactor.backend_mut(), tid, None);
@@ -567,10 +567,15 @@ impl CoreLoop {
             for (_, h) in st.net.writers.drain() {
                 dropped.push(h);
             }
-            st.net.events.clear(); // events hold only Py refs; move them too
-            dropped
+            // ADR-5: NetEvent variants OWN Python references. Clearing the
+            // vector here would decref them while `with` holds the exclusive
+            // &mut, and a finalizer reached by one of those decrefs can
+            // re-enter the loop and alias the state. Move them out and drop
+            // after leaving the cell, exactly as the tick path does.
+            (dropped, std::mem::take(&mut st.net.events))
         })?;
         drop(pending);
+        drop(events);
         self.drain_graveyards(py)?;
         Ok(())
     }

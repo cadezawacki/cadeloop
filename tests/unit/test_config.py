@@ -44,7 +44,7 @@ def test_unknown_kwarg_raises_typeerror():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"backend": "epoll"},
+        {"backend": "kqueue"},
         {"latency_mode": "warp"},
         {"gc_mode": "sometimes"},
         {"accept_pool": 0},
@@ -57,6 +57,14 @@ def test_unknown_kwarg_raises_typeerror():
 def test_validation_errors(kwargs):
     with pytest.raises(ValueError):
         Config(**kwargs)
+
+
+def test_epoll_backend_is_accepted():
+    """The CLI offers --backend epoll on non-Windows platforms, so Config
+    must accept it: rejecting it made the advertised flag always raise
+    before binding (Codex review, PR #1). This previously asserted the
+    opposite, encoding the bug."""
+    assert Config(backend="epoll").backend == "epoll"
 
 
 def test_from_env(monkeypatch):
