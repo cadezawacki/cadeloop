@@ -1596,3 +1596,44 @@ def test_http10_request_gets_an_http10_status_line(loop):
     resp11 = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
     assert resp11.startswith(b"HTTP/1.1 200")
     loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize(
+    "raw,label",
+    [
+        (b"GET / HTTP/1.1\r\n\r\n", "no Host"),
+        (b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", "two Hosts"),
+    ],
+)
+def test_http11_requires_exactly_one_host(loop, raw, label):
+    """RFC 7230 5.4. llhttp validates syntax only, so without this a
+    request with no Host — or two disagreeing ones — reaches the app and
+    the authority it routes on can differ from what an intermediary saw.
+    Reported by Codex review on PR #1 (twice)."""
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(scope["path"])
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, raw, read_all=True))
+    assert b"400" in resp.split(b"\r\n", 1)[0], f"{label}: {resp[:60]!r}"
+    assert not seen, f"{label}: request reached the application"
+    loop._core.listener_close(lid)
+
+
+def test_http10_without_host_is_still_accepted(loop):
+    """The requirement is HTTP/1.1-only; 1.0 has no Host requirement."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.0\r\n\r\n", read_all=True))
+    assert resp.startswith(b"HTTP/1.0 200"), resp[:40]
+    loop._core.listener_close(lid)

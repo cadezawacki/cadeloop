@@ -1630,8 +1630,14 @@ pub(crate) fn ws_ingest(
         // window, so this needs the same cap the accepted path enforces --
         // otherwise one connection can grow it until the worker dies.
         if conn.ws_trailing.len() + data.len() > WS_MAX_MESSAGE {
-            let f = ws::close_frame(1009, "pre-accept buffer limit exceeded");
-            net::http_enqueue(py, net, backend, tid, f);
+            // The 101 has NOT been sent yet -- the app has not accepted --
+            // so the peer is still parsing an HTTP response. Writing a
+            // WebSocket close frame here (which my first version of this
+            // cap did) puts raw binary where a status line belongs. Answer
+            // in the protocol actually in effect.
+            let resp = error_response(ParseError { status: 413, reason: "payload too large" });
+            conn.ws_trailing.clear();
+            net::http_enqueue(py, net, backend, tid, resp);
             net::http_close_after_write(py, net, backend, tid);
             return;
         }

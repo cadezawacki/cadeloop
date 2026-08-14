@@ -252,3 +252,21 @@ def test_datagram_endpoint_closed_when_connection_made_raises(loop):
     loop.run_until_complete(main())
     # Every endpoint torn down: no pool slots and no live datagram state.
     assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_create_datagram_endpoint_rejects_stream_socket(loop):
+    """A stream socket handed to sock= was detached into the datagram
+    machinery, which then applies recvfrom/sendto semantics and datagram
+    callbacks to a byte stream. Reported by Codex review on PR #1."""
+    import socket as socket_module
+
+    s = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    try:
+        with pytest.raises(ValueError, match="datagram socket"):
+            loop.run_until_complete(
+                loop.create_datagram_endpoint(asyncio.DatagramProtocol, sock=s)
+            )
+        # Rejected before ownership transferred: still usable.
+        assert s.fileno() != -1
+    finally:
+        s.close()

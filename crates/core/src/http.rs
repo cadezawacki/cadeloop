@@ -230,9 +230,20 @@ unsafe extern "C" fn on_message_begin(p: *mut Llhttp) -> c_int {
 }
 
 unsafe extern "C" fn on_headers_complete(p: *mut Llhttp) -> c_int {
+    let minor = unsafe { (*p).http_minor };
     let a = unsafe { acc(p) };
     a.commit_header();
     a.in_head = false;
+    // RFC 7230 5.4: an HTTP/1.1 request MUST carry exactly one Host.
+    // llhttp validates syntax only, so without this a request with none
+    // (or two disagreeing ones) reaches the application and the authority
+    // it routes on can differ from what an intermediary saw.
+    if minor >= 1 {
+        let hosts = a.headers.iter().filter(|(n, _)| n.as_slice() == b"host").count();
+        if hosts != 1 {
+            return a.fail(400, "HTTP/1.1 requires exactly one Host header");
+        }
+    }
     0
 }
 
@@ -453,14 +464,14 @@ mod tests {
     #[test]
     fn header_count_limit_is_431() {
         let mut p = HttpParser::new(Limits { max_headers: 2, ..Default::default() });
-        let err = p.feed(b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n").unwrap_err();
+        let err = p.feed(b"GET / HTTP/1.1\r\nHost: h\r\nA: 1\r\nB: 2\r\n\r\n").unwrap_err();
         assert_eq!(err.status, 431);
     }
 
     #[test]
     fn body_limit_is_413() {
         let mut p = HttpParser::new(Limits { max_body: Some(4), ..Default::default() });
-        let err = p.feed(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n0123456789").unwrap_err();
+        let err = p.feed(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\n0123456789").unwrap_err();
         assert_eq!(err.status, 413);
     }
 }

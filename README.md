@@ -11,6 +11,10 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Net | Accepted socket leaked when `wire_http` failed (fallout from my ownership change) | `HEAD` |
+> | WebSocket | Pre-accept cap wrote a WS frame before the 101; now answers 413 | `HEAD` |
+> | HTTP | HTTP/1.1 requires exactly one `Host` (RFC 7230 5.4) | `HEAD` |
+> | UDP | `create_datagram_endpoint(sock=)` rejects stream sockets | `HEAD` |
 > | WebSocket | Inbox budget not decremented on the steady-state delivery path (stalled connections) | `09696cf` |
 > | CI | ADR-24 tracing switched off after two clean Windows runs | `09696cf` |
 > | HTTP | HTTP/1.0 requests now get an `HTTP/1.0` status line | `d0cdad0` |

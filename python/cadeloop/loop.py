@@ -580,6 +580,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         if sock is not None:
             if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
                 raise ValueError("sock is mutually exclusive with address/options")
+            if sock.type != socket_module.SOCK_DGRAM:
+                # Otherwise a stream socket is detached into the datagram
+                # machinery, which then applies recvfrom/sendto semantics
+                # and datagram callbacks to a byte stream.
+                raise ValueError(f"A datagram socket was expected, got {sock!r}")
             udp_sock = sock
         else:
             fam = family or socket_module.AF_INET

@@ -1768,6 +1768,19 @@ pub(crate) fn dispatch_events(
                         if let Err(e) =
                             wire_http(py, slf, sock, app, pyloop, state, limits, eager, tuning, tls)
                         {
+                            // wire_http leaves the descriptor to its caller
+                            // on every failure (see its ownership note), so
+                            // this branch owns the cleanup -- as the Factory
+                            // branch above already does. Making wire_http
+                            // stop closing without adding this was my own
+                            // regression: it turned a double close into a
+                            // leak of every connection whose registration or
+                            // TLS setup failed.
+                            core.with_net(|net, reactor| {
+                                let _ = net;
+                                reactor.backend_mut().detach_socket(sock);
+                            })?;
+                            netsys::close(sock);
                             core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                         }
                     }
