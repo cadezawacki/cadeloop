@@ -4,14 +4,15 @@
 >
 > An external review pass (Codex on PR #1, plus a consolidated engineering
 > audit) raised ~90 findings. This is the running record; it is updated as
-> items land. Newest first.
+> items land. Newest first. (A row's commit id is filled in by the next
+> commit — a commit cannot contain its own hash.)
 >
 > **Fixed and on `claude/new-session-bq3hp6`**
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Server | Grace deadline now entered as soon as shutdown begins | `c1649f7` |
-> | UDP | Endpoint torn down when `connection_made` raises | `c1649f7` |
+> | Server | Grace deadline now entered as soon as shutdown begins | `d1f471f` |
+> | UDP | Endpoint torn down when `connection_made` raises | `d1f471f` |
 > | HTTP | 1xx rejected on the final-response path; `Content-Length` stripped from 204 | `38cdbd9` |
 > | Server | `server.sockets` returns `()` after close (was EBADF / stale dups) | `38cdbd9` |
 > | Transport | Changing watermarks now re-takes the pause/resume decision | `38cdbd9` |
