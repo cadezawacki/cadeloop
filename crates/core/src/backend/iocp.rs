@@ -414,6 +414,14 @@ impl IocpBackend {
     }
 
     fn accept_socket_for(&mut self, listener: SOCKET) -> io::Result<SOCKET> {
+        // TEMPORARY (ADR-24): bisecting a Windows-only worker-model crash
+        // that server.py's tracing narrowed to somewhere inside
+        // run_forever() — this is the sole listener-protocol-info query
+        // unique to accepting on a WSADuplicateSocketW-origin listener
+        // (accept_socket_for/take_accept_socket are the only R-032 code
+        // that differs for a duplicated vs natively-created listener).
+        eprintln!("cadeloop-iocp: accept_socket_for listener={listener}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         // R-033: prefer recycled sockets.
         if let Some(s) = self.free_sockets.pop() {
             return Ok(s);
@@ -433,8 +441,16 @@ impl IocpBackend {
                     )
                 };
                 if rc == SOCKET_ERROR {
-                    return Err(wsa_error());
+                    let err = wsa_error();
+                    eprintln!("cadeloop-iocp: SO_PROTOCOL_INFOW failed: {err}");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    return Err(err);
                 }
+                eprintln!(
+                    "cadeloop-iocp: SO_PROTOCOL_INFOW ok family={} type={} proto={}",
+                    info.iAddressFamily, info.iSocketType, info.iProtocol
+                );
+                let _ = std::io::Write::flush(&mut std::io::stderr());
                 self.listener_info.insert(listener, info);
                 info
             }
@@ -450,8 +466,13 @@ impl IocpBackend {
             )
         };
         if s == !0usize {
-            return Err(wsa_error());
+            let err = wsa_error();
+            eprintln!("cadeloop-iocp: WSASocketW failed: {err}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            return Err(err);
         }
+        eprintln!("cadeloop-iocp: accept_socket_for -> {s}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         Ok(s)
     }
 
@@ -1002,6 +1023,10 @@ impl IoBackend for IocpBackend {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "accept op not live"))?;
             (slot.data.accept_socket, slot.data.socket)
         };
+        // TEMPORARY (ADR-24): see accept_socket_for's comment — same
+        // bisection, this time the SO_UPDATE_ACCEPT_CONTEXT call itself.
+        eprintln!("cadeloop-iocp: take_accept_socket op={op:?} accepted={accepted} listener={listener}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         // R-032: inherit listener properties.
         let rc = unsafe {
             setsockopt(
@@ -1012,12 +1037,18 @@ impl IoBackend for IocpBackend {
                 size_of::<SOCKET>() as i32,
             )
         };
+        eprintln!("cadeloop-iocp: SO_UPDATE_ACCEPT_CONTEXT rc={rc}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         self.slab.release(op);
         if rc == SOCKET_ERROR {
             let err = wsa_error();
+            eprintln!("cadeloop-iocp: SO_UPDATE_ACCEPT_CONTEXT failed: {err}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
             unsafe { closesocket(accepted) };
             return Err(err);
         }
+        eprintln!("cadeloop-iocp: take_accept_socket ok -> {accepted}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         Ok(accepted)
     }
 
