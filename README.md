@@ -11,7 +11,8 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Unix | Abstract-namespace socket addresses were reported as lossy strings instead of bytes; non-UTF-8 paths were mangled | `` |
+> | HTTP | `OPTIONS *` was normalized to `/` in the ASGI scope, indistinguishable from an OPTIONS on the root resource | `` |
+> | Unix | Abstract-namespace socket addresses were reported as lossy strings instead of bytes; non-UTF-8 paths were mangled | `afb64a8` |
 > | Loop | Cancelling `shutdown_default_executor()` produced a spurious `InvalidStateError` when the shutdown thread finished | `5c096bb` |
 > | Net | A fatal callback error dropped the rest of its dispatch batch: other connections' events were lost for good | `4d9c231` |
 > | TCP | `create_server` failed outright when one resolved address family was unavailable instead of serving the rest | `7464cd6` |
@@ -166,11 +167,31 @@
 > | Net | Cancelled ops' buffers freed while the kernel still owned them | `02c9414` |
 > | HTTP/WS | WS upgrade header injection, 204/304 bodies, buffered body on half-close, absolute-form targets, `Sec-WebSocket-Key` | `df9484b` |
 >
-> **Open** — ASGI `send()` backpressure, grace-drain ordering, loop↔hook
-> cycle leak, TLS `close_notify`, ALPN `h2` rejection, `Host` validation,
-> IPv6 flow/scope fields, `get_extra_info("socket")`, `_winpipes`
-> `data_received` guard, UDP `set_protocol` rewiring, config validation,
-> Ruff/typing in CI.
+> **Open** — reconstructed from the unresolved Codex threads on PR #1
+> (each with its round timestamp checked against the fix commits, so this
+> list reflects what is actually unfixed, with file/line anchors):
+> CONNECT requests are answered 400 by WebSocket validation before the
+> app sees them (`http.rs` ~2299, needs a tunnel/close-after design);
+> error responses hardcode an `HTTP/1.1` status line for HTTP/1.0
+> requests (`http.rs` ~383); supervisor grace is not reserved for
+> lifespan shutdown (`server.py` ~483); WS close-code state evicts after
+> 64 teardowns (`net.rs` ~699); WS frames keep parsing after a close
+> event (`http.rs` ~2101); a handed-in listener fd can double-close
+> (`coreloop.rs` ~1634); the spawn supervisor binds only the first
+> resolved address (`server.py` ~1237); signal state is not rolled back
+> when installation fails (`loop.py` ~917); datagram `sendto` does not
+> resolve hostnames (`coreloop.rs` ~1667); UDP bind/connect does not
+> retry remaining addrinfo candidates (`loop.py` ~706); subprocess args
+> reject path-likes (`loop.py` ~1174); datagram transports expose no
+> `socket` extra (`tcp.py` ~1156); `loop.sendfile` has no runtime
+> fallback when `os.sendfile` fails `ENOSYS` (`loop.py` ~776); promised
+> response trailers are dropped when framing is trailer-capable
+> (`http.rs` ~1244); and explicit unix-path `transport.sendto(data,
+> path)` on an unconnected datagram socket is unsupported (recorded
+> limitation of `86d609f` — needs `netsys::Addr` through
+> `post_send_to` on all three backends). Declined on evidence:
+> BaseException reporting in `shutdown_asyncgens` (CPython tests
+> `Exception`; the reason is recorded in the code).
 >
 > **Watching** — the intermittent Windows hang in
 > `test_starlette_routes_and_streaming` (`/bg`) has not reproduced since

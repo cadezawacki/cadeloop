@@ -1006,7 +1006,13 @@ fn absolute_form_parts(url: &[u8]) -> (Option<&[u8]>, &[u8]) {
     let is_absolute =
         scheme_len > 0 && url[0].is_ascii_alphabetic() && url.get(scheme_len..scheme_len + 3) == Some(b"://");
     if !is_absolute {
-        // asterisk-form or authority-form: no path component.
+        // Asterisk-form keeps its target: OPTIONS * is a server-wide
+        // request (RFC 7230 5.3.4), and normalizing it to "/" made it
+        // indistinguishable from an OPTIONS on the root resource.
+        // Authority-form (CONNECT) has no path component.
+        if url == b"*" {
+            return (None, b"*");
+        }
         return (None, b"/");
     }
     let start = scheme_len + 3;

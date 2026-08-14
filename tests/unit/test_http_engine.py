@@ -442,6 +442,20 @@ def test_request_parsed_ahead_of_malformed_bytes_still_answered(loop):
     loop._core.listener_close(lid)
 
 
+def test_asterisk_form_target_preserved(loop):
+    """OPTIONS * is a valid server-wide request (RFC 7230 5.3.4);
+    normalizing the target to "/" made it indistinguishable from an
+    OPTIONS on the root resource. Reported on PR #1."""
+    lid, port = listen(loop, echo_scope_app)
+    resp = loop.run_until_complete(
+        _request(port, b"OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n")
+    )
+    data = json.loads(_body(resp))
+    assert data["path"] == "*"
+    assert data["raw_path"] == "*"
+    loop._core.listener_close(lid)
+
+
 def test_uri_limit_414(loop):
     lid, port = listen(loop, echo_scope_app, max_url=32)
     resp = loop.run_until_complete(
