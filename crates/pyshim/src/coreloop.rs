@@ -61,6 +61,8 @@ pub struct CoreLoop {
     cached_time_ns: AtomicU64,
     /// Tick counter for the throttled signal check.
     tick_no: AtomicU64,
+    /// Consecutive idle ticks, for the ADR-24 idle-state trace only.
+    idle_ticks: AtomicU64,
     /// Facade hook: `(handle, exception) -> None` for callback errors.
     error_hook: OnceLock<Py<PyAny>>,
     /// Facade hook: `(message, exception) -> None` for protocol/net errors.
@@ -214,10 +216,6 @@ impl CoreLoop {
         // hot path exercised by every test, not just the worker model.
         let trace_tick = trace_tick_enabled();
         let stopping = self.stopping.load(Ordering::Acquire);
-        if trace_tick {
-            eprintln!("cadeloop-tick: start stopping={stopping}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-        }
         DISPATCH_BUF.with_borrow_mut(|batch| -> PyResult<()> {
             debug_assert!(batch.is_empty());
             type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Graveyards);
@@ -236,10 +234,6 @@ impl CoreLoop {
                 } else {
                     st.reactor.poll_timeout()
                 };
-                if trace_tick {
-                    eprintln!("cadeloop-tick: about to poll timeout={timeout:?}");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
                 let reactor = &mut st.reactor;
                 let (poll_result, parked) = if timeout.is_zero() {
                     // Non-blocking reap: keeping the GIL is legal (nothing
@@ -250,10 +244,6 @@ impl CoreLoop {
                     // `claim` guarantees no other thread enters this state.
                     (py.detach(move || reactor.poll(timeout)), true)
                 };
-                if trace_tick {
-                    eprintln!("cadeloop-tick: poll returned ok={} parked={parked}", poll_result.is_ok());
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
                 if poll_result.is_err() {
                     return (
                         poll_result,
@@ -269,9 +259,37 @@ impl CoreLoop {
                 }
                 let mut comps = std::mem::take(&mut st.completions_scratch);
                 st.reactor.drain_completions(&mut comps);
-                if trace_tick {
-                    eprintln!("cadeloop-tick: drained {} completions", comps.len());
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                // ADR-24: a per-tick log of "drained 0 completions" told us
+                // only that the loop was idle, which we already knew. What
+                // the /bg hang needs is the STATE it is idle in: whether an
+                // accept is outstanding, whether the connection exists,
+                // whether anything is queued. Printed only while idle and
+                // only every IDLE_TRACE_EVERY ticks, so a healthy run pays
+                // nothing and a hung one produces a readable trace instead
+                // of thousands of identical lines.
+                if trace_tick && parked && comps.is_empty() {
+                    let n = self.idle_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(IDLE_TRACE_EVERY) {
+                        let (accept_ops, listeners): (usize, usize) = (
+                            st.net.listeners.values().map(|l| l.accept_ops_len()).sum(),
+                            st.net.listeners.len(),
+                        );
+                        eprintln!(
+                            "cadeloop-tick: idle x{n} listeners={listeners} accept_ops={accept_ops} \
+                             transports={} ops={} reap_guards={} events={} ready={} timers={} \
+                             starved={}",
+                            st.net.transports.len(),
+                            st.net.ops.len(),
+                            st.net.reap_guards.len(),
+                            st.net.events.len(),
+                            st.reactor.ready_len(),
+                            st.reactor.timers_len(),
+                            st.net.any_starved_listener,
+                        );
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    }
+                } else if trace_tick {
+                    self.idle_ticks.store(0, Ordering::Relaxed);
                 }
                 if !comps.is_empty() {
                     net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
@@ -279,10 +297,6 @@ impl CoreLoop {
                     // failure has no completion left to retry it (R-032).
                     net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut());
                     comps.clear();
-                }
-                if trace_tick {
-                    eprintln!("cadeloop-tick: translate done");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
                 st.completions_scratch = comps;
                 // Readiness watch callbacks join the ordinary ready queue.
@@ -431,6 +445,10 @@ const CO_COROUTINE: i32 = 0x80;
 /// cached OnceLock (a plain per-tick env var read would itself be a
 /// measurable hot-path cost). Remove alongside the eprintln! call sites
 /// in `CoreLoop::tick` once the crash site is found.
+/// How many consecutive idle ticks between ADR-24 state dumps. At the
+/// 100ms park this is roughly one line every two seconds.
+const IDLE_TRACE_EVERY: u64 = 20;
+
 fn trace_tick_enabled() -> bool {
     static TRACE_TICK: OnceLock<bool> = OnceLock::new();
     *TRACE_TICK.get_or_init(|| std::env::var_os("CADELOOP_TRACE_TICK").is_some())
@@ -495,6 +513,7 @@ impl CoreLoop {
             debug: AtomicBool::new(false),
             cached_time_ns: AtomicU64::new(0),
             tick_no: AtomicU64::new(0),
+            idle_ticks: AtomicU64::new(0),
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
             slow_callback_hook: OnceLock::new(),

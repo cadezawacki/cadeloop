@@ -1088,6 +1088,13 @@ fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64)
     }
 }
 
+impl ListenerEntry {
+    /// Outstanding AcceptEx count — read by the ADR-24 idle-state trace.
+    pub(crate) fn accept_ops_len(&self) -> usize {
+        self.accept_ops.len()
+    }
+}
+
 pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: ListenerKind, target: usize) -> u64 {
     let lid = net.next_id();
     net.listeners.insert(
