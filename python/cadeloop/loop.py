@@ -812,9 +812,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # sendfile are user error, as in stdlib asyncio).
         while transport.get_write_buffer_size() > 0:
             await tasks.sleep(0.001)
-        return await self._sendfile_native_fd(transport.fileno(), file, offset, count)
+        return await self._sendfile_native_fd(transport, file, offset, count)
 
-    async def _sendfile_native_fd(self, fd, file, offset, count):
+    async def _sendfile_native_fd(self, transport, file, offset, count):
         in_fd = file.fileno()
         total = 0
         # The file position must reflect what actually reached the peer
@@ -826,6 +826,16 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # the loop reached and concurrent sendfiles stay independent.
         try:
             while True:
+                # Revalidated after EVERY suspension, and re-read rather
+                # than cached: the transport can close while this
+                # coroutine is parked, freeing its descriptor number for
+                # reuse -- a cached integer then aims os.sendfile at
+                # whatever unrelated connection inherited it. Between
+                # this check and the syscall there is no await, so a
+                # close cannot interleave on the loop thread.
+                if transport.is_closing():
+                    raise ConnectionResetError("transport closed during sendfile")
+                fd = transport.fileno()
                 blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
                 if blocksize <= 0:
                     break
@@ -850,7 +860,20 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
                 self._core.add_writer(fd, on_writable)
                 try:
-                    await fut
+                    # Bounded waits, not a bare await: closing the fd
+                    # removes it from the poller, so a transport that
+                    # dies while this is parked would otherwise leave the
+                    # future unresolved forever. shield() keeps the
+                    # timeout from cancelling the future we re-await.
+                    while not fut.done():
+                        if transport.is_closing():
+                            raise ConnectionResetError(
+                                "transport closed during sendfile"
+                            )
+                        try:
+                            await tasks.wait_for(tasks.shield(fut), 0.1)
+                        except TimeoutError:
+                            pass
                 finally:
                     self._core.remove_writer(fd)
             return total

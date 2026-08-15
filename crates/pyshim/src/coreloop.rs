@@ -1041,6 +1041,10 @@ impl CoreLoop {
     }
 
     /// Adopt an existing listening socket fd (create_server(sock=...)).
+    /// Owns the caller-detached descriptor from entry: every error path
+    /// closes it exactly once, and the Python side no longer discards on
+    /// failure -- doing both was a double close, and in a threaded
+    /// process the second close lands on whatever reused the number.
     #[pyo3(signature = (fd, factory, accept_pool=64, start=true))]
     fn listen_fd(
         &self,
@@ -1050,7 +1054,10 @@ impl CoreLoop {
         accept_pool: usize,
         start: bool,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
-        self.check_closed()?;
+        if let Err(e) = self.check_closed() {
+            netsys::close(fd as RawSocket);
+            return Err(e);
+        }
         self.listen_socket(
             py,
             fd as RawSocket,
@@ -1639,13 +1646,6 @@ impl CoreLoop {
         start: bool,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         let sockname = netsys::sockname(sock).ok();
-        let name_obj = sockname
-            .map(|a| {
-                let t = (a.ip().to_string(), a.port());
-                t.into_pyobject(py).map(|b| b.into_any().unbind())
-            })
-            .transpose()?
-            .unwrap_or_else(|| py.None());
         let lid = self.with_net(|net, reactor| -> std::io::Result<u64> {
             if let Err(e) = reactor.backend_mut().register_socket(sock) {
                 // Nothing owns this descriptor yet: `listener_create` has
@@ -1670,6 +1670,16 @@ impl CoreLoop {
             }
             Ok(lid)
         })??;
+        // Converted only now: an error above leaves the descriptor closed
+        // by the branch that hit it, and nothing after the native work
+        // can return early while the socket has no owner.
+        let name_obj = sockname
+            .map(|a| {
+                let t = (a.ip().to_string(), a.port());
+                t.into_pyobject(py).map(|b| b.into_any().unbind())
+            })
+            .transpose()?
+            .unwrap_or_else(|| py.None());
         Ok((lid, name_obj, sock as u64))
     }
 }

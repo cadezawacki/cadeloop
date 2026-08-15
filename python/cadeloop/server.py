@@ -107,6 +107,13 @@ class _Lifespan:
         async def _run():
             try:
                 await self.app(scope, self._receive, self._send)
+            except (KeyboardInterrupt, SystemExit):
+                # Process-control exceptions are not "no lifespan
+                # support": a Ctrl-C landing in synchronous startup code
+                # (or the app's deliberate exit) must stop the worker,
+                # not silently disable lifespan and serve on. The task
+                # machinery re-raises these out of the loop tick.
+                raise
             except BaseException as exc:  # noqa: BLE001 — app may not do lifespan
                 if not self._startup.done():
                     # Errored before startup completed: app has no lifespan
@@ -477,12 +484,25 @@ def _serve_single(
         if stats_lid is not None:
             loop._core.listener_close(stats_lid)
         if served:
-            _drain_connections(loop, config.grace)
+            # Not the whole grace budget: the supervisor SIGKILLs
+            # `grace` after shutdown begins, and lifespan.shutdown()
+            # below needs a slice of it -- a drain that spends all of
+            # the budget means the app's cleanup hook never runs.
+            _drain_connections(loop, _drain_budget(config.grace))
         if access_log is not None:
             access_log.close()
         lifespan.shutdown()
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def _drain_budget(grace):
+    """Portion of the grace budget the connection drain may spend. The
+    rest is reserved for the application's lifespan.shutdown hook, which
+    runs after the drain but before the supervisor's SIGKILL deadline: a
+    quarter of the budget, capped at 5 seconds -- enough for typical
+    pool/client teardown without starving the drain."""
+    return max(0.0, grace - min(5.0, grace * 0.25))
 
 
 def _drain_connections(loop, grace):

@@ -548,13 +548,13 @@ class TcpSurface:
                         f"A listening socket was expected, got a connected socket {sock!r}"
                     ) from exc
             fd = sock.detach()
-            try:
-                lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)
-            except BaseException:
-                # detach() already ran, so nothing else owns this
-                # descriptor; without the close it leaks.
-                self._core.discard_socket(fd)
-                raise
+            # No cleanup here on failure: the native listen_fd owns the
+            # descriptor from this point and closes it on every one of
+            # its error paths. Closing it here as well was a double
+            # close -- in a threaded process another thread can reuse
+            # the number between the two, and the second close lands on
+            # an unrelated descriptor.
+            lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)
             entries.append((lid, name, rawfd))
             return Server(self, entries, factory, accept_pool, start_serving)
 

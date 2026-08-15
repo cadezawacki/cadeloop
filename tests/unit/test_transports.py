@@ -419,6 +419,53 @@ def test_create_server_raises_when_no_family_is_available(loop):
         loop._core = real_core
 
 
+def test_sendfile_aborts_when_the_transport_closes(loop, tmp_path):
+    """The native sendfile path held a raw descriptor across awaits: a
+    transport closed mid-transfer freed the fd for reuse, and the next
+    os.sendfile could write file bytes into an unrelated connection --
+    or park on writability of a closed fd forever. The transport is
+    revalidated after every suspension. Reported by Codex on PR #4."""
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * (8 << 20))
+
+    class Paused(asyncio.Protocol):
+        def connection_made(self, transport):
+            transport.pause_reading()  # never drain: the sender stalls
+
+    async def main():
+        server = await loop.create_server(Paused, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        tr, _pr = await loop.create_connection(asyncio.Protocol, "127.0.0.1", port)
+        with open(big, "rb") as f:
+            task = asyncio.ensure_future(loop.sendfile(tr, f))
+            await asyncio.sleep(0.3)  # kernel buffers full: parked on writability
+            assert not task.done(), "transfer finished without stalling"
+            tr.abort()
+            await asyncio.sleep(0)  # abort closes the fd in-cell
+            # Grab the freed descriptor number: on the unfixed code the
+            # parked sendfile resumes against this unrelated socket.
+            a, b = socket.socketpair()
+            # ConnectionError specifically: the unfixed code HANGS here
+            # (the writability watcher died with the closed fd), and
+            # wait_for's TimeoutError is an OSError subclass that a
+            # broader raises() would silently accept.
+            with pytest.raises(ConnectionError):
+                await asyncio.wait_for(task, 5)
+            b.setblocking(False)
+            leaked = b""
+            try:
+                leaked = b.recv(65536)
+            except (BlockingIOError, OSError):
+                pass
+            a.close()
+            b.close()
+            assert leaked == b"", "file bytes written into an unrelated socket"
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 def test_undispatched_events_survive_a_fatal_callback(loop):
     """A KeyboardInterrupt from one protocol callback unwinds the tick,
     but the rest of that dispatch batch must be reclaimed, not dropped:
@@ -1814,10 +1861,19 @@ def test_sendfile_reports_position_after_an_interrupted_transfer(loop, monkeypat
                 raise BrokenPipeError(32, "peer went away mid-transfer")
             return real_sendfile(out_fd, in_fd, offset, sent_before_failure)
 
+        class _Wrapper:
+            # _sendfile_native_fd revalidates the transport per iteration
+            # now; this stands in for one over the raw socketpair end.
+            def is_closing(self):
+                return False
+
+            def fileno(self):
+                return a.fileno()
+
         monkeypatch.setattr(os, "sendfile", flaky)
         try:
             with pytest.raises(BrokenPipeError):
-                loop.run_until_complete(loop._sendfile_native_fd(a.fileno(), fh, 0, None))
+                loop.run_until_complete(loop._sendfile_native_fd(_Wrapper(), fh, 0, None))
             assert fh.tell() == sent_before_failure, (
                 f"tell() reports {fh.tell()} after {sent_before_failure} bytes were sent"
             )

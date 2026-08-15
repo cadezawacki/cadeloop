@@ -200,6 +200,37 @@ def test_cli_rejects_a_non_numeric_body_cap(monkeypatch):
             cli.main(["mod:app", "--max-body", "banana"])
 
 
+def test_lifespan_raising_system_exit_stops_startup():
+    """A lifespan app raising SystemExit/KeyboardInterrupt before
+    startup.complete must stop the worker -- classifying it as "no
+    lifespan support" swallowed a Ctrl-C landing in synchronous startup
+    code and served on. Reported by Codex on PR #4."""
+    import threading
+
+    from cadeloop.server import _serve_single
+
+    async def app(scope, receive, send):
+        if scope["type"] != "lifespan":
+            return  # pragma: no cover
+        await receive()
+        raise SystemExit(7)
+
+    cfg = cadeloop.Config(grace=0.0)
+    result = {}
+
+    def run():
+        try:
+            _serve_single(app, "127.0.0.1", 0, cfg)
+        except BaseException as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=20)
+    assert not t.is_alive(), "worker kept serving after SystemExit in lifespan"
+    assert isinstance(result.get("error"), SystemExit), result
+
+
 def test_lifespan_crash_after_startup_stops_the_worker():
     """A lifespan task that raises after startup.complete used to be
     logged and ignored, leaving a worker that looked healthy while the
@@ -436,3 +467,16 @@ def test_a_lifespan_that_returns_after_startup_stops_the_worker():
     assert not t.is_alive(), "worker kept serving after its lifespan context exited"
     assert isinstance(result.get("error"), RuntimeError), result
     assert "lifespan task crashed" in str(result["error"])
+
+
+def test_drain_budget_reserves_grace_for_lifespan():
+    """The supervisor SIGKILLs `grace` after shutdown begins; the drain
+    must not spend all of it, or lifespan.shutdown never runs. Reported
+    by Codex on PR #4."""
+    from cadeloop.server import _drain_budget
+
+    assert _drain_budget(0.0) == 0.0
+    assert _drain_budget(10.0) == 7.5  # quarter reserved
+    assert _drain_budget(40.0) == 35.0  # reserve capped at 5s
+    for grace in (0.5, 2.0, 10.0, 120.0):
+        assert 0.0 < _drain_budget(grace) < grace

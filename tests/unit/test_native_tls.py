@@ -368,3 +368,33 @@ def test_close_sends_a_tls_close_notify(loop, certs):
     assert "error" not in result, f"client saw a ragged close: {result['error']!r}"
     assert result.get("body", b"").endswith(b"ok"), result.get("body")
     assert result.get("unwrapped"), "TLS shutdown handshake never completed"
+
+
+def test_silent_tls_connection_is_torn_down_at_head_timeout(loop, certs):
+    """A peer that connects to a TLS listener and never sends a
+    ClientHello must be torn down at the head deadline. Staging a
+    plaintext 408 that no cipher state can ever encrypt kept the socket
+    and its receive slot alive forever -- one more staged 408 per sweep,
+    free amplification for a silent client. Reported by Codex on PR #4."""
+    server_ctx, _client_ctx = certs
+    lid, port = listen_tls(loop, scope_echo_app, server_ctx, request_line_timeout=0.3)
+
+    def sweep():
+        if loop.is_closed():
+            return
+        loop._core.http_sweep()
+        loop.call_later(0.05, sweep)
+
+    loop.call_later(0.05, sweep)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            data = await asyncio.wait_for(reader.read(), 5)
+            assert data == b"", "plaintext bytes leaked into a TLS stream"
+        except ConnectionResetError:
+            pass  # an abortive close ends the connection just as well
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)

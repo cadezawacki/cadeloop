@@ -1278,6 +1278,18 @@ pub(crate) fn http_sweep(
         }
     }
     for &tid in &expire_head {
+        // A TLS session that never completed its handshake cannot be
+        // answered: the 408 would stage as plaintext no cipher state can
+        // ever encrypt, close_after_write defers behind that stage, and
+        // every later sweep appended another 408 -- socket and receive
+        // slot held forever, free amplification for a peer that connects
+        // and sends nothing. Tear it down instead.
+        let handshaking =
+            net.http_conn_mut(tid).and_then(|c| c.tls.as_ref()).map(|t| t.handshaking).unwrap_or(false);
+        if handshaking {
+            teardown_with(py, net, backend, tid, None);
+            continue;
+        }
         // 408 then close: the head never completed inside the window.
         let minor = net.http_conn_mut(tid).and_then(|c| c.parser.http_version()).map(|(_, m)| m).unwrap_or(1);
         let resp = crate::http::error_response(ParseError { status: 408, reason: "Request Timeout" }, minor);
