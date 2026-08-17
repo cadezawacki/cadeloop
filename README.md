@@ -1,18 +1,14 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/cadeloop-hero.svg" alt="cadeloop" width="100%">
-</p>
+# cadeloop
 
-<p align="center">
-  <b>A drop-in <code>asyncio</code> event loop with a Rust core — and a native HTTP/1.1 + ASGI server built on top of it.</b>
-</p>
+**Rust Powered drop-in asyncio event loop +<br>
+Native HTTP/1.1 + ASGI server**
 
-<p align="center">
-  <a href="https://pypi.org/project/cadeloop/"><img alt="PyPI" src="https://img.shields.io/pypi/v/cadeloop?style=flat-square&label=pypi&labelColor=0B0D11&color=5a9996"></a>
-  <a href="https://pypi.org/project/cadeloop/"><img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-5a9996?style=flat-square&labelColor=0B0D11"></a>
-  <a href="https://github.com/cadezawacki/cadeloop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/cadezawacki/cadeloop/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0B0D11&color=5a9996"></a>
-  <a href="#installation"><img alt="Platforms" src="https://img.shields.io/badge/platform-windows%20x64%20%7C%20linux%20x64-5a9996?style=flat-square&labelColor=0B0D11"></a>
-  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-5a9996?style=flat-square&labelColor=0B0D11"></a>
-</p>
+[![Python 3.11](https://img.shields.io/badge/python-3.11-5a9996?style=flat-square&labelColor=0B0D11)](https://pypi.org/project/cadeloop/)
+[![CI](https://img.shields.io/github/actions/workflow/status/cadezawacki/cadeloop/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0B0D11&color=5a9996)](https://github.com/cadezawacki/cadeloop/actions/workflows/ci.yml)
+[![MIT](https://img.shields.io/badge/license-MIT-5a9996?style=flat-square&labelColor=0B0D11)](LICENSE)
+
+[![PyPI](https://img.shields.io/pypi/v/cadeloop?style=flat-square&label=pypi&labelColor=0B0D11&color=5a9996)](https://pypi.org/project/cadeloop/)
+[![Platforms](https://img.shields.io/badge/platform-windows%20x64%20%7C%20linux%20x64-5a9996?style=flat-square&labelColor=0B0D11)](#installation)
 
 ```python
 import asyncio, cadeloop
@@ -21,24 +17,22 @@ cadeloop.install()          # every asyncio API below now runs on cadeloop
 asyncio.run(main())
 ```
 
-Two lines, and your existing `asyncio` code runs on a Rust reactor. Nothing else
+Two lines to boost the performance of your existing asyncio code. Nothing else
 changes: `asyncio.start_server`, `open_connection`, `add_reader`, `sock_*`,
 subprocesses, signals, and third-party libraries like **uvicorn** and **aiohttp**
-all work unmodified.
+work unmodified.
 
-When you want more than a faster loop, skip the Python HTTP stack entirely.
+For an even faster performance boost, skip the Python HTTP stack entirely.
 `cadeloop.serve()` parses HTTP, builds the ASGI scope, and serializes responses
-**in Rust**. Your `async def app(scope, receive, send)` is the only Python left on
-the request path — which is why it serves **2.4× a tuned uvicorn**
+**in Rust**. Your `async def app(scope, receive, send)` is the only Python left
+on the request path — which is why it serves **2.4× a tuned uvicorn**
 (httptools + uvloop), **1.5× granian**, and **15.8× uvicorn + h11 on stdlib
-asyncio**. Every number is [measured below](#benchmarks), on a stated machine,
-with a reproduction command.
+asyncio**.
 
 ---
 
 ## Table of contents
 
-- [What runs where](#what-runs-where)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Benchmarks](#benchmarks)
@@ -53,25 +47,8 @@ with a reproduction command.
   - [Environment variables](#environment-variables)
   - [`loop.stats()` — introspection](#loopstats--introspection)
 - [Use cases and recipes](#use-cases-and-recipes)
-- [Compatibility](#compatibility)
 - [Development](#development)
 - [License](#license)
-
----
-
-## What runs where
-
-| | Python | Rust |
-|---|---|---|
-| stdlib `asyncio` | loop, transports, protocols, HTTP | — |
-| uvloop / rloop / rsloop | transports, protocols, HTTP | loop |
-| **cadeloop** (drop-in mode) | protocols, HTTP | loop, transports |
-| **cadeloop** (`serve()`) | your ASGI app | loop, transports, HTTP parse + scope + serialize |
-
-Backends: IOCP on Windows, `epoll` on Linux. The `epoll` side is wrapped as a
-proactor — the syscall is attempted at post time and parked only on
-`EWOULDBLOCK` — so one Rust transport layer serves both and behaviour does not
-fork by OS.
 
 ---
 
@@ -91,22 +68,6 @@ pip install cadeloop
 
 Wheels are published for Windows x64 and Linux x64 (manylinux2014,
 glibc ≥ 2.17), plus a source distribution.
-
-### The PGO and `x86-64-v3` wheels
-
-Windows wheels are built with profile-guided optimization: an instrumented
-build runs the project's own scheduling and HTTP workload, and the final wheel
-is compiled against those profiles. `pip install cadeloop` gets that wheel.
-
-Each [GitHub Release](https://github.com/cadezawacki/cadeloop/releases) also
-carries a second Windows wheel built for the **x86-64-v3** microarchitecture
-level (AVX2, BMI1/BMI2, FMA, F16C). It requires Haswell (2013) / Zen 1 (2017)
-or newer — there is no runtime CPU check, so on an older processor it faults
-on import. Install it by URL:
-
-```bash
-pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<v3-wheel>
-```
 
 ### Verifying an install
 
@@ -196,8 +157,8 @@ Methodology, raw commands, and known measurement pitfalls:
 <tr><td>uvicorn + h11</td><td>Python</td><td>uvloop</td><td align="right">9.3 K</td><td align="right">6.34 ms</td><td align="right">13.46 ms</td></tr>
 <tr><td>uvicorn + h11</td><td>Python</td><td>asyncio</td><td align="right">6.6 K</td><td align="right">9.50 ms</td><td align="right">11.94 ms</td></tr>
 <tr><td>uvicorn + h11</td><td>Python</td><td>rsloop</td><td align="right">6.4 K</td><td align="right">9.82 ms</td><td align="right">14.39 ms</td></tr>
-<tr><td>hypercorn</td><td>Python</td><td>asyncio</td><td align="right">4.1 K</td><td align="right">15.01 ms</td><td align="right">20.58 ms</td></tr>
 <tr><td>uvicorn + h11</td><td>Python</td><td>rloop</td><td align="right" colspan="3"><i>crashed under load</i></td></tr>
+<tr><td>hypercorn</td><td>Python</td><td>asyncio</td><td align="right">4.1 K</td><td align="right">15.01 ms</td><td align="right">20.58 ms</td></tr>
 </tbody>
 </table>
 
@@ -965,29 +926,6 @@ async def stats(scope, receive, send):
 ```
 
 Or skip the code and use `--stats-endpoint 9001`.
-
----
-
-## Compatibility
-
-| surface | state |
-|---|---|
-| Scheduling: `call_soon`, `call_later`, `call_at`, timers, threadsafe, tasks | ✅ tested |
-| TCP transports, `create_server` / `create_connection`, streams | ✅ tested |
-| TLS: native termination (`serve(ssl=...)`, https/wss), client `ssl=` / `start_tls` | ✅ tested |
-| `sock_*`, `add_reader` / `add_writer`, signals | ✅ tested |
-| UDP (`create_datagram_endpoint`) | ✅ tested |
-| WebSockets (RFC 6455, native engine) | ✅ tested |
-| Native HTTP/1.1 + ASGI engine, lifespan, CLI | ✅ tested (Starlette, FastAPI) |
-| Multi-worker (`workers > 1`) | ✅ tested (fork + `SO_REUSEPORT`; spawn + shared listener on Windows) |
-| Subprocess (`create_subprocess_exec` / `shell`) | ✅ POSIX; Windows pipes in progress |
-| Drop-in with uvicorn, aiohttp | ✅ interop-tested |
-| CPython asyncio conformance suite | ✅ runs against the stdlib's own tests |
-| RIO backend (`backend="rio"`) | 🔶 implemented; blocked on an OS-level RIO failure on the test machine — `auto` stays on IOCP |
-| Native `loop.sendfile` | 🔶 `sock_sendfile` fallback works |
-
-Full requirement-by-requirement map:
-[docs/requirements-traceability.md](docs/requirements-traceability.md).
 
 ---
 
