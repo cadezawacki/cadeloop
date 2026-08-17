@@ -503,8 +503,14 @@ def test_undispatched_events_survive_a_fatal_callback(loop):
     c1.sendall(b"a")
     c2.sendall(b"b")
     for _ in range(2):
+        # run_forever, not run_until_complete(sleep): the reclaimed
+        # event's KeyboardInterrupt can win the tick before a fresh
+        # sleep task's first step, leaving its coroutine collected
+        # un-awaited (a RuntimeWarning in CI). The timer bounds a
+        # broken run that raises nothing.
+        loop.call_later(2, loop.stop)
         with pytest.raises(KeyboardInterrupt):
-            loop.run_until_complete(asyncio.sleep(0.5))
+            loop.run_forever()
     assert sorted(seen) == [b"a", b"b"]
     c1.close()
     c2.close()
