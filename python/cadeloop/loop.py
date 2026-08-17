@@ -248,6 +248,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             rsock.close()
             csock.close()
             return None
+        # The wake pipe's watch is infrastructure, not I/O interest:
+        # without this, its permanent registration would keep the poll
+        # elision (pure-scheduling fast path) from ever engaging.
+        self._core.set_signal_wakeup_fd(rsock.fileno())
         return (rsock, csock, old_fd)
 
     def _remove_signal_wakeup(self, wakeup):
@@ -256,6 +260,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         import signal as signal_module
 
         rsock, csock, old_fd = wakeup
+        self._core.set_signal_wakeup_fd(None)
         try:
             self._core.remove_reader(rsock.fileno())
         except OSError:

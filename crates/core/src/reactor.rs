@@ -65,6 +65,9 @@ pub struct Stats {
     pub timers_fired: u64,
     pub xthread_items: u64,
     pub spin_hits: u64,
+    /// Zero-timeout polls skipped outright because the backend had no
+    /// possible completion source (has_io_interest() == false).
+    pub polls_elided: u64,
     pub polls: u64,
 }
 
@@ -189,6 +192,12 @@ impl<T> Reactor<T> {
 
     /// Start-of-tick bookkeeping (GIL held): refresh clock, absorb timer
     /// cancellations, drain the cross-thread queue, fire expired timers.
+    /// R-052: mark/clear the signal-wakeup fd on the backend so poll
+    /// elision does not count it as I/O interest.
+    pub fn set_wake_only(&mut self, fd: Option<crate::backend::RawSocket>) {
+        self.backend.set_wake_only(fd);
+    }
+
     pub fn prepare_tick(&mut self) {
         self.stats.ticks += 1;
         self.clock.refresh();
@@ -238,6 +247,18 @@ impl<T> Reactor<T> {
     pub fn poll(&mut self, timeout: Duration) -> io::Result<()> {
         self.completions.clear();
         if timeout.is_zero() {
+            // Full poll elision: with no op in flight, no readiness watch
+            // armed and no completion staged, the kernel has nothing to
+            // say at all -- pure-scheduling workloads (task ping-pong,
+            // call_soon chains) skip the epoll_wait/GQCSEx syscall
+            // entirely, not merely 249 ticks in 250. Cross-thread wakeups
+            // are unaffected: their queue is drained in-memory every tick,
+            // and the wake signal exists to interrupt PARKED polls, which
+            // are never elided.
+            if !self.backend.has_io_interest() {
+                self.stats.polls_elided += 1;
+                return Ok(());
+            }
             // Poll-skip window (adopted from rloop): with ready callbacks
             // pending, an actual kernel poll is only taken every 250us —
             // bounded I/O-discovery staleness under CPU saturation in

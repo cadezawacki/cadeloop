@@ -159,6 +159,9 @@ pub struct EpollBackend {
     /// Ops completed inline or cancelled, delivered on the next poll.
     inline_completions: Vec<Completion>,
     events: Vec<libc::epoll_event>,
+    /// The signal-wakeup pipe's read end (R-052): watched, but not
+    /// I/O interest -- see has_io_interest.
+    wake_only: Option<RawSocket>,
     pub syscalls_saved_inline: u64,
 }
 
@@ -179,6 +182,7 @@ impl EpollBackend {
             fds: HashMap::new(),
             inline_completions: Vec::with_capacity(32),
             events: vec![unsafe { zeroed() }; 1024],
+            wake_only: None,
             syscalls_saved_inline: 0,
         })
     }
@@ -692,6 +696,26 @@ impl IoBackend for EpollBackend {
                 });
             }
         }
+    }
+
+    fn has_io_interest(&self) -> bool {
+        // A staged completion or an op the kernel may still finish is
+        // always interest. Registered fds count too -- except the
+        // signal-wakeup pipe, which exists only to interrupt parked
+        // polls (its bytes are drained by a Ready callback whenever a
+        // real poll does run; an un-drained buffer merely keeps the fd
+        // readable, which is exactly what a later park wants).
+        if !self.inline_completions.is_empty() || self.slab.in_flight() > 0 {
+            return true;
+        }
+        match self.wake_only {
+            Some(w) => self.fds.len() > 1 || !self.fds.contains_key(&(w as RawFd)),
+            None => !self.fds.is_empty(),
+        }
+    }
+
+    fn set_wake_only(&mut self, fd: Option<RawSocket>) {
+        self.wake_only = fd;
     }
 
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {

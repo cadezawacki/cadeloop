@@ -801,7 +801,7 @@ impl ValueAwaitable {
     }
 }
 
-fn value_awaitable(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+pub(crate) fn value_awaitable(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
     Ok(Py::new(py, ValueAwaitable { value: Some(value) })?.into_any())
 }
 

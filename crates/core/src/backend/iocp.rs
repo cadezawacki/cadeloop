@@ -269,6 +269,9 @@ pub struct IocpBackend {
     watch_rearm: Vec<SOCKET>,
     /// Live probe ops -> socket, so completions translate to Ready events.
     probe_ops: HashMap<OpId, (SOCKET, bool /*write probe*/)>,
+    /// The signal-wakeup fd (R-052): watched, but not I/O interest --
+    /// see has_io_interest.
+    wake_only: Option<RawSocket>,
     /// Sockets where FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is active.
     /// Synchronous returns may ONLY be handled inline for these (R-031);
     /// for LSP/non-IFS sockets the port still queues a completion even on
@@ -324,6 +327,7 @@ impl IocpBackend {
             watches: HashMap::new(),
             watch_rearm: Vec::new(),
             probe_ops: HashMap::new(),
+            wake_only: None,
             skip_ok: std::collections::HashSet::new(),
             accept_socket_flags: WSA_FLAG_OVERLAPPED | crate::netsys::WSA_FLAG_NO_HANDLE_INHERIT,
             associated: std::collections::HashSet::new(),
@@ -1122,6 +1126,26 @@ impl IoBackend for IocpBackend {
             return Err(err);
         }
         Ok(accepted)
+    }
+
+    fn has_io_interest(&self) -> bool {
+        // Staged completions always poll, and so does ANY pending watch
+        // re-arm -- even the signal-wakeup fd's, or its fired probe would
+        // never repost and a later park could sleep unwakeable. Beyond
+        // that: in-flight ops other than the wake fd's own probes, or
+        // any watch on a socket that is not the wake fd.
+        if !self.inline_completions.is_empty() || !self.watch_rearm.is_empty() {
+            return true;
+        }
+        let wake_probes = self
+            .wake_only
+            .map_or(0, |w| self.probe_ops.values().filter(|(s, _)| *s as RawSocket == w).count());
+        self.slab.in_flight() > wake_probes
+            || self.watches.keys().any(|&s| Some(s as RawSocket) != self.wake_only)
+    }
+
+    fn set_wake_only(&mut self, fd: Option<RawSocket>) {
+        self.wake_only = fd;
     }
 
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {

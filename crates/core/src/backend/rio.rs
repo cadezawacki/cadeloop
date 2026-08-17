@@ -641,6 +641,9 @@ impl IoBackend for RioBackend {
         Ok(())
     }
 
+    // has_io_interest deliberately not overridden: the RIO scaffold keeps
+    // the conservative default (always poll) until it is hardware-validated.
+
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {
         let before = out.len();
         self.inner.pre_poll(out);

@@ -1067,6 +1067,13 @@ impl CoreLoop {
         )
     }
 
+    /// R-052: the facade marks the signal-wakeup pipe's read end here so
+    /// poll elision does not treat its permanent watch as I/O interest.
+    #[pyo3(signature = (fd=None))]
+    fn set_signal_wakeup_fd(&self, fd: Option<u64>) -> PyResult<()> {
+        self.with_net(|_net, reactor| reactor.set_wake_only(fd.map(|f| f as RawSocket)))
+    }
+
     /// Start (or restart) accepting on a listener created with start=false.
     fn listener_start(&self, lid: u64) -> PyResult<()> {
         self.with_net(|net, reactor| net::listener_start(net, reactor.backend_mut(), lid))??;
@@ -1573,6 +1580,7 @@ impl CoreLoop {
         d.set_item("timers_fired", stats.timers_fired)?;
         d.set_item("xthread_items", stats.xthread_items)?;
         d.set_item("spin_hits", stats.spin_hits)?;
+        d.set_item("polls_elided", stats.polls_elided)?;
         d.set_item("ready_len", ready)?;
         d.set_item("timers_len", timers)?;
         d.set_item("connections", netstats.0)?;
