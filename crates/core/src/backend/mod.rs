@@ -174,6 +174,24 @@ pub trait IoBackend {
         self.poll(out, Some(Duration::ZERO))
     }
 
+    /// Can this backend possibly produce a completion right now -- any op
+    /// in flight, readiness watch armed, or completion already staged?
+    /// `false` lets the reactor elide zero-timeout kernel polls entirely
+    /// during pure-scheduling workloads (cross-thread wakeups are exempt:
+    /// their queue is drained in-memory every tick, and the wake signal
+    /// only matters to a PARKED poll, which is never elided). Backends
+    /// that cannot answer cheaply keep the conservative default.
+    fn has_io_interest(&self) -> bool {
+        true
+    }
+
+    /// Mark (or clear) the loop's signal-wakeup descriptor (R-052). Its
+    /// watch exists only to interrupt PARKED polls -- signal dispatch
+    /// itself rides the interpreter's pending-signal machinery -- so it
+    /// must not count as I/O interest, or a loop whose only registered
+    /// fd is this one could never elide busy-tick polls.
+    fn set_wake_only(&mut self, _fd: Option<RawSocket>) {}
+
     fn register_buffers(&mut self, _regions: &mut [(*mut u8, usize, &mut Option<u64>)]) -> io::Result<()> {
         Ok(())
     }

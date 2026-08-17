@@ -1,6 +1,7 @@
 //! `cadeloop._core` — the PyO3 extension module (L2 bindings).
 
 mod coreloop;
+mod fastqueue;
 mod gil_boundary;
 mod handles;
 mod http;
@@ -21,6 +22,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<handles::Handle>()?;
     m.add_class::<handles::TimerHandle>()?;
     m.add_class::<net::Transport>()?;
+    m.add_class::<fastqueue::FastQueue>()?;
     m.add_class::<http::CompletedAwaitable>()?;
     m.add_class::<http::ValueAwaitable>()?;
     m.add_class::<http::HttpReceive>()?;

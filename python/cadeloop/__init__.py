@@ -16,6 +16,7 @@ from ._core import __version__ as _core_version
 from .config import Config
 from .loop import Loop
 from .policy import EventLoopPolicy, install, new_event_loop, run
+from .queues import Queue
 from .server import serve
 
 __version__ = _core_version
@@ -28,4 +29,5 @@ __all__ = [
     "run",
     "serve",
     "__version__",
+    "Queue",
 ]

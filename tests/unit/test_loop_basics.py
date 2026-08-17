@@ -432,6 +432,30 @@ def test_exception_handler_raising_system_exit_stops_the_loop(loop):
         loop.run_forever()
 
 
+def test_pure_scheduling_elides_kernel_polls(loop):
+    """R-150: with no op in flight and no fd registered (the signal-wakeup
+    pipe is exempt), busy ticks must not touch the kernel at all."""
+    n = [0]
+
+    def chain():
+        n[0] += 1
+        if n[0] < 2000:
+            loop.call_soon(chain)
+        else:
+            loop.stop()
+
+    loop.call_soon(chain)
+    loop.run_forever()
+    st = loop.stats()
+    assert st["polls_elided"] > 0, st
+    # Elision must never suppress parked polls: a timer-driven park still
+    # wakes on time.
+    t0 = loop.time()
+    loop.call_later(0.05, loop.stop)
+    loop.run_forever()
+    assert loop.time() - t0 >= 0.04
+
+
 def test_loop_keeps_running_after_callback_exception(loop):
     loop.set_exception_handler(lambda lp, ctx: None)
     out = []

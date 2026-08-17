@@ -207,6 +207,32 @@ def bench_queue_pingpong(loop, n):
     return n, time.perf_counter() - t0
 
 
+def bench_queue_pingpong_native(loop, n):
+    """queue_pingpong with cadeloop.Queue (native hot paths) instead of
+    asyncio.Queue -- same workload, loop-agnostic queue, so the delta vs
+    queue_pingpong isolates what the stdlib queue itself costs."""
+    import cadeloop
+
+    async def main():
+        q = cadeloop.Queue(maxsize=64)
+
+        async def producer():
+            for i in range(n):
+                await q.put(i)
+            await q.put(None)
+
+        async def consumer():
+            while True:
+                if await q.get() is None:
+                    return
+
+        await asyncio.gather(producer(), consumer())
+
+    t0 = time.perf_counter()
+    loop.run_until_complete(main())
+    return n, time.perf_counter() - t0
+
+
 BENCHES = {
     "call_soon_chain": (bench_call_soon_chain, 200_000),
     "call_soon_burst": (bench_call_soon_burst, 200_000),
@@ -218,6 +244,7 @@ BENCHES = {
     "future_chain": (bench_future_chain, 100_000),
     "gather_fanin": (bench_gather_fanin, 50_000),
     "queue_pingpong": (bench_queue_pingpong, 100_000),
+    "queue_pingpong_native": (bench_queue_pingpong_native, 100_000),
 }
 
 
