@@ -18,8 +18,8 @@ import pathlib
 # Entity -> categorical slot (fixed across every chart; color follows the
 # entity, never the rank).
 LIGHT = {
-    "cadeloop": "#2a78d6",
-    "cadeloop-native": "#164a9e",
+    "cadeloop": "#5a9996",
+    "cadeloop-native": "#5a9996",
     "cadeloop-native-w2": "#3d6fc2",
     "asyncio": "#eb6834",
     "uvloop": "#1baf7a",
@@ -32,8 +32,8 @@ LIGHT = {
     "winloop": "#6f6e69",
 }
 DARK = {
-    "cadeloop": "#3987e5",
-    "cadeloop-native": "#6fa9ef",
+    "cadeloop": "#5a9996",
+    "cadeloop-native": "#5a9996",
     "cadeloop-native-w2": "#4f88d8",
     "asyncio": "#d95926",
     "uvloop": "#199e70",
@@ -66,8 +66,6 @@ INK = {
         "axis": "#232830",
     },
 }
-
-BEST = {"light": "#0a7d72", "dark": "#00F0D1"}  # brand signal teal; dark = #00F0D1 exactly
 
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 BAR = 16  # bar thickness (<= 24)
@@ -240,7 +238,9 @@ def chart_ranked(title, rows, unit, mode, note=None):
     `rows` is [(label, value)] or [(label, value, entity)] in any order; it
     is sorted here so the chart reads as a ranking. The optional third
     field keeps the color tied to the entity when the displayed label is a
-    friendlier rewrite of it. The leader is drawn in the teal accent that
+    friendlier rewrite of it. Rank is carried by order and by the bolded
+    leader label only -- never by hue, so the cadeloop bar is the same
+    brand accent in every chart. The leader is drawn in the teal accent that
     marks the same value in the README table, and every other bar keeps
     its entity color -- rank changes the highlight, never the hue.
     """
@@ -276,7 +276,7 @@ def chart_ranked(title, rows, unit, mode, note=None):
         label, value = row[0], row[1]
         entity = row[2] if len(row) > 2 else label
         y = top + i * row_h
-        color = BEST[mode] if i == 0 else series_color(mode, entity)
+        color = series_color(mode, entity)
         weight = "600" if i == 0 else "400"
         fill = ink["primary"] if i == 0 else ink["secondary"]
         out.append(

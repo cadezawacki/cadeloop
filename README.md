@@ -7,11 +7,11 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/cadeloop/"><img alt="PyPI" src="https://img.shields.io/pypi/v/cadeloop?style=flat-square&label=pypi&labelColor=0B0D11&color=00F0D1"></a>
-  <a href="https://pypi.org/project/cadeloop/"><img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-00F0D1?style=flat-square&labelColor=0B0D11"></a>
-  <a href="https://github.com/cadezawacki/cadeloop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/cadezawacki/cadeloop/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0B0D11&color=00F0D1"></a>
-  <a href="#installation"><img alt="Platforms" src="https://img.shields.io/badge/platform-windows%20x64%20%7C%20linux%20x64-00F0D1?style=flat-square&labelColor=0B0D11"></a>
-  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-00F0D1?style=flat-square&labelColor=0B0D11"></a>
+  <a href="https://pypi.org/project/cadeloop/"><img alt="PyPI" src="https://img.shields.io/pypi/v/cadeloop?style=flat-square&label=pypi&labelColor=0B0D11&color=5a9996"></a>
+  <a href="https://pypi.org/project/cadeloop/"><img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-5a9996?style=flat-square&labelColor=0B0D11"></a>
+  <a href="https://github.com/cadezawacki/cadeloop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/cadezawacki/cadeloop/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0B0D11&color=5a9996"></a>
+  <a href="#installation"><img alt="Platforms" src="https://img.shields.io/badge/platform-windows%20x64%20%7C%20linux%20x64-5a9996?style=flat-square&labelColor=0B0D11"></a>
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-5a9996?style=flat-square&labelColor=0B0D11"></a>
 </p>
 
 ```python
@@ -26,12 +26,7 @@ changes: `asyncio.start_server`, `open_connection`, `add_reader`, `sock_*`,
 subprocesses, signals, and third-party libraries like **uvicorn** and **aiohttp**
 all work unmodified.
 
-When you want more than a faster loop, skip the Python HTTP stack entirely:
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/terminal-demo.svg" alt="Terminal: pip install cadeloop, then cadeloop myapp:app --workers 4 starting four workers, and curl returning Hello, World!" width="100%">
-</p>
-
+When you want more than a faster loop, skip the Python HTTP stack entirely.
 `cadeloop.serve()` parses HTTP, builds the ASGI scope, and serializes responses
 **in Rust**. Your `async def app(scope, receive, send)` is the only Python left on
 the request path — which is why it serves **2.4× a tuned uvicorn**
@@ -39,7 +34,7 @@ the request path — which is why it serves **2.4× a tuned uvicorn**
 asyncio**. Every number is [measured below](#benchmarks), on a stated machine,
 with a reproduction command.
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Table of contents
 
@@ -59,11 +54,10 @@ with a reproduction command.
   - [`loop.stats()` — introspection](#loopstats--introspection)
 - [Use cases and recipes](#use-cases-and-recipes)
 - [Compatibility](#compatibility)
-- [Architecture](#architecture)
 - [Development](#development)
 - [License](#license)
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## What runs where
 
@@ -79,7 +73,7 @@ proactor — the syscall is attempted at post time and parked only on
 `EWOULDBLOCK` — so one Rust transport layer serves both and behaviour does not
 fork by OS.
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Installation
 
@@ -122,7 +116,7 @@ python -c "import cadeloop; l = cadeloop.new_event_loop(); print(cadeloop.__vers
 # 0.0.1 epoll-dev (Linux)
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Quick start
 
@@ -169,7 +163,7 @@ if __name__ == "__main__":
     cadeloop.serve(app, "0.0.0.0", 8000, workers=4)
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Benchmarks
 
@@ -191,18 +185,21 @@ Methodology, raw commands, and known measurement pitfalls:
   <img alt="HTTP throughput: cadeloop serve() 104.7K req/s, granian 68.1K, uvicorn+httptools/uvloop 43.7K, uvicorn+h11 6.6-10.0K, hypercorn 4.1K" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-http-ranked.svg">
 </picture>
 
-| server | parsing | loop | req/s | p50 | p99 |
-|---|---|---|---:|---:|---:|
-| **cadeloop** `serve()` | Rust | cadeloop | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **104.7 K** | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **0.54 ms** | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **1.36 ms** |
-| granian | Rust (hyper) | its own | 68.1 K | 0.89 ms | 1.99 ms |
-| uvicorn + httptools | C | uvloop | 43.7 K | 1.34 ms | 2.91 ms |
-| uvicorn + httptools | C | asyncio | 25.5 K | 2.37 ms | 4.20 ms |
-| uvicorn + h11 | Python | cadeloop | 10.0 K | 6.00 ms | 9.69 ms |
-| uvicorn + h11 | Python | uvloop | 9.3 K | 6.34 ms | 13.46 ms |
-| uvicorn + h11 | Python | asyncio | 6.6 K | 9.50 ms | 11.94 ms |
-| uvicorn + h11 | Python | rsloop | 6.4 K | 9.82 ms | 14.39 ms |
-| uvicorn + h11 | Python | rloop | *crashed under load* | | |
-| hypercorn | Python | asyncio | 4.1 K | 15.01 ms | 20.58 ms |
+<table>
+<thead><tr><th>server</th><th>parsing</th><th>loop</th><th align="right">req/s</th><th align="right">p50</th><th align="right">p99</th></tr></thead>
+<tbody>
+<tr><td><b>cadeloop</b> <code>serve()</code></td><td>Rust</td><td>cadeloop</td><td align="right" style="background-color: #00f0d11a"><b>104.7 K</b></td><td align="right" style="background-color: #00f0d11a"><b>0.54 ms</b></td><td align="right" style="background-color: #00f0d11a"><b>1.36 ms</b></td></tr>
+<tr><td>granian</td><td>Rust (hyper)</td><td>its own</td><td align="right">68.1 K</td><td align="right">0.89 ms</td><td align="right">1.99 ms</td></tr>
+<tr><td>uvicorn + httptools</td><td>C</td><td>uvloop</td><td align="right">43.7 K</td><td align="right">1.34 ms</td><td align="right">2.91 ms</td></tr>
+<tr><td>uvicorn + httptools</td><td>C</td><td>asyncio</td><td align="right">25.5 K</td><td align="right">2.37 ms</td><td align="right">4.20 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>cadeloop</td><td align="right">10.0 K</td><td align="right">6.00 ms</td><td align="right">9.69 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>uvloop</td><td align="right">9.3 K</td><td align="right">6.34 ms</td><td align="right">13.46 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>asyncio</td><td align="right">6.6 K</td><td align="right">9.50 ms</td><td align="right">11.94 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>rsloop</td><td align="right">6.4 K</td><td align="right">9.82 ms</td><td align="right">14.39 ms</td></tr>
+<tr><td>hypercorn</td><td>Python</td><td>asyncio</td><td align="right">4.1 K</td><td align="right">15.01 ms</td><td align="right">20.58 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>rloop</td><td align="right" colspan="3"><i>crashed under load</i></td></tr>
+</tbody>
+</table>
 
 Holding uvicorn+h11 fixed, cadeloop is 1.51× stdlib asyncio. Holding the loop
 fixed at cadeloop, `serve()` is 10.5× uvicorn+h11. The comparable stacks —
@@ -226,13 +223,16 @@ and the node count are verified, so a loop cannot win by skipping work.
   <img alt="Recursive async fib(21): cadeloop 77.3K calls/s, rsloop 76.6K, rloop 69.6K, uvloop 69.0K, asyncio 49.4K" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-sched-task-fib.svg">
 </picture>
 
-| loop | K coroutine calls/s | vs asyncio |
-|---|---:|---:|
-| **cadeloop** | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **77.3** | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **1.57×** |
-| rsloop | 76.6 | 1.55× |
-| rloop | 69.6 | 1.41× |
-| uvloop | 69.0 | 1.40× |
-| asyncio | 49.4 | 1.00× |
+<table>
+<thead><tr><th>loop</th><th align="right">K coroutine calls/s</th><th align="right">vs asyncio</th></tr></thead>
+<tbody>
+<tr><td><b>cadeloop</b></td><td align="right" style="background-color: #00f0d11a"><b>77.3</b></td><td align="right" style="background-color: #00f0d11a"><b>1.57×</b></td></tr>
+<tr><td>rsloop</td><td align="right">76.6</td><td align="right">1.55×</td></tr>
+<tr><td>rloop</td><td align="right">69.6</td><td align="right">1.41×</td></tr>
+<tr><td>uvloop</td><td align="right">69.0</td><td align="right">1.40×</td></tr>
+<tr><td>asyncio</td><td align="right">49.4</td><td align="right">1.00×</td></tr>
+</tbody>
+</table>
 
 cadeloop and rsloop are within 1% of each other here — a tie in practice. The
 spread across every Rust loop is 1.4–1.6× over stdlib, well short of what the
@@ -249,23 +249,26 @@ medians. Millions of ops/second.
   <img alt="Scheduling speedup vs stdlib asyncio across ten microbenchmarks" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-sched.svg">
 </picture>
 
-| benchmark | cadeloop | asyncio | uvloop | rloop | rsloop |
-|---|---:|---:|---:|---:|---:|
-| `call_soon_chain` | 4.003 | 0.572 | 1.738 | 4.042 | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **5.419** |
-| `call_soon_burst` | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **3.107** | 0.714 | 0.936 | 2.740 | 1.425 |
-| `timer_fire` | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **1.608** | 0.278 | 1.072 | 1.589 | 0.710 |
-| `timer_schedule_cancel` | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **2.166** | 0.518 | 0.436 | 1.666 | 0.752 |
-| `sleep0_chain` | 1.680 | 0.440 | 1.057 | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **1.899** | 1.691 |
-| `task_spawn` | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **0.256** | 0.168 | 0.224 | 0.248 | 0.195 |
-| `threadsafe_throughput` | 3.224 | 0.139 | 1.545 | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **3.866** | 2.598 |
-| `future_chain` | 1.178 | 0.214 | 0.599 | 1.086 | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **1.187** |
-| `gather_fanin` | 0.235 | 0.164 | 0.231 | 0.219 | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **0.239** |
-| `queue_pingpong` | 1.086 | 1.115 | 1.299 | <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/best.svg" alt="best" height="14"> **1.347** | 1.280 |
+<table>
+<thead><tr><th>benchmark</th><th align="right">cadeloop</th><th align="right">asyncio</th><th align="right">uvloop</th><th align="right">rloop</th><th align="right">rsloop</th></tr></thead>
+<tbody>
+<tr><td><code>call_soon_chain</code></td><td align="right">4.003</td><td align="right">0.572</td><td align="right">1.738</td><td align="right">4.042</td><td align="right" style="background-color: #00f0d11a"><b>5.419</b></td></tr>
+<tr><td><code>call_soon_burst</code></td><td align="right" style="background-color: #00f0d11a"><b>3.107</b></td><td align="right">0.714</td><td align="right">0.936</td><td align="right">2.740</td><td align="right">1.425</td></tr>
+<tr><td><code>timer_fire</code></td><td align="right" style="background-color: #00f0d11a"><b>1.608</b></td><td align="right">0.278</td><td align="right">1.072</td><td align="right">1.589</td><td align="right">0.710</td></tr>
+<tr><td><code>timer_schedule_cancel</code></td><td align="right" style="background-color: #00f0d11a"><b>2.166</b></td><td align="right">0.518</td><td align="right">0.436</td><td align="right">1.666</td><td align="right">0.752</td></tr>
+<tr><td><code>sleep0_chain</code></td><td align="right">1.680</td><td align="right">0.440</td><td align="right">1.057</td><td align="right" style="background-color: #00f0d11a"><b>1.899</b></td><td align="right">1.691</td></tr>
+<tr><td><code>task_spawn</code></td><td align="right" style="background-color: #00f0d11a"><b>0.256</b></td><td align="right">0.168</td><td align="right">0.224</td><td align="right">0.248</td><td align="right">0.195</td></tr>
+<tr><td><code>threadsafe_throughput</code></td><td align="right">3.224</td><td align="right">0.139</td><td align="right">1.545</td><td align="right" style="background-color: #00f0d11a"><b>3.866</b></td><td align="right">2.598</td></tr>
+<tr><td><code>future_chain</code></td><td align="right">1.178</td><td align="right">0.214</td><td align="right">0.599</td><td align="right">1.086</td><td align="right" style="background-color: #00f0d11a"><b>1.187</b></td></tr>
+<tr><td><code>gather_fanin</code></td><td align="right">0.235</td><td align="right">0.164</td><td align="right">0.231</td><td align="right">0.219</td><td align="right" style="background-color: #00f0d11a"><b>0.239</b></td></tr>
+<tr><td><code>queue_pingpong</code></td><td align="right">1.086</td><td align="right">1.115</td><td align="right">1.299</td><td align="right" style="background-color: #00f0d11a"><b>1.347</b></td><td align="right">1.280</td></tr>
+</tbody>
+</table>
 
 cadeloop leads on four, and beats stdlib asyncio everywhere except
 `queue_pingpong`, where all five loops land within 20% of each other.
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Usage guide
 
@@ -275,17 +278,17 @@ on that loop, and a **CLI** wrapping that server.
 <table>
 <tr>
 <td width="33%" align="center">
-  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/icon-loop.svg" width="56" alt=""><br>
+  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/icon-loop.svg" width="36" alt=""><br>
   <b><a href="#1-as-a-drop-in-event-loop">Event loop</a></b><br>
   <sub>Swap the loop under code you already have</sub>
 </td>
 <td width="33%" align="center">
-  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/icon-modules.svg" width="56" alt=""><br>
+  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/icon-modules.svg" width="36" alt=""><br>
   <b><a href="#2-as-an-asgi-server-cadeloopserve">ASGI server</a></b><br>
   <sub><code>serve()</code> — HTTP parsed and serialized in Rust</sub>
 </td>
 <td width="33%" align="center">
-  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/icon-terminal.svg" width="56" alt=""><br>
+  <img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/icon-terminal.svg" width="36" alt=""><br>
   <b><a href="#3-from-the-command-line">Command line</a></b><br>
   <sub><code>cadeloop myapp:app</code>, every tunable a flag</sub>
 </td>
@@ -371,7 +374,7 @@ with asyncio.Runner(loop_factory=loop_factory) as runner:
     runner.run(main())
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### 2. As an ASGI server (`cadeloop.serve`)
 
@@ -481,7 +484,7 @@ Workers are supervised and restarted, with a fast-crash cutoff so a worker that
 dies immediately and repeatedly does not restart forever. `pin=True` (the
 default) pins each worker to a core.
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### 3. From the command line
 
@@ -501,7 +504,7 @@ cadeloop myapp:app --latency-mode spin --max-body none --stats-endpoint 9001
 cadeloop myapp:app -w 8 --latency-mode throughput --keepalive-idle 15
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### `Loop()` — every constructor argument
 
@@ -549,7 +552,7 @@ Two attributes worth knowing:
 | `loop.slow_callback_duration` | Seconds a callback may run before debug mode logs it. Default `0.1`. Settable; the native dispatcher honours it. |
 | `loop.stats()` | Live counters — see [`loop.stats()`](#loopstats--introspection). |
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### `Config` — every tunable
 
@@ -655,7 +658,7 @@ export CADELOOP_ACCESS_LOG=true
 cfg = Config.from_env()                 # or Config.from_env(prefix="MYAPP_")
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### `serve()` — every argument
 
@@ -695,7 +698,7 @@ cadeloop.serve(
 )
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### CLI flag reference
 
@@ -742,7 +745,7 @@ Every boolean tunable has a paired `--no-` form, and the three
 `int | None` options (`--spin-us`, `--max-body`, `--stats-endpoint`) accept the
 literal `none` — without it, those states would be unreachable from the shell.
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### Environment variables
 
@@ -753,7 +756,7 @@ literal `none` — without it, those states would be unreachable from the shell.
 | `CADELOOP_ALLOW_EXPERIMENTAL_RIO` | `Config` | Required to set `backend="rio"` through `Config`/`serve()`. `Loop(backend="rio")` stays reachable without it, for RIO diagnosis. |
 | `PYTHONASYNCIODEBUG` | `Loop()` | Enables asyncio debug mode, as with the stdlib loop. `-X dev` does the same. |
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ### `loop.stats()` — introspection
 
@@ -794,7 +797,7 @@ cadeloop myapp:app --stats-endpoint 9001 &
 curl -s localhost:9001 | python -m json.tool
 ```
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Use cases and recipes
 
@@ -963,7 +966,7 @@ async def stats(scope, receive, send):
 
 Or skip the code and use `--stats-endpoint 9001`.
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Compatibility
 
@@ -986,37 +989,7 @@ Or skip the code and use `--stats-endpoint 9001`.
 Full requirement-by-requirement map:
 [docs/requirements-traceability.md](docs/requirements-traceability.md).
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
-
-## Architecture
-
-```
-L4  Python user code / ASGI app
-L3  python/cadeloop — Loop facade, policy, Config, CLI       [Python]
-L2  crates/pyshim   — transports, listeners, bindings        [Rust]
-L1  crates/core     — reactor: timers, queues, dispatch      [Rust]
-L0  crates/core     — IOCP | RIO (hybrid) | epoll (Linux)    [Rust]
-```
-
-- **One completion-style op API over both kernels** — IOCP natively; epoll
-  wrapped as a proactor (syscall attempted at post time, parked only on
-  `EWOULDBLOCK`), so a single Rust transport layer serves both.
-- **One thread, one conditional GIL release per tick.** The kernel poll drops the
-  GIL only when it can actually block; completions dispatch in batches via
-  vectorcall, with per-connection protocol callbacks cached as bound methods.
-- **Cancel-safe by construction.** Pinned op slabs with a
-  `{Free, Posted, Completed, Cancelled}` state machine (property-tested), buffer
-  slots refcounted by kernel ops and memoryview exports alike, and a graveyard
-  protocol so no Python object is dropped — and no `__del__` can re-enter —
-  inside the loop's critical section.
-- **Corked gather writes.** Writes coalesce within a tick into ≤16-slice
-  `writev`/`WSASend` calls, flushing at tick end, at 64 KiB, or on drain; `bytes`
-  payloads are retained zero-copy.
-
-Details in [docs/architecture.md](docs/architecture.md); design decisions in
-[docs/decisions.md](docs/decisions.md).
-
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## Development
 
@@ -1038,10 +1011,8 @@ Repo layout: `crates/core`, `crates/pyshim`, `python/cadeloop`, `vendor/llhttp`,
 
 Release and packaging process: [docs/ops.md](docs/ops.md).
 
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/divider.svg" alt="" width="100%">
+---
 
 ## License
-
-<img src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/brand/cadeloop-mark.svg" width="44" align="left" alt="" hspace="12">
 
 MIT — see [LICENSE](LICENSE). No GPL dependencies, enforced by `cargo deny`.
