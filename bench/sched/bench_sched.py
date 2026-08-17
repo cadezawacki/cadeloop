@@ -207,7 +207,53 @@ def bench_queue_pingpong(loop, n):
     return n, time.perf_counter() - t0
 
 
+def bench_task_fib(loop, n):
+    """Recursive async fibonacci: the whole scheduler on one workload.
+
+    `fib(n)` spawns its two recursive calls as concurrent tasks, so a
+    single call expands into a deep, irregular tree of tasks that each
+    create children, suspend on them, and resolve back up. Unlike the
+    microbenchmarks above -- which isolate one operation apiece -- this
+    exercises task creation, the ready queue, future resolution, and
+    gather bookkeeping together, in the interleaved pattern real
+    application code produces. It is the event-loop equivalent of the
+    naive recursive fib(): not how you would compute Fibonacci, but a
+    compact, reproducible stress test of the machinery underneath.
+
+    `n` is the fib argument, not an op count. Ops are counted as calls
+    made -- the recursion visits 2*fib(n+1)-1 nodes -- so the reported
+    ops/sec stays comparable across loops at a fixed n.
+    """
+    calls = 0
+
+    async def fib(k):
+        nonlocal calls
+        calls += 1
+        if k < 2:
+            return k
+        a, b = await asyncio.gather(fib(k - 1), fib(k - 2))
+        return a + b
+
+    t0 = time.perf_counter()
+    result = loop.run_until_complete(fib(n))
+    elapsed = time.perf_counter() - t0
+
+    # Guard against a loop that "wins" by not running all the work. Both
+    # the value and the node count are checked: the recursion visits
+    # 2*fib(n+1)-1 nodes, so a dropped subtree shows up even when the
+    # returned sum happens to survive it.
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    if result != a:
+        raise SystemExit(f"fib({n}) returned {result}, expected {a}")
+    if calls != 2 * b - 1:
+        raise SystemExit(f"fib({n}) made {calls} calls, expected {2 * b - 1}")
+    return calls, elapsed
+
+
 BENCHES = {
+    "task_fib": (bench_task_fib, 21),
     "call_soon_chain": (bench_call_soon_chain, 200_000),
     "call_soon_burst": (bench_call_soon_burst, 200_000),
     "timer_schedule_cancel": (bench_timer_schedule_cancel, 100_000),

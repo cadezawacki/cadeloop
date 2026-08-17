@@ -28,6 +28,7 @@ LIGHT = {
     "aiofastnet": "#00879e",
     "aiofastnet-cadeloop": "#79aede",
     "hypercorn": "#4a3aa7",
+    "granian": "#b4531f",
     "winloop": "#6f6e69",
 }
 DARK = {
@@ -41,6 +42,7 @@ DARK = {
     "aiofastnet": "#1fa2b8",
     "aiofastnet-cadeloop": "#5e93c9",
     "hypercorn": "#9085e9",
+    "granian": "#d97742",
     "winloop": "#a3a29c",
 }
 
@@ -62,6 +64,8 @@ INK = {
         "axis": "#383835",
     },
 }
+
+BEST = {"light": "#0e7c86", "dark": "#2ab5c0"}  # leader accent; pairs with the tables' teal cell
 
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 BAR = 16  # bar thickness (<= 24)
@@ -227,6 +231,71 @@ def chart_speedup(sched, mode, story="cadeloop"):
     return "\n".join(out), w, h
 
 
+
+def chart_ranked(title, rows, unit, mode, note=None):
+    """Ranked horizontal bars: one bar per contender, best at the top.
+
+    `rows` is [(label, value)] or [(label, value, entity)] in any order; it
+    is sorted here so the chart reads as a ranking. The optional third
+    field keeps the color tied to the entity when the displayed label is a
+    friendlier rewrite of it. The leader is drawn in the teal accent that
+    marks the same value in the README table, and every other bar keeps
+    its entity color -- rank changes the highlight, never the hue.
+    """
+    ink = INK[mode]
+    rows = sorted(rows, key=lambda r: r[1], reverse=True)
+    left, right, top = 232, 74, 52
+    plot_w = 520
+    row_h = BAR + 12
+    h = top + len(rows) * row_h + (34 if note else 16) + 26
+    w = left + plot_w + right
+
+    vmax = max(r[1] for r in rows)
+    tks = ticks_for(vmax * 1.04)
+    scale = plot_w / max(tks[-1], 1e-9)
+
+    out = svg_open(w, h, ink)
+    out.append(
+        f'<text x="20" y="30" font-size="15" font-weight="600" fill="{ink["primary"]}">'
+        f"{title}</text>"
+    )
+    for t in tks:
+        x = left + t * scale
+        out.append(
+            f'<line x1="{x:.1f}" y1="{top - 8}" x2="{x:.1f}" y2="{top + len(rows) * row_h - 4}" '
+            f'stroke="{ink["grid"]}" stroke-width="1"/>'
+        )
+        out.append(
+            f'<text x="{x:.1f}" y="{top + len(rows) * row_h + 12}" font-size="11" '
+            f'fill="{ink["muted"]}" text-anchor="middle">{fmt_tick(t)}</text>'
+        )
+
+    for i, row in enumerate(rows):
+        label, value = row[0], row[1]
+        entity = row[2] if len(row) > 2 else label
+        y = top + i * row_h
+        color = BEST[mode] if i == 0 else series_color(mode, entity)
+        weight = "600" if i == 0 else "400"
+        fill = ink["primary"] if i == 0 else ink["secondary"]
+        out.append(
+            f'<text x="{left - 12}" y="{y + BAR - 3}" font-size="12" font-weight="{weight}" '
+            f'fill="{fill}" text-anchor="end">{label}</text>'
+        )
+        out.append(hbar(left, y, value * scale, color, ink["surface"]))
+        out.append(
+            f'<text x="{left + value * scale + 8:.1f}" y="{y + BAR - 3}" font-size="12" '
+            f'font-weight="{weight}" fill="{fill}">{fmt(value)}</text>'
+        )
+
+    baseline_y = top + len(rows) * row_h + 26
+    out.append(
+        f'<text x="20" y="{baseline_y}" font-size="11" fill="{ink["muted"]}">{unit}'
+        + (f" — {note}" if note else "")
+        + "</text>"
+    )
+    out.append("</svg>")
+    return "\n".join(out), w, h
+
 def chart_two_panel(title, entries, left_metric, right_metric, mode):
     """Two panels: throughput (left) and p99 latency (right), one bar per
     entity, value labels on every bar (few bars)."""
@@ -314,6 +383,9 @@ def main():
     parser.add_argument(
         "--http-title", default="HTTP/1.1 plaintext — 64 keep-alive connections (loopback)"
     )
+    parser.add_argument("--http-ranked", help="wrk http json -> ranked req/s bars")
+    parser.add_argument("--sched-ranked", help="sched json -> ranked bars for one benchmark")
+    parser.add_argument("--sched-ranked-bench", default="task_fib")
     parser.add_argument("--prefix", default="bench", help="output filename prefix")
     parser.add_argument("--outdir", default="docs/assets")
     args = parser.parse_args()
@@ -331,6 +403,51 @@ def main():
     if args.sched:
         sched = json.loads(pathlib.Path(args.sched).read_text())
         emit("sched", lambda m: chart_speedup(sched, m))
+    if args.http_ranked:
+        http = json.loads(pathlib.Path(args.http_ranked).read_text())
+        display = {
+            "cadeloop-native": "cadeloop serve()",
+            "uvicorn-httptools+uvloop": "uvicorn httptools / uvloop",
+            "uvicorn-httptools+asyncio": "uvicorn httptools / asyncio",
+            "uvicorn+cadeloop": "uvicorn h11 / cadeloop",
+            "uvicorn+uvloop": "uvicorn h11 / uvloop",
+            "uvicorn+asyncio": "uvicorn h11 / asyncio",
+            "uvicorn+rloop": "uvicorn h11 / rloop",
+            "uvicorn+rsloop": "uvicorn h11 / rsloop",
+        }
+        rows = [
+            (display.get(name, name), e["median_rps"] / 1e3, name)
+            for name, e in http["results"].items()
+            if e
+        ]
+        emit(
+            "http-ranked",
+            lambda m: chart_ranked(
+                "HTTP/1.1 plaintext — throughput (higher is better)",
+                rows,
+                "thousand requests/second",
+                m,
+                note="wrk -t2 -c64, loopback, single worker",
+            ),
+        )
+    if args.sched_ranked:
+        sr = json.loads(pathlib.Path(args.sched_ranked).read_text())
+        b = args.sched_ranked_bench
+        rows = [
+            (name, e["median_ops_per_sec"] / 1e3)
+            for name, e in sr["results"][b].items()
+            if e
+        ]
+        emit(
+            f"sched-{b.replace('_', '-')}",
+            lambda m: chart_ranked(
+                "Recursive async fib(21) — scheduler throughput (higher is better)",
+                rows,
+                "thousand coroutine calls/second",
+                m,
+                note="35,421 coroutine calls per run, median of 5",
+            ),
+        )
     if args.echo:
         echo = json.loads(pathlib.Path(args.echo).read_text())
         emit(

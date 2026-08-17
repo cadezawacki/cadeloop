@@ -41,6 +41,9 @@ HTTP_SERVER = ROOT / "bench" / "http" / "server.py"
 HTTP_CLIENT = ROOT / "bench" / "http" / "client.py"
 
 SCHED_BENCHES = [
+    # Composite workload first: it exercises the whole scheduler at once,
+    # where the rest isolate a single operation apiece.
+    "task_fib",
     "call_soon_chain",
     "call_soon_burst",
     "timer_schedule_cancel",

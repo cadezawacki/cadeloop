@@ -37,7 +37,7 @@ with a reproduction command.
 
 ## Table of contents
 
-- [Why cadeloop](#why-cadeloop)
+- [What runs where](#what-runs-where)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Benchmarks](#benchmarks)
@@ -59,39 +59,19 @@ with a reproduction command.
 
 ---
 
-## Why cadeloop
+## What runs where
 
-Most async Python performance work stops at the event loop. cadeloop goes one
-layer further and moves the *protocol* into Rust as well:
-
-| | what runs in Python | what runs in Rust |
+| | Python | Rust |
 |---|---|---|
 | stdlib `asyncio` | loop, transports, protocols, HTTP | — |
 | uvloop / rloop / rsloop | transports, protocols, HTTP | loop |
-| **cadeloop (drop-in mode)** | protocols, HTTP | loop, transports |
-| **cadeloop (`serve()`)** | your ASGI app, and nothing else | loop, transports, HTTP parse + scope + serialize |
+| **cadeloop** (drop-in mode) | protocols, HTTP | loop, transports |
+| **cadeloop** (`serve()`) | your ASGI app | loop, transports, HTTP parse + scope + serialize |
 
-Three properties fall out of that design:
-
-**Windows is a first-class target, not an afterthought.** cadeloop is built on
-IOCP — the completion-based API Windows actually wants you to use — with a
-Registered I/O backend implemented behind it. uvloop does not support Windows at
-all. If you deploy Python services on Windows, this is the point.
-
-**One transport layer, two kernels.** Linux `epoll` is wrapped as a proactor
-(the syscall is attempted at post time and only parked on `EWOULDBLOCK`), so the
-same Rust transport code serves both platforms and behaviour does not fork by OS.
-
-**Drop-in means drop-in.** cadeloop implements the full
-`asyncio.AbstractEventLoop` surface and is verified against **CPython's own
-asyncio conformance suite**, not just its own tests. If it does not behave like
-the stdlib loop, that is a bug.
-
-> **Project status: alpha (0.0.x).** The scheduling core, transports, TLS, UDP,
-> WebSockets, the HTTP/ASGI engine, and multi-worker serving are implemented and
-> tested. The API may still move before 1.0. See
-> [docs/README.md](docs/README.md) for the full engineering record, milestone
-> status, and the hardening log.
+Backends: IOCP on Windows, `epoll` on Linux. The `epoll` side is wrapped as a
+proactor — the syscall is attempted at post time and parked only on
+`EWOULDBLOCK` — so one Rust transport layer serves both and behaviour does not
+fork by OS.
 
 ---
 
@@ -103,44 +83,26 @@ pip install cadeloop
 
 ### Requirements
 
-| | requirement | notes |
-|---|---|---|
-| Python | **CPython 3.11.x only** | Not abi3 — 3.10 and 3.12 will not install. |
-| OS | Windows 10/11, or Linux | |
-| CPU | x86-64 (Intel **or** AMD) | `amd64` is the instruction set, unrelated to GPUs. |
+| | |
+|---|---|
+| Python | CPython 3.11.x |
+| OS | Windows 10/11, or Linux |
+| CPU | x86-64 |
 
-Wheels are published for **Windows x64** and **Linux x64 (manylinux2014,
-glibc ≥ 2.17)**. No GPU, no compiler, and no Rust toolchain are needed to
-install a wheel.
-
-### Platforms without a wheel
-
-There is no aarch64 wheel yet — Apple Silicon, Windows on ARM, Raspberry Pi, and
-AWS Graviton will fall through to the source distribution, which needs a Rust
-toolchain:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-pip install cadeloop --no-binary cadeloop
-```
-
-The Rust sources gate on operating system rather than CPU architecture, so an
-aarch64 build is expected to work — but it is not built or tested in CI, so
-treat it as unsupported rather than proven.
+Wheels are published for Windows x64 and Linux x64 (manylinux2014,
+glibc ≥ 2.17), plus a source distribution.
 
 ### The PGO and `x86-64-v3` wheels
 
-Windows wheels are built with **profile-guided optimization**: an instrumented
-build runs the project's own scheduling and HTTP workload, and the final wheel is
-compiled against those profiles. That is the wheel `pip` installs by default —
-you get it automatically.
+Windows wheels are built with profile-guided optimization: an instrumented
+build runs the project's own scheduling and HTTP workload, and the final wheel
+is compiled against those profiles. `pip install cadeloop` gets that wheel.
 
 Each [GitHub Release](https://github.com/cadezawacki/cadeloop/releases) also
-carries a second Windows wheel compiled for the **x86-64-v3** microarchitecture
-level (AVX2, BMI1/BMI2, FMA, F16C). It is deliberately **not on PyPI**: it has no
-runtime CPU check, so on a pre-Haswell (2013) / pre-Zen-1 (2017) processor it
-does not degrade gracefully — it dies with an illegal-instruction fault on
-import. Install it by explicit URL only, and only when you control the hardware:
+carries a second Windows wheel built for the **x86-64-v3** microarchitecture
+level (AVX2, BMI1/BMI2, FMA, F16C). It requires Haswell (2013) / Zen 1 (2017)
+or newer — there is no runtime CPU check, so on an older processor it faults
+on import. Install it by URL:
 
 ```bash
 pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<v3-wheel>
@@ -205,128 +167,115 @@ if __name__ == "__main__":
 
 ## Benchmarks
 
-> **Read this first.** Every number below is **Linux over loopback on a
-> 4-vCPU box**, with the load generator sharing those cores with the server.
-> That makes absolute throughput conservative and the results useful for
-> *relative* comparison only. Linux also runs cadeloop's **`epoll` dev
-> backend** — the production target is Windows/IOCP, whose numbers live in
-> [docs/README.md](docs/README.md) and are not re-run here.
->
-> Environment: Linux 6.18.5, 4 vCPU Intel Xeon @ 2.80 GHz, CPython 3.11.15,
-> glibc 2.39. Contenders: uvloop 0.22.1, rloop 0.3.1, rsloop 0.1.36,
-> uvicorn 0.52.3 (h11 and httptools), granian 2.8.1, hypercorn 0.18.
+Linux 6.18.5, 4 vCPU Intel Xeon @ 2.80 GHz, CPython 3.11.15. Loopback,
+single box, load generator sharing the cores — relative comparison, not
+capacity numbers. Linux runs the `epoll` dev backend; the Windows/IOCP
+numbers are in [docs/README.md](docs/README.md).
 
-### HTTP / ASGI — requests per second
+Methodology, raw commands, and known measurement pitfalls:
+[docs/benchmarks.md](docs/benchmarks.md).
 
-Load generator: **`wrk`** (C, its own event loop), `-t2 -c64`, 3s warmup +
-3 measured 10s runs, median reported. Single worker for every contender.
-Workload: the plaintext `Hello, World!` ASGI app in
-[`bench/http/app.py`](bench/http/app.py).
+### HTTP / ASGI
 
-| server | HTTP parsing | event loop | req/s | p50 | p99 |
-|---|---|---|---:|---:|---:|
-| **cadeloop** (`serve()`) | **Rust** | cadeloop | **104.7 K** | **0.54 ms** | **1.36 ms** |
-| granian | Rust (hyper) | its own | 68.1 K | 0.89 ms | 1.99 ms |
-| uvicorn + httptools | C | uvloop | 43.7 K | 1.34 ms | 2.91 ms |
-| uvicorn + httptools | C | asyncio | 25.5 K | 2.37 ms | 4.20 ms |
-| uvicorn + h11 | Python | **cadeloop** | 10.0 K | 6.00 ms | 9.69 ms |
-| uvicorn + h11 | Python | uvloop | 9.3 K | 6.34 ms | 13.46 ms |
-| uvicorn + h11 | Python | asyncio | 6.6 K | 9.50 ms | 11.94 ms |
-| uvicorn + h11 | Python | rsloop | 6.4 K | 9.82 ms | 14.39 ms |
-| uvicorn + h11 | Python | rloop | *crashed — see below* | | |
-| hypercorn | Python | asyncio | 4.1 K | 15.01 ms | 20.58 ms |
+`wrk -t2 -c64`, 3s warmup + 3×10s measured, median. Single worker, plaintext
+`Hello, World!` ASGI app.
 
-Relative to `cadeloop.serve()`: **1.5× granian**, **2.4× a tuned uvicorn**
-(httptools + uvloop), **4.1× uvicorn + httptools on stdlib asyncio**, and
-**15.8× uvicorn + h11 on stdlib asyncio**.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-http-ranked-dark.svg">
+  <img alt="HTTP throughput: cadeloop serve() 104.7K req/s, granian 68.1K, uvicorn+httptools/uvloop 43.7K, uvicorn+h11 6.6-10.0K, hypercorn 4.1K" src="docs/assets/bench-http-ranked.svg">
+</picture>
 
-**Both layers matter, and they are worth very different amounts.**
+<table>
+<thead>
+<tr><th>server</th><th>parsing</th><th>loop</th><th align="right">req/s</th><th align="right">p50</th><th align="right">p99</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><b>cadeloop</b> <code>serve()</code></td><td>Rust</td><td>cadeloop</td>
+  <td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>104.7 K</b></td>
+  <td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>0.54 ms</b></td>
+  <td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>1.36 ms</b></td>
+</tr>
+<tr><td>granian</td><td>Rust (hyper)</td><td>its own</td><td align="right">68.1 K</td><td align="right">0.89 ms</td><td align="right">1.99 ms</td></tr>
+<tr><td>uvicorn + httptools</td><td>C</td><td>uvloop</td><td align="right">43.7 K</td><td align="right">1.34 ms</td><td align="right">2.91 ms</td></tr>
+<tr><td>uvicorn + httptools</td><td>C</td><td>asyncio</td><td align="right">25.5 K</td><td align="right">2.37 ms</td><td align="right">4.20 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>cadeloop</td><td align="right">10.0 K</td><td align="right">6.00 ms</td><td align="right">9.69 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>uvloop</td><td align="right">9.3 K</td><td align="right">6.34 ms</td><td align="right">13.46 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>asyncio</td><td align="right">6.6 K</td><td align="right">9.50 ms</td><td align="right">11.94 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>rsloop</td><td align="right">6.4 K</td><td align="right">9.82 ms</td><td align="right">14.39 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>rloop</td><td align="right" colspan="3"><i>crashed under load</i></td></tr>
+<tr><td>hypercorn</td><td>Python</td><td>asyncio</td><td align="right">4.1 K</td><td align="right">15.01 ms</td><td align="right">20.58 ms</td></tr>
+</tbody>
+</table>
 
-*Swapping the loop is real but bounded.* Holding uvicorn+h11 fixed, cadeloop
-beats stdlib asyncio by **1.51×** (10.0 K vs 6.6 K) and edges uvloop by 1.07×.
-With the faster C parser the loop matters more, not less: httptools on uvloop
-is **1.71×** the same stack on asyncio.
+Holding uvicorn+h11 fixed, cadeloop is 1.51× stdlib asyncio. Holding the loop
+fixed at cadeloop, `serve()` is 10.5× uvicorn+h11. The comparable stacks —
+those that also moved parsing out of Python — are granian (1.5×) and
+uvicorn+httptools+uvloop (2.4×).
 
-*Moving the protocol out of Python is worth more.* `cadeloop.serve()` is
-**10.5× uvicorn-on-cadeloop** — same loop, same machine, same app. The
-difference is entirely that h11 is no longer parsing in Python.
+rloop 0.3.1 aborted mid-run on a Rust panic and has no result; details in
+[docs/benchmarks.md](docs/benchmarks.md#rloop-031-aborts-under-sustained-load).
 
-So the honest opponents for `serve()` are not the h11 rows; they are
-**granian** (1.5×) and **uvicorn + httptools + uvloop** (2.4×) — the stacks
-that already moved parsing out of Python.
+### Scheduling — recursive async `fib(21)`
 
-> **rloop 0.3.1 crashed under this benchmark.** It served ~7.1 K req/s for two
-> consecutive 3s runs and then aborted the process on a Rust panic —
-> `called Option::unwrap() on a None value` at `src/event_loop.rs:417:44` —
-> so it could not complete the 3×10s protocol. Reported as measured rather
-> than dropped; this is an upstream bug, not a harness failure, and its
-> scheduling numbers below were collected before load was applied.
+The composite workload: `fib(k)` spawns its two recursive calls as concurrent
+tasks, so one call expands into 35,421 coroutine calls across a deep, irregular
+task tree. Task creation, the ready queue, future resolution, and `gather`
+bookkeeping all run together, in the interleaving real application code
+produces — the event-loop analogue of naive recursive `fib()`. Both the result
+and the node count are verified, so a loop cannot win by skipping work.
 
-### Scheduling core — millions of ops/second
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-sched-task-fib-dark.svg">
+  <img alt="Recursive async fib(21): cadeloop 77.3K calls/s, rsloop 76.6K, rloop 69.6K, uvloop 69.0K, asyncio 49.4K" src="docs/assets/bench-sched-task-fib.svg">
+</picture>
 
-In-process microbenchmarks: no sockets, no external load generator. 3 warmup
-+ 5 measured runs, fresh process per run, medians reported.
+<table>
+<thead><tr><th>loop</th><th align="right">K coroutine calls/s</th><th align="right">vs asyncio</th></tr></thead>
+<tbody>
+<tr><td><b>cadeloop</b></td>
+    <td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>77.3</b></td>
+    <td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>1.57×</b></td></tr>
+<tr><td>rsloop</td><td align="right">76.6</td><td align="right">1.55×</td></tr>
+<tr><td>rloop</td><td align="right">69.6</td><td align="right">1.41×</td></tr>
+<tr><td>uvloop</td><td align="right">69.0</td><td align="right">1.40×</td></tr>
+<tr><td>asyncio</td><td align="right">49.4</td><td align="right">1.00×</td></tr>
+</tbody>
+</table>
 
-| benchmark | cadeloop | asyncio | uvloop | rloop | rsloop | vs asyncio | vs uvloop |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `call_soon_burst` | **2.492** | 0.698 | 0.901 | 2.303 | 1.334 | 3.6× | 2.8× |
-| `call_soon_chain` | 3.213 | 0.515 | 1.376 | 3.807 | **4.086** | 6.2× | 2.3× |
-| `future_chain` | 0.855 | 0.227 | 0.499 | **0.924** | 0.804 | 3.8× | 1.7× |
-| `gather_fanin` | **0.257** | 0.160 | 0.232 | 0.240 | 0.229 | 1.6× | 1.1× |
-| `queue_pingpong` | **1.163** | 1.013 | 1.129 | 1.144 | 1.084 | 1.1× | 1.0× |
-| `sleep0_chain` | 1.269 | 0.393 | 0.744 | **1.424** | 1.361 | 3.2× | 1.7× |
-| `task_spawn` | **0.261** | 0.195 | 0.238 | 0.245 | 0.252 | 1.3× | 1.1× |
-| `threadsafe_throughput` | 3.123 | 0.142 | 1.542 | **3.939** | 2.659 | 22.0× | 2.0× |
-| `timer_fire` | **1.547** | 0.248 | 0.980 | 1.279 | 0.660 | 6.2× | 1.6× |
-| `timer_schedule_cancel` | **1.836** | 0.467 | 0.386 | 1.343 | 0.995 | 3.9× | 4.8× |
+cadeloop and rsloop are within 1% of each other here — a tie in practice. The
+spread across every Rust loop is 1.4–1.6× over stdlib, well short of what the
+single-operation microbenchmarks below suggest, because this workload also
+spends real time in CPython's coroutine machinery, which no loop replaces.
 
-cadeloop beats stdlib asyncio and uvloop on all ten. Against the other Rust
-loops it is more even — **fastest on 6 of 10**, with rloop ahead on
-`call_soon_chain`, `future_chain`, `sleep0_chain` and `threadsafe_throughput`,
-and rsloop ahead on `call_soon_chain`. Treat these as a profile of where the
-scheduling core is strong, not as a ranking.
+### Scheduling microbenchmarks
 
-### Reproducing these
+Single-operation isolation, 3 warmup + 5 measured runs, fresh process per run,
+medians. Millions of ops/second.
 
-```bash
-pip install uvloop rloop rsloop "uvicorn[standard]" hypercorn granian
-sudo apt-get install wrk
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-sched-dark.svg">
+  <img alt="Scheduling speedup vs stdlib asyncio across ten microbenchmarks" src="docs/assets/bench-sched.svg">
+</picture>
 
-# HTTP/ASGI (wrk-driven)
-PYTHONPATH=$PWD/python python bench/http/run_wrk.py
+<table>
+<thead><tr><th>benchmark</th><th align="right">cadeloop</th><th align="right">asyncio</th><th align="right">uvloop</th><th align="right">rloop</th><th align="right">rsloop</th></tr></thead>
+<tbody>
+<tr><td><code>call_soon_chain</code></td><td align="right">4.003</td><td align="right">0.572</td><td align="right">1.738</td><td align="right">4.042</td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>5.419</b></td></tr>
+<tr><td><code>call_soon_burst</code></td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>3.107</b></td><td align="right">0.714</td><td align="right">0.936</td><td align="right">2.740</td><td align="right">1.425</td></tr>
+<tr><td><code>timer_fire</code></td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>1.608</b></td><td align="right">0.278</td><td align="right">1.072</td><td align="right">1.589</td><td align="right">0.710</td></tr>
+<tr><td><code>timer_schedule_cancel</code></td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>2.166</b></td><td align="right">0.518</td><td align="right">0.436</td><td align="right">1.666</td><td align="right">0.752</td></tr>
+<tr><td><code>sleep0_chain</code></td><td align="right">1.680</td><td align="right">0.440</td><td align="right">1.057</td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>1.899</b></td><td align="right">1.691</td></tr>
+<tr><td><code>task_spawn</code></td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>0.256</b></td><td align="right">0.168</td><td align="right">0.224</td><td align="right">0.248</td><td align="right">0.195</td></tr>
+<tr><td><code>threadsafe_throughput</code></td><td align="right">3.224</td><td align="right">0.139</td><td align="right">1.545</td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>3.866</b></td><td align="right">2.598</td></tr>
+<tr><td><code>future_chain</code></td><td align="right">1.178</td><td align="right">0.214</td><td align="right">0.599</td><td align="right">1.086</td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>1.187</b></td></tr>
+<tr><td><code>gather_fanin</code></td><td align="right">0.235</td><td align="right">0.164</td><td align="right">0.231</td><td align="right">0.219</td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>0.239</b></td></tr>
+<tr><td><code>queue_pingpong</code></td><td align="right">1.086</td><td align="right">1.115</td><td align="right">1.299</td><td align="right" bgcolor="#d7efee" style="background-color:#d7efee"><b>1.347</b></td><td align="right">1.280</td></tr>
+</tbody>
+</table>
 
-# scheduling core
-PYTHONPATH=$PWD/python python bench/harness/harness.py --suite sched \
-    --loops cadeloop,asyncio,uvloop,rloop,rsloop
-```
-
-### Two measurement traps these numbers avoid
-
-Both were found while producing this table, and both had silently flattened an
-earlier draft of it into a near-tie.
-
-**1. The load generator must not be the bottleneck.** The repo also ships
-`harness.py --suite http`, whose client is 64 Python threads in one process.
-Splitting the same offered load across two client *processes* nearly doubles
-the measured total against an unchanged server — 23.3 K → 43.9 K req/s — which
-is a GIL ceiling in the client, not a limit in the server. Under that
-generator cadeloop, granian and uvicorn+httptools all report 20–25 K req/s and
-look interchangeable; under `wrk` they separate by 4×.
-[`bench/http/run_wrk.py`](bench/http/run_wrk.py) exists for this reason.
-
-**2. Asking uvicorn for a loop does not get you that loop.** Since 0.35
-uvicorn selects its loop *by class* through a loop-factory table:
-`--loop asyncio` returns `SelectorEventLoop` no matter what
-`asyncio.set_event_loop_policy()` was set to. Benchmarking a policy swap that
-way measures the stdlib loop under someone else's label — it is what made
-every `uvicorn + h11` row land on the same 6.5 K, and it hid a genuine 1.7×
-between uvloop and asyncio on the httptools rows. The harness now passes
-`loop="none"` and drives `uvicorn.Server.serve()` from a loop it constructed
-itself.
-
-The TCP echo suite (`--suite echo`) still has the trap-1 client ceiling
-(28.5 K → 47.2 K msg/s across two processes), so its numbers are omitted here
-rather than published as a loop comparison.
+cadeloop leads on four, and beats stdlib asyncio everywhere except
+`queue_pingpong`, where all five loops land within 20% of each other.
 
 ---
 
@@ -852,22 +801,39 @@ plus a native ASGI server on top.
 cadeloop myapp:app --host 0.0.0.0 --port 8000 --workers 0
 ```
 
-### Latency-sensitive services
+### Choosing a latency mode
 
-Spend CPU to avoid kernel wait wake-ups, and flush responses as soon as they are
-ready rather than at tick end:
+`latency_mode` sets two things at once: how long the loop spins before making a
+blocking kernel wait, and whether responses are flushed immediately or corked
+until the tick's flush phase.
+
+| mode | `spin_us` | `immediate_flush` | behaviour |
+|---|---:|---|---|
+| `throughput` | 0 | off | Never spins. Every idle tick makes a blocking wait; writes coalesce and go out at tick end. Lowest CPU per request, highest syscall efficiency. |
+| `balanced` *(default)* | 20 | off | Spins 20 µs before parking. Catches work that arrives during the tick without a wake-up round trip, at a small idle-CPU cost. |
+| `spin` | 200 | on | Spins 200 µs *and* writes each response the moment it is ready. Trades CPU and syscalls for tail latency. |
+
+**Spinning** removes the sleep/wake round trip when work arrives just after the
+loop decides to park. It costs idle CPU: with `spin_us=200` a loop serving light
+traffic burns close to a core doing nothing.
+
+**Immediate flush** matters for tail latency specifically. With corking, a
+response that became wire-ready first still waits behind however many *other*
+connections' app dispatch the same tick batched ahead of it. Flushing
+immediately puts it on the wire straight away — at the cost of one syscall per
+response instead of one per batch.
+
+The two are independent, so a mixed setting is legitimate:
 
 ```python
-cadeloop.serve(app, "0.0.0.0", 8000, latency_mode="spin")
+# spin for wake-up latency, but keep corking for syscall efficiency
+cadeloop.serve(app, "0.0.0.0", 8000, spin_us=200, immediate_flush=False)
 ```
 
-```python
-cadeloop.serve(app, "0.0.0.0", 8000, spin_us=500, immediate_flush=True)
-```
-
-This burns a core busy-waiting. Measure it: the tradeoff is real and
-deployment-specific, and on a small VM the run-to-run p99 spread can exceed the
-difference between modes.
+Measure before committing. On a small or shared VM the run-to-run p99 spread
+can exceed the difference between modes in both directions;
+`stats()["sends_posted"]` read against `stats()["bytes_sent"]` shows what
+corking is actually buying.
 
 ### Throughput-oriented services
 
@@ -877,19 +843,30 @@ Let writes cork and batch, and skip the spin window entirely:
 cadeloop myapp:app -w 0 --latency-mode throughput --keepalive-idle 120
 ```
 
-### Large uploads
+### Accepting large request bodies
 
-The body cap is finite by default because the engine buffers a whole request body
-before dispatch. Raise it deliberately, and pair it with a longer head timeout:
+`max_body` defaults to **16 MiB**. The engine buffers a whole request body in
+memory before dispatching it to your app, so the cap is a memory bound, not
+just a policy: peak usage is roughly `max_body x concurrent uploads`.
+
+Say you accept 200 MB video uploads, 8 at a time:
 
 ```python
-cadeloop.serve(app, "0.0.0.0", 8000,
-               max_body=512 * 1024 * 1024,
-               request_line_timeout=30.0)
+cadeloop.serve(
+    app, "0.0.0.0", 8000,
+    max_body=200 * 1024 * 1024,   # 200 MiB -> a 201 MiB upload gets a 413
+    request_line_timeout=60.0,    # slow phones need longer to send the head
+    keepalive_idle=120.0,
+)
 ```
 
-Setting `max_body=None` removes the cap entirely — only do that behind
-authentication or a proxy that enforces its own limit.
+That configuration can hold **~1.6 GiB** of request bodies at 8 concurrent
+uploads, before your app has allocated anything. Size the worker count and the
+box against that number, not against the request rate.
+
+Over the cap the client gets a `413`. `max_body=None` removes it entirely,
+which makes memory usage a function of what clients choose to send — only
+reasonable behind authentication or a proxy enforcing its own limit.
 
 ### Keeping uvicorn, gaining the loop
 
