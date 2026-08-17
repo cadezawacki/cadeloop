@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">Successful build terminal icon</title>
+  <desc id="desc">A dark terminal window with a cyan prompt, check mark, and completed progress line.</desc>
+  <defs>
+    <pattern id="grid" width="8" height="8" patternUnits="userSpaceOnUse">
+      <path d="M8 0H0V8" fill="none" stroke="#22272F" stroke-width="0.5"/>
+    </pattern>
+  </defs>
+  <style>
+    .edge { fill: #0B0D11; stroke: #2A3038; stroke-width: 2; }
+    .accent { fill: #00F0D1; }
+    .soft { fill: #A7F9F1; }
+  </style>
+  <rect class="edge" x="1" y="1" width="94" height="94" rx="12"/>
+  <rect x="8" y="8" width="80" height="80" rx="7" fill="url(#grid)" opacity="0.46"/>
+  <rect x="17" y="20" width="62" height="56" rx="3" fill="#101318" stroke="#FFFFFF" stroke-width="3"/>
+  <rect x="17" y="20" width="62" height="12" fill="#171A1F"/>
+  <rect class="accent" x="23" y="24" width="4" height="4"/>
+  <rect x="31" y="24" width="4" height="4" fill="#6A737E"/>
+  <rect x="39" y="24" width="4" height="4" fill="#6A737E"/>
+  <path d="M27 43 35 49 27 55" fill="none" stroke="#00F0D1" stroke-width="4"/>
+  <rect class="soft" x="40" y="53" width="13" height="4"/>
+  <path d="m56 45 5 5 10-12" fill="none" stroke="#00F0D1" stroke-width="4" stroke-linecap="square"/>
+  <rect x="25" y="65" width="46" height="3" fill="#2A3038"/>
+  <rect class="accent" x="25" y="65" width="38" height="3"/>
+</svg>

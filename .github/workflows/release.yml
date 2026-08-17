@@ -292,10 +292,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [github-release]
     runs-on: ubuntu-latest
+    # Must equal the "Environment name" on the PyPI trusted publisher
+    # (currently `pypi`). The OIDC token carries this as a claim and PyPI
+    # checks it: a mismatched or missing environment is rejected at upload
+    # with an unhelpful "not a trusted publisher" error.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cadeloop
     permissions:
       # Trusted Publishing: the job mints a short-lived OIDC token PyPI
-      # verifies against the publisher configured for this repo and
-      # workflow filename. No API token is stored anywhere.
+      # verifies against the publisher configured for this repo, workflow
+      # filename, and environment. No API token is stored anywhere.
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

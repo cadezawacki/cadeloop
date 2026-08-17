@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">CadeLoop</title>
+  <desc id="desc">A seven-segment CadeLoop wordmark beside a stopwatch build-status display on a dark technical grid.</desc>
+
+  <defs>
+    <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+      <path d="M20 0H0V20" fill="none" stroke="#22272F" stroke-width="0.65"/>
+    </pattern>
+    <radialGradient id="vignette" cx="45%" cy="42%" r="72%">
+      <stop offset="0" stop-color="#171A1F" stop-opacity="0"/>
+      <stop offset="0.72" stop-color="#0B0D11" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#050609" stop-opacity="0.9"/>
+    </radialGradient>
+    <linearGradient id="panel-sheen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#171A1F"/>
+      <stop offset="1" stop-color="#0B0D11"/>
+    </linearGradient>
+    <filter id="segment-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2.4" result="blur"/>
+      <feFlood flood-color="#A7F9F1" flood-opacity="0.18" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Chamfered seven-segment primitives. -->
+    <path id="seg-a" d="M10 0H57L66 8 57 16H10L2 8Z"/>
+    <path id="seg-g" d="M10 57H57L66 65 57 73H10L2 65Z"/>
+    <path id="seg-d" d="M10 114H57L66 122 57 130H10L2 122Z"/>
+    <path id="seg-f" d="M0 10 8 2 16 10V53L8 61 0 53Z"/>
+    <path id="seg-b" d="M57 10 65 2 73 10V53L65 61 57 53Z"/>
+    <path id="seg-e" d="M0 77 8 69 16 77V111L8 119 0 111Z"/>
+    <path id="seg-c" d="M57 77 65 69 73 77V111L65 119 57 111Z"/>
+
+    <g id="letter-c">
+      <use href="#seg-a"/><use href="#seg-f"/><use href="#seg-e"/><use href="#seg-d"/>
+    </g>
+    <g id="letter-a">
+      <use href="#seg-a"/><use href="#seg-b"/><use href="#seg-c"/><use href="#seg-e"/><use href="#seg-f"/><use href="#seg-g"/>
+    </g>
+    <g id="letter-d">
+      <use href="#seg-b"/><use href="#seg-c"/><use href="#seg-d"/><use href="#seg-e"/><use href="#seg-g"/>
+    </g>
+    <g id="letter-e">
+      <use href="#seg-a"/><use href="#seg-d"/><use href="#seg-e"/><use href="#seg-f"/><use href="#seg-g"/>
+    </g>
+    <g id="letter-l">
+      <use href="#seg-d"/><use href="#seg-e"/><use href="#seg-f"/>
+    </g>
+    <g id="letter-o">
+      <use href="#seg-a"/><use href="#seg-b"/><use href="#seg-c"/><use href="#seg-d"/><use href="#seg-e"/><use href="#seg-f"/>
+    </g>
+    <g id="letter-p">
+      <use href="#seg-a"/><use href="#seg-b"/><use href="#seg-e"/><use href="#seg-f"/><use href="#seg-g"/>
+    </g>
+  </defs>
+
+  <style>
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .eyebrow { fill: #A7F9F1; font-size: 12px; font-weight: 700; letter-spacing: 3.2px; }
+    .tagline { fill: #FFFFFF; font-size: 17px; font-weight: 700; letter-spacing: 3.8px; }
+    .micro { fill: #87919D; font-size: 10px; font-weight: 600; letter-spacing: 1.8px; }
+    .status { fill: #00F0D1; font-size: 18px; font-weight: 700; letter-spacing: 1.6px; }
+    .timer { fill: #FFFFFF; font-size: 21px; letter-spacing: 1.2px; }
+    .wordmark { fill: #F8FFFF; filter: url(#segment-glow); }
+    .accent { fill: #00F0D1; }
+    .soft { fill: #A7F9F1; }
+  </style>
+
+  <rect width="1200" height="420" rx="20" fill="#0B0D11"/>
+  <rect x="1" y="1" width="1198" height="418" rx="19" fill="none" stroke="#242A32" stroke-width="2"/>
+  <rect x="20" y="20" width="1160" height="380" rx="10" fill="url(#grid)" opacity="0.72"/>
+
+  <!-- Sparse matrix signals. -->
+  <g opacity="0.7">
+    <rect class="accent" x="80" y="34" width="5" height="5"/>
+    <rect class="accent" x="180" y="74" width="5" height="5" opacity="0.45"/>
+    <rect class="accent" x="300" y="34" width="5" height="5" opacity="0.3"/>
+    <rect class="accent" x="420" y="74" width="5" height="5"/>
+    <rect class="accent" x="560" y="34" width="5" height="5" opacity="0.4"/>
+    <rect class="accent" x="680" y="74" width="5" height="5" opacity="0.75"/>
+    <rect class="accent" x="780" y="34" width="5" height="5" opacity="0.28"/>
+    <rect class="accent" x="140" y="354" width="5" height="5" opacity="0.35"/>
+    <rect class="accent" x="260" y="374" width="5" height="5" opacity="0.65"/>
+    <rect class="accent" x="440" y="354" width="5" height="5" opacity="0.3"/>
+    <rect class="accent" x="620" y="374" width="5" height="5" opacity="0.8"/>
+    <rect class="accent" x="760" y="354" width="5" height="5" opacity="0.42"/>
+  </g>
+
+  <text class="mono eyebrow" x="56" y="67">BUILD // MEASURE // ITERATE</text>
+  <rect x="56" y="82" width="742" height="1" fill="#323943"/>
+  <rect x="56" y="82" width="118" height="2" fill="#00F0D1"/>
+
+  <!-- CADELOOP, rendered entirely as segment geometry. -->
+  <g class="wordmark" transform="translate(54 108) scale(1.1)">
+    <use href="#letter-c" x="0"/>
+    <use href="#letter-a" x="85"/>
+    <use href="#letter-d" x="170"/>
+    <use href="#letter-e" x="255"/>
+    <use href="#letter-l" x="340"/>
+    <use href="#letter-o" x="425"/>
+    <use href="#letter-o" x="510"/>
+    <use href="#letter-p" x="595"/>
+  </g>
+
+  <text class="mono tagline" x="56" y="301">PRECISE LOOPS. VISIBLE MOMENTUM.</text>
+  <text class="mono micro" x="56" y="328">CADELOOP / SYSTEM READY / SIGNAL NOMINAL</text>
+
+  <rect x="56" y="352" width="742" height="2" fill="#252B33"/>
+  <rect x="56" y="352" width="514" height="2" fill="#00F0D1"/>
+  <rect x="578" y="348" width="8" height="8" fill="#A7F9F1"/>
+  <text class="mono micro" x="56" y="380">00</text>
+  <text class="mono micro" x="770" y="380">LOOP</text>
+
+  <!-- Stopwatch telemetry panel. -->
+  <g>
+    <rect x="842" y="48" width="304" height="324" rx="6" fill="url(#panel-sheen)" stroke="#2A3038" stroke-width="2"/>
+    <rect x="856" y="62" width="276" height="296" rx="3" fill="none" stroke="#20252C"/>
+
+    <g transform="translate(947 74)" shape-rendering="crispEdges">
+      <rect x="31" y="0" width="32" height="6" fill="#FFFFFF"/>
+      <rect x="37" y="6" width="20" height="6" fill="#5E6670"/>
+      <rect x="72" y="15" width="14" height="6" fill="#FFFFFF"/>
+      <rect x="78" y="21" width="14" height="6" fill="#5E6670"/>
+      <path d="M22 18H70L82 30V78L70 90H22L10 78V30Z" fill="#0B0D11" stroke="#FFFFFF" stroke-width="6"/>
+      <path d="M28 26H64L74 36V72L64 82H28L18 72V36Z" fill="none" stroke="#4A525D" stroke-width="3"/>
+      <rect class="accent" x="44" y="29" width="6" height="9"/>
+      <rect class="accent" x="44" y="70" width="6" height="9"/>
+      <rect class="accent" x="22" y="51" width="9" height="6"/>
+      <rect class="accent" x="67" y="51" width="9" height="6"/>
+      <rect class="soft" x="43" y="48" width="8" height="8"/>
+      <rect class="accent" x="46" y="39" width="4" height="14"/>
+      <rect class="accent" x="50" y="53" width="5" height="5"/>
+      <rect class="accent" x="55" y="58" width="5" height="5"/>
+      <rect class="accent" x="60" y="63" width="5" height="5"/>
+    </g>
+
+    <text class="mono status" x="876" y="224">BUILD SUCCESSFUL</text>
+    <text class="mono micro" x="876" y="252">TIME ELAPSED</text>
+    <text class="mono timer" x="876" y="282">00:00:04.27</text>
+    <rect x="876" y="306" width="224" height="3" fill="#242A32"/>
+    <rect x="876" y="306" width="186" height="3" fill="#00F0D1"/>
+    <rect x="1098" y="302" width="7" height="11" fill="#A7F9F1"/>
+    <text class="mono micro" x="876" y="336">SIGNAL  /  NOMINAL</text>
+  </g>
+
+  <rect width="1200" height="420" rx="20" fill="url(#vignette)" pointer-events="none"/>
+</svg>

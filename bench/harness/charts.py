@@ -55,17 +55,19 @@ INK = {
         "grid": "#e1e0d9",
         "axis": "#c3c2b7",
     },
+    # Dark surface matches the brand canvas/panel so the charts sit next
+    # to the hero and icons without a seam.
     "dark": {
-        "surface": "#1a1a19",
+        "surface": "#0B0D11",
         "primary": "#ffffff",
-        "secondary": "#c3c2b7",
-        "muted": "#898781",
-        "grid": "#2c2c2a",
-        "axis": "#383835",
+        "secondary": "#c9d1d9",
+        "muted": "#8b949e",
+        "grid": "#171A1F",
+        "axis": "#232830",
     },
 }
 
-BEST = {"light": "#0e7c86", "dark": "#2ab5c0"}  # leader accent; pairs with the tables' teal cell
+BEST = {"light": "#0a7d72", "dark": "#00F0D1"}  # brand signal teal; dark = #00F0D1 exactly
 
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 BAR = 16  # bar thickness (<= 24)

@@ -118,11 +118,17 @@ tolerable as the wheel PyPI serves to everyone. The sdist step runs
 *before* the container step so `dist/` belongs to the runner user rather
 than to root.
 
-**Trusted Publishing must match.** PyPI's publisher config names the
-owner, repository, and workflow filename (`release.yml`), and optionally
-a GitHub environment. This workflow declares no environment — if one is
-configured on the PyPI side, add a matching `environment:` key to the
-`pypi-publish` job or the upload is rejected.
+**Trusted Publishing must match on every field.** PyPI's publisher
+config names the owner, repository, workflow filename (`release.yml`) and
+environment name (`pypi`). All four are claims in the OIDC token and all
+four are checked, so the `pypi-publish` job declares
+`environment: name: pypi` to match. Change one side and the upload fails
+with a generic "not a trusted publisher" error that does not say which
+field disagreed.
+
+The environment also gives you a place to hang a required reviewer: add
+one under Settings → Environments → pypi and every publish pauses for
+manual approval.
 
 ### Why the Windows wheels carry a build tag
 

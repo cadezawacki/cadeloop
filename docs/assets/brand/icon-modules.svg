@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">Composable modules icon</title>
+  <desc id="desc">Connected technical modules with active cyan cells.</desc>
+  <defs>
+    <pattern id="grid" width="8" height="8" patternUnits="userSpaceOnUse">
+      <path d="M8 0H0V8" fill="none" stroke="#22272F" stroke-width="0.5"/>
+    </pattern>
+  </defs>
+  <style>
+    .tile { fill: #0B0D11; stroke: #2A3038; stroke-width: 2; }
+    .module { fill: #171A1F; stroke: #FFFFFF; stroke-width: 3; }
+    .accent { fill: #00F0D1; }
+  </style>
+  <rect class="tile" x="1" y="1" width="94" height="94" rx="12"/>
+  <rect x="8" y="8" width="80" height="80" rx="7" fill="url(#grid)" opacity="0.48"/>
+  <path d="M34 31H62M34 48H62M34 65H62" stroke="#3A424C" stroke-width="4"/>
+  <path d="M31 34V62M48 34V62M65 34V62" stroke="#3A424C" stroke-width="4"/>
+  <rect class="module" x="19" y="19" width="22" height="22" rx="2"/>
+  <rect class="module" x="55" y="19" width="22" height="22" rx="2"/>
+  <rect class="module" x="19" y="55" width="22" height="22" rx="2"/>
+  <rect x="55" y="55" width="22" height="22" rx="2" fill="#00F0D1" stroke="#A7F9F1" stroke-width="3"/>
+  <rect class="accent" x="27" y="27" width="6" height="6"/>
+  <rect x="63" y="27" width="6" height="6" fill="#A7F9F1"/>
+  <rect x="27" y="63" width="6" height="6" fill="#FFFFFF"/>
+  <path d="m62 66 3 3 7-8" fill="none" stroke="#0B0D11" stroke-width="3"/>
+</svg>
