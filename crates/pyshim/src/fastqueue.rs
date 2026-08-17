@@ -265,6 +265,24 @@ impl FastQueue {
         Ok(fut.unbind())
     }
 
+    /// The join-side removal Event.wait() does in its finally: a join
+    /// whose await was cancelled must not stay parked until the count
+    /// happens to reach zero (it may never), or repeated timed-out joins
+    /// retain one future each, without bound. No-op for the completed
+    /// fast-path awaitable and for waiters task_done already drained.
+    fn unjoin(&self, py: Python<'_>, fut: Py<PyAny>) {
+        let fut = fut.bind(py);
+        let mut w = self.join_waiters.borrow_mut();
+        if let Some(pos) = w.iter().position(|f| f.bind(py).is(fut)) {
+            w.remove(pos);
+        }
+    }
+
+    /// Test introspection only: parked join waiters.
+    fn _join_waiter_count(&self) -> usize {
+        self.join_waiters.borrow().len()
+    }
+
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         for v in self.items.borrow().iter() {
             visit.call(v)?;
