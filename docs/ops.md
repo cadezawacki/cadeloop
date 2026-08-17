@@ -77,10 +77,36 @@ Two caveats worth stating plainly:
   newer.
 - `wheel-linux` — the Linux wheel.
 
-**Nothing is published yet.** These are GitHub Actions *run artifacts*:
-the workflow does not create a GitHub Release, upload release assets, or
-push to PyPI, so there is no `pip install <url>` or `pip install cadeloop`
-route today. Download them from the workflow run, or build from source
-with `maturin build --release`. Publication will be turned on
-deliberately; until then, treat any install instruction that names a
-release URL as wrong.
+### Where the wheels land
+
+A **tag push** (`v*`) attaches all three to the GitHub Release for that
+tag, so they install by direct URL:
+
+```bash
+pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<wheel>
+```
+
+A **workflow_dispatch** run has no tag to hang a Release off, publishes
+nothing, and leaves its wheels as run artifacts only — that is the way
+to spot-check a build without shipping it.
+
+**Still nothing on PyPI.** `pip install cadeloop` resolves to nothing;
+the direct URL above and `maturin build --release` are the only install
+routes. Adding a PyPI upload is a separate, deliberate decision.
+
+### Why the Windows wheels carry a build tag
+
+Both Windows legs produce the same PEP 427 filename — same project,
+version, `cp311`, `win_amd64` — so they would collide in one Release and
+silently overwrite each other. The workflow retags them:
+`cadeloop-<ver>-2-cp311-...` (baseline) and `cadeloop-<ver>-1v3-cp311-...`
+(v3). Only the build tag differs; project name and version are untouched,
+so nothing disagrees with the wheel's own metadata.
+
+The numbering is deliberate. pip orders build tags as `(int, str)` with
+"no tag" ranking lowest, so `2` beats `1v3` — aim pip at a directory
+holding both and it picks the portable wheel, and reaching the v3 wheel
+takes naming it explicitly. Had the baseline kept its untagged name, any
+tag at all on the v3 wheel would have outranked it and made the
+SIGILL-on-old-hardware build the default. Keep both tags if you touch
+this, and keep baseline's number higher.
