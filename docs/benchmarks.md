@@ -8,6 +8,14 @@ the README table into a near-tie.
 The Windows/IOCP benchmark history is separate, in
 [docs/README.md](README.md#benchmarks-windows-11-loopback).
 
+Charts are generated from the same JSON the tables quote:
+
+```bash
+python bench/harness/charts.py --sched /tmp/sched.json \
+    --sched-ranked /tmp/sched.json --http-ranked /tmp/http-wrk.json \
+    --outdir docs/assets
+```
+
 ## Environment
 
 | | |

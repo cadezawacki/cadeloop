@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">CadeLoop stopwatch mark</title>
+  <desc id="desc">A pixel-inspired stopwatch with cyan timing marks and hands on a dark tile.</desc>
+  <defs>
+    <pattern id="grid" width="8" height="8" patternUnits="userSpaceOnUse">
+      <path d="M8 0H0V8" fill="none" stroke="#22272F" stroke-width="0.5"/>
+    </pattern>
+  </defs>
+  <style>
+    .case { fill: #FFFFFF; }
+    .shadow { fill: #555E68; }
+    .dial { fill: #0B0D11; }
+    .accent { fill: #00F0D1; }
+    .highlight { fill: #A7F9F1; }
+  </style>
+
+  <rect width="128" height="128" rx="16" fill="#0B0D11"/>
+  <rect x="1" y="1" width="126" height="126" rx="15" fill="none" stroke="#2A3038" stroke-width="2"/>
+  <rect x="8" y="8" width="112" height="112" rx="9" fill="url(#grid)" opacity="0.58"/>
+
+  <rect class="case" x="50" y="10" width="28" height="6"/>
+  <rect class="shadow" x="56" y="16" width="16" height="6"/>
+  <rect class="case" x="88" y="24" width="14" height="6"/>
+  <rect class="shadow" x="94" y="30" width="14" height="6"/>
+
+  <path class="case" fill-rule="evenodd" d="M38 22H82L102 42V86L82 106H38L18 86V42ZM42 32H78L92 46V82L78 96H42L28 82V46Z"/>
+  <path class="shadow" d="M18 70H28V82L42 96H78V106H38L18 86Z"/>
+  <path class="dial" d="M42 32H78L92 46V82L78 96H42L28 82V46Z"/>
+
+  <rect class="accent" x="57" y="36" width="6" height="10"/>
+  <rect class="accent" x="57" y="82" width="6" height="10"/>
+  <rect class="accent" x="32" y="61" width="10" height="6"/>
+  <rect class="accent" x="78" y="61" width="10" height="6"/>
+  <rect class="accent" x="39" y="44" width="6" height="6"/>
+  <rect class="accent" x="75" y="44" width="6" height="6"/>
+  <rect class="accent" x="39" y="78" width="6" height="6"/>
+  <rect class="accent" x="75" y="78" width="6" height="6"/>
+
+  <rect class="highlight" x="56" y="57" width="8" height="8"/>
+  <rect class="accent" x="58" y="45" width="4" height="14"/>
+  <rect class="accent" x="64" y="63" width="6" height="6"/>
+  <rect class="accent" x="70" y="69" width="6" height="6"/>
+  <rect class="accent" x="76" y="75" width="6" height="6"/>
+</svg>
