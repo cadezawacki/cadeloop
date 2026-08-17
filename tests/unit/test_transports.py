@@ -1515,7 +1515,11 @@ def test_failing_protocol_factory_does_not_leak_the_connected_socket(loop):
         finally:
             server.close()
             await server.wait_closed()
-        assert leaked == 0, f"{leaked} descriptors leaked across 20 failed connects"
+        # One-sided on purpose: deferred closes from EARLIER tests can
+        # land inside this window under full-suite ordering, driving the
+        # delta negative. The bug this pins was strictly positive (+1 per
+        # failed connect), so only growth is a failure.
+        assert leaked <= 0, f"{leaked} descriptors leaked across 20 failed connects"
 
     loop.run_until_complete(main())
 

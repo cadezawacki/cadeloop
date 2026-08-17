@@ -158,3 +158,21 @@ def test_queue_is_loop_agnostic():
         assert lp.run_until_complete(main()) == list(range(100))
     finally:
         lp.close()
+
+
+def test_cancelled_join_waiters_are_removed(loop):
+    """A join() cancelled or timed out while work is outstanding must not
+    stay parked: on a queue that never reaches zero, the heartbeat
+    pattern (wait_for(join, t) retried) would retain one future per
+    attempt, without bound. Event.wait() removes its waiter in a
+    finally; so does this."""
+
+    async def main():
+        q = cadeloop.Queue()
+        q.put_nowait("never-done")
+        for _ in range(10):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(q.join(), 0.005)
+        assert q._q._join_waiter_count() == 0
+
+    loop.run_until_complete(main())

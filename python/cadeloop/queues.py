@@ -87,4 +87,12 @@ class Queue:
         return v
 
     async def join(self):
-        await self._q.join()
+        fut = self._q.join()
+        try:
+            await fut
+        finally:
+            # Event.wait()-style removal: a cancelled or timed-out join
+            # must not stay parked until the count reaches zero -- on a
+            # queue that never drains, repeated timed-out joins would
+            # retain one future each, without bound.
+            self._q.unjoin(fut)
