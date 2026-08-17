@@ -46,7 +46,12 @@ jobs:
       - name: build instrumented (profile-generate)
         shell: bash
         run: |
-          export RUSTFLAGS="$ARCH_FLAGS -Cprofile-generate=$PWD/pgo-data"
+          # cygpath -m, not $PWD: git-bash's POSIX form (/d/a/...) gets
+          # baked into the instrumented binary, and the profile runtime
+          # -- a plain Windows process -- writes the .profraw files
+          # relative to the current drive root instead of the workspace,
+          # so the merge step finds no pgo-data at all.
+          export RUSTFLAGS="$ARCH_FLAGS -Cprofile-generate=$(cygpath -m "$PWD")/pgo-data"
           cargo build --release -p cadeloop-pyshim
           cp target/release/_core.dll python/cadeloop/_core.pyd
       - name: run the profiling workload (R-111)
@@ -98,7 +103,9 @@ jobs:
       - name: build optimized (profile-use) wheel
         shell: bash
         run: |
-          export RUSTFLAGS="$ARCH_FLAGS -Cprofile-use=$PWD/pgo-data/merged.profdata"
+          # Same cygpath -m dance: rustc is a Windows process and cannot
+          # read the POSIX-form path either.
+          export RUSTFLAGS="$ARCH_FLAGS -Cprofile-use=$(cygpath -m "$PWD")/pgo-data/merged.profdata"
           maturin build --release --out dist
       - name: smoke the wheel
         shell: bash

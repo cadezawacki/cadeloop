@@ -11,11 +11,12 @@
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | TLS | A peer that connected and never sent a ClientHello was never torn down: each sweep staged another unencryptable 408 while the socket and receive slot stayed held | `` |
-> | Loop | `sendfile` held a raw fd across suspensions: a transport closed mid-transfer could aim `os.sendfile` at whatever connection reused the number, or park forever on a dead watcher | `` |
-> | Server | A lifespan app raising `KeyboardInterrupt`/`SystemExit` before `startup.complete` was classified as "no lifespan support" and served through | `` |
-> | Server | The connection drain could spend the whole grace budget, leaving `lifespan.shutdown` to be SIGKILLed before it ran; a quarter (capped 5s) is now reserved | `` |
-> | Net | `create_server(sock=...)` failure closed the detached descriptor in both Python and Rust -- the second close could land on an unrelated fd; the native side is now the single owner | `` |
+> | CI | The PGO wheel build baked a git-bash POSIX path into the instrumented binary, so Windows wrote the profiles elsewhere and the merge found nothing | `` |
+> | TLS | A peer that connected and never sent a ClientHello was never torn down: each sweep staged another unencryptable 408 while the socket and receive slot stayed held | `7069869` |
+> | Loop | `sendfile` held a raw fd across suspensions: a transport closed mid-transfer could aim `os.sendfile` at whatever connection reused the number, or park forever on a dead watcher | `7069869` |
+> | Server | A lifespan app raising `KeyboardInterrupt`/`SystemExit` before `startup.complete` was classified as "no lifespan support" and served through | `7069869` |
+> | Server | The connection drain could spend the whole grace budget, leaving `lifespan.shutdown` to be SIGKILLed before it ran; a quarter (capped 5s) is now reserved | `7069869` |
+> | Net | `create_server(sock=...)` failure closed the detached descriptor in both Python and Rust -- the second close could land on an unrelated fd; the native side is now the single owner | `7069869` |
 > | ASGI | Cancelled `receive()` futures stayed parked forever, growing the waiter queue without bound (regression of the waiter-queue fix, caught by Codex on PR #4) | `d12b4fe` |
 > | Loop | `subprocess_exec` rejected `os.PathLike` arguments the standard loop hands to Popen unchecked | `6ac1232` |
 > | HTTP | Engine-generated errors (400/408/413/431/500...) carried an `HTTP/1.1` status line even for parsed HTTP/1.0 requests | `d70d30f` |

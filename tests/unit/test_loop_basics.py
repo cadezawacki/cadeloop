@@ -937,8 +937,12 @@ def test_run_until_complete_rejects_before_scheduling_the_coroutine():
     async def inner():
         # Re-entering the running loop must refuse, and must not have
         # scheduled anything on the way to refusing.
+        coro = should_not_run()
         with pytest.raises(RuntimeError, match="already running"):
-            lp.run_until_complete(should_not_run())
+            lp.run_until_complete(coro)
+        # Never scheduled -- that is the fix under test -- so close it
+        # here, or it is collected with a "never awaited" RuntimeWarning.
+        coro.close()
 
     try:
         lp.run_until_complete(inner())
