@@ -6,7 +6,9 @@ status, the full benchmark history (including the Windows/IOCP runs,
 which the top-level README does not repeat), and the architecture notes.*
 
 *Looking for install instructions, usage documentation, or current
-benchmark numbers? See the [top-level README](../README.md).*
+benchmark numbers? See the [top-level README](../README.md). Supported
+`asyncio` surface: [compatibility.md](compatibility.md). Benchmark
+methodology: [benchmarks.md](benchmarks.md).*
 
 > ### Hardening log — review backlog
 >
@@ -263,7 +265,7 @@ hardware-validated (full test sweep + benchmarks); the M3 Registered
 I/O backend awaits a machine whose OS RIO subsystem works (see the
 Windows benchmarks section). Remaining: Windows subprocess pipes, PGO
 wheels, docs floor, and the two-machine acceptance runs. Full R-xxx
-map: [docs/requirements-traceability.md](docs/requirements-traceability.md).
+map: [docs/requirements-traceability.md](requirements-traceability.md).
 
 | Surface | State |
 |---|---|
@@ -292,14 +294,14 @@ map: [docs/requirements-traceability.md](docs/requirements-traceability.md).
 > uvloop 0.22.1, rloop 0.3.1, rsloop 0.1.30, aiofastnet 1.0.5 (both
 > standalone on asyncio and stacked on cadeloop), hypercorn 0.18, and
 > cadeloop's own native ASGI server. Raw JSON lives in
-> [`bench/baselines/`](bench/baselines/). Reproduce with
+> [`bench/baselines/`](../bench/baselines/). Reproduce with
 > `python bench/harness/harness.py --suite {sched,echo,http}`.
 
 ### Scheduling core
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-sched-dark.svg">
-  <img alt="Scheduling speedup vs stdlib asyncio: cadeloop faster than asyncio on all ten benchmarks and ahead of uvloop on nine" src="docs/assets/bench-sched.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-sched-dark.svg">
+  <img alt="Scheduling speedup vs stdlib asyncio: cadeloop faster than asyncio on all ten benchmarks and ahead of uvloop on nine" src="assets/bench-sched.svg">
 </picture>
 
 Median throughput, millions of ops/second:
@@ -337,8 +339,8 @@ Median throughput, millions of ops/second:
 ### TCP echo — per-message loop overhead
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-echo-dark.svg">
-  <img alt="Single-connection TCP echo: cadeloop 44.5K msgs/s at 47us p99 vs uvloop 23.9K at 68us; the aiofastnet-on-cadeloop stack trails cadeloop slightly" src="docs/assets/bench-echo.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-echo-dark.svg">
+  <img alt="Single-connection TCP echo: cadeloop 44.5K msgs/s at 47us p99 vs uvloop 23.9K at 68us; the aiofastnet-on-cadeloop stack trails cadeloop slightly" src="assets/bench-echo.svg">
 </picture>
 
 Single connection, 1 KiB ping-pong (RTT measures the full transport +
@@ -379,8 +381,8 @@ run can separate the servers.
 ### HTTP/1.1 — the native engine vs everything else
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-http-dark.svg">
-  <img alt="HTTP plaintext RPS: cadeloop-native 41K req/s at 7.2ms p99 vs the uvicorn pack at ~7.1-7.6K and hypercorn 4.46K" src="docs/assets/bench-http.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-http-dark.svg">
+  <img alt="HTTP plaintext RPS: cadeloop-native 41K req/s at 7.2ms p99 vs the uvicorn pack at ~7.1-7.6K and hypercorn 4.46K" src="assets/bench-http.svg">
 </picture>
 
 Plaintext "Hello, World!" ASGI, 64 keep-alive connections. `cadeloop-native`
@@ -447,14 +449,14 @@ import in this container and is excluded.)
 > not the spec's two-machine acceptance numbers (R-131). Contenders:
 > stdlib asyncio (proactor), winloop 0.2 (uvloop's Windows port), rsloop,
 > and cadeloop on its IOCP backend. Raw JSON lives in
-> [`bench/baselines/`](bench/baselines/) (`windows-*.json`); the whole
+> [`bench/baselines/`](../bench/baselines/) (`windows-*.json`); the whole
 > suite is collected by `tools\windows\validate.ps1`.
 
 ### Scheduling core
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-win-sched-dark.svg">
-  <img alt="Windows scheduling speedup vs stdlib asyncio: cadeloop ahead of asyncio on all ten benchmarks and ahead of winloop on ten; rsloop leads the call_soon chain but fails three timer benches" src="docs/assets/bench-win-sched.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-win-sched-dark.svg">
+  <img alt="Windows scheduling speedup vs stdlib asyncio: cadeloop ahead of asyncio on all ten benchmarks and ahead of winloop on ten; rsloop leads the call_soon chain but fails three timer benches" src="assets/bench-win-sched.svg">
 </picture>
 
 Median throughput, millions of ops/second:
@@ -488,8 +490,8 @@ Median throughput, millions of ops/second:
 ### TCP echo — per-message loop overhead
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-win-echo-dark.svg">
-  <img alt="Windows single-connection TCP echo: cadeloop 26.8K msgs/s at 107us p99 vs winloop 20.5K at 143us and asyncio 17.6K at 161us" src="docs/assets/bench-win-echo.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-win-echo-dark.svg">
+  <img alt="Windows single-connection TCP echo: cadeloop 26.8K msgs/s at 107us p99 vs winloop 20.5K at 143us and asyncio 17.6K at 161us" src="assets/bench-win-echo.svg">
 </picture>
 
 Single connection, 1 KiB ping-pong:
@@ -520,8 +522,8 @@ one), with cadeloop holding the tail latency.
 ### HTTP/1.1 — the native engine on its production platform
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-win-http-dark.svg">
-  <img alt="Windows HTTP plaintext RPS: cadeloop-native 34.7K req/s at 2.7ms p99 vs the uvicorn pack at ~7.7-7.9K and hypercorn 5.6K" src="docs/assets/bench-win-http.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-win-http-dark.svg">
+  <img alt="Windows HTTP plaintext RPS: cadeloop-native 34.7K req/s at 2.7ms p99 vs the uvicorn pack at ~7.7-7.9K and hypercorn 5.6K" src="assets/bench-win-http.svg">
 </picture>
 
 Plaintext "Hello, World!" ASGI, 64 keep-alive connections:
@@ -552,7 +554,7 @@ all notification variants) returns WSAEFAULT from calls whose argument
 lists contain no pointer, with the function table verified to resolve
 from genuine unhooked `mswsock.dll`, an LSP-free Winsock catalog, and a
 native-x64 process. The full diagnosis lives in
-[`crates/core/examples/rio_probe.rs`](crates/core/examples/rio_probe.rs)
+[`crates/core/examples/rio_probe.rs`](../crates/core/examples/rio_probe.rs)
 (run it on any Windows box for a verdict in seconds). `backend="auto"`
 stays on IOCP; the validation orchestrator detects the condition in 2s
 and skips RIO steps. Behavioral validation waits for a stable x64 build
@@ -568,8 +570,8 @@ L1  crates/core     — reactor: timers, queues, dispatch      [Rust]
 L0  crates/core     — IOCP | RIO (hybrid) | epoll (Linux)    [Rust]
 ```
 
-Highlights (details in [docs/architecture.md](docs/architecture.md),
-decisions in [docs/decisions.md](docs/decisions.md)):
+Highlights (details in [docs/architecture.md](architecture.md),
+decisions in [docs/decisions.md](decisions.md)):
 
 - **One completion-style op API over both kernels** — IOCP natively;
   epoll wrapped as a proactor (syscall attempted at post time, parked
