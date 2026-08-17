@@ -58,6 +58,11 @@ fast because it is answering wrongly shows up rather than averaging in.
 (loop, benchmark) pair, medians reported. No sockets and no external load
 generator, so these are free of trap 1 below.
 
+`queue_pingpong` and `queue_pingpong_native` are the same workload on
+`asyncio.Queue` and on `cadeloop.Queue`. The latter is loop-agnostic and runs
+under every contender, so the pair measures the queue implementation rather
+than the loop.
+
 ## Trap 1 — the load generator was the bottleneck
 
 The repo also ships `harness.py --suite http`, whose load generator is
@@ -105,7 +110,9 @@ installed. There is also no `--loop cadeloop`; uvicorn's `--loop` accepts only
 
 This is what made every `uvicorn + h11` row land on the same ~6.5 K req/s and
 support a tidy but false conclusion ("the loop doesn't matter"). Correcting it
-moved real numbers:
+moved real numbers (both columns measured on the build current at the time,
+so they compare the two *methods*, not two builds — the README's figures are
+from a later run and differ slightly):
 
 | row | with the policy idiom | driving the loop directly |
 |---|---|---|
@@ -131,6 +138,14 @@ called `Option::unwrap()` on a `None` value
 It could not complete the 3×10s protocol, so it has no HTTP row. This is an
 upstream bug, not a harness failure. Its scheduling numbers were collected
 before sustained socket load was applied and are unaffected.
+
+## Result history
+
+Numbers are re-measured whenever the engine changes, so the README's table and
+these notes move together. Figures quoted inside "Trap 1" and "Trap 2" are kept
+at the values from the run that exposed each problem, because the point of
+those tables is the delta between two measurement methods rather than the
+current throughput.
 
 ## Known limitations
 
