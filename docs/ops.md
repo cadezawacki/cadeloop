@@ -77,10 +77,72 @@ Two caveats worth stating plainly:
   newer.
 - `wheel-linux` — the Linux wheel.
 
-**Nothing is published yet.** These are GitHub Actions *run artifacts*:
-the workflow does not create a GitHub Release, upload release assets, or
-push to PyPI, so there is no `pip install <url>` or `pip install cadeloop`
-route today. Download them from the workflow run, or build from source
-with `maturin build --release`. Publication will be turned on
-deliberately; until then, treat any install instruction that names a
-release URL as wrong.
+### Where the wheels land
+
+A **tag push** (`v*`) publishes to two places:
+
+1. **The GitHub Release** for that tag gets every artifact — both Windows
+   wheels, the Linux wheel, and the sdist.
+2. **PyPI** gets everything *except* the x86-64-v3 wheel, via Trusted
+   Publishing (OIDC, no stored API token).
+
+```bash
+pip install cadeloop                                    # PyPI
+pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<wheel>
+```
+
+A **workflow_dispatch** run has no tag to hang a Release off, publishes
+to neither destination, and leaves its wheels as run artifacts only —
+that is the way to spot-check a build without shipping it.
+
+### Things that will bite you on a release
+
+**PyPI uploads are irreversible.** A filename, once uploaded, can never
+be reused for that project — deleting the release does not free it. The
+`pypi-publish` job therefore runs last, gated on `github-release`
+succeeding, and asserts that every file's version matches the tag before
+uploading. A tag that disagrees with `Cargo.toml`'s workspace version
+fails the job instead of burning the wrong filename forever.
+
+**The v3 wheel is withheld from PyPI on purpose.** pip's build-tag
+ordering already prefers the baseline, but "prefers" is the wrong
+guarantee for an index everyone installs from without reading. It stays a
+Release asset, reachable only by explicit URL.
+
+**The Linux wheel is built in a manylinux2014 container**
+(`PyO3/maturin-action`), not on the runner. A plain `maturin build` on
+`ubuntu-latest` links against glibc 2.39 and is tagged `manylinux_2_39`,
+which pip refuses to install on Debian 12, RHEL 9, or Ubuntu 22.04. That
+was tolerable when a human picked the artifact by hand; it is not
+tolerable as the wheel PyPI serves to everyone. The sdist step runs
+*before* the container step so `dist/` belongs to the runner user rather
+than to root.
+
+**Trusted Publishing must match on every field.** PyPI's publisher
+config names the owner, repository, workflow filename (`release.yml`) and
+environment name (`pypi`). All four are claims in the OIDC token and all
+four are checked, so the `pypi-publish` job declares
+`environment: name: pypi` to match. Change one side and the upload fails
+with a generic "not a trusted publisher" error that does not say which
+field disagreed.
+
+The environment also gives you a place to hang a required reviewer: add
+one under Settings → Environments → pypi and every publish pauses for
+manual approval.
+
+### Why the Windows wheels carry a build tag
+
+Both Windows legs produce the same PEP 427 filename — same project,
+version, `cp311`, `win_amd64` — so they would collide in one Release and
+silently overwrite each other. The workflow retags them:
+`cadeloop-<ver>-2-cp311-...` (baseline) and `cadeloop-<ver>-1v3-cp311-...`
+(v3). Only the build tag differs; project name and version are untouched,
+so nothing disagrees with the wheel's own metadata.
+
+The numbering is deliberate. pip orders build tags as `(int, str)` with
+"no tag" ranking lowest, so `2` beats `1v3` — aim pip at a directory
+holding both and it picks the portable wheel, and reaching the v3 wheel
+takes naming it explicitly. Had the baseline kept its untagged name, any
+tag at all on the v3 wheel would have outranked it and made the
+SIGILL-on-old-hardware build the default. Keep both tags if you touch
+this, and keep baseline's number higher.
