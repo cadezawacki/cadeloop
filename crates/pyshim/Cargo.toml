@@ -1,0 +1,29 @@
+[package]
+name = "cadeloop-pyshim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CadeLoop PyO3 bindings (the cadeloop._core extension module)"
+
+[lib]
+# The extension module: ships as cadeloop/_core.pyd (maturin renames from
+# the cdylib). Must NOT be named like the cadeloop-core rlib.
+name = "_core"
+crate-type = ["cdylib"]
+doctest = false
+
+[features]
+# R-070: mimalloc as the extension's global allocator. Default-on (all
+# shipped builds); disable only for cross-checks on hosts without an MSVC C
+# toolchain (`cargo check --no-default-features --target x86_64-pc-windows-msvc`).
+default = ["mimalloc-allocator"]
+mimalloc-allocator = ["dep:mimalloc"]
+
+[dependencies]
+cadeloop-core = { path = "../core" }
+# R-012: PyO3 >= 0.21. Pinned minor for reproducible builds.
+pyo3 = { version = "0.29", features = ["extension-module", "generate-import-lib"] }
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

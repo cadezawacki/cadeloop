@@ -1,0 +1,1246 @@
+"""L3 facade: the ``asyncio.AbstractEventLoop`` subclass (R-013, R-050).
+
+The scheduling hot paths (call_soon / timers / run_forever / time /
+call_soon_threadsafe) are implemented natively in ``cadeloop._core`` and
+bound directly onto the instance in ``__init__``, so calls bypass Python-level
+wrapper frames entirely. This module supplies the rest of the surface:
+futures/tasks integration, executors, DNS (R-055), exception-handler
+machinery, and asyncgen shutdown — plus explicit, milestone-annotated
+``NotImplementedError``s for the I/O surface that arrives with the Windows
+transport milestones (M1/M2/M4; see docs/roadmap.md).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import os
+import reprlib
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import warnings
+import weakref
+from asyncio import events, futures, tasks
+
+from . import _core
+from .tcp import TcpSurface, _DatagramTransport
+
+__all__ = ["Loop"]
+
+logger = __import__("logging").getLogger("cadeloop")
+
+_MILESTONES = {
+    "tcp": "TCP transports arrive with the IOCP backend in milestone M1",
+    "http": "the native HTTP/ASGI engine arrives in milestone M2",
+    "udp": "UDP endpoints arrive in milestone M4 (R-058)",
+    "tls": "the native TLS engine arrives in milestone M4 (R-059)",
+    "readiness": "add_reader/add_writer readiness emulation arrives in "
+    "milestone M1 and is hardened in M4 (R-057)",
+    "sendfile": "loop.sendfile (TransmitFile, R-036) arrives in milestone M1",
+}
+
+
+def _not_yet(feature: str, key: str):
+    raise NotImplementedError(
+        f"cadeloop: {feature} is not implemented yet — {_MILESTONES[key]}. "
+        "See docs/roadmap.md for the milestone plan."
+    )
+
+
+def _run_until_complete_cb(fut):
+    if not fut.cancelled():
+        exc = fut.exception()
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            # Leave it to run_forever to propagate.
+            return
+    futures._get_loop(fut).stop()
+
+
+class Loop(TcpSurface, asyncio.AbstractEventLoop):
+    """A cadeloop event loop (portable dev backend off-Windows; IOCP/RIO on
+    Windows). Drop-in compatible with ``asyncio.run()`` and stdlib tasks."""
+
+    def __init__(
+        self,
+        *,
+        backend: str | None = None,
+        spin_us: int = 20,
+        high_water: int = 64 * 1024,
+        low_water: int = 16 * 1024,
+        accept_pool: int = 64,
+        rio_cq_size: int = 65536,
+        rio_rq_recv: int = 32,
+        rio_rq_send: int = 32,
+        dns_cache: bool = False,
+        dns_cache_ttl: float = 5.0,
+        tfo: bool = False,
+        loopback_fast_path: bool = True,
+    ):
+        # Backend resolution: explicit arg > CADELOOP_BACKEND env (lets the
+        # whole test/bench suite run against a chosen backend, e.g. "rio"
+        # on Windows) > "auto".
+        if backend is None:
+            backend = os.environ.get("CADELOOP_BACKEND", "auto")
+        if backend == "rio":
+            # R-020: 'auto' deliberately avoids RIO until it's validated on
+            # real hardware (docs/roadmap.md M3) — an explicit request gets
+            # a loud, dismissible warning rather than a silent footgun.
+            # cadeloop.Config/serve() additionally require
+            # CADELOOP_ALLOW_EXPERIMENTAL_RIO=1 for this exact reason; this
+            # low-level constructor stays unblocked for RIO diagnosis
+            # (tools/windows/rio_smoke.py, rio_bisect.py).
+            warnings.warn(
+                "cadeloop: backend='rio' is experimental and unvalidated on "
+                "real Windows hardware — every machine tested so far has hit "
+                "either an OS-level RIO initialization failure or a data-path "
+                "stall. 'auto' stays on the hardware-validated IOCP backend.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        core = _core.CoreLoop(
+            backend=backend,
+            spin_us=spin_us,
+            high_water=high_water,
+            low_water=low_water,
+            rio_cq_size=rio_cq_size,
+            rio_rq_recv=rio_rq_recv,
+            rio_rq_send=rio_rq_send,
+            tfo=tfo,
+            loopback_fast_path=loopback_fast_path,
+        )
+        self._core = core
+        self._accept_pool = accept_pool  # R-032
+        self._signal_handlers = {}
+        self._console_ctrl_handler_ref = None  # R-052: keeps the ctypes callback alive
+        core.set_error_hook(self._on_callback_error)
+        core.set_net_error_hook(self._on_net_error)
+        core.set_slow_callback_hook(self._on_slow_callback)
+        # asyncio's own knob, and a real attribute rather than a stub: the
+        # native dispatcher had 100ms baked in, so tuning this silently did
+        # nothing and merely READING it raised AttributeError. A property
+        # keeps the two sides from drifting apart again.
+        self._slow_callback_duration = 0.1
+
+        # R-050: native fast paths bound straight onto the instance —
+        # attribute lookup finds the bound native method, no Python frame.
+        self.call_soon = core.call_soon
+        self.call_soon_threadsafe = core.call_soon_threadsafe
+        self.call_later = core.call_later
+        self.call_at = core.call_at
+        self.time = core.time
+        self.stop = core.stop
+        self.is_running = core.is_running
+        self.is_closed = core.is_closed
+        self.get_debug = core.get_debug
+        self.stats = core.stats  # R-103
+
+        self._task_factory = None
+        core.set_owner(self)
+        self._rebind_task_fastpath()
+        self._exception_handler = None
+        self._default_executor = None
+        self._executor_shutdown_called = False
+        self._dns_executor = None
+        self._dns_cache: dict = {}
+        # R-055: off by default (matches the AbstractEventLoop contract —
+        # real asyncio.getaddrinfo never caches). cadeloop.Config/serve()
+        # default this on (documented: RFC TTLs ignored) since a short
+        # server-side cache is a deliberate, reasonable tradeoff there;
+        # direct Loop() construction gets stdlib-faithful behavior unless
+        # asked for otherwise.
+        self._dns_cache_enabled = dns_cache
+        self._dns_cache_ttl = dns_cache_ttl
+        self._asyncgens = weakref.WeakSet()
+        self._asyncgens_shutdown_called = False
+        self._coroutine_origin_tracking_enabled = False
+        self._coroutine_origin_tracking_saved_depth = 0
+
+        # R-142: honor PYTHONASYNCIODEBUG / -X dev.
+        core.set_debug(
+            sys.flags.dev_mode or bool(os.environ.get("PYTHONASYNCIODEBUG"))
+        )
+
+    # ------------------------------------------------------------------ #
+    # lifecycle                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _check_running(self):
+        """The two running-loop refusals, in one place.
+
+        run_until_complete needs them BEFORE it creates a Task, and
+        run_forever needs them at entry; duplicating the pair is how the
+        two come to disagree.
+        """
+        if self.is_running():
+            raise RuntimeError("This event loop is already running")
+        if events._get_running_loop() is not None:
+            raise RuntimeError(
+                "Cannot run the event loop while another loop is running"
+            )
+
+    def run_forever(self):
+        self._check_closed()
+        self._check_running()
+        self._set_coroutine_origin_tracking(self.get_debug())
+        old_agen_hooks = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(
+            firstiter=self._asyncgen_firstiter_hook,
+            finalizer=self._asyncgen_finalizer_hook,
+        )
+        events._set_running_loop(self)
+        wakeup = self._install_signal_wakeup()
+        try:
+            self._core.run_forever()
+        finally:
+            self._remove_signal_wakeup(wakeup)
+            events._set_running_loop(None)
+            sys.set_asyncgen_hooks(*old_agen_hooks)
+            self._set_coroutine_origin_tracking(False)
+
+    def _set_coroutine_origin_tracking(self, enabled):
+        """R-142: sys.set_coroutine_origin_tracking_depth ports directly
+        from base_events._set_coroutine_origin_tracking — debug mode
+        previously only flipped the core loop's own debug flag, missing
+        the richer "Object created at (most recent call last)"
+        coroutine-origin tracebacks real asyncio's debug mode adds."""
+        if bool(enabled) == bool(self._coroutine_origin_tracking_enabled):
+            return
+        if enabled:
+            self._coroutine_origin_tracking_saved_depth = sys.get_coroutine_origin_tracking_depth()
+            sys.set_coroutine_origin_tracking_depth(10)  # asyncio.constants.DEBUG_STACK_DEPTH
+        else:
+            sys.set_coroutine_origin_tracking_depth(self._coroutine_origin_tracking_saved_depth)
+        self._coroutine_origin_tracking_enabled = enabled
+
+    def _install_signal_wakeup(self):
+        """R-052: CPython's C-level signal handler writes one byte to the
+        wakeup fd; watching the read end makes a parked kernel poll return
+        immediately, so CTRL+C interrupts an idle loop at once. This is
+        the proactor CTRL+C fix on Windows, and on POSIX it also closes
+        the race of a signal landing between the tick's signal check and
+        the park. Main thread only (set_wakeup_fd's own rule)."""
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        import signal as signal_module
+
+        try:
+            rsock, csock = socket.socketpair()
+            rsock.setblocking(False)
+            csock.setblocking(False)
+            old_fd = signal_module.set_wakeup_fd(csock.fileno(), warn_on_full_buffer=False)
+        except (ValueError, OSError, AttributeError):
+            return None
+
+        def drain():
+            try:
+                while rsock.recv(4096):
+                    pass
+            except (BlockingIOError, InterruptedError, OSError):
+                pass
+
+        try:
+            self._core.add_reader(rsock.fileno(), drain)
+        except OSError:
+            signal_module.set_wakeup_fd(old_fd)
+            rsock.close()
+            csock.close()
+            return None
+        return (rsock, csock, old_fd)
+
+    def _remove_signal_wakeup(self, wakeup):
+        if wakeup is None:
+            return
+        import signal as signal_module
+
+        rsock, csock, old_fd = wakeup
+        try:
+            self._core.remove_reader(rsock.fileno())
+        except OSError:
+            pass
+        try:
+            signal_module.set_wakeup_fd(old_fd)
+        except (ValueError, OSError):
+            pass
+        rsock.close()
+        csock.close()
+
+    def run_until_complete(self, future):
+        self._check_closed()
+        # BEFORE ensure_future, as base_events does. Scheduling first meant
+        # a call made while a loop was already running in this thread had
+        # already created and queued a Task by the time run_forever()
+        # raised -- so the coroutine the caller was told had been REJECTED
+        # went on executing as an unobserved background task.
+        self._check_running()
+        new_task = not futures.isfuture(future)
+        future = tasks.ensure_future(future, loop=self)
+        if new_task:
+            # An exception is raised if the future didn't complete, so there
+            # is no need to log the "destroy pending task" message.
+            future._log_destroy_pending = False
+        future.add_done_callback(_run_until_complete_cb)
+        try:
+            self.run_forever()
+        except BaseException:
+            if new_task and future.done() and not future.cancelled():
+                # The coroutine raised a BaseException. Consume the exception
+                # to not log a warning; the caller doesn't have access to the
+                # local task.
+                future.exception()
+            raise
+        finally:
+            future.remove_done_callback(_run_until_complete_cb)
+        if not future.done():
+            raise RuntimeError("Event loop stopped before Future completed.")
+        return future.result()
+
+    def close(self):
+        # Check-before-teardown (base_events.close()'s own order): a
+        # close() on a running loop must fail cleanly, not leave the
+        # executors permanently shut down as a side effect of a call
+        # that itself raised.
+        if self.is_running():
+            raise RuntimeError("Cannot close a running event loop")
+        # Restore process-level signal disposition before tearing the core
+        # down. Leaving handlers installed pointed the signal module at a
+        # _dispatch that returns immediately once the loop is closed, so
+        # SIGINT/SIGTERM were silently swallowed for the rest of the
+        # process instead of resuming default behaviour -- and the closed
+        # loop stayed referenced from the signal module. Matches what the
+        # stdlib Unix loop does in its own close().
+        for sig in list(self._signal_handlers):
+            try:
+                self.remove_signal_handler(sig)
+            except (OSError, ValueError, RuntimeError):
+                self._signal_handlers.pop(sig, None)
+        self._remove_console_ctrl_handler()
+        if self._default_executor is not None:
+            self._default_executor.shutdown(wait=False)
+            self._default_executor = None
+        if self._dns_executor is not None:
+            self._dns_executor.shutdown(wait=False)
+            self._dns_executor = None
+        self._core.close()
+
+    def _check_closed(self):
+        if self._core.is_closed():
+            raise RuntimeError("Event loop is closed")
+
+    def set_debug(self, enabled):
+        self._core.set_debug(bool(enabled))
+        if self.is_running():
+            # Deferred to the loop's own thread (matches base_events):
+            # sys.set_coroutine_origin_tracking_depth is process-global
+            # state, so mutating it off-thread while the loop runs would
+            # race. If not running, run_forever() applies it at startup.
+            self.call_soon_threadsafe(self._set_coroutine_origin_tracking, enabled)
+
+    def __repr__(self):
+        return (
+            f"<cadeloop.Loop running={self.is_running()} "
+            f"closed={self.is_closed()} debug={self.get_debug()}>"
+        )
+
+    # ------------------------------------------------------------------ #
+    # futures & tasks                                                    #
+    # ------------------------------------------------------------------ #
+
+    # Both of these are shadowed on the instance by native vectorcall fast
+    # paths (see _rebind_task_fastpath). They stay here as the general
+    # implementation: the native create_task hands anything it does not
+    # model -- debug mode, a **kwarg a newer CPython grew -- straight back
+    # to this method, and a task factory unbinds the fast path outright.
+
+    def create_future(self):
+        return futures.Future(loop=self)
+
+    def create_task(self, coro, *, name=None, context=None, **kwargs):
+        self._check_closed()
+        if self._task_factory is None:
+            task = tasks.Task(coro, loop=self, name=name, context=context, **kwargs)
+            if task._source_traceback:
+                del task._source_traceback[-1]
+        else:
+            if context is None:
+                task = self._task_factory(self, coro, **kwargs)
+            else:
+                task = self._task_factory(self, coro, context=context, **kwargs)
+            if name is not None:
+                try:
+                    set_name = task.set_name
+                except AttributeError:
+                    pass
+                else:
+                    set_name(name)
+        return task
+
+    def _rebind_task_fastpath(self):
+        """(Re)install the native create_task/create_future fast paths.
+
+        R-050: binding the native method straight onto the instance means
+        ``loop.create_task(coro)`` resolves to it with no Python frame in
+        between. Two things take that back:
+
+        * a task factory -- the native path only builds ``asyncio.Task``;
+        * a subclass that overrides either method -- an instance attribute
+          would otherwise shadow the override, which is a silent way to
+          break a subclass that has every right to expect its method to be
+          called.
+        """
+        cls = type(self)
+        if cls.create_future is Loop.create_future:
+            self.create_future = self._core.create_future
+        if self._task_factory is None and cls.create_task is Loop.create_task:
+            self.create_task = self._core.create_task
+        else:
+            self.__dict__.pop("create_task", None)
+
+    def set_task_factory(self, factory):
+        if factory is not None and not callable(factory):
+            raise TypeError("task factory must be a callable or None")
+        self._task_factory = factory
+        self._rebind_task_fastpath()
+
+    def get_task_factory(self):
+        return self._task_factory
+
+    # ------------------------------------------------------------------ #
+    # executors & DNS (R-055)                                            #
+    # ------------------------------------------------------------------ #
+
+    def run_in_executor(self, executor, func, *args):
+        self._check_closed()
+        if asyncio.iscoroutine(func) or asyncio.iscoroutinefunction(func):
+            raise TypeError("coroutines cannot be used with run_in_executor()")
+        if executor is None:
+            executor = self._default_executor
+            if self._executor_shutdown_called:
+                raise RuntimeError("Executor shutdown has been called")
+            if executor is None:
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    thread_name_prefix="cadeloop"
+                )
+                self._default_executor = executor
+        return futures.wrap_future(executor.submit(func, *args), loop=self)
+
+    def set_default_executor(self, executor):
+        if not isinstance(executor, concurrent.futures.ThreadPoolExecutor):
+            raise TypeError("executor must be ThreadPoolExecutor instance")
+        self._default_executor = executor
+
+    def _dns_pool(self):
+        # R-055: fixed internal pool, size = min(8, cpus).
+        if self._dns_executor is None:
+            self._dns_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, os.cpu_count() or 1),
+                thread_name_prefix="cadeloop-dns",
+            )
+        return self._dns_executor
+
+    async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
+        key = (host, port, family, type, proto, flags)
+        if self._dns_cache_enabled:
+            hit = self._dns_cache.get(key)
+            if hit is not None and hit[0] > self.time():
+                return hit[1]
+        result = await futures.wrap_future(
+            self._dns_pool().submit(
+                socket.getaddrinfo, host, port, family, type, proto, flags
+            ),
+            loop=self,
+        )
+        if self._dns_cache_enabled:
+            if len(self._dns_cache) > 1024:
+                self._dns_cache.clear()
+            self._dns_cache[key] = (self.time() + self._dns_cache_ttl, result)
+        return result
+
+    async def getnameinfo(self, sockaddr, flags=0):
+        return await futures.wrap_future(
+            self._dns_pool().submit(socket.getnameinfo, sockaddr, flags),
+            loop=self,
+        )
+
+    async def shutdown_default_executor(self):
+        self._executor_shutdown_called = True
+        if self._default_executor is None:
+            return
+        future = self.create_future()
+        thread = threading.Thread(target=self._do_shutdown, args=(future,))
+        thread.start()
+        try:
+            await future
+        finally:
+            thread.join()
+
+    def _do_shutdown(self, future):
+        try:
+            self._default_executor.shutdown(wait=True)
+            if not self.is_closed():
+                # Not future.set_result: the awaiting task may have been
+                # cancelled, and resolving a cancelled future raises
+                # InvalidStateError through the exception handler for a
+                # perfectly valid cancellation (CPython schedules the
+                # same cancellation-aware setter here).
+                self.call_soon_threadsafe(
+                    futures._set_result_unless_cancelled, future, None
+                )
+        except Exception as ex:
+            if not self.is_closed() and not future.cancelled():
+                self.call_soon_threadsafe(future.set_exception, ex)
+
+    # ------------------------------------------------------------------ #
+    # async generators                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _asyncgen_firstiter_hook(self, agen):
+        if self._asyncgens_shutdown_called:
+            warnings.warn(
+                f"asynchronous generator {agen!r} was scheduled after "
+                f"loop.shutdown_asyncgens() call",
+                ResourceWarning,
+                source=self,
+                stacklevel=2,
+            )
+        self._asyncgens.add(agen)
+
+    def _asyncgen_finalizer_hook(self, agen):
+        self._asyncgens.discard(agen)
+        if not self.is_closed():
+            self.call_soon_threadsafe(self.create_task, agen.aclose())
+
+    async def shutdown_asyncgens(self):
+        self._asyncgens_shutdown_called = True
+        if not len(self._asyncgens):
+            return
+        closing_agens = list(self._asyncgens)
+        self._asyncgens.clear()
+        results = await tasks.gather(
+            *[ag.aclose() for ag in closing_agens], return_exceptions=True
+        )
+        for result, agen in zip(results, closing_agens, strict=True):
+            # `Exception`, not `BaseException`, verbatim from CPython's
+            # base_events.shutdown_asyncgens. Widening it was suggested on
+            # the grounds that the standard loop tests BaseException; it
+            # does not (checked against 3.11), and for a drop-in loop
+            # matching the stdlib's reporting is the point.
+            if isinstance(result, Exception):
+                self.call_exception_handler(
+                    {
+                        "message": f"an error occurred during closing of "
+                        f"asynchronous generator {agen!r}",
+                        "exception": result,
+                        "asyncgen": agen,
+                    }
+                )
+
+    # ------------------------------------------------------------------ #
+    # exception handling                                                 #
+    # ------------------------------------------------------------------ #
+
+    def set_exception_handler(self, handler):
+        if handler is not None and not callable(handler):
+            raise TypeError(
+                f"A callable object or None is expected, got {handler!r}"
+            )
+        self._exception_handler = handler
+
+    def get_exception_handler(self):
+        return self._exception_handler
+
+    def default_exception_handler(self, context):
+        message = context.get("message")
+        if not message:
+            message = "Unhandled exception in event loop"
+        exception = context.get("exception")
+        if exception is not None:
+            exc_info = (type(exception), exception, exception.__traceback__)
+        else:
+            exc_info = False
+        log_lines = [message]
+        for key in sorted(context):
+            if key in {"message", "exception"}:
+                continue
+            log_lines.append(f"{key}: {context[key]!r}")
+        logger.error("\n".join(log_lines), exc_info=exc_info)
+
+    def call_exception_handler(self, context):
+        if self._exception_handler is None:
+            try:
+                self.default_exception_handler(context)
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException:
+                logger.error(
+                    "Exception in default exception handler", exc_info=True
+                )
+            return
+        try:
+            self._exception_handler(self, context)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            try:
+                self.default_exception_handler(
+                    {
+                        "message": "Unhandled error in exception handler",
+                        "exception": exc,
+                        "context": context,
+                    }
+                )
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException:
+                logger.error(
+                    "Exception in default exception handler "
+                    "while handling an unexpected error "
+                    "in custom exception handler",
+                    exc_info=True,
+                )
+
+    # Hooks invoked from the native dispatcher.
+
+    def _on_callback_error(self, handle, exc):
+        self.call_exception_handler(
+            {
+                "message": f"Exception in callback {handle!r}",
+                "exception": exc,
+                "handle": handle,
+            }
+        )
+
+    def _on_net_error(self, message, exc):
+        self.call_exception_handler({"message": message, "exception": exc})
+
+    @property
+    def slow_callback_duration(self):
+        return self._slow_callback_duration
+
+    @slow_callback_duration.setter
+    def slow_callback_duration(self, seconds):
+        # Pushed straight through: a value the core never hears about is
+        # exactly the bug this replaces.
+        self._core.set_slow_callback_duration(seconds)
+        self._slow_callback_duration = seconds
+
+    def _on_slow_callback(self, handle, seconds):
+        # R-142: slow-callback warnings in debug mode (>100ms).
+        logger.warning(
+            "Executing %s took %.3f seconds", reprlib.repr(handle), seconds
+        )
+
+    # ------------------------------------------------------------------ #
+    # I/O surface — milestone-gated (see docs/roadmap.md)                #
+    # ------------------------------------------------------------------ #
+
+
+
+    async def create_datagram_endpoint(
+        self,
+        protocol_factory,
+        local_addr=None,
+        remote_addr=None,
+        *,
+        family=0,
+        proto=0,
+        flags=0,
+        reuse_port=None,
+        allow_broadcast=None,
+        sock=None,
+    ):
+        """R-058: native datagram endpoint (WSARecvFrom/WSASendTo on IOCP,
+        recvfrom/sendto on epoll — no readiness probes, which would
+        truncate datagrams on Windows)."""
+        import socket as socket_module
+
+        local_res = remote_res = None
+        if sock is not None:
+            if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
+                raise ValueError("sock is mutually exclusive with address/options")
+            if sock.type != socket_module.SOCK_DGRAM:
+                # Otherwise a stream socket is detached into the datagram
+                # machinery, which then applies recvfrom/sendto semantics
+                # and datagram callbacks to a byte stream.
+                raise ValueError(f"A datagram socket was expected, got {sock!r}")
+            udp_sock = sock
+        else:
+            fam = family or socket_module.AF_INET
+            # Resolve BOTH addresses here and keep the sockaddrs, rather
+            # than resolving one to pick a family and throwing the result
+            # away. bind()/connect() below would otherwise resolve the
+            # hostname again -- synchronously, on the loop thread, so a
+            # slow resolver stalls every other connection this worker is
+            # serving -- and the second lookup can return a different
+            # family than the socket was created with.
+            if (
+                hasattr(socket_module, "AF_UNIX")
+                and fam == socket_module.AF_UNIX
+                and (local_addr or remote_addr)
+            ):
+                # AF_UNIX datagram addresses are filesystem paths, not
+                # (host, port) pairs: the resolver either refuses them or
+                # addr[0]/addr[1] below indexes characters out of the
+                # path. CPython parity: type-check, clear a stale socket
+                # file at local_addr, and hand the raw paths to
+                # bind()/connect() via pseudo-addrinfo entries.
+                for addr in (local_addr, remote_addr):
+                    if addr is not None and not isinstance(addr, str):
+                        raise TypeError(f"string is expected, got {addr!r}")
+                if local_addr and local_addr[0] not in (0, "\x00"):
+                    # Not the abstract namespace: remove a leftover
+                    # socket file so bind() does not fail EADDRINUSE.
+                    try:
+                        if stat.S_ISSOCK(os.stat(local_addr).st_mode):
+                            os.remove(local_addr)
+                    except FileNotFoundError:
+                        pass
+                if local_addr:
+                    local_res = (fam, socket_module.SOCK_DGRAM, proto, "", local_addr)
+                if remote_addr:
+                    remote_res = (fam, socket_module.SOCK_DGRAM, proto, "", remote_addr)
+            elif local_addr or remote_addr:
+                candidates = {}
+                for key, addr in (("local", local_addr), ("remote", remote_addr)):
+                    if not addr:
+                        continue
+                    infos = await self.getaddrinfo(
+                        addr[0],
+                        addr[1],
+                        family=family,
+                        type=socket_module.SOCK_DGRAM,
+                        proto=proto,
+                        flags=flags,
+                    )
+                    if not infos:
+                        raise OSError(f"getaddrinfo({addr!r}) returned empty list")
+                    candidates[key] = infos
+                # A family both ends can speak, not merely the family the
+                # first result of one of them happens to have. With
+                # AF_UNSPEC an IPv4 local_addr and a dual-stack remote that
+                # lists IPv6 first are perfectly compatible, and comparing
+                # only infos[0] rejected exactly that pair.
+                families = [
+                    dict.fromkeys(i[0] for i in infos) for infos in candidates.values()
+                ]
+                common = [f for f in families[0] if all(f in fs for fs in families[1:])]
+                if not common:
+                    raise ValueError(
+                        "local_addr and remote_addr have no address family in common "
+                        f"({[list(fs) for fs in families]})"
+                    )
+                fam = common[0]
+                local_res = next(
+                    (i for i in candidates.get("local", ()) if i[0] == fam), None
+                )
+                remote_res = next(
+                    (i for i in candidates.get("remote", ()) if i[0] == fam), None
+                )
+            udp_sock = socket_module.socket(fam, socket_module.SOCK_DGRAM, proto)
+            try:
+                if reuse_port:
+                    if not hasattr(socket_module, "SO_REUSEPORT"):
+                        raise ValueError("reuse_port not supported on this platform")
+                    udp_sock.setsockopt(
+                        socket_module.SOL_SOCKET, socket_module.SO_REUSEPORT, 1
+                    )
+                if allow_broadcast:
+                    udp_sock.setsockopt(
+                        socket_module.SOL_SOCKET, socket_module.SO_BROADCAST, 1
+                    )
+                if local_addr:
+                    # The already-resolved sockaddr, not the original
+                    # tuple: no second (blocking) lookup.
+                    udp_sock.bind(local_res[4])
+                if remote_addr and not allow_broadcast:
+                    # CPython skips connect() under allow_broadcast: a
+                    # connected UDP socket only receives from its peer,
+                    # which drops the unicast replies broadcast discovery
+                    # exists to collect. The transport still targets
+                    # remote_addr on default sends (see sendto).
+                    udp_sock.connect(remote_res[4])
+            except BaseException:
+                udp_sock.close()
+                raise
+        udp_sock.setblocking(False)
+        protocol = protocol_factory()
+        # The resolved sockaddr, so a connected endpoint's peername is an
+        # address rather than whatever hostname the caller typed.
+        peer = remote_res[4] if remote_res is not None else remote_addr
+        transport = _DatagramTransport(self, udp_sock, protocol, peer)
+        try:
+            transport._open()
+        except BaseException:
+            if sock is None:
+                udp_sock.close()
+            raise
+        return transport, protocol
+
+    async def sendfile(self, transport, file, offset=0, count=None, *, fallback=True):
+        """R-036. Native path: drain the transport's corked writes, then
+        os.sendfile straight on the borrowed socket fd (zero-copy).
+        TransmitFile on Windows is the remaining native refinement; there
+        (and for SSL transports, which have no raw fd) the chunked
+        transport-write fallback applies."""
+        # Validated BEFORE a path is chosen, and by the same helper
+        # sock_sendfile uses: without it `count=0` quietly returned zero
+        # instead of raising, a text-mode file went straight to
+        # os.sendfile, and every other bad value failed later with an
+        # exception that depended on which path had been taken.
+        self._check_sendfile_params(file, offset, count)
+        if transport.is_closing():
+            raise RuntimeError("Transport is closing")
+        fileno = getattr(transport, "fileno", None)
+        can_native = (
+            fileno is not None and hasattr(os, "sendfile") and hasattr(file, "fileno")
+        )
+        if can_native:
+            try:
+                file.fileno()
+            except (OSError, AttributeError, ValueError):
+                can_native = False
+        if not can_native:
+            if not fallback:
+                raise asyncio.SendfileNotAvailableError(
+                    "sendfile is not available for this transport/file"
+                )
+            return await self._sendfile_fallback(transport, file, offset, count)
+        # No byte may interleave: wait out writes already queued in the
+        # engine before bypassing it (concurrent app writes during a
+        # sendfile are user error, as in stdlib asyncio).
+        while transport.get_write_buffer_size() > 0:
+            await tasks.sleep(0.001)
+        return await self._sendfile_native_fd(transport, file, offset, count)
+
+    async def _sendfile_native_fd(self, transport, file, offset, count):
+        in_fd = file.fileno()
+        total = 0
+        # The file position must reflect what actually reached the peer
+        # even when this raises or is cancelled part-way. Advancing it only
+        # on the success path left tell() at the original offset after an
+        # interrupted transfer whose bytes had already gone out, so a
+        # caller retrying from the reported position duplicated them.
+        # `total` is a local of this frame, so the finally sees whatever
+        # the loop reached and concurrent sendfiles stay independent.
+        try:
+            while True:
+                # Revalidated after EVERY suspension, and re-read rather
+                # than cached: the transport can close while this
+                # coroutine is parked, freeing its descriptor number for
+                # reuse -- a cached integer then aims os.sendfile at
+                # whatever unrelated connection inherited it. Between
+                # this check and the syscall there is no await, so a
+                # close cannot interleave on the loop thread.
+                if transport.is_closing():
+                    raise ConnectionResetError("transport closed during sendfile")
+                fd = transport.fileno()
+                blocksize = 256 * 1024 if count is None else min(count - total, 256 * 1024)
+                if blocksize <= 0:
+                    break
+                try:
+                    sent = os.sendfile(fd, in_fd, offset + total, blocksize)
+                except BlockingIOError:
+                    sent = None
+                except InterruptedError:
+                    continue
+                if sent == 0:
+                    break  # end of file
+                if sent is not None:
+                    total += sent
+                    continue
+                # Socket buffer full: wait for writability.
+                fut = self.create_future()
+
+                # Bound as a default; see the matching note in tcp.py.
+                def on_writable(fut=fut):
+                    if not fut.done():
+                        fut.set_result(None)
+
+                self._core.add_writer(fd, on_writable)
+                try:
+                    # Bounded waits, not a bare await: closing the fd
+                    # removes it from the poller, so a transport that
+                    # dies while this is parked would otherwise leave the
+                    # future unresolved forever. shield() keeps the
+                    # timeout from cancelling the future we re-await.
+                    while not fut.done():
+                        if transport.is_closing():
+                            raise ConnectionResetError(
+                                "transport closed during sendfile"
+                            )
+                        try:
+                            await tasks.wait_for(tasks.shield(fut), 0.1)
+                        except TimeoutError:
+                            pass
+                finally:
+                    self._core.remove_writer(fd)
+            return total
+        finally:
+            # stdlib convention: leave the file positioned after the bytes
+            # actually sent.
+            file.seek(offset + total)
+
+    async def _sendfile_fallback(self, transport, file, offset, count):
+        # Seek unconditionally: with the default offset=0 the old guard
+        # skipped the seek entirely, so a fallback (BytesIO, SSL, Windows)
+        # sent from the file's CURRENT position while the native path sent
+        # from byte zero — the same call returning different bytes
+        # depending on which path was taken.
+        #
+        # File I/O goes through the executor. This path serves EVERY
+        # Windows transport and every SSL one, so a disk (or network-
+        # backed file) that is slow to read would otherwise stall every
+        # connection the loop is serving for the duration of each read.
+        # asyncio's own fallback does the same.
+        total = 0
+        try:
+            await self.run_in_executor(None, file.seek, offset)
+            while True:
+                blocksize = 16384 if count is None else min(count - total, 16384)
+                if blocksize <= 0:
+                    break
+                data = await self.run_in_executor(None, file.read, blocksize)
+                if not data:
+                    break
+                # A closing transport DISCARDS write() silently, so
+                # counting every non-raising write as sent meant that once
+                # the peer went away this loop read the rest of the file,
+                # reported bytes that never left the process, and left the
+                # file positioned past a transfer that never happened.
+                if transport.is_closing():
+                    raise ConnectionResetError("transport closed while sending file")
+                transport.write(data)
+                total += len(data)
+                while transport.get_write_buffer_size() > 64 * 1024:
+                    if transport.is_closing():
+                        raise ConnectionResetError("transport closed while sending file")
+                    await tasks.sleep(0.001)
+            return total
+        finally:
+            # Synchronous, unlike the reads above: awaiting here would
+            # re-raise during a cancellation unwind and the position would
+            # never be corrected. One lseek is not worth an executor hop.
+            file.seek(offset + total)
+
+    def add_signal_handler(self, sig, callback, *args):
+        """R-052. The Python-level handler runs on the main thread once
+        the parked poll wakes (the run_forever wakeup fd guarantees that
+        promptly) and enqueues the callback thread-safely. On Windows the
+        deliverable console signals are SIGINT (CTRL+C) and SIGBREAK
+        (CTRL+BREAK); SIGTERM is accepted for artificial delivery
+        (os.kill / raise_signal) like CPython itself.
+
+        A genuinely external stop request — a process supervisor, Docker,
+        or ``Popen.send_signal(SIGTERM)`` — reaches none of these:
+        Windows has no real SIGTERM delivery, and ``Popen.send_signal``
+        maps SIGTERM straight to ``TerminateProcess`` (uncatchable by any
+        process, full stop — no workaround exists or ever will). What
+        *can* be caught is ``GenerateConsoleCtrlEvent`` (CTRL_BREAK_EVENT
+        et al.), which arrives through ``SetConsoleCtrlHandler``, not
+        Python's ``signal`` module — so this installs that handler
+        (idempotently, once per loop) and routes CTRL_BREAK/CLOSE/LOGOFF/
+        SHUTDOWN events into whichever of SIGTERM/SIGINT/SIGBREAK is
+        registered here, giving external supervisors a real graceful-
+        shutdown path if they send CTRL_BREAK_EVENT instead of a blind
+        kill. cadeloop's own multi-worker supervisor already gets this for
+        its spawned children via CREATE_NEW_PROCESS_GROUP + a control
+        pipe (server.py); this covers the top-level process an external
+        manager controls, which that mechanism does not reach."""
+        import signal as signal_module
+
+        if not isinstance(sig, int):
+            raise TypeError(f"sig must be an int, not {sig!r}")
+        if sys.platform == "win32":
+            allowed = {signal_module.SIGINT, signal_module.SIGTERM}
+            if hasattr(signal_module, "SIGBREAK"):
+                allowed.add(signal_module.SIGBREAK)
+            if sig not in allowed:
+                raise ValueError(f"signal {sig!r} not supported on this platform")
+            self._install_console_ctrl_handler()
+        elif sig not in signal_module.valid_signals():
+            raise ValueError(f"invalid signal number {sig}")
+        if (
+            asyncio.iscoroutine(callback)
+            or asyncio.iscoroutinefunction(callback)
+        ):
+            raise TypeError("coroutines cannot be used with add_signal_handler()")
+        self._check_closed()
+        self._signal_handlers[sig] = (callback, args)
+
+        def _dispatch(signum, frame):
+            entry = self._signal_handlers.get(signum)
+            if entry is None or self.is_closed():
+                return
+            cb, cb_args = entry
+            self.call_soon_threadsafe(cb, *cb_args)
+
+        signal_module.signal(sig, _dispatch)
+
+    def remove_signal_handler(self, sig):
+        import signal as signal_module
+
+        if sig not in self._signal_handlers:
+            return False
+        del self._signal_handlers[sig]
+        if sig == signal_module.SIGINT:
+            signal_module.signal(sig, signal_module.default_int_handler)
+        else:
+            signal_module.signal(sig, signal_module.SIG_DFL)
+        return True
+
+    # Console control events SetConsoleCtrlHandler treats as a stop
+    # request; CTRL_C_EVENT (0) is deliberately excluded — Python's own
+    # SIGINT plumbing already owns that one.
+    _CTRL_BREAK_EVENT = 1
+    _CTRL_CLOSE_EVENT = 2
+    _CTRL_LOGOFF_EVENT = 5
+    _CTRL_SHUTDOWN_EVENT = 6
+    _STOP_CTRL_EVENTS = frozenset(
+        (_CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT, _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT)
+    )
+
+    def _remove_console_ctrl_handler(self):
+        """R-052 (win32 only): unregister the console-control callback so a
+        closed loop stops intercepting CTRL_BREAK/CLOSE/LOGOFF/SHUTDOWN."""
+        if self._console_ctrl_handler_ref is None:
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(self._console_ctrl_handler_ref, False)
+        except (AttributeError, OSError):
+            pass  # not Windows, or the console is already gone
+        finally:
+            self._console_ctrl_handler_ref = None
+
+    def _install_console_ctrl_handler(self):
+        """R-052 (win32 only, idempotent). See add_signal_handler's
+        docstring for why this exists alongside the signal-module path."""
+        if self._console_ctrl_handler_ref is not None:
+            return
+        import ctypes
+        import signal as signal_module
+
+        handler_routine = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+        def handler(ctrl_type):
+            # Runs on a dedicated OS thread Windows spawns to deliver the
+            # event — never this loop's own thread (R-022 discipline).
+            if ctrl_type not in self._STOP_CTRL_EVENTS:
+                return 0  # not ours: let the next handler (or Python's
+                # own SIGINT/SIGBREAK plumbing, for CTRL_C/CTRL_BREAK) act
+            for candidate in (
+                signal_module.SIGTERM,
+                signal_module.SIGINT,
+                getattr(signal_module, "SIGBREAK", None),
+            ):
+                entry = self._signal_handlers.get(candidate) if candidate is not None else None
+                if entry is not None:
+                    cb, cb_args = entry
+                    try:
+                        self.call_soon_threadsafe(cb, *cb_args)
+                    except RuntimeError:
+                        pass  # loop already closing/closed
+                    return 1
+            return 0  # nothing registered: let Windows apply the default
+
+        self._console_ctrl_handler_ref = handler_routine(handler)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleCtrlHandler.argtypes = [handler_routine, ctypes.c_int]
+        kernel32.SetConsoleCtrlHandler.restype = ctypes.c_int
+        if not kernel32.SetConsoleCtrlHandler(self._console_ctrl_handler_ref, 1):
+            warnings.warn(
+                "cadeloop: SetConsoleCtrlHandler registration failed — "
+                "CTRL_CLOSE/LOGOFF/SHUTDOWN events won't trigger graceful "
+                "shutdown (CTRL+C/CTRL+BREAK are unaffected).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+    # ---- pipes + subprocess (R-051) ----------------------------------
+    # POSIX rides the stdlib 3.11 machinery (this project pins CPython
+    # 3.11): the _Unix*PipeTransport / _UnixSubprocessTransport classes
+    # drive readiness through the selector-loop-private _add_reader
+    # family, which maps 1:1 onto our public watch surface. Windows rides
+    # its own _winpipes transports over overlapped ReadFile/WriteFile
+    # (IOCP backend) — see connect_read_pipe/connect_write_pipe/
+    # _make_subprocess_transport below.
+
+    def _add_reader(self, fd, callback, *args):
+        return self.add_reader(fd, callback, *args)
+
+    def _remove_reader(self, fd):
+        return self.remove_reader(fd)
+
+    def _add_writer(self, fd, callback, *args):
+        return self.add_writer(fd, callback, *args)
+
+    def _remove_writer(self, fd):
+        return self.remove_writer(fd)
+
+    async def connect_read_pipe(self, protocol_factory, pipe):
+        protocol = protocol_factory()
+        waiter = self.create_future()
+        if sys.platform == "win32":
+            from . import _winpipes
+
+            transport = _winpipes.ReadPipeTransport(self, pipe, protocol, waiter)
+        else:
+            from asyncio import unix_events
+
+            transport = unix_events._UnixReadPipeTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return transport, protocol
+
+    async def connect_write_pipe(self, protocol_factory, pipe):
+        protocol = protocol_factory()
+        waiter = self.create_future()
+        if sys.platform == "win32":
+            from . import _winpipes
+
+            transport = _winpipes.WritePipeTransport(self, pipe, protocol, waiter)
+        else:
+            from asyncio import unix_events
+
+            transport = unix_events._UnixWritePipeTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return transport, protocol
+
+    async def _make_subprocess_transport(
+        self, protocol, args, shell, stdin, stdout, stderr, bufsize, extra=None, **kwargs
+    ):
+        if sys.platform == "win32":
+            from . import _winpipes
+
+            waiter = self.create_future()
+            transp = _winpipes.SubprocessTransport(
+                self, protocol, args, shell, stdin, stdout, stderr, bufsize,
+                waiter=waiter, extra=extra, **kwargs,
+            )
+            try:
+                await waiter
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException:
+                transp.close()
+                await transp._wait()
+                raise
+            return transp
+
+        from asyncio import events as _events
+        from asyncio import unix_events
+
+        with _events.get_child_watcher() as watcher:
+            if not watcher.is_active():
+                raise RuntimeError(
+                    "asyncio child watcher is not activated, "
+                    "subprocess support is not installed"
+                )
+            waiter = self.create_future()
+            transp = unix_events._UnixSubprocessTransport(
+                self,
+                protocol,
+                args,
+                shell,
+                stdin,
+                stdout,
+                stderr,
+                bufsize,
+                waiter=waiter,
+                extra=extra,
+                **kwargs,
+            )
+            watcher.add_child_handler(
+                transp.get_pid(), self._child_watcher_callback, transp
+            )
+            try:
+                await waiter
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException:
+                transp.close()
+                await transp._wait()
+                raise
+        return transp
+
+    def _child_watcher_callback(self, pid, returncode, transp):
+        # Thread-safe: the watcher reaps from its waiter thread.
+        self.call_soon_threadsafe(self.call_soon, transp._process_exited, returncode)
+
+    async def subprocess_shell(
+        self,
+        protocol_factory,
+        cmd,
+        *,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=False,
+        shell=True,
+        bufsize=0,
+        encoding=None,
+        errors=None,
+        text=None,
+        **kwargs,
+    ):
+        if not isinstance(cmd, (bytes, str)):
+            raise ValueError("cmd must be a string")
+        if universal_newlines or text or encoding is not None or errors is not None:
+            raise ValueError("text mode is not supported")
+        if not shell:
+            raise ValueError("shell must be True")
+        if bufsize != 0:
+            raise ValueError("bufsize must be 0")
+        protocol = protocol_factory()
+        transport = await self._make_subprocess_transport(
+            protocol, cmd, True, stdin, stdout, stderr, bufsize, **kwargs
+        )
+        return transport, protocol
+
+    async def subprocess_exec(
+        self,
+        protocol_factory,
+        program,
+        *args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=False,
+        shell=False,
+        bufsize=0,
+        encoding=None,
+        errors=None,
+        text=None,
+        **kwargs,
+    ):
+        if universal_newlines or text or encoding is not None or errors is not None:
+            raise ValueError("text mode is not supported")
+        if shell:
+            raise ValueError("shell must be False")
+        if bufsize != 0:
+            raise ValueError("bufsize must be 0")
+        popen_args = (program,) + args
+        for arg in popen_args:
+            # os.PathLike included: CPython performs no check here at all
+            # and hands the tuple to Popen, which accepts path-likes -- a
+            # pathlib.Path program must not fail only on this loop.
+            if not isinstance(arg, (str, bytes, os.PathLike)):
+                raise TypeError(
+                    f"program arguments must be a bytes or text string "
+                    f"or os.PathLike, not {type(arg).__name__}"
+                )
+        protocol = protocol_factory()
+        transport = await self._make_subprocess_transport(
+            protocol, popen_args, False, stdin, stdout, stderr, bufsize, **kwargs
+        )
+        return transport, protocol

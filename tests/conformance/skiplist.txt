@@ -1,0 +1,13 @@
+# R-120 conformance skip-list. One `TestClass.test_name` per line; every
+# entry MUST carry a justification. This list must shrink monotonically
+# across milestones (checked in review; a milestone exit criterion).
+#
+# ---- M5 floor ----------------------------------------------------------
+# Every feature-area skip from M0 has been removed: TCP transports (M1),
+# reader/writer callbacks (M1), UDP (M4), signal handlers (R-052),
+# subprocess (M5-POSIX) are all implemented and covered by the in-repo
+# suites. Windows CI's suite-shipping interpreter adjudicates the CPython
+# tests themselves; any test that fails there gets re-added WITH a fresh
+# justification (the documented process), never silently.
+#
+# (currently empty)

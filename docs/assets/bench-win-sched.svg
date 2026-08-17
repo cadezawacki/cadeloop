@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 790" width="820" height="790" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<rect width="820" height="790" fill="#fcfcfb" rx="8"/>
+<text x="20" y="28" font-size="15" font-weight="600" fill="#0b0b0b">Scheduling speedup vs stdlib asyncio (higher is better)</text>
+<rect x="20" y="39" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="37" y="49" font-size="12" fill="#52514e">cadeloop</text>
+<rect x="112.6" y="39" width="12" height="12" rx="3" fill="#6f6e69"/>
+<text x="129.6" y="49" font-size="12" fill="#52514e">winloop</text>
+<rect x="198.0" y="39" width="12" height="12" rx="3" fill="#e87ba4"/>
+<text x="215.0" y="49" font-size="12" fill="#52514e">rsloop</text>
+<line x1="190.0" y1="66" x2="190.0" y2="754" stroke="#e1e0d9" stroke-width="1"/>
+<text x="190.0" y="770" font-size="11" fill="#898781" text-anchor="middle">0x</text>
+<line x1="330.0" y1="66" x2="330.0" y2="754" stroke="#e1e0d9" stroke-width="1"/>
+<text x="330.0" y="770" font-size="11" fill="#898781" text-anchor="middle">2x</text>
+<line x1="470.0" y1="66" x2="470.0" y2="754" stroke="#e1e0d9" stroke-width="1"/>
+<text x="470.0" y="770" font-size="11" fill="#898781" text-anchor="middle">4x</text>
+<line x1="610.0" y1="66" x2="610.0" y2="754" stroke="#e1e0d9" stroke-width="1"/>
+<text x="610.0" y="770" font-size="11" fill="#898781" text-anchor="middle">6x</text>
+<line x1="750.0" y1="66" x2="750.0" y2="754" stroke="#e1e0d9" stroke-width="1"/>
+<text x="750.0" y="770" font-size="11" fill="#898781" text-anchor="middle">8x</text>
+<line x1="260.0" y1="66" x2="260.0" y2="754" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="260.0" y="784" font-size="10.5" fill="#898781" text-anchor="middle">asyncio = 1x</text>
+<text x="180" y="103.0" font-size="12" fill="#52514e" text-anchor="end">call_soon_chain</text>
+<path d="M190.0,72.0 h526.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-526.7 z" fill="#2a78d6"/><rect x="190.0" y="71.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="726.7" y="84" font-size="11" font-weight="600" fill="#0b0b0b">7.58x</text>
+<path d="M190.0,90.0 h182.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-182.2 z" fill="#6f6e69"/><rect x="190.0" y="89.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M190.0,108.0 h556.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-556.0 z" fill="#e87ba4"/><rect x="190.0" y="107.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="754.0" y="120" font-size="11" font-weight="600" fill="#0b0b0b">&#187; 11.3x</text>
+<text x="180" y="171.0" font-size="12" fill="#52514e" text-anchor="end">call_soon_burst</text>
+<path d="M190.0,140.0 h305.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-305.8 z" fill="#2a78d6"/><rect x="190.0" y="139.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="505.8" y="152" font-size="11" font-weight="600" fill="#0b0b0b">4.43x</text>
+<path d="M190.0,158.0 h88.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-88.1 z" fill="#6f6e69"/><rect x="190.0" y="157.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="239.0" font-size="12" fill="#52514e" text-anchor="end">timer_schedule_cancel</text>
+<path d="M190.0,208.0 h286.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-286.6 z" fill="#2a78d6"/><rect x="190.0" y="207.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="486.6" y="220" font-size="11" font-weight="600" fill="#0b0b0b">4.15x</text>
+<path d="M190.0,226.0 h47.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-47.7 z" fill="#6f6e69"/><rect x="190.0" y="225.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="307.0" font-size="12" fill="#52514e" text-anchor="end">timer_fire</text>
+<path d="M190.0,276.0 h419.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-419.4 z" fill="#2a78d6"/><rect x="190.0" y="275.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="619.4" y="288" font-size="11" font-weight="600" fill="#0b0b0b">6.05x</text>
+<path d="M190.0,294.0 h262.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-262.9 z" fill="#6f6e69"/><rect x="190.0" y="293.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="375.0" font-size="12" fill="#52514e" text-anchor="end">sleep0_chain</text>
+<path d="M190.0,344.0 h280.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-280.9 z" fill="#2a78d6"/><rect x="190.0" y="343.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="480.9" y="356" font-size="11" font-weight="600" fill="#0b0b0b">4.07x</text>
+<path d="M190.0,362.0 h140.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-140.7 z" fill="#6f6e69"/><rect x="190.0" y="361.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M190.0,380.0 h297.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-297.6 z" fill="#e87ba4"/><rect x="190.0" y="379.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="443.0" font-size="12" fill="#52514e" text-anchor="end">task_spawn</text>
+<path d="M190.0,412.0 h91.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-91.7 z" fill="#2a78d6"/><rect x="190.0" y="411.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="291.7" y="424" font-size="11" font-weight="600" fill="#0b0b0b">1.37x</text>
+<path d="M190.0,430.0 h80.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-80.0 z" fill="#6f6e69"/><rect x="190.0" y="429.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M190.0,448.0 h95.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-95.3 z" fill="#e87ba4"/><rect x="190.0" y="447.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="511.0" font-size="12" fill="#52514e" text-anchor="end">threadsafe_throughput</text>
+<path d="M190.0,480.0 h556.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-556.0 z" fill="#2a78d6"/><rect x="190.0" y="479.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="754.0" y="492" font-size="11" font-weight="600" fill="#0b0b0b">&#187; 141x</text>
+<path d="M190.0,498.0 h556.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-556.0 z" fill="#6f6e69"/><rect x="190.0" y="497.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="754.0" y="510" font-size="11" font-weight="600" fill="#0b0b0b">&#187; 60.4x</text>
+<path d="M190.0,516.0 h556.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-556.0 z" fill="#e87ba4"/><rect x="190.0" y="515.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="754.0" y="528" font-size="11" font-weight="600" fill="#0b0b0b">&#187; 123x</text>
+<text x="180" y="579.0" font-size="12" fill="#52514e" text-anchor="end">future_chain</text>
+<path d="M190.0,548.0 h377.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-377.3 z" fill="#2a78d6"/><rect x="190.0" y="547.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="577.3" y="560" font-size="11" font-weight="600" fill="#0b0b0b">5.45x</text>
+<path d="M190.0,566.0 h164.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-164.6 z" fill="#6f6e69"/><rect x="190.0" y="565.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M190.0,584.0 h510.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-510.8 z" fill="#e87ba4"/><rect x="190.0" y="583.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="647.0" font-size="12" fill="#52514e" text-anchor="end">gather_fanin</text>
+<path d="M190.0,616.0 h108.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-108.0 z" fill="#2a78d6"/><rect x="190.0" y="615.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="308.0" y="628" font-size="11" font-weight="600" fill="#0b0b0b">1.60x</text>
+<path d="M190.0,634.0 h103.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-103.4 z" fill="#6f6e69"/><rect x="190.0" y="633.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M190.0,652.0 h114.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-114.7 z" fill="#e87ba4"/><rect x="190.0" y="651.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="180" y="715.0" font-size="12" fill="#52514e" text-anchor="end">queue_pingpong</text>
+<path d="M190.0,684.0 h66.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-66.1 z" fill="#2a78d6"/><rect x="190.0" y="683.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="266.1" y="696" font-size="11" font-weight="600" fill="#0b0b0b">1.00x</text>
+<path d="M190.0,702.0 h65.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-65.6 z" fill="#6f6e69"/><rect x="190.0" y="701.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M190.0,720.0 h68.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-68.3 z" fill="#e87ba4"/><rect x="190.0" y="719.0" width="0" height="0" fill="#fcfcfb"/>
+<line x1="190" y1="66" x2="190" y2="754" stroke="#c3c2b7" stroke-width="1"/>
+</svg>
