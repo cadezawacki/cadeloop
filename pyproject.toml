@@ -10,6 +10,19 @@ license = { text = "MIT" }
 authors = [{ name = "Cade Zawacki" }]
 # R-010: CPython 3.11.x only for v1 (cp311-win_amd64 wheels; abi3 not used).
 requires-python = ">=3.11,<3.12"
+keywords = [
+    "asyncio",
+    "event-loop",
+    "asgi",
+    "asgi-server",
+    "http",
+    "websockets",
+    "iocp",
+    "windows",
+    "rust",
+    "performance",
+    "uvloop",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -18,14 +31,27 @@ classifiers = [
     "Operating System :: Microsoft :: Windows :: Windows 11",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Framework :: AsyncIO",
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dynamic = ["version"]
 
+# `python -m cadeloop` still works; this is the same entry point under a
+# name that lands on PATH, which is what a reader coming from `uvicorn`
+# or `gunicorn` will reach for first.
+[project.scripts]
+cadeloop = "cadeloop.__main__:main"
+
 [project.urls]
+Homepage = "https://github.com/cadezawacki/cadeloop"
+Documentation = "https://github.com/cadezawacki/cadeloop#readme"
 Repository = "https://github.com/cadezawacki/cadeloop"
+Issues = "https://github.com/cadezawacki/cadeloop/issues"
+Changelog = "https://github.com/cadezawacki/cadeloop/releases"
 
 [tool.maturin]
 manifest-path = "crates/pyshim/Cargo.toml"

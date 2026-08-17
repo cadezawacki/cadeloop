@@ -1,554 +1,1007 @@
 # cadeloop
 
-> ### Hardening log — review backlog
->
-> An external review pass (Codex on PR #1, plus a consolidated engineering
-> audit) raised ~90 findings. This is the running record; it is updated as
-> items land. Newest first. (A row's commit id is filled in by the next
-> commit — a commit cannot contain its own hash.)
->
-> **Fixed and on `claude/pipelined-parse-error-desync-k6y3tp` (continues `claude/new-session-bq3hp6`)**
->
-> | Area | Fix | Commit |
-> |---|---|---|
-> | CI | The PGO wheel build baked a git-bash POSIX path into the instrumented binary, so Windows wrote the profiles elsewhere and the merge found nothing | `` |
-> | TLS | A peer that connected and never sent a ClientHello was never torn down: each sweep staged another unencryptable 408 while the socket and receive slot stayed held | `7069869` |
-> | Loop | `sendfile` held a raw fd across suspensions: a transport closed mid-transfer could aim `os.sendfile` at whatever connection reused the number, or park forever on a dead watcher | `7069869` |
-> | Server | A lifespan app raising `KeyboardInterrupt`/`SystemExit` before `startup.complete` was classified as "no lifespan support" and served through | `7069869` |
-> | Server | The connection drain could spend the whole grace budget, leaving `lifespan.shutdown` to be SIGKILLed before it ran; a quarter (capped 5s) is now reserved | `7069869` |
-> | Net | `create_server(sock=...)` failure closed the detached descriptor in both Python and Rust -- the second close could land on an unrelated fd; the native side is now the single owner | `7069869` |
-> | ASGI | Cancelled `receive()` futures stayed parked forever, growing the waiter queue without bound (regression of the waiter-queue fix, caught by Codex on PR #4) | `d12b4fe` |
-> | Loop | `subprocess_exec` rejected `os.PathLike` arguments the standard loop hands to Popen unchecked | `6ac1232` |
-> | HTTP | Engine-generated errors (400/408/413/431/500...) carried an `HTTP/1.1` status line even for parsed HTTP/1.0 requests | `d70d30f` |
-> | HTTP | `OPTIONS *` was normalized to `/` in the ASGI scope, indistinguishable from an OPTIONS on the root resource | `2a97321` |
-> | Unix | Abstract-namespace socket addresses were reported as lossy strings instead of bytes; non-UTF-8 paths were mangled | `afb64a8` |
-> | Loop | Cancelling `shutdown_default_executor()` produced a spurious `InvalidStateError` when the shutdown thread finished | `5c096bb` |
-> | Net | A fatal callback error dropped the rest of its dispatch batch: other connections' events were lost for good | `4d9c231` |
-> | TCP | `create_server` failed outright when one resolved address family was unavailable instead of serving the rest | `7464cd6` |
-> | UDP | `allow_broadcast` + `remote_addr` connected the socket, so replies from any other source were silently dropped | `82426cb` |
-> | UDP | AF_UNIX datagram paths went through the Internet resolver, and a unix sender's source address was dropped on receive | `86d609f` |
-> | Loop | An exception handler raising `KeyboardInterrupt`/`SystemExit` was demoted to an unraisable warning; the loop kept running | `2813bb9` |
-> | ASGI | A second concurrent `receive()` displaced the first waiter, whose awaiter then stayed pending forever | `5186907` |
-> | HTTP | A pipelined parse error was answered out of order: its 400 could reach the client as (or spliced into) an earlier request's response, and valid requests parsed ahead of it in the same buffer were dropped | `e37e9ad` |
-> | Loop | `run_until_complete` scheduled the coroutine before refusing to run it | `fc8da98` |
-> | ASGI | `scope["asgi"]` and `scope["extensions"]` were shared process-wide and mutable | `5c0e21a` |
-> | Loop | `slow_callback_duration` was absent from the facade and ignored by the core | `5c0e21a` |
-> | Net | A WS read-pause re-check could remove the transport an `unwrap()` then assumed | `17aefb3` |
-> | Server | Each forked worker inherited every earlier worker's readiness pipe | `17aefb3` |
-> | HTTP | The head deadline killed body uploads that ran past it while actively sending | `e4e2a70` |
-> | WS | A read pause taken for write pressure was never released | `e4e2a70` |
-> | HTTP | A trailer leaked into the next pipelined request as its first header | `a0f02cd` |
-> | Server | The stats endpoint inherited `max_body=None`, buffering any body sent to it | `a0f02cd` |
-> | Net | `create_server(sock=...)` accepted a connected socket and span on failing accepts | `a0f02cd` |
-> | HTTP | A connection that sent nothing never hit the head timeout | `383f049` |
-> | WS | A ping flood from a peer that stops reading queued pongs without bound | `383f049` |
-> | Server | The spawn supervisor kept the old restart rule the fork one had outgrown | `7649432` |
-> | Windows | `SO_REUSEADDR` let another process bind a live listener; now exclusive | `7649432` |
-> | Core | Sub-millisecond waits truncated to zero, busy-polling a core until the timer fired | `7649432` |
-> | Server | A slow-failing worker restarted forever; the crash-loop guard never engaged | `52ca2dc` |
-> | CI | Actions ran from moving tags and a branch; now pinned to commit SHAs | `becb220` |
-> | HTTP | Request trailers were merged into `scope["headers"]`, smuggling a second `Host` | `7249648` |
-> | WS | Empty frames cost nothing against the inbox budget, so it never bounded the queue | `7249648` |
-> | WS | `Upgrade` was compared whole instead of parsed as a token list | `7249648` |
-> | WS | Subprotocol offers were trimmed of spaces but not tabs | `7249648` |
-> | UDP | Empty datagrams cost nothing against the send-queue cap | `7249648` |
-> | Server | `serve()` reset an embedder's signal handlers to default instead of restoring them | `7249648` |
-> | Config | Negative watermarks passed validation and failed later as an `OverflowError` | `7249648` |
-> | Server | A lifespan that returned after `startup.complete` left the worker serving without it | `b0c2632` |
-> | Transport | `sendfile` fallback counted writes a closing transport had discarded | `b0c2632` |
-> | Transport | `loop.sendfile` validated none of its parameters, unlike `sock_sendfile` | `b0c2632` |
-> | CI | Python was never linted: `[tool.ruff]` existed, no workflow ran it | `d096b8b` |
-> | Loop | A Context that could not be entered stopped the loop instead of one callback | `1269e7c` |
-> | Server | A stalled worker took unbounded connection handoffs until it ran out of handles | `14e50ec` |
-> | HTTP | A non-eager spawn failure killed the worker's loop instead of failing one request | `14e50ec` |
-> | WS | A receive() after teardown reported `http.disconnect` and lost the close code | `14e50ec` |
-> | TLS | A failed SSL protocol build leaked the connected descriptor | `14e50ec` |
-> | Windows | Native sockets were inheritable, so a child could hold the port open | `14e50ec` |
-> | Server | Access-log `close()` discarded a queued record, uncounted, to fit its sentinel | `14e50ec` |
-> | Server | `gc_mode='freeze'` still froze onto a caller's own permanent generation | `14e50ec` |
-> | Server | `serve(host="localhost")` failed at startup: hostnames were never resolved | `b234f96` |
-> | ASGI | Awaiting a foreign loop's future hung the request instead of failing it | `b234f96` |
-> | WS | `Sec-WebSocket-Extensions` from the app was forwarded but never negotiated | `b234f96` |
-> | Server | `serve()` never restored the collector it reconfigured | `e114bb1` |
-> | Loop | `close()` never reaped the buffers of the sends it cancelled | `c567a0e` |
-> | HTTP | Graceful shutdown tore down connections whose bytes were still queued | `c567a0e` |
-> | Server | `close()` could not wake a `serve_forever()` it had superseded | `c567a0e` |
-> | Net | Scoped IPv6 listen addresses lost their `scope_id` at bind | `c567a0e` |
-> | Transport | `sendfile` fallback's position seek was skipped by a cancellation unwind | `a443086` |
-> | Unix | AF_UNIX peer/sock addresses were dropped, so `get_extra_info` said `None` | `a443086` |
-> | ASGI | IPv6 `client`/`server` leaked the 4-item socket form into the scope | `046d2da` |
-> | HTTP | Absolute-form target: authority now overrides a conflicting `Host` | `046d2da` |
-> | TLS | `SSLWantWrite` while decrypting tore down a valid session | `046d2da` |
-> | Transport | `eof_received` raising left the connection half-open forever | `046d2da` |
-> | Transport | `wire_stream` leaked the socket when protocol discovery failed | `046d2da` |
-> | Transport | `create_connection(sock=)` accepted a datagram socket | `046d2da` |
-> | Transport | `sendfile` misreported the file position after a failed transfer | `046d2da` |
-> | Transport | `sendfile` fallback read files on the loop thread | `046d2da` |
-> | UDP | Datagram family match compared only the first `getaddrinfo` result | `046d2da` |
-> | Windows | Affinity mask overflowed above 64 CPUs, crashing those workers | `046d2da` |
-> | Buffers | `SlotId` had no generation: a stale id could free a live buffer | `cd90483` |
-> | OpSlab | An out-of-range `OpId` panicked before the generation check ran | `cd90483` |
-> | ADR-24 | `/bg` trace markers removed; op-target breakdown kept in `stats()` | `d4cfe3e` |
-> | CI | Soak + benchmark gates moved to `slow.yml`, where they are not cancelled | `48e584c` |
-> | Net | A starved listener stayed deaf: the retry only ran when other I/O arrived | `999eab8` |
-> | Net | Wildcard IPv6 listeners need `IPV6_V6ONLY`; `host=None` failed `EADDRINUSE` | `999eab8` |
-> | Transport | `pause_reading()` still delivered the in-flight read, defeating backpressure | `999eab8` |
-> | Transport | `create_server(sock=)` never called `listen()` | `999eab8` |
-> | Transport | `connect` dropped IPv6 scope, so link-local peers were unreachable | `999eab8` |
-> | Transport | TLS handshake cancellation left the transport attached | `999eab8` |
-> | UDP | A failing `udp_open()` leaked the detached descriptor | `999eab8` |
-> | Server | Lifespan crashing after startup left the worker serving | `999eab8` |
-> | Config | `tfo` / `loopback_fast_path` were read by nothing | `999eab8` |
-> | HTTP | ASGI `http.response.trailers` implemented and declared in the scope | `1e48aff` |
-> | HTTP | Idle sweep could tear down a connection still writing its response | `1e48aff` |
-> | WebSocket | `accept` could select a subprotocol the client never offered | `52347cd` |
-> | Loop | `add_reader`/`add_writer` left a phantom watcher when `set_watch` failed | `e9ebd2d` |
-> | Transport | Cancelling a connect left the native op running until the OS gave up | `e9ebd2d` |
-> | CLI | `--max-body none` was unexpressible, so the cap could not be turned off | `e9ebd2d` |
-> | UDP | Datagram endpoint resolved hostnames twice, the second time blocking the loop | `cf696dc` |
-> | Transport | `data_received` exceptions left the connection open and reading | `2750ecc` |
-> | Ops | Access log ran on the loop thread; now a bounded queue + writer thread | `2750ecc` |
-> | Ops | `stats_endpoint` was documented since M2 but did nothing | `2750ecc` |
-> | HTTP | `Expect: 100-continue` ignored; oversized declared bodies now refused early | `91a5c74` |
-> | HTTP | 205 sent no framing at all, desynchronising the keep-alive stream | `91a5c74` |
-> | Transport | `get_extra_info("socket")` dup kept the connection alive past close | `91a5c74` |
-> | Server | Supervisor's blocking `waitpid` never reached the grace deadline | `91a5c74` |
-> | Transport | `create_server(sock=)` accepted a datagram socket | `91a5c74` |
-> | TLS | Close sent no `close_notify`: strict clients got `SSLEOFError` and lost the response | `7bc7486` |
-> | Transport | `get_extra_info("socket")` answered (over a dup; ownership fixed in `91a5c74`) | `2b579c7` |
-> | Net | IPv6 addresses lost flowinfo/scope_id; `sendto` now takes the 4-tuple | `2b579c7` |
-> | Transport | `protocol_factory` raising leaked the connected socket, one per failure | `355e82f` |
-> | Net | Listener socket left open when backend registration failed | `355e82f` |
-> | Config | NaN/inf durations passed the `< 0` check and disabled the guard they set | `355e82f` |
-> | Pipes | Windows `data_received` exceptions left the pipe open and reading | `355e82f` |
-> | Perf | Immediate-flush latency mode: selectable, honestly unmeasured | `dfe01b0` |
-> | TLS | `h2` could be negotiated, then every request failed against the HTTP/1 parser | `355e82f` |
-> | Server | Shutdown truncated in-flight responses; `grace` was never applied inside a worker | `65fe5c8` |
-> | Server | Failed *replacement* fork left every surviving worker running unsupervised | `65fe5c8` |
-> | WebSocket | Shutdown now sends a 1012 close frame instead of dropping the TCP connection | `65fe5c8` |
-> | Loop | Every closed `Loop` leaked: the loop/core cycle had no `tp_traverse` | `8a11392` |
-> | Perf | Native vectorcall `create_task` (-25%) / `create_future` (-11%) | `8a11392` |
-> | Perf | `call_soon` validation gated behind debug, as CPython gates it (~+11%) | `4ee108e` |
-> | IOCP | Recycled pipe HANDLEs skipped association (the pipe sibling of `5d96fcb`) | `5aeeb0e` |
-> | UDP | `set_protocol()` now rewires the native callbacks | `5aeeb0e` |
-> | Transport | `write()` after `write_eof()` raises; watermarks derive `high` from `low` | `5aeeb0e` |
-> | WebSocket | Inbox budget restored when a cancelled delivery is requeued | `5aeeb0e` |
-> | Net | Accepted socket leaked when `wire_http` failed (fallout from my ownership change) | `e799e9c` |
-> | WebSocket | Pre-accept cap wrote a WS frame before the 101; now answers 413 | `e799e9c` |
-> | HTTP | HTTP/1.1 requires exactly one `Host` (RFC 7230 5.4) | `e799e9c` |
-> | UDP | `create_datagram_endpoint(sock=)` rejects stream sockets | `e799e9c` |
-> | WebSocket | Inbox budget not decremented on the steady-state delivery path (stalled connections) | `09696cf` |
-> | CI | ADR-24 tracing switched off after two clean Windows runs | `09696cf` |
-> | HTTP | HTTP/1.0 requests now get an `HTTP/1.0` status line | `d0cdad0` |
-> | WebSocket | `websocket.accept` rejects reserved handshake headers | `d0cdad0` |
-> | Server | Fork supervisor cleans up workers when a later fork fails | `d0cdad0` |
-> | HTTP/TLS | Staged plaintext now counted in ASGI backpressure (was inert on HTTPS) | `ee37f02` |
-> | HTTP | 304 keeps its `Content-Length` (my 204 strip was too broad) | `ee37f02` |
-> | Worker | Failed `http_adopt` no longer double-closes the descriptor | `ee37f02` |
-> | Net | `udp_wire` / `listener_start` roll back a half-created endpoint or listener | `ee37f02` |
-> | Server | Grace deadline now entered as soon as shutdown begins | `d1f471f` |
-> | UDP | Endpoint torn down when `connection_made` raises | `d1f471f` |
-> | HTTP | 1xx rejected on the final-response path; `Content-Length` stripped from 204 | `38cdbd9` |
-> | Server | `server.sockets` returns `()` after close (was EBADF / stale dups) | `38cdbd9` |
-> | Transport | Changing watermarks now re-takes the pause/resume decision | `38cdbd9` |
-> | HTTP | ASGI `send()` now applies write backpressure at the watermarks | `5298130` |
-> | HTTP/TLS | Pipeline bound never applied to HTTPS (repost ignored the flag) | `5298130` |
-> | Loop | Close freed pipe buffers the kernel could still be writing | `5298130` |
-> | epoll | Accept pool overwrote one parked slot 64x, stranding 63 slab entries | `57e0b7d` |
-> | Transport | `sock_accept` fast path returned a *blocking* socket (froze the loop) | `57e0b7d` |
-> | WebSocket | Post-accept inbox unbounded; now budgeted with read backpressure | `57e0b7d` |
-> | Transport | `sock_sendto` returned `None` after a would-block retry | `57e0b7d` |
-> | sendfile | Both fallbacks skipped the seek for `offset=0` | `57e0b7d` |
-> | CI | Every commit ran twice; superseded runs never cancelled | `2b67add` |
-> | HTTP | `max_body` now defaults to 16 MiB (was unbounded) → 413 | `39b73ee` |
-> | Packaging | Wheels are build artifacts only; docs no longer claim otherwise | `39b73ee` |
-> | IOCP | Stale `associated` set let a recycled handle skip IOCP association | `5d96fcb` |
-> | HTTP | Pipelined-request queue bounded with read backpressure | `b770126` |
-> | Loop | POSIX child watcher; signal disposition restored on `close()` | `3a4a764` |
-> | CI | Benchmark harness and PGO training could hang forever | `3a4a764` |
-> | Soak | Measured the requested duration; gates on second-half growth | `1420158` |
-> | Loop | Standalone connect/pipe ops cancelled at close | `8d11d75` |
-> | Server | Spawn-worker startup, address family, accept race, adoption leak | `99cde61` |
-> | UDP | Send queue bounded + reported; recv recovers; queue drains on close | `a50f3d6` |
-> | Net | Listener could end up with an empty accept pool and go deaf | `2b86ee9` |
-> | HTTP/WS | `Transfer-Encoding` stripped, `Content-Length` enforced, status + close codes validated, pre-accept WS bytes bounded | `98f660e` |
-> | TLS | Short/retryable `SSL_write` silently truncated responses | `a9961a9` |
-> | Net | Cancelled ops' buffers freed while the kernel still owned them | `02c9414` |
-> | HTTP/WS | WS upgrade header injection, 204/304 bodies, buffered body on half-close, absolute-form targets, `Sec-WebSocket-Key` | `df9484b` |
->
-> **Open** — reconstructed from the unresolved Codex threads on PR #1
-> (each with its round timestamp checked against the fix commits, so this
-> list reflects what is actually unfixed, with file/line anchors):
-> CONNECT requests are answered 400 by WebSocket validation before the
-> app sees them (`http.rs` ~2299, needs a tunnel/close-after design);
-> error responses hardcode an `HTTP/1.1` status line for HTTP/1.0
-> requests (`http.rs` ~383); supervisor grace is not reserved for
-> lifespan shutdown (`server.py` ~483); WS close-code state evicts after
-> 64 teardowns (`net.rs` ~699); WS frames keep parsing after a close
-> event (`http.rs` ~2101); a handed-in listener fd can double-close
-> (`coreloop.rs` ~1634); the spawn supervisor binds only the first
-> resolved address (`server.py` ~1237); signal state is not rolled back
-> when installation fails (`loop.py` ~917); datagram `sendto` does not
-> resolve hostnames (`coreloop.rs` ~1667); UDP bind/connect does not
-> retry remaining addrinfo candidates (`loop.py` ~706); subprocess args
-> reject path-likes (`loop.py` ~1174); datagram transports expose no
-> `socket` extra (`tcp.py` ~1156); `loop.sendfile` has no runtime
-> fallback when `os.sendfile` fails `ENOSYS` (`loop.py` ~776); promised
-> response trailers are dropped when framing is trailer-capable
-> (`http.rs` ~1244); and explicit unix-path `transport.sendto(data,
-> path)` on an unconnected datagram socket is unsupported (recorded
-> limitation of `86d609f` — needs `netsys::Addr` through
-> `post_send_to` on all three backends). Declined on evidence:
-> BaseException reporting in `shutdown_asyncgens` (CPython tests
-> `Exception`; the reason is recorded in the code).
->
-> **Watching** — the intermittent Windows hang in
-> `test_starlette_routes_and_streaming` (`/bg`) has not reproduced since
-> `5d96fcb`, across every Windows run since — three confirmed clean runs
-> on both runners, each including the full CPython asyncio conformance
-> suite and `test_spawn_worker_pool_serves_and_stops`, which is the
-> end-to-end `workers > 1` check ADR-24 was waiting on.
->
-> `5d96fcb` fixes a real bug matching the signature — a recycled SOCKET
-> value letting a socket skip IOCP association, so its connect completion
-> was never delivered — but **the mechanism was never confirmed from a
-> trace**, so this is empirically settled, not proven. The
-> `CADELOOP_TRACE_TICK` / `CADELOOP_TRACE_APP` instrumentation has been
-> removed now that the bar is met; `git show 999eab8~1 -- crates/pyshim`
-> brings it back if it ever returns. What survives it is the op-target
-> breakdown, promoted from that trace into `stats()["ops_by_target"]`:
-> a stuck loop looks healthy on every other counter, and this is the one
-> that says where.
+**A drop-in `asyncio` event loop with a Rust core — and a native HTTP/1.1 + ASGI server built on top of it.**
 
-A maximum-performance asyncio event loop + ASGI stack with a Rust core.
-Windows (IOCP, with a Registered I/O backend implemented and awaiting
-hardware validation) is the production performance target; Linux runs the same transport layer over epoll, making cadeloop a
-**working drop-in `asyncio.AbstractEventLoop` replacement on both** —
-uvicorn and aiohttp run on it unmodified — plus a **native HTTP/1.1 +
-ASGI 3.0 server** (`cadeloop.serve`) whose parsing, scope construction,
-and response serialization all happen in Rust.
+[![PyPI](https://img.shields.io/pypi/v/cadeloop.svg)](https://pypi.org/project/cadeloop/)
+[![Python](https://img.shields.io/pypi/pyversions/cadeloop.svg)](https://pypi.org/project/cadeloop/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64-lightgrey.svg)](#installation)
 
 ```python
 import asyncio, cadeloop
 
-cadeloop.install()      # asyncio.set_event_loop_policy(cadeloop.EventLoopPolicy())
-asyncio.run(main())     # everything below now runs on cadeloop:
-
-server = await asyncio.start_server(handler, "0.0.0.0", 8000)
-reader, writer = await asyncio.open_connection("example.org", 443, ssl=ctx)
-loop.add_reader(fd, callback)      # readiness, sock_*, signals — all live
+cadeloop.install()          # every asyncio API below now runs on cadeloop
+asyncio.run(main())
 ```
+
+Two lines, and your existing `asyncio` code runs on a Rust reactor. Nothing else
+changes: `asyncio.start_server`, `open_connection`, `add_reader`, `sock_*`,
+subprocesses, signals, and third-party libraries like **uvicorn** and **aiohttp**
+all work unmodified.
+
+When you want more than a faster loop, skip the Python HTTP stack entirely:
 
 ```bash
-# the native ASGI server (llhttp in Rust, 5.6x uvicorn on loopback):
-python -m cadeloop myapp:app --port 8000
+pip install cadeloop
+cadeloop myapp:app --port 8000 --workers 4
 ```
 
-## Status
+`cadeloop.serve()` parses HTTP, builds the ASGI scope, and serializes responses
+**in Rust**. Your `async def app(scope, receive, send)` is the only Python left on
+the request path — which is why it serves **2.4× a tuned uvicorn**
+(httptools + uvloop), **1.5× granian**, and **15.8× uvicorn + h11 on stdlib
+asyncio**. Every number is [measured below](#benchmarks), on a stated machine,
+with a reproduction command.
 
-**M0–M4 complete; M5 (1.0) underway.** Scheduling core, Rust TCP
-transports, the full drop-in surface, native TLS termination, UDP,
-WebSockets, the native HTTP/ASGI engine (Starlette/FastAPI verified),
-multi-worker serving on both process models, and POSIX subprocess are
-all implemented and tested. The Windows IOCP backend is
-hardware-validated (full test sweep + benchmarks); the M3 Registered
-I/O backend awaits a machine whose OS RIO subsystem works (see the
-Windows benchmarks section). Remaining: Windows subprocess pipes, PGO
-wheels, docs floor, and the two-machine acceptance runs. Full R-xxx
-map: [docs/requirements-traceability.md](docs/requirements-traceability.md).
+---
 
-| Surface | State |
+## Table of contents
+
+- [Why cadeloop](#why-cadeloop)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Benchmarks](#benchmarks)
+- [Usage guide](#usage-guide)
+  - [1. As a drop-in event loop](#1-as-a-drop-in-event-loop)
+  - [2. As an ASGI server](#2-as-an-asgi-server-cadeloopserve)
+  - [3. From the command line](#3-from-the-command-line)
+  - [`Loop()` — every constructor argument](#loop--every-constructor-argument)
+  - [`Config` — every tunable](#config--every-tunable)
+  - [`serve()` — every argument](#serve--every-argument)
+  - [CLI flag reference](#cli-flag-reference)
+  - [Environment variables](#environment-variables)
+  - [`loop.stats()` — introspection](#loopstats--introspection)
+- [Use cases and recipes](#use-cases-and-recipes)
+- [Compatibility](#compatibility)
+- [Architecture](#architecture)
+- [Development](#development)
+- [License](#license)
+
+---
+
+## Why cadeloop
+
+Most async Python performance work stops at the event loop. cadeloop goes one
+layer further and moves the *protocol* into Rust as well:
+
+| | what runs in Python | what runs in Rust |
+|---|---|---|
+| stdlib `asyncio` | loop, transports, protocols, HTTP | — |
+| uvloop / rloop / rsloop | transports, protocols, HTTP | loop |
+| **cadeloop (drop-in mode)** | protocols, HTTP | loop, transports |
+| **cadeloop (`serve()`)** | your ASGI app, and nothing else | loop, transports, HTTP parse + scope + serialize |
+
+Three properties fall out of that design:
+
+**Windows is a first-class target, not an afterthought.** cadeloop is built on
+IOCP — the completion-based API Windows actually wants you to use — with a
+Registered I/O backend implemented behind it. uvloop does not support Windows at
+all. If you deploy Python services on Windows, this is the point.
+
+**One transport layer, two kernels.** Linux `epoll` is wrapped as a proactor
+(the syscall is attempted at post time and only parked on `EWOULDBLOCK`), so the
+same Rust transport code serves both platforms and behaviour does not fork by OS.
+
+**Drop-in means drop-in.** cadeloop implements the full
+`asyncio.AbstractEventLoop` surface and is verified against **CPython's own
+asyncio conformance suite**, not just its own tests. If it does not behave like
+the stdlib loop, that is a bug.
+
+> **Project status: alpha (0.0.x).** The scheduling core, transports, TLS, UDP,
+> WebSockets, the HTTP/ASGI engine, and multi-worker serving are implemented and
+> tested. The API may still move before 1.0. See
+> [docs/README.md](docs/README.md) for the full engineering record, milestone
+> status, and the hardening log.
+
+---
+
+## Installation
+
+```bash
+pip install cadeloop
+```
+
+### Requirements
+
+| | requirement | notes |
+|---|---|---|
+| Python | **CPython 3.11.x only** | Not abi3 — 3.10 and 3.12 will not install. |
+| OS | Windows 10/11, or Linux | |
+| CPU | x86-64 (Intel **or** AMD) | `amd64` is the instruction set, unrelated to GPUs. |
+
+Wheels are published for **Windows x64** and **Linux x64 (manylinux2014,
+glibc ≥ 2.17)**. No GPU, no compiler, and no Rust toolchain are needed to
+install a wheel.
+
+### Platforms without a wheel
+
+There is no aarch64 wheel yet — Apple Silicon, Windows on ARM, Raspberry Pi, and
+AWS Graviton will fall through to the source distribution, which needs a Rust
+toolchain:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+pip install cadeloop --no-binary cadeloop
+```
+
+The Rust sources gate on operating system rather than CPU architecture, so an
+aarch64 build is expected to work — but it is not built or tested in CI, so
+treat it as unsupported rather than proven.
+
+### The PGO and `x86-64-v3` wheels
+
+Windows wheels are built with **profile-guided optimization**: an instrumented
+build runs the project's own scheduling and HTTP workload, and the final wheel is
+compiled against those profiles. That is the wheel `pip` installs by default —
+you get it automatically.
+
+Each [GitHub Release](https://github.com/cadezawacki/cadeloop/releases) also
+carries a second Windows wheel compiled for the **x86-64-v3** microarchitecture
+level (AVX2, BMI1/BMI2, FMA, F16C). It is deliberately **not on PyPI**: it has no
+runtime CPU check, so on a pre-Haswell (2013) / pre-Zen-1 (2017) processor it
+does not degrade gracefully — it dies with an illegal-instruction fault on
+import. Install it by explicit URL only, and only when you control the hardware:
+
+```bash
+pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<v3-wheel>
+```
+
+### Verifying an install
+
+```bash
+python -c "import cadeloop; l = cadeloop.new_event_loop(); print(cadeloop.__version__, l.stats()['backend']); l.close()"
+# 0.0.1 iocp     (Windows)
+# 0.0.1 epoll-dev (Linux)
+```
+
+---
+
+## Quick start
+
+### Speed up code you already have
+
+```python
+import asyncio, cadeloop
+
+cadeloop.install()                 # process-wide policy swap
+
+async def main():
+    reader, writer = await asyncio.open_connection("example.org", 80)
+    writer.write(b"GET / HTTP/1.0\r\nHost: example.org\r\n\r\n")
+    await writer.drain()
+    print(await reader.read())
+    writer.close()
+
+asyncio.run(main())                # runs on cadeloop
+```
+
+### Run an existing ASGI app faster
+
+```bash
+cadeloop myapp:app --port 8000           # drop uvicorn entirely
+```
+
+Or keep uvicorn and swap only the loop underneath it — see
+[Keeping uvicorn, gaining the loop](#keeping-uvicorn-gaining-the-loop).
+
+### Serve from Python
+
+```python
+import cadeloop
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+async def hello(request):
+    return JSONResponse({"hello": "world"})
+
+app = Starlette(routes=[Route("/", hello)])
+
+if __name__ == "__main__":
+    cadeloop.serve(app, "0.0.0.0", 8000, workers=4)
+```
+
+---
+
+## Benchmarks
+
+> **Read this first.** Every number below is **Linux over loopback on a
+> 4-vCPU box**, with the load generator sharing those cores with the server.
+> That makes absolute throughput conservative and the results useful for
+> *relative* comparison only. Linux also runs cadeloop's **`epoll` dev
+> backend** — the production target is Windows/IOCP, whose numbers live in
+> [docs/README.md](docs/README.md) and are not re-run here.
+>
+> Environment: Linux 6.18.5, 4 vCPU Intel Xeon @ 2.80 GHz, CPython 3.11.15,
+> glibc 2.39. Contenders: uvloop 0.22.1, rloop 0.3.1, rsloop 0.1.36,
+> uvicorn 0.52.3 (h11 and httptools), granian 2.8.1, hypercorn 0.18.
+
+### HTTP / ASGI — requests per second
+
+Load generator: **`wrk`** (C, its own event loop), `-t2 -c64`, 3s warmup +
+3 measured 10s runs, median reported. Single worker for every contender.
+Workload: the plaintext `Hello, World!` ASGI app in
+[`bench/http/app.py`](bench/http/app.py).
+
+| server | HTTP parsing | event loop | req/s | p50 | p99 |
+|---|---|---|---:|---:|---:|
+| **cadeloop** (`serve()`) | **Rust** | cadeloop | **104.7 K** | **0.54 ms** | **1.36 ms** |
+| granian | Rust (hyper) | its own | 68.1 K | 0.89 ms | 1.99 ms |
+| uvicorn + httptools | C | uvloop | 43.7 K | 1.34 ms | 2.91 ms |
+| uvicorn + httptools | C | asyncio | 25.5 K | 2.37 ms | 4.20 ms |
+| uvicorn + h11 | Python | **cadeloop** | 10.0 K | 6.00 ms | 9.69 ms |
+| uvicorn + h11 | Python | uvloop | 9.3 K | 6.34 ms | 13.46 ms |
+| uvicorn + h11 | Python | asyncio | 6.6 K | 9.50 ms | 11.94 ms |
+| uvicorn + h11 | Python | rsloop | 6.4 K | 9.82 ms | 14.39 ms |
+| uvicorn + h11 | Python | rloop | *crashed — see below* | | |
+| hypercorn | Python | asyncio | 4.1 K | 15.01 ms | 20.58 ms |
+
+Relative to `cadeloop.serve()`: **1.5× granian**, **2.4× a tuned uvicorn**
+(httptools + uvloop), **4.1× uvicorn + httptools on stdlib asyncio**, and
+**15.8× uvicorn + h11 on stdlib asyncio**.
+
+**Both layers matter, and they are worth very different amounts.**
+
+*Swapping the loop is real but bounded.* Holding uvicorn+h11 fixed, cadeloop
+beats stdlib asyncio by **1.51×** (10.0 K vs 6.6 K) and edges uvloop by 1.07×.
+With the faster C parser the loop matters more, not less: httptools on uvloop
+is **1.71×** the same stack on asyncio.
+
+*Moving the protocol out of Python is worth more.* `cadeloop.serve()` is
+**10.5× uvicorn-on-cadeloop** — same loop, same machine, same app. The
+difference is entirely that h11 is no longer parsing in Python.
+
+So the honest opponents for `serve()` are not the h11 rows; they are
+**granian** (1.5×) and **uvicorn + httptools + uvloop** (2.4×) — the stacks
+that already moved parsing out of Python.
+
+> **rloop 0.3.1 crashed under this benchmark.** It served ~7.1 K req/s for two
+> consecutive 3s runs and then aborted the process on a Rust panic —
+> `called Option::unwrap() on a None value` at `src/event_loop.rs:417:44` —
+> so it could not complete the 3×10s protocol. Reported as measured rather
+> than dropped; this is an upstream bug, not a harness failure, and its
+> scheduling numbers below were collected before load was applied.
+
+### Scheduling core — millions of ops/second
+
+In-process microbenchmarks: no sockets, no external load generator. 3 warmup
++ 5 measured runs, fresh process per run, medians reported.
+
+| benchmark | cadeloop | asyncio | uvloop | rloop | rsloop | vs asyncio | vs uvloop |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `call_soon_burst` | **2.492** | 0.698 | 0.901 | 2.303 | 1.334 | 3.6× | 2.8× |
+| `call_soon_chain` | 3.213 | 0.515 | 1.376 | 3.807 | **4.086** | 6.2× | 2.3× |
+| `future_chain` | 0.855 | 0.227 | 0.499 | **0.924** | 0.804 | 3.8× | 1.7× |
+| `gather_fanin` | **0.257** | 0.160 | 0.232 | 0.240 | 0.229 | 1.6× | 1.1× |
+| `queue_pingpong` | **1.163** | 1.013 | 1.129 | 1.144 | 1.084 | 1.1× | 1.0× |
+| `sleep0_chain` | 1.269 | 0.393 | 0.744 | **1.424** | 1.361 | 3.2× | 1.7× |
+| `task_spawn` | **0.261** | 0.195 | 0.238 | 0.245 | 0.252 | 1.3× | 1.1× |
+| `threadsafe_throughput` | 3.123 | 0.142 | 1.542 | **3.939** | 2.659 | 22.0× | 2.0× |
+| `timer_fire` | **1.547** | 0.248 | 0.980 | 1.279 | 0.660 | 6.2× | 1.6× |
+| `timer_schedule_cancel` | **1.836** | 0.467 | 0.386 | 1.343 | 0.995 | 3.9× | 4.8× |
+
+cadeloop beats stdlib asyncio and uvloop on all ten. Against the other Rust
+loops it is more even — **fastest on 6 of 10**, with rloop ahead on
+`call_soon_chain`, `future_chain`, `sleep0_chain` and `threadsafe_throughput`,
+and rsloop ahead on `call_soon_chain`. Treat these as a profile of where the
+scheduling core is strong, not as a ranking.
+
+### Reproducing these
+
+```bash
+pip install uvloop rloop rsloop "uvicorn[standard]" hypercorn granian
+sudo apt-get install wrk
+
+# HTTP/ASGI (wrk-driven)
+PYTHONPATH=$PWD/python python bench/http/run_wrk.py
+
+# scheduling core
+PYTHONPATH=$PWD/python python bench/harness/harness.py --suite sched \
+    --loops cadeloop,asyncio,uvloop,rloop,rsloop
+```
+
+### Two measurement traps these numbers avoid
+
+Both were found while producing this table, and both had silently flattened an
+earlier draft of it into a near-tie.
+
+**1. The load generator must not be the bottleneck.** The repo also ships
+`harness.py --suite http`, whose client is 64 Python threads in one process.
+Splitting the same offered load across two client *processes* nearly doubles
+the measured total against an unchanged server — 23.3 K → 43.9 K req/s — which
+is a GIL ceiling in the client, not a limit in the server. Under that
+generator cadeloop, granian and uvicorn+httptools all report 20–25 K req/s and
+look interchangeable; under `wrk` they separate by 4×.
+[`bench/http/run_wrk.py`](bench/http/run_wrk.py) exists for this reason.
+
+**2. Asking uvicorn for a loop does not get you that loop.** Since 0.35
+uvicorn selects its loop *by class* through a loop-factory table:
+`--loop asyncio` returns `SelectorEventLoop` no matter what
+`asyncio.set_event_loop_policy()` was set to. Benchmarking a policy swap that
+way measures the stdlib loop under someone else's label — it is what made
+every `uvicorn + h11` row land on the same 6.5 K, and it hid a genuine 1.7×
+between uvloop and asyncio on the httptools rows. The harness now passes
+`loop="none"` and drives `uvicorn.Server.serve()` from a loop it constructed
+itself.
+
+The TCP echo suite (`--suite echo`) still has the trap-1 client ceiling
+(28.5 K → 47.2 K msg/s across two processes), so its numbers are omitted here
+rather than published as a loop comparison.
+
+---
+
+## Usage guide
+
+cadeloop has three entry points, and they stack: a **loop**, a **server** built
+on that loop, and a **CLI** wrapping that server.
+
+### 1. As a drop-in event loop
+
+There are four ways in, depending on how much of the process you want to claim.
+
+#### `cadeloop.install()` — process-wide
+
+Sets cadeloop as the asyncio policy for the whole process. Everything that later
+calls `asyncio.run()`, `asyncio.new_event_loop()`, or `get_event_loop()` gets a
+cadeloop loop. This is the uvloop/winloop convention.
+
+```python
+import asyncio, cadeloop
+
+cadeloop.install()
+asyncio.run(main())
+```
+
+Call it **once, at startup, before any loop is created**. Libraries that
+constructed a loop earlier keep the one they have.
+
+#### `cadeloop.run(coro, *, debug=None)` — one call, no global state
+
+Like `asyncio.run()`, but always uses a cadeloop loop regardless of the installed
+policy. Use this when you do not want to change process-wide behaviour — in a
+library, a test, or an app that shares a process with something else.
+
+| argument | type | default | meaning |
+|---|---|---|---|
+| `main` | coroutine | *required* | The coroutine to run to completion. |
+| `debug` | `bool \| None` | `None` | Enables asyncio debug mode. `None` leaves the loop's own default (which honours `PYTHONASYNCIODEBUG` and `-X dev`). |
+
+```python
+import cadeloop
+
+result = cadeloop.run(main())
+cadeloop.run(main(), debug=True)     # slow-callback warnings, origin tracking
+```
+
+#### `cadeloop.new_event_loop()` — an explicit loop object
+
+Returns a `Loop` with default settings. You own its lifecycle.
+
+```python
+import cadeloop
+
+loop = cadeloop.new_event_loop()
+try:
+    loop.run_until_complete(main())
+finally:
+    loop.close()
+```
+
+#### `cadeloop.EventLoopPolicy()` — for frameworks that want a policy
+
+```python
+import asyncio, cadeloop
+
+asyncio.set_event_loop_policy(cadeloop.EventLoopPolicy())
+```
+
+The policy subclasses the *platform default* policy rather than the abstract
+base, so POSIX keeps its child-watcher machinery and
+`asyncio.create_subprocess_exec()` keeps working after the swap.
+
+#### Tuning the loop directly
+
+For a tuned loop, construct `Loop` yourself — see
+[`Loop()` — every constructor argument](#loop--every-constructor-argument):
+
+```python
+import asyncio, cadeloop
+
+def loop_factory():
+    return cadeloop.Loop(spin_us=200, dns_cache=True)
+
+with asyncio.Runner(loop_factory=loop_factory) as runner:
+    runner.run(main())
+```
+
+---
+
+### 2. As an ASGI server (`cadeloop.serve`)
+
+`serve()` runs an ASGI 3.0 application on the native engine: HTTP parsing (llhttp
+in Rust), scope construction, and response serialization never enter Python.
+
+```python
+import cadeloop
+
+async def app(scope, receive, send):
+    if scope["type"] != "http":
+        return
+    await receive()
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"text/plain")],
+    })
+    await send({"type": "http.response.body", "body": b"Hello, World!"})
+
+cadeloop.serve(app, "0.0.0.0", 8000)
+```
+
+`serve()` **blocks** until the server stops — via `SIGINT`/`SIGTERM`, or
+`loop.stop()` from inside a handler.
+
+The `app` argument may be a callable or a `"module:attribute"` string. Pass the
+**string** when using `workers > 1` on Windows: the fork-free worker model
+re-imports the app in each child, and a resolved callable cannot cross that
+boundary.
+
+```python
+cadeloop.serve("myapp:app", "0.0.0.0", 8000, workers=4)
+```
+
+#### TLS
+
+```python
+import ssl, cadeloop
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain("cert.pem", "key.pem")
+
+cadeloop.serve(app, "0.0.0.0", 8443, ssl=ctx)
+```
+
+TLS is terminated natively in Rust (a memory-BIO `wrap_bio` path), so encrypted
+traffic keeps the same zero-Python parsing path. `serve()` forces the context's
+ALPN list to `["http/1.1"]` — the engine speaks HTTP/1.1 only, and a context
+advertising `h2` would let a client negotiate a protocol the server then rejects
+on every request.
+
+#### WebSockets
+
+WebSockets (RFC 6455) are handled by the same native engine; your app receives
+`websocket` scopes as usual.
+
+```python
+async def app(scope, receive, send):
+    if scope["type"] == "websocket":
+        await receive()                                   # websocket.connect
+        await send({"type": "websocket.accept"})
+        while True:
+            msg = await receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            await send({"type": "websocket.send", "text": msg["text"]})
+```
+
+#### Lifespan
+
+The ASGI lifespan protocol is supported and detected automatically. An app
+without lifespan support is served normally.
+
+```python
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await pool.connect()
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                await pool.close()
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+```
+
+On shutdown, a quarter of the grace budget (capped at 5s) is reserved for
+`lifespan.shutdown` so connection draining cannot consume the whole window and
+leave shutdown hooks unrun.
+
+#### Multiple workers
+
+```python
+cadeloop.serve("myapp:app", "0.0.0.0", 8000, workers=0)   # 0 = one per CPU
+```
+
+Two process models, chosen automatically:
+
+- **POSIX** — `fork` + `SO_REUSEPORT`; each worker has its own listener and the
+  kernel balances accepts.
+- **Windows** — `spawn` with a shared listener handed to children via
+  `WSADuplicateSocketW`.
+
+Workers are supervised and restarted, with a fast-crash cutoff so a worker that
+dies immediately and repeatedly does not restart forever. `pin=True` (the
+default) pins each worker to a core.
+
+---
+
+### 3. From the command line
+
+```bash
+cadeloop myapp:app --host 0.0.0.0 --port 8000 --workers 4
+python -m cadeloop myapp:app --port 8000        # equivalent
+```
+
+Every `Config` field is exposed as a flag — see the
+[CLI flag reference](#cli-flag-reference).
+
+```bash
+# low-latency single worker, no body cap, stats on 9001
+cadeloop myapp:app --latency-mode spin --max-body none --stats-endpoint 9001
+
+# throughput-tuned pool with a short keep-alive
+cadeloop myapp:app -w 8 --latency-mode throughput --keepalive-idle 15
+```
+
+---
+
+### `Loop()` — every constructor argument
+
+`cadeloop.Loop(**kwargs)` builds a loop directly. All arguments are
+**keyword-only**.
+
+| argument | type | default | what it does |
+|---|---|---|---|
+| `backend` | `str \| None` | `None` → `CADELOOP_BACKEND` env, else `"auto"` | Reactor to use: `"auto"`, `"iocp"`, `"rio"`, `"epoll"`. `"auto"` picks IOCP on Windows and epoll on Linux. `"rio"` is experimental and warns. |
+| `spin_us` | `int` | `20` | Microseconds to spin before making a blocking kernel wait. Higher values trade CPU for lower wake-up latency. `0` disables spinning. |
+| `high_water` | `int` | `65536` | Transport write buffer high-water mark, in bytes. Above it, `transport.is_writing_paused()` becomes true and protocols get `pause_writing()`. |
+| `low_water` | `int` | `16384` | Write buffer low-water mark. Writing resumes below it. Must be `<= high_water`. |
+| `accept_pool` | `int` | `64` | Accept operations posted concurrently per listener. Raise it for connection-storm workloads; each slot costs a pending kernel op. |
+| `rio_cq_size` | `int` | `65536` | Windows RIO completion queue size. Ignored on other backends. |
+| `rio_rq_recv` | `int` | `32` | RIO per-socket receive request queue depth. |
+| `rio_rq_send` | `int` | `32` | RIO per-socket send request queue depth. |
+| `dns_cache` | `bool` | `False` | Cache `getaddrinfo` results. Off by default here to match the `AbstractEventLoop` contract — real `asyncio.getaddrinfo` never caches. (`Config`/`serve()` default it **on**.) |
+| `dns_cache_ttl` | `float` | `5.0` | Seconds a cached DNS answer lives. RFC TTLs from the resolver are **ignored**. |
+| `tfo` | `bool` | `False` | Enable TCP Fast Open on listeners. |
+| `loopback_fast_path` | `bool` | `True` | Windows `SIO_LOOPBACK_FAST_PATH`. Relevant to loopback benchmarks; no effect on real network traffic. |
+
+```python
+loop = cadeloop.Loop(
+    spin_us=200,          # latency over CPU
+    accept_pool=256,      # heavy accept churn
+    high_water=1 << 20,   # 1 MiB before backpressure
+    low_water=1 << 18,
+    dns_cache=True,
+)
+```
+
+Beyond these, a `Loop` is an ordinary `asyncio` loop:
+`run_forever`, `run_until_complete`, `call_soon`, `call_later`, `call_at`,
+`call_soon_threadsafe`, `create_task`, `create_future`, `run_in_executor`,
+`set_default_executor`, `add_reader`/`add_writer`, `sock_*`,
+`add_signal_handler`, `create_server`, `create_connection`,
+`create_datagram_endpoint`, `create_unix_server`, `subprocess_exec`,
+`set_exception_handler`, `set_task_factory`, `sendfile`, `start_tls`,
+`shutdown_asyncgens`, `shutdown_default_executor`, and `close`.
+
+Two attributes worth knowing:
+
+| attribute | meaning |
 |---|---|
-| Scheduling (call_soon, timers, threadsafe, tasks) | ✅ tested |
-| TCP transports, `create_server`/`create_connection`, streams | ✅ tested (Linux/epoll; Windows/IOCP compile-verified) |
-| TLS: native termination on the engine (`serve(ssl=...)`, https/wss) | ✅ tested (Rust-driven `wrap_bio` memory-BIO; client `ssl=`/`start_tls` via stdlib sslproto) |
-| `sock_*`, `add_reader`/`add_writer`, signals (SIGINT/SIGBREAK incl. idle-park delivery) | ✅ tested |
-| Drop-in: uvicorn (HTTP/1.1), aiohttp | ✅ interop-tested |
-| Native HTTP/1.1 + ASGI engine (`cadeloop.serve`, CLI, lifespan) | ✅ tested (Starlette/FastAPI, keep-alive/pipelining, chunked, limits, R-080 timeouts, access log) |
-| WebSockets (RFC 6455 on the native engine) | ✅ tested (handshake/frames/close vs hand-rolled RFC client; Starlette WebSocketRoute) |
-| UDP datagram endpoints (`create_datagram_endpoint`) | ✅ tested (native recv_from/send_to on both backends) |
-| Multi-worker (`--workers N`) | ✅ tested (fork + SO_REUSEPORT on POSIX; spawn + shared listener — WSADuplicateSocketW on Windows, fd-passing e2e test) |
-| RIO backend (`backend="rio"`: CQ/RQ, registered buffers, staging) | 🔶 implemented; blocked by an OS-level RIO failure on the test machine (Win11 beta 26200) — `auto` stays IOCP; see Windows benchmarks |
-| Subprocess + pipes (`create_subprocess_exec/shell`) | ✅ tested on POSIX (Windows: M5, IOCP named pipes) |
-| Native `loop.sendfile` | M1-Windows (`sock_sendfile` fallback ✅) |
+| `loop.slow_callback_duration` | Seconds a callback may run before debug mode logs it. Default `0.1`. Settable; the native dispatcher honours it. |
+| `loop.stats()` | Live counters — see [`loop.stats()`](#loopstats--introspection). |
 
-## Benchmarks (Linux, loopback)
+---
 
-> **Scope.** Everything below is measured on one machine over loopback
-> (Linux 6.18, 4 vCPU Intel Xeon 2.10 GHz, CPython 3.11.15) with client
-> and server sharing the box — useful for relative comparison, **not** the
-> spec's acceptance numbers, which are two-machine Windows runs against
-> winloop (R-131). Methodology per R-130: 3 warmup + 5 measured runs,
-> medians reported, fresh process per run, loop-independent (threaded,
-> non-asyncio) load generators. Contenders: stdlib asyncio 3.11.15,
-> uvloop 0.22.1, rloop 0.3.1, rsloop 0.1.30, aiofastnet 1.0.5 (both
-> standalone on asyncio and stacked on cadeloop), hypercorn 0.18, and
-> cadeloop's own native ASGI server. Raw JSON lives in
-> [`bench/baselines/`](bench/baselines/). Reproduce with
-> `python bench/harness/harness.py --suite {sched,echo,http}`.
+### `Config` — every tunable
 
-### Scheduling core
+`cadeloop.Config` is a validated dataclass holding every server tunable.
+Validation is **eager**: bad values raise `ValueError` at construction, and
+unknown keyword arguments raise `TypeError`.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-sched-dark.svg">
-  <img alt="Scheduling speedup vs stdlib asyncio: cadeloop faster than asyncio on all ten benchmarks and ahead of uvloop on nine" src="docs/assets/bench-sched.svg">
-</picture>
+```python
+from cadeloop import Config
 
-Median throughput, millions of ops/second:
+cfg = Config(latency_mode="spin", workers=4, max_body=None)
+cfg = Config.from_env()                       # reads CADELOOP_* variables
+cadeloop.serve(app, "0.0.0.0", 8000, **vars(cfg))
+```
 
-| benchmark | cadeloop | asyncio | uvloop | rloop | rsloop |
-|---|---|---|---|---|---|
-| call_soon_chain | 3.42 | 0.56 | 1.64 | 4.19 | 4.92 |
-| call_soon_burst | 3.42 | 0.92 | 1.47 | 3.14 | failed¹ |
-| timer_schedule_cancel | **2.72** | 0.55 | 0.54 | 1.81 | failed¹ |
-| timer_fire | **1.89** | 0.36 | 1.45 | 1.79 | failed¹ |
-| sleep0_chain | 1.63 | 0.46 | 0.97 | 1.80 | 1.71 |
-| task_spawn | 0.30 | 0.22 | 0.27 | 0.31 | 0.26 |
-| threadsafe_throughput | 3.33 | 0.16 | 1.75 | **4.77** | 2.94 |
-| future_chain | 1.01 | 0.25 | 0.63 | 1.15 | 1.00 |
-| gather_fanin | 0.28 | 0.19 | 0.29 | 0.31 | 0.27 |
-| queue_pingpong | 1.29 | 1.24 | 1.30 | 1.36 | 1.17 |
+#### Loop and reactor
 
-- **vs stdlib asyncio: faster on 10/10** (1.04x–20.8x). **vs uvloop:
-  faster on 8/10** with two ~3% ties (gather_fanin, queue_pingpong —
-  stdlib Task/Queue Python code dominates those for every loop). The
-  timer benches (5x uvloop on schedule/cancel) and cross-thread wakeups
-  are the standouts.
-- These numbers include the competitive-analysis round: adopting rloop's
-  tick anatomy (one state-cell entry per pure-scheduling tick) took the
-  call_soon chain from 3.15 to 3.42–3.64 M ops/s and threadsafe
-  throughput from 2.58 to 3.3+. rloop's remaining threadsafe lead is a
-  semantic shortcut we declined: it reuses a loop-init context snapshot
-  instead of capturing the caller's contextvars per call (ADR-22).
-- The other Rust loops are honest company: rloop wins cross-thread
-  wakeups, rsloop wins the call_soon chain. Both are experimental
-  schedulers without a working socket layer (rloop has no
-  `create_server`; ¹rsloop 0.1.30 hung reproducibly on three benches at
-  full scale and is recorded as failed — the harness kills runs at 90s).
-
-### TCP echo — per-message loop overhead
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-echo-dark.svg">
-  <img alt="Single-connection TCP echo: cadeloop 44.5K msgs/s at 47us p99 vs uvloop 23.9K at 68us; the aiofastnet-on-cadeloop stack trails cadeloop slightly" src="docs/assets/bench-echo.svg">
-</picture>
-
-Single connection, 1 KiB ping-pong (RTT measures the full transport +
-loop wakeup path; no client saturation):
-
-| loop | msgs/s | p50 RTT | p99 RTT |
+| field | type | default | meaning |
 |---|---|---|---|
-| **cadeloop** | **44.5K** | **21.0 µs** | **47.3 µs** |
-| aiofastnet on cadeloop | 43.9K | 21.0 µs | 55.5 µs |
-| uvloop | 23.9K | 40.1 µs | 67.5 µs |
-| rsloop | 22.8K | 43.6 µs | 76.6 µs |
-| asyncio | 21.7K | 46.0 µs | 73.2 µs |
-| aiofastnet (on asyncio) | 21.2K | 45.7 µs | 74.9 µs |
+| `backend` | `str` | `"auto"` | `"auto"`, `"iocp"`, `"rio"`, `"epoll"`. `"rio"` additionally requires `CADELOOP_ALLOW_EXPERIMENTAL_RIO=1`. |
+| `latency_mode` | `str` | `"balanced"` | Preset controlling spin and flush behaviour: `"throughput"` (spin 0µs), `"balanced"` (20µs), `"spin"` (200µs + immediate flush). |
+| `spin_us` | `int \| None` | `None` | Explicit spin window in µs, overriding the preset. `None` derives it from `latency_mode`. |
+| `immediate_flush` | `bool \| None` | `None` | Put each response on the wire as soon as it is ready instead of corking until the tick's flush phase. Costs syscalls, buys tail latency. `None` derives from `latency_mode` (on only for `"spin"`). |
 
-**1.86x uvloop's single-stream throughput at half the p50 latency and
-30% lower p99.** Two designs compound here: R-060 spin-then-park (the
-reply usually lands inside the 20 µs spin window, skipping the park/wake
-cycle every other loop pays per message), and the ADR-21 steady-state
-recv path — one `recv` syscall per message, zero `epoll_ctl`.
+#### Kernel I/O
 
-The aiofastnet rows are the control experiment that *drove* that second
-design. aiofastnet patches only the networking calls (Cython transports
-over `add_reader`) and keeps the host loop's scheduler. An earlier run
-had the stacked "aiofastnet-on-cadeloop" configuration ~10% AHEAD of our
-own transports, which isolated three wasted syscalls per message in the
-epoll proactor emulation (a DEL/ADD `epoll_ctl` pair plus a speculative
-recv). Mirroring the readiness-transport pattern (lazy kernel interest +
-a drained-socket heuristic, ADR-21) closed the gap and moved us ahead —
-while the stack still runs unmodified on top of cadeloop, which is the
-drop-in claim demonstrated from an unusual angle. Windows/IOCP never had
-this hop; completions are the kernel's native interface there.
-
-At 64 concurrent connections on this 4-vCPU box the *client* saturates
-first and every contender converges into the 40.5–43.9K msgs/s band —
-that configuration measures the load generator, and only a two-machine
-run can separate the servers.
-
-### HTTP/1.1 — the native engine vs everything else
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-http-dark.svg">
-  <img alt="HTTP plaintext RPS: cadeloop-native 41K req/s at 7.2ms p99 vs the uvicorn pack at ~7.1-7.6K and hypercorn 4.46K" src="docs/assets/bench-http.svg">
-</picture>
-
-Plaintext "Hello, World!" ASGI, 64 keep-alive connections. `cadeloop-native`
-is `cadeloop.serve()` — the M2 engine: llhttp parses inside the Rust
-core, the scope is built natively, the app coroutine is stepped eagerly
-(no asyncio Task for a request that never suspends, R-056), and the
-response is serialized in Rust straight into the corked write queue. The
-uvicorn rows run uvicorn (h11) **unmodified** on each loop:
-
-| contender | req/s | p50 | p99 |
+| field | type | default | meaning |
 |---|---|---|---|
-| **cadeloop native** (`cadeloop.serve`) | **40.96K** | **0.98 ms** | **7.20 ms** |
-| cadeloop native, 2 workers² | 36.50K | 1.16 ms | 7.82 ms |
-| uvicorn + asyncio | 7.60K | 8.42 ms | 10.4 ms |
-| uvicorn + aiofastnet | 7.48K | 8.47 ms | 13.3 ms |
-| uvicorn + rsloop | 7.41K | 8.63 ms | 10.5 ms |
-| uvicorn + uvloop | 7.36K | 8.63 ms | 11.1 ms |
-| uvicorn + cadeloop | 7.11K | 8.91 ms | 11.4 ms |
-| uvicorn + aiofastnet-cadeloop | 7.09K | 8.81 ms | 13.7 ms |
-| hypercorn + asyncio | 4.46K | 14.1 ms | 18.2 ms |
+| `accept_pool` | `int` | `64` | Concurrent accept operations per listener. Must be ≥ 1. |
+| `rio_cq_size` | `int` | `65536` | Windows RIO completion queue size. Must be ≥ 1. |
+| `rio_rq_recv` | `int` | `32` | RIO receive queue depth. Must be ≥ 1. |
+| `rio_rq_send` | `int` | `32` | RIO send queue depth. Must be ≥ 1. |
+| `loopback_fast_path` | `bool` | `True` | Windows `SIO_LOOPBACK_FAST_PATH`; benchmark-relevant only. |
+| `tfo` | `bool` | `False` | TCP Fast Open on listeners. |
 
-**5.6x uvicorn+uvloop's throughput at 8.8x lower p50 latency** — the
-spec's ≥2x-uvicorn target (R-002) cleared with headroom on this box
-(the acceptance measurement itself remains a two-machine Windows run,
-R-131). Honest notes: the uvicorn pack sits within ±4% — h11's
-Python-side parsing flattens *any* loop's advantage, which is why the
-native engine exists — and this is the same app, same client, same
-methodology, so the 5.6x is pure server-stack difference, not tuning.
-²The multi-worker row is slower than one worker HERE because client and
-server share 4 vCPUs: two server workers steal a core from the threaded
-load generator, which is the actual bottleneck — worker scaling is a
-two-machine measurement, and this row exists to prove the SO_REUSEPORT
-pool serves correctly under load, not to measure it. The engine passes
-the same ASGI suites as the drop-in path: Starlette (including streaming
-responses and background tasks) and FastAPI run on it unmodified
-(R-123). (socketify.py, the intended C-level reference ceiling, hangs on
-import in this container and is excluded.)
+#### DNS
 
-### Three findings from building these benchmarks
-
-- Benchmarks are tests: the first echo runs exposed two real transport
-  races (data loss on `pause_reading` with an in-flight completion; slot
-  reuse corrupting streams) — both fixed with a design change (pausing
-  cancels nothing) plus kernel-op buffer refcounts (R-073), and now
-  covered by the 10 MB-transfer test.
-- Benchmarks are regression gates: the M1 transport work initially taxed
-  every scheduling tick ~430 ns; three fast-path fixes (skip `epoll_wait`
-  on idle zero-timeout polls, keep the GIL for non-blocking reaps, one
-  clock read per tick) restored M0 numbers exactly, and one state-cell
-  entry removed from `transport.write` took uvicorn+cadeloop from 10%
-  behind uvicorn+uvloop to ahead of it.
-- Benchmarks are competitive analysis: benching aiofastnet *stacked on*
-  cadeloop (echo table above) exposed a ~10% transport-layer cost ours
-  pays on the epoll dev backend and handed us the M2.5 fix for free;
-  benching rsloop's `#[pyclass(freelist)]` trick the same way showed it
-  *doubling* call_soon cost under pyo3 (the freelist locks) — adopted
-  findings and rejected ones both end up as ADRs (16, 20).
-
-## Benchmarks (Windows 11, loopback)
-
-> **Scope.** Same R-130 methodology, on the production target: Windows 11
-> (build 26200) on an Intel Core Ultra 7 265K (20 cores), CPython 3.11.9,
-> client and server sharing the box over loopback — relative comparison,
-> not the spec's two-machine acceptance numbers (R-131). Contenders:
-> stdlib asyncio (proactor), winloop 0.2 (uvloop's Windows port), rsloop,
-> and cadeloop on its IOCP backend. Raw JSON lives in
-> [`bench/baselines/`](bench/baselines/) (`windows-*.json`); the whole
-> suite is collected by `tools\windows\validate.ps1`.
-
-### Scheduling core
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-win-sched-dark.svg">
-  <img alt="Windows scheduling speedup vs stdlib asyncio: cadeloop ahead of asyncio on all ten benchmarks and ahead of winloop on ten; rsloop leads the call_soon chain but fails three timer benches" src="docs/assets/bench-win-sched.svg">
-</picture>
-
-Median throughput, millions of ops/second:
-
-| benchmark | cadeloop | asyncio | winloop | rsloop |
-|---|---|---|---|---|
-| call_soon_chain | 6.20 | 0.82 | 2.18 | **9.27** |
-| call_soon_burst | **4.88** | 1.10 | 1.45 | failed¹ |
-| timer_schedule_cancel | **3.56** | 0.86 | 0.63 | failed¹ |
-| timer_fire | **3.08** | 0.51 | 1.94 | failed¹ |
-| sleep0_chain | 2.94 | 0.72 | 1.49 | **3.11** |
-| task_spawn | 0.51 | 0.38 | 0.45 | **0.53** |
-| threadsafe_throughput | **5.09** | 0.04 | 2.18 | 4.44 |
-| future_chain | 2.06 | 0.38 | 0.91 | **2.78** |
-| gather_fanin | 0.50 | 0.32 | 0.48 | **0.53** |
-| queue_pingpong | 1.71 | 1.71 | 1.70 | **1.76** |
-
-- **vs stdlib asyncio: faster on 10/10 (1.0x–141x). vs winloop: faster
-  on 10/10 (1.01x–5.6x)**, with the timer benches (5.6x) and cross-thread
-  wakeups (2.3x; proactor's own threadsafe path collapses to 36K ops/s)
-  the standouts.
-- rsloop is the strongest scheduling rival here, as on Linux: of the
-  seven benches it finishes it wins six — four by ≤6%, future_chain by
-  35%, and call_soon_chain by 49% (a per-call contextvars-capture
-  shortcut we decline for drop-in semantics, ADR-22, plus a handle
-  allocation gap that is a measured optimization target). ¹And exactly as
-  on Linux, rsloop 0.1.30 hangs reproducibly on the three timer-centric
-  benches — recorded as failed; the harness watchdog kills a run at 12s.
-  cadeloop wins everything involving timers or threads outright.
-
-### TCP echo — per-message loop overhead
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-win-echo-dark.svg">
-  <img alt="Windows single-connection TCP echo: cadeloop 26.8K msgs/s at 107us p99 vs winloop 20.5K at 143us and asyncio 17.6K at 161us" src="docs/assets/bench-win-echo.svg">
-</picture>
-
-Single connection, 1 KiB ping-pong:
-
-| loop | msgs/s | p50 RTT | p99 RTT |
+| field | type | default | meaning |
 |---|---|---|---|
-| **cadeloop** | **26.8K** | **30.0 µs** | 107.3 µs |
-| rsloop | 23.9K | 36.1 µs | **103.9 µs** |
-| winloop | 20.5K | 40.9 µs | 142.7 µs |
-| asyncio | 17.6K | 54.3 µs | 160.7 µs |
+| `dns_cache` | `bool` | `True` | Cache resolver answers. On by default for servers (a deliberate tradeoff), unlike bare `Loop()`. |
+| `dns_cache_ttl` | `float` | `5.0` | Cache lifetime in seconds. Must be finite and ≥ 0. RFC TTLs are ignored. |
 
-64 connections, 1 KiB messages:
+#### Tasks and GC
 
-| loop | msgs/s | p50 | p99 |
+| field | type | default | meaning |
 |---|---|---|---|
-| rsloop | **43.0K** | **1.42 ms** | 2.45 ms |
-| **cadeloop** | 41.2K | 1.52 ms | **2.13 ms** |
-| winloop | 34.1K | 1.80 ms | 3.59 ms |
-| asyncio | 30.7K | 1.96 ms | 3.44 ms |
+| `eager_tasks` | `bool` | `True` | Start tasks eagerly (run synchronously until first suspension). Turn off if a library depends on deferred-start semantics. |
+| `gc_mode` | `str` | `"freeze"` | `"default"`, `"freeze"` (call `gc.freeze()` after warmup so startup objects stop being traced), or `"disable"`. |
+| `warmup` | `int` | `1000` | Requests served before `gc.freeze()` runs. Must be ≥ 0. |
 
-**1.31x winloop single-stream at 27% lower p50; 1.21x at 64
-connections with the best p99 in the field.** Unlike rloop, rsloop
-ships working transports on Windows and is honest competition: 12%
-behind on single-stream RTT, 4% ahead on 64-connection throughput
-(inside the shared-box noise band — the two-machine run decides that
-one), with cadeloop holding the tail latency.
+#### HTTP engine
 
-### HTTP/1.1 — the native engine on its production platform
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-win-http-dark.svg">
-  <img alt="Windows HTTP plaintext RPS: cadeloop-native 34.7K req/s at 2.7ms p99 vs the uvicorn pack at ~7.7-7.9K and hypercorn 5.6K" src="docs/assets/bench-win-http.svg">
-</picture>
-
-Plaintext "Hello, World!" ASGI, 64 keep-alive connections:
-
-| contender | req/s | p50 | p99 |
+| field | type | default | meaning |
 |---|---|---|---|
-| **cadeloop native** (`cadeloop.serve`) | **34.7K** | **1.75 ms** | **2.65 ms** |
-| uvicorn + asyncio | 7.87K | 8.03 ms | 10.2 ms |
-| uvicorn + winloop | 7.85K | 8.03 ms | 10.0 ms |
-| uvicorn + cadeloop | 7.81K | 8.07 ms | 10.8 ms |
-| uvicorn + rsloop | 7.74K | 8.22 ms | 9.8 ms |
-| hypercorn + asyncio | 5.59K | 11.4 ms | 15.1 ms |
+| `max_header_bytes` | `int` | `65536` | Maximum total header bytes per request. Over it → `431`. Must be ≥ 1. |
+| `max_headers` | `int` | `100` | Maximum header count per request. Must be ≥ 1. |
+| `max_url` | `int` | `8192` | Maximum request-target length. Must be ≥ 1. |
+| `request_line_timeout` | `float` | `5.0` | Seconds a connection may stay silent before sending a complete request head. Guards slowloris. `0` disables. |
+| `keepalive_idle` | `float` | `75.0` | Seconds an idle keep-alive connection is held open. |
+| `max_body` | `int \| None` | `16777216` | Maximum request body bytes; over it → `413`. **Finite on purpose**: the engine buffers the whole body before dispatch, so `None` (unlimited) lets an unauthenticated client turn one request into unbounded memory. |
+| `reuse_scope` | `bool` | `False` | Reuse the ASGI scope dict between requests on a connection. Faster, but unsafe for apps that retain the scope past the response. |
 
-**4.4x uvicorn+winloop's throughput at 4.6x lower p50** — the spec's
-≥2.0x-uvicorn-winloop target (R-002) cleared with headroom on the
-production platform (loopback preview; the acceptance measurement is a
-two-machine run, R-131). The uvicorn pack sits within ±2% of each other
-— h11's Python-side parsing flattens any loop's advantage, which is the
-native engine's reason to exist.
+#### Transports
 
-### RIO status on this machine
+| field | type | default | meaning |
+|---|---|---|---|
+| `write_high_water` | `int` | `65536` | Backpressure high-water mark in bytes. Must be ≥ 0. |
+| `write_low_water` | `int` | `16384` | Backpressure low-water mark. Must be ≥ 0 and ≤ `write_high_water`. |
 
-The RIO backend (`backend="rio"`) could not be behaviorally validated
-on the test machine: on its Windows 11 Insider build (26200.9168) the
-OS's RIO subsystem itself fails to initialize — every kernel-touching
-RIO entry point (`RIORegisterBuffer`, `RIOCreateCompletionQueue` under
-all notification variants) returns WSAEFAULT from calls whose argument
-lists contain no pointer, with the function table verified to resolve
-from genuine unhooked `mswsock.dll`, an LSP-free Winsock catalog, and a
-native-x64 process. The full diagnosis lives in
-[`crates/core/examples/rio_probe.rs`](crates/core/examples/rio_probe.rs)
-(run it on any Windows box for a verdict in seconds). `backend="auto"`
-stays on IOCP; the validation orchestrator detects the condition in 2s
-and skips RIO steps. Behavioral validation waits for a stable x64 build
-(23H2/24H2 or Server).
+#### Multi-process
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `workers` | `int` | `0` | Worker processes. `0` means one per physical core. Must be ≥ 0. |
+| `pin` | `bool` | `True` | Pin each worker to a CPU core. |
+| `grace` | `float` | `10.0` | Graceful-drain budget in seconds on shutdown. Must be finite and ≥ 0. |
+
+#### Observability
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `access_log` | `bool` | `False` | Emit a per-request line on the `cadeloop.access` logger. Nothing appears until logging is configured at `INFO` — `logging.basicConfig(level=logging.INFO)` — because the root logger defaults to `WARNING`. |
+| `stats_endpoint` | `int \| None` | `None` | Serve `loop.stats()` as JSON on `127.0.0.1:<port>`. Bound by one worker only; the payload names which. Must be `None` or a port in 1–65535. |
+
+#### `Config.from_env(prefix="CADELOOP_")`
+
+Reads `{prefix}{FIELD_NAME_UPPERCASED}` for every field, with typed parsing.
+
+| field type | accepted values |
+|---|---|
+| `bool` | `1/true/yes/on` and `0/false/no/off` (case-insensitive) |
+| `int`, `float` | any literal Python accepts |
+| optional (`int \| None`) | `none` or the empty string → `None` |
+
+```bash
+export CADELOOP_LATENCY_MODE=spin
+export CADELOOP_WORKERS=8
+export CADELOOP_MAX_BODY=none
+export CADELOOP_ACCESS_LOG=true
+```
+
+```python
+cfg = Config.from_env()                 # or Config.from_env(prefix="MYAPP_")
+```
+
+---
+
+### `serve()` — every argument
+
+```python
+cadeloop.serve(app, host="127.0.0.1", port=8000, *,
+               workers=1, backend="auto", ssl=None,
+               latency_mode="balanced", access_log=False, **cfg)
+```
+
+| argument | type | default | meaning |
+|---|---|---|---|
+| `app` | callable or `str` | *required* | An ASGI 3.0 application, or a `"module:attribute"` spec. Use the string form with `workers > 1` on Windows. |
+| `host` | `str` | `"127.0.0.1"` | Bind address. Use `"0.0.0.0"` to accept external traffic. |
+| `port` | `int` | `8000` | Bind port. |
+| `workers` | `int` | `1` | Worker processes; `0` means one per CPU. |
+| `backend` | `str` | `"auto"` | Reactor backend, as in `Config.backend`. |
+| `ssl` | `ssl.SSLContext \| None` | `None` | Enables TLS. Must be an `SSLContext` — anything else raises `TypeError`. Its ALPN list is forced to `["http/1.1"]`. |
+| `latency_mode` | `str` | `"balanced"` | `"throughput"`, `"balanced"`, or `"spin"`. |
+| `access_log` | `bool` | `False` | Per-request logging. |
+| `**cfg` | | | **Any other `Config` field.** Unknown names raise `TypeError`; invalid values raise `ValueError`. |
+
+Because `**cfg` forwards to `Config`, every tunable in the tables above is
+available here:
+
+```python
+cadeloop.serve(
+    "myapp:app", "0.0.0.0", 8443,
+    workers=0,
+    ssl=ctx,
+    latency_mode="spin",
+    max_body=64 * 1024 * 1024,      # 64 MiB uploads
+    keepalive_idle=30.0,
+    request_line_timeout=3.0,
+    stats_endpoint=9001,
+    gc_mode="freeze",
+    access_log=True,
+)
+```
+
+---
+
+### CLI flag reference
+
+```
+cadeloop APP [options]
+python -m cadeloop APP [options]
+```
+
+`APP` is a required `module:attribute` spec. It is validated (imported) before
+anything binds, so a typo fails immediately rather than after the port is taken.
+
+| flag | maps to | notes |
+|---|---|---|
+| `--host HOST` | — | Bind address. |
+| `--port`, `-p PORT` | — | Bind port. |
+| `--workers`, `-w N` | `workers` | `0` = one per CPU. |
+| `--backend {auto,epoll}` | `backend` | Choices are platform-dependent (`iocp` on Windows). |
+| `--latency-mode {throughput,balanced,spin}` | `latency_mode` | |
+| `--access-log` | `access_log` | |
+| `--spin-us N` | `spin_us` | Accepts `none` to derive from `--latency-mode`. |
+| `--immediate-flush` / `--no-immediate-flush` | `immediate_flush` | |
+| `--accept-pool N` | `accept_pool` | |
+| `--rio-cq-size N`, `--rio-rq-recv N`, `--rio-rq-send N` | RIO fields | Windows RIO only. |
+| `--loopback-fast-path` / `--no-loopback-fast-path` | `loopback_fast_path` | |
+| `--tfo` / `--no-tfo` | `tfo` | |
+| `--dns-cache` / `--no-dns-cache` | `dns_cache` | |
+| `--dns-cache-ttl S` | `dns_cache_ttl` | |
+| `--eager-tasks` / `--no-eager-tasks` | `eager_tasks` | |
+| `--gc-mode {default,freeze,disable}` | `gc_mode` | |
+| `--warmup N` | `warmup` | |
+| `--max-header-bytes N` | `max_header_bytes` | |
+| `--max-headers N` | `max_headers` | |
+| `--max-url N` | `max_url` | |
+| `--request-line-timeout S` | `request_line_timeout` | |
+| `--keepalive-idle S` | `keepalive_idle` | |
+| `--max-body N` | `max_body` | Accepts `none` to remove the cap. |
+| `--reuse-scope` / `--no-reuse-scope` | `reuse_scope` | |
+| `--write-high-water N`, `--write-low-water N` | watermarks | |
+| `--pin` / `--no-pin` | `pin` | |
+| `--grace S` | `grace` | |
+| `--stats-endpoint PORT` | `stats_endpoint` | Accepts `none` to disable. |
+
+Every boolean tunable has a paired `--no-` form, and the three
+`int | None` options (`--spin-us`, `--max-body`, `--stats-endpoint`) accept the
+literal `none` — without it, those states would be unreachable from the shell.
+
+---
+
+### Environment variables
+
+| variable | read by | effect |
+|---|---|---|
+| `CADELOOP_<FIELD>` | `Config.from_env()` | Sets the matching `Config` field. |
+| `CADELOOP_BACKEND` | `Loop()` | Default backend when the `backend` argument is `None`. Lets a whole test or benchmark run target one backend. |
+| `CADELOOP_ALLOW_EXPERIMENTAL_RIO` | `Config` | Required to set `backend="rio"` through `Config`/`serve()`. `Loop(backend="rio")` stays reachable without it, for RIO diagnosis. |
+| `PYTHONASYNCIODEBUG` | `Loop()` | Enables asyncio debug mode, as with the stdlib loop. `-X dev` does the same. |
+
+---
+
+### `loop.stats()` — introspection
+
+`loop.stats()` returns a plain dict of live counters. It is cheap enough to poll
+and is the intended way to answer "what is this loop actually doing".
+
+```python
+loop = cadeloop.new_event_loop()
+print(loop.stats())
+```
+
+| key | meaning |
+|---|---|
+| `backend` | Active reactor: `"iocp"`, `"rio"`, `"epoll-dev"`. |
+| `ticks` | Loop iterations completed. |
+| `polls` | Kernel wait calls made. |
+| `completions` | I/O completions reaped. |
+| `callbacks_dispatched` | Callbacks run. |
+| `timers_fired` | Timers that fired. |
+| `xthread_items` | Items delivered via `call_soon_threadsafe`. |
+| `spin_hits` | Times the spin window found work without a blocking wait. |
+| `ready_len`, `timers_len` | Current ready-queue and timer-heap depth. |
+| `connections`, `listeners` | Live counts. |
+| `buffers_in_use` | Buffer slots currently held by kernel ops or exported memoryviews. |
+| `bytes_received`, `bytes_sent` | Cumulative byte counters. |
+| `connections_accepted` | Cumulative accepts. |
+| `accept_starved` | Times a listener's accept pool ran dry — raise `accept_pool` if this climbs. |
+| `pipeline_pauses` | Times a pipelined read was paused for budget. |
+| `sends_posted` | Send operations posted. Read against `bytes_sent`, this shows what write corking is buying you. |
+| `accept_ops` | Accept operations posted. |
+| `stale_buffer_ids`, `unreaped_ops` | Leak indicators; both should stay at zero. |
+| `ops_by_target` | Per-target op breakdown: `recv`, `send`, `accept`, `connect`, `dgram`, `pipe`. A stuck loop looks healthy on every other counter; this is the one that says where. |
+
+Serve it over HTTP with `--stats-endpoint`:
+
+```bash
+cadeloop myapp:app --stats-endpoint 9001 &
+curl -s localhost:9001 | python -m json.tool
+```
+
+---
+
+## Use cases and recipes
+
+### Python services on Windows
+
+The original reason cadeloop exists. uvloop does not support Windows, so the
+stdlib Proactor loop has been the ceiling. cadeloop uses IOCP directly and gives
+Windows deployments the same class of speedup Linux users get from uvloop —
+plus a native ASGI server on top.
+
+```bash
+cadeloop myapp:app --host 0.0.0.0 --port 8000 --workers 0
+```
+
+### Latency-sensitive services
+
+Spend CPU to avoid kernel wait wake-ups, and flush responses as soon as they are
+ready rather than at tick end:
+
+```python
+cadeloop.serve(app, "0.0.0.0", 8000, latency_mode="spin")
+```
+
+```python
+cadeloop.serve(app, "0.0.0.0", 8000, spin_us=500, immediate_flush=True)
+```
+
+This burns a core busy-waiting. Measure it: the tradeoff is real and
+deployment-specific, and on a small VM the run-to-run p99 spread can exceed the
+difference between modes.
+
+### Throughput-oriented services
+
+Let writes cork and batch, and skip the spin window entirely:
+
+```bash
+cadeloop myapp:app -w 0 --latency-mode throughput --keepalive-idle 120
+```
+
+### Large uploads
+
+The body cap is finite by default because the engine buffers a whole request body
+before dispatch. Raise it deliberately, and pair it with a longer head timeout:
+
+```python
+cadeloop.serve(app, "0.0.0.0", 8000,
+               max_body=512 * 1024 * 1024,
+               request_line_timeout=30.0)
+```
+
+Setting `max_body=None` removes the cap entirely — only do that behind
+authentication or a proxy that enforces its own limit.
+
+### Keeping uvicorn, gaining the loop
+
+If you depend on uvicorn's features (lifespan flavours, `--reload`, its logging),
+you can keep it and replace only the loop underneath.
+
+**There is no `--loop cadeloop` flag**, and installing the policy is not enough
+either: modern uvicorn (0.35+) picks its loop *by class* through a loop-factory
+table — `--loop asyncio` hands back `SelectorEventLoop`/`ProactorEventLoop`
+regardless of `asyncio.set_event_loop_policy()`. Setting a policy and passing
+`--loop asyncio` silently runs the stdlib loop.
+
+Tell uvicorn to build no loop at all, and drive it from one you made:
+
+```python
+import cadeloop, uvicorn
+
+config = uvicorn.Config("myapp:app", host="0.0.0.0", port=8000, loop="none")
+server = uvicorn.Server(config)
+
+loop = cadeloop.new_event_loop()
+try:
+    loop.run_until_complete(server.serve())
+finally:
+    loop.close()
+```
+
+You get the loop and transport speedup while HTTP parsing stays in Python — and
+as the [benchmarks](#benchmarks) show, that second half is where the time
+actually goes.
+
+### Hardening a public listener
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)   # or access_log writes nowhere
+
+cadeloop.serve(
+    app, "0.0.0.0", 8000,
+    max_body=2 * 1024 * 1024,        # small bodies only
+    max_header_bytes=16 * 1024,
+    max_headers=50,
+    max_url=2048,
+    request_line_timeout=3.0,        # slowloris guard
+    keepalive_idle=15.0,
+    access_log=True,
+)
+```
+
+```
+cadeloop.access 127.0.0.1:55888 "GET /" 200 0.42ms
+```
+
+### Graceful shutdown behind an orchestrator
+
+```bash
+cadeloop myapp:app -w 4 --grace 30
+```
+
+`SIGTERM` starts a drain: existing connections finish, new ones stop being
+accepted, and a reserved slice of the budget guarantees `lifespan.shutdown` runs.
+
+### Running alongside another loop
+
+Use `cadeloop.run()` instead of `install()` so nothing else in the process
+changes behaviour:
+
+```python
+import cadeloop
+
+def run_worker(coro):
+    return cadeloop.run(coro)         # this call only
+```
+
+### Watching a live server
+
+```python
+import json, cadeloop
+
+async def stats(scope, receive, send):
+    body = json.dumps(loop.stats()).encode()
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": body})
+```
+
+Or skip the code and use `--stats-endpoint 9001`.
+
+---
+
+## Compatibility
+
+| surface | state |
+|---|---|
+| Scheduling: `call_soon`, `call_later`, `call_at`, timers, threadsafe, tasks | ✅ tested |
+| TCP transports, `create_server` / `create_connection`, streams | ✅ tested |
+| TLS: native termination (`serve(ssl=...)`, https/wss), client `ssl=` / `start_tls` | ✅ tested |
+| `sock_*`, `add_reader` / `add_writer`, signals | ✅ tested |
+| UDP (`create_datagram_endpoint`) | ✅ tested |
+| WebSockets (RFC 6455, native engine) | ✅ tested |
+| Native HTTP/1.1 + ASGI engine, lifespan, CLI | ✅ tested (Starlette, FastAPI) |
+| Multi-worker (`workers > 1`) | ✅ tested (fork + `SO_REUSEPORT`; spawn + shared listener on Windows) |
+| Subprocess (`create_subprocess_exec` / `shell`) | ✅ POSIX; Windows pipes in progress |
+| Drop-in with uvicorn, aiohttp | ✅ interop-tested |
+| CPython asyncio conformance suite | ✅ runs against the stdlib's own tests |
+| RIO backend (`backend="rio"`) | 🔶 implemented; blocked on an OS-level RIO failure on the test machine — `auto` stays on IOCP |
+| Native `loop.sendfile` | 🔶 `sock_sendfile` fallback works |
+
+Full requirement-by-requirement map:
+[docs/requirements-traceability.md](docs/requirements-traceability.md).
+
+---
 
 ## Architecture
 
@@ -560,44 +1013,48 @@ L1  crates/core     — reactor: timers, queues, dispatch      [Rust]
 L0  crates/core     — IOCP | RIO (hybrid) | epoll (Linux)    [Rust]
 ```
 
-Highlights (details in [docs/architecture.md](docs/architecture.md),
-decisions in [docs/decisions.md](docs/decisions.md)):
+- **One completion-style op API over both kernels** — IOCP natively; epoll
+  wrapped as a proactor (syscall attempted at post time, parked only on
+  `EWOULDBLOCK`), so a single Rust transport layer serves both.
+- **One thread, one conditional GIL release per tick.** The kernel poll drops the
+  GIL only when it can actually block; completions dispatch in batches via
+  vectorcall, with per-connection protocol callbacks cached as bound methods.
+- **Cancel-safe by construction.** Pinned op slabs with a
+  `{Free, Posted, Completed, Cancelled}` state machine (property-tested), buffer
+  slots refcounted by kernel ops and memoryview exports alike, and a graveyard
+  protocol so no Python object is dropped — and no `__del__` can re-enter —
+  inside the loop's critical section.
+- **Corked gather writes.** Writes coalesce within a tick into ≤16-slice
+  `writev`/`WSASend` calls, flushing at tick end, at 64 KiB, or on drain; `bytes`
+  payloads are retained zero-copy.
 
-- **One completion-style op API over both kernels** — IOCP natively;
-  epoll wrapped as a proactor (syscall attempted at post time, parked
-  only on EWOULDBLOCK) so a single Rust transport layer serves both.
-- **One thread, one conditional GIL release per tick**: the kernel poll
-  drops the GIL only when it can actually block; completions dispatch in
-  batches via vectorcall with per-connection protocol callbacks cached as
-  bound methods.
-- **Cancel-safe by construction**: pinned op slabs with a
-  `{Free, Posted, Completed, Cancelled}` state machine (property-tested),
-  buffer slots refcounted by kernel ops and memoryview exports alike, and
-  a graveyard protocol so no Python object can be dropped — and no
-  `__del__` can re-enter — inside the loop's critical section.
-- **Corked gather writes** (R-035): writes coalesce within a tick into
-  ≤16-slice `writev`/`WSASend` calls, flushing at tick end, at 64 KiB, or
-  on drain; `bytes` payloads are retained zero-copy (R-074).
+Details in [docs/architecture.md](docs/architecture.md); design decisions in
+[docs/decisions.md](docs/decisions.md).
+
+---
 
 ## Development
 
 ```bash
-cargo test --workspace                                    # Rust core (59 tests)
+cargo test --workspace                                    # Rust core
 cargo check -p cadeloop-core --target x86_64-pc-windows-msvc
 
 cargo build -p cadeloop-pyshim --release                  # extension
 cp target/release/lib_core.so python/cadeloop/_core.so    # Linux dev shortcut
 pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi
-PYTHONPATH=python pytest tests/unit tests/conformance     # 112 tests
+PYTHONPATH=python pytest tests/unit tests/conformance
 
 pip install maturin && maturin build --release            # the real wheel
 python tests/conformance/run_cpython_suite.py             # CPython asyncio suite
 ```
 
-Repo layout follows the spec (R-114): `crates/core`, `crates/pyshim`,
-`python/cadeloop`, `vendor/llhttp`, `tests/{unit,conformance,stress}`,
-`bench/{echo,http,sched,harness}`, `docs/`.
+Repo layout: `crates/core`, `crates/pyshim`, `python/cadeloop`, `vendor/llhttp`,
+`tests/{unit,conformance,stress}`, `bench/{echo,http,sched,harness}`, `docs/`.
+
+Release and packaging process: [docs/ops.md](docs/ops.md).
+
+---
 
 ## License
 
-MIT (no GPL dependencies — enforced by `cargo deny`).
+MIT — see [LICENSE](LICENSE). No GPL dependencies, enforced by `cargo deny`.

@@ -79,20 +79,50 @@ Two caveats worth stating plainly:
 
 ### Where the wheels land
 
-A **tag push** (`v*`) attaches all three to the GitHub Release for that
-tag, so they install by direct URL:
+A **tag push** (`v*`) publishes to two places:
+
+1. **The GitHub Release** for that tag gets every artifact — both Windows
+   wheels, the Linux wheel, and the sdist.
+2. **PyPI** gets everything *except* the x86-64-v3 wheel, via Trusted
+   Publishing (OIDC, no stored API token).
 
 ```bash
+pip install cadeloop                                    # PyPI
 pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<wheel>
 ```
 
 A **workflow_dispatch** run has no tag to hang a Release off, publishes
-nothing, and leaves its wheels as run artifacts only — that is the way
-to spot-check a build without shipping it.
+to neither destination, and leaves its wheels as run artifacts only —
+that is the way to spot-check a build without shipping it.
 
-**Still nothing on PyPI.** `pip install cadeloop` resolves to nothing;
-the direct URL above and `maturin build --release` are the only install
-routes. Adding a PyPI upload is a separate, deliberate decision.
+### Things that will bite you on a release
+
+**PyPI uploads are irreversible.** A filename, once uploaded, can never
+be reused for that project — deleting the release does not free it. The
+`pypi-publish` job therefore runs last, gated on `github-release`
+succeeding, and asserts that every file's version matches the tag before
+uploading. A tag that disagrees with `Cargo.toml`'s workspace version
+fails the job instead of burning the wrong filename forever.
+
+**The v3 wheel is withheld from PyPI on purpose.** pip's build-tag
+ordering already prefers the baseline, but "prefers" is the wrong
+guarantee for an index everyone installs from without reading. It stays a
+Release asset, reachable only by explicit URL.
+
+**The Linux wheel is built in a manylinux2014 container**
+(`PyO3/maturin-action`), not on the runner. A plain `maturin build` on
+`ubuntu-latest` links against glibc 2.39 and is tagged `manylinux_2_39`,
+which pip refuses to install on Debian 12, RHEL 9, or Ubuntu 22.04. That
+was tolerable when a human picked the artifact by hand; it is not
+tolerable as the wheel PyPI serves to everyone. The sdist step runs
+*before* the container step so `dist/` belongs to the runner user rather
+than to root.
+
+**Trusted Publishing must match.** PyPI's publisher config names the
+owner, repository, and workflow filename (`release.yml`), and optionally
+a GitHub environment. This workflow declares no environment — if one is
+configured on the PyPI side, add a matching `environment:` key to the
+`pypi-publish` job or the upload is rejected.
 
 ### Why the Windows wheels carry a build tag
 

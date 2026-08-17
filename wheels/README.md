@@ -22,17 +22,21 @@ Windows wheels (`cp311-win_amd64`, R-110) must be built on Windows; CI
 builds them on every push and uploads them as run artifacts (see the
 `build-windows` job in `.github/workflows/ci.yml`).
 
-## Or download a released one
+## Or just install it
 
-Tagged releases carry prebuilt wheels as assets — a PGO Windows wheel, a
-PGO + `x86-64-v3` Windows wheel, and a Linux wheel. Grab one from
-<https://github.com/cadezawacki/cadeloop/releases>, or install by URL:
+```bash
+pip install cadeloop
+```
+
+Tagged releases publish to PyPI and attach the same files to the GitHub
+Release, so <https://github.com/cadezawacki/cadeloop/releases> works as a
+direct-URL alternative:
 
 ```bash
 pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<wheel>
 ```
 
-Take the baseline wheel (build tag `2`) unless every target CPU is
-Haswell/Zen 1 or newer; the `1v3` wheel faults on anything older. See
-"Release wheels" in `docs/ops.md`. Nothing is on PyPI, so
-`pip install cadeloop` still does not work.
+One wheel is Release-only: the `x86-64-v3` Windows build (build tag
+`1v3`) is deliberately kept off PyPI because it faults on pre-Haswell
+CPUs. `pip install cadeloop` gets the portable PGO wheel (build tag `2`);
+the v3 one has to be named by URL. See "Release wheels" in `docs/ops.md`.
