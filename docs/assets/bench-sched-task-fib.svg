@@ -14,19 +14,19 @@
 <line x1="752.0" y1="44" x2="752.0" y2="188" stroke="#e1e0d9" stroke-width="1"/>
 <text x="752.0" y="204" font-size="11" fill="#898781" text-anchor="middle">100</text>
 <text x="220" y="65" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="end">cadeloop</text>
-<path d="M232.0,52.0 h398.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-398.2 z" fill="#5a9996"/><rect x="232.0" y="51.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="642.2" y="65" font-size="12" font-weight="600" fill="#0b0b0b">77.3</text>
-<text x="220" y="93" font-size="12" font-weight="400" fill="#52514e" text-anchor="end">rsloop</text>
-<path d="M232.0,80.0 h394.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-394.1 z" fill="#e87ba4"/><rect x="232.0" y="79.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="638.1" y="93" font-size="12" font-weight="400" fill="#52514e">76.6</text>
-<text x="220" y="121" font-size="12" font-weight="400" fill="#52514e" text-anchor="end">rloop</text>
-<path d="M232.0,108.0 h357.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-357.8 z" fill="#eda100"/><rect x="232.0" y="107.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="601.8" y="121" font-size="12" font-weight="400" fill="#52514e">69.6</text>
+<path d="M232.0,52.0 h452.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-452.8 z" fill="#5a9996"/><rect x="232.0" y="51.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.8" y="65" font-size="12" font-weight="600" fill="#0b0b0b">87.8</text>
+<text x="220" y="93" font-size="12" font-weight="400" fill="#52514e" text-anchor="end">rloop</text>
+<path d="M232.0,80.0 h410.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-410.2 z" fill="#eda100"/><rect x="232.0" y="79.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="654.2" y="93" font-size="12" font-weight="400" fill="#52514e">79.7</text>
+<text x="220" y="121" font-size="12" font-weight="400" fill="#52514e" text-anchor="end">rsloop</text>
+<path d="M232.0,108.0 h410.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-410.0 z" fill="#e87ba4"/><rect x="232.0" y="107.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="654.0" y="121" font-size="12" font-weight="400" fill="#52514e">79.6</text>
 <text x="220" y="149" font-size="12" font-weight="400" fill="#52514e" text-anchor="end">uvloop</text>
-<path d="M232.0,136.0 h355.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-355.0 z" fill="#1baf7a"/><rect x="232.0" y="135.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="599.0" y="149" font-size="12" font-weight="400" fill="#52514e">69.0</text>
+<path d="M232.0,136.0 h387.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-387.0 z" fill="#1baf7a"/><rect x="232.0" y="135.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="631.0" y="149" font-size="12" font-weight="400" fill="#52514e">75.2</text>
 <text x="220" y="177" font-size="12" font-weight="400" fill="#52514e" text-anchor="end">asyncio</text>
-<path d="M232.0,164.0 h252.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-252.9 z" fill="#eb6834"/><rect x="232.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="496.9" y="177" font-size="12" font-weight="400" fill="#52514e">49.4</text>
+<path d="M232.0,164.0 h292.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-292.7 z" fill="#eb6834"/><rect x="232.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="536.7" y="177" font-size="12" font-weight="400" fill="#52514e">57.1</text>
 <text x="20" y="218" font-size="11" fill="#898781">thousand coroutine calls/second — 35,421 coroutine calls per run, median of 5</text>
 </svg>

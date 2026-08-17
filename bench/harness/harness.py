@@ -54,6 +54,10 @@ SCHED_BENCHES = [
     "future_chain",
     "gather_fanin",
     "queue_pingpong",
+    # Same workload on cadeloop.Queue. Runs on every loop -- the queue is
+    # loop-agnostic -- so the pair isolates what asyncio.Queue's own
+    # pure-Python put/get costs, independently of the loop under it.
+    "queue_pingpong_native",
 ]
 
 
