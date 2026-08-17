@@ -58,7 +58,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy, multi-worker pool | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
 | R-103 | loop.stats() introspection | ✅ (M0 counters incl. syscalls_saved_inline plumbing) | coreloop.rs |
-| R-110 | maturin cp311-win_amd64 wheels; v2/v3 variants | 🔶 packaging ✅; v3 variant + publish 📅 M5 | pyproject.toml, ci.yml |
+| R-110 | maturin cp311-win_amd64 wheels; v2/v3 variants | 🔶 packaging ✅; v3 variant ✅; Release assets on tag push ✅; PyPI 📅 M5 | pyproject.toml, ci.yml, release.yml |
 | R-111 | LTO/opt/codegen/panic; PGO wheels | 🔶 profile ✅; PGO 📅 M5 | Cargo.toml |
 | R-112 | Vendored llhttp + static OpenSSL | 🔶 llhttp pin/fetch ✅; OpenSSL 📅 M4 | vendor/llhttp |
 | R-113 | CI matrix: build/unit/conformance/stress/bench-regression/lints | ✅ wired | .github/workflows/ci.yml |

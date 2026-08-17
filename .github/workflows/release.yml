@@ -4,12 +4,12 @@
 # against an instrumented build — the same hot paths the loop serves in
 # production (scheduling, echo, native HTTP).
 #
-# DELIBERATELY DOES NOT PUBLISH. Every wheel here is uploaded as a GitHub
-# Actions run artifact only: no GitHub Release is created, no release
-# asset is attached, and nothing goes to PyPI. Both platforms are
-# supported targets and both are built and tested on every tag; turning
-# publication on is a separate, deliberate decision. Do not add a
-# publish step without that decision being made.
+# PUBLISHES TO A GITHUB RELEASE, NOT TO PyPI. On a `v*` tag push the
+# three wheels are attached to the Release for that tag, so they install
+# by direct URL. Nothing is uploaded to PyPI — `pip install cadeloop`
+# still resolves to nothing, and adding a PyPI step is a separate,
+# deliberate decision. workflow_dispatch runs carry no tag, so they
+# create no Release and stay run-artifact-only.
 name: release
 
 on:
@@ -19,6 +19,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+# Least privilege by default; the publishing job opts up to contents:
+# write for itself and nothing else does.
+permissions:
+  contents: read
 
 jobs:
   wheel-windows-pgo:
@@ -107,6 +112,30 @@ jobs:
           # read the POSIX-form path either.
           export RUSTFLAGS="$ARCH_FLAGS -Cprofile-use=$(cygpath -m "$PWD")/pgo-data/merged.profdata"
           maturin build --release --out dist
+          # Both matrix legs emit a byte-different wheel under the SAME
+          # PEP 427 filename -- same project, version, cp311, win_amd64 --
+          # which collides the moment they share a Release or a
+          # --find-links directory. Disambiguate with the build tag, the
+          # one filename field that exists for this and that pip parses
+          # rather than rejects. pip orders build tags as (int, str) with
+          # "absent" lowest, so baseline's `2` outranks v3's `1v3`: point
+          # pip at a directory holding both and it resolves to the wheel
+          # that runs on any x86-64, never the one that dies with an
+          # illegal instruction on a pre-Haswell CPU. Picking v3 has to
+          # be explicit -- name the file, or install it on its own.
+          case "${{ matrix.variant }}" in
+            v3) BUILD_TAG=1v3 ;;
+            *)  BUILD_TAG=2 ;;
+          esac
+          for whl in dist/*.whl; do
+            retagged="dist/$(basename "$whl" | sed -E "s/^([^-]+-[^-]+)-/\1-${BUILD_TAG}-/")"
+            if [ "$whl" = "$retagged" ]; then
+              echo "cannot place a build tag in $whl -- unexpected wheel name" >&2
+              exit 1
+            fi
+            mv "$whl" "$retagged"
+          done
+          ls -l dist
       - name: smoke the wheel
         shell: bash
         run: |
@@ -131,3 +160,94 @@ jobs:
         with:
           name: wheel-linux
           path: dist/*.whl
+
+  github-release:
+    # A Release hangs off a tag, and only the tag-push trigger has one.
+    # A workflow_dispatch run -- the way a build gets spot-checked
+    # off-cycle -- publishes nothing and leaves its wheels as run
+    # artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheel-windows-pgo, wheel-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the Release and upload its assets
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+      - name: attach the wheels to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # An unmatched glob below would otherwise survive as its own
+          # literal text and get published into the notes as a filename.
+          shopt -s failglob
+          ls -l dist
+          # merge-multiple flattens every artifact into one directory and
+          # resolves a name clash by silently overwriting, which would
+          # publish two wheels as one. The build tags upstream keep the
+          # names distinct; this asserts they did. Bump the count when
+          # the build matrix grows.
+          found=$(ls dist/*.whl | wc -l)
+          if [ "$found" -ne 3 ]; then
+            echo "expected 3 wheels, found $found -- names collided?" >&2
+            exit 1
+          fi
+          WIN_BASELINE=$(basename dist/*-2-cp311-*win_amd64.whl)
+          WIN_V3=$(basename dist/*-1v3-cp311-*win_amd64.whl)
+          LINUX=$(basename dist/*linux*.whl)
+
+          cat > notes.md <<'EOF'
+          Prebuilt CPython 3.11 wheels, built and smoke-tested by
+          `.github/workflows/release.yml`.
+
+          | wheel | target | build |
+          | --- | --- | --- |
+          | `@WIN_BASELINE@` | Windows x64 | PGO, portable x86-64 baseline |
+          | `@WIN_V3@` | Windows x64, **v3 CPUs only** | PGO + `-C target-cpu=x86-64-v3` |
+          | `@LINUX@` | Linux x64 | release build, no PGO |
+
+          **Take the baseline Windows wheel unless every target CPU is
+          known to be Haswell (2013) / Zen 1 (2017) or newer.** The `1v3`
+          wheel is compiled to the x86-64-v3 microarchitecture level
+          (AVX2, BMI1/BMI2, FMA, F16C) with no runtime dispatch and no CPU
+          check: on an older processor it does not fall back and does not
+          raise, it dies with an illegal-instruction fault on import.
+          Both Windows wheels are otherwise identical — same source, same
+          PGO profiles, gathered by running this repo's scheduling and
+          native-HTTP workload against an instrumented build.
+
+          The two Windows wheels differ only by PEP 427 build tag, so pip
+          resolves a directory holding both to the portable `2` wheel;
+          installing the v3 one means naming it.
+
+          Not on PyPI — install by URL:
+
+          ```
+          pip install https://github.com/@REPO@/releases/download/@TAG@/@WIN_BASELINE@
+          ```
+          EOF
+          sed -i "s|@WIN_BASELINE@|$WIN_BASELINE|g; s|@WIN_V3@|$WIN_V3|g; s|@LINUX@|$LINUX|g; s|@TAG@|$TAG|g; s|@REPO@|$GITHUB_REPOSITORY|g" notes.md
+
+          # A retried matrix leg re-runs this job against a tag that has
+          # already published, so replace the assets instead of failing
+          # the run on "release already exists".
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.whl --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            # --verify-tag: publish against the pushed tag or not at all,
+            # never conjure a tag from whatever the default branch is now.
+            flags=(--verify-tag)
+            # Semver spelling: v1.2.0-rc.1 is a pre-release, v1.2.0 is not.
+            case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+            gh release create "$TAG" dist/*.whl \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "cadeloop $TAG" \
+              --notes-file notes.md \
+              "${flags[@]}"
+          fi
