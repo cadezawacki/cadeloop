@@ -109,6 +109,19 @@ ordering already prefers the baseline, but "prefers" is the wrong
 guarantee for an index everyone installs from without reading. It stays a
 Release asset, reachable only by explicit URL.
 
+**The manylinux container has no `python3` on PATH.** Every CPython in
+the image lives under `/opt/python/<tag>/bin`, and the runner's
+`setup-python` is not mounted into the container, so a bare
+`maturin build` dies with *"Couldn't find any python interpreters from
+'python3'"*. The job passes
+`--interpreter /opt/python/cp311-cp311/bin/python` explicitly, which also
+pins the build to the single version `requires-python` allows rather than
+whatever `--find-interpreter` turns up in a future image. A follow-up step
+asserts the result is exactly one `cp311` + `manylinux2014`/`manylinux_2_17`
+wheel — a wheel tagged `linux_x86_64` or `manylinux_2_39` is not a crash,
+it just installs nowhere, and without the check only a user running
+`pip install cadeloop` would find out.
+
 **The Linux wheel is built in a manylinux2014 container**
 (`PyO3/maturin-action`), not on the runner. A plain `maturin build` on
 `ubuntu-latest` links against glibc 2.39 and is tagged `manylinux_2_39`,
