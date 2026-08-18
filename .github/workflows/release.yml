@@ -176,12 +176,46 @@ jobs:
       # to install on Debian 12, RHEL 9, or Ubuntu 22.04 -- i.e. most of
       # the installed base. Fine while these were run artifacts a human
       # picked by hand; not fine as the wheel PyPI hands to everyone.
+      #
+      # --interpreter is load-bearing. The manylinux image keeps every
+      # CPython under /opt/python/<tag>/bin and puts NONE of them on PATH,
+      # and the host's setup-python is not mounted into the container, so
+      # maturin's default probe fails with "Couldn't find any python
+      # interpreters from 'python3'". Naming cp311 also pins the build to
+      # the one version requires-python allows, instead of whatever
+      # --find-interpreter happens to turn up in a future image.
       - uses: PyO3/maturin-action@3e2bdf6ba6453a61e649744019b8a2d906c7eb38 # v1.51.0
         with:
           command: build
-          args: --release --out dist
+          args: --release --out dist --interpreter /opt/python/cp311-cp311/bin/python
           manylinux: "2014"
           target: x86_64
+      - name: check the linux wheel is cp311 + manylinux
+        shell: bash
+        run: |
+          shopt -s failglob
+          ls -l dist
+          # The failure this guards against is not a crash: a wheel built
+          # against the wrong interpreter, or tagged linux_x86_64 because
+          # auditwheel did not run, installs nowhere and would only be
+          # noticed by a user typing `pip install cadeloop`.
+          found=$(ls dist/*.whl | wc -l)
+          if [ "$found" -ne 1 ]; then
+            echo "expected exactly 1 linux wheel, found $found" >&2
+            exit 1
+          fi
+          # Spelled out rather than `manylinux*`: that looser glob also
+          # accepts manylinux_2_39, which is what a build that escaped the
+          # container back onto the runner's own glibc produces -- the
+          # original bug this job exists to prevent.
+          case "$(basename dist/*.whl)" in
+            *-cp311-cp311-manylinux2014_x86_64.whl) ;;
+            *-cp311-cp311-manylinux_2_17_x86_64*.whl) ;;
+            *)
+              echo "not a cp311 manylinux2014 wheel: $(basename dist/*.whl)" >&2
+              exit 1
+              ;;
+          esac
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-linux
