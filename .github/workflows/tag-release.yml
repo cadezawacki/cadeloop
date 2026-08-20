@@ -143,46 +143,57 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Cargo.lock records the workspace members' own versions, so
-          # every bump leaves it a version behind. That is derived data,
-          # and regenerating it is this workflow's job, not a human's --
-          # the whole point of one source of truth is that everything
-          # else follows from it without anyone remembering to.
+          # BEST EFFORT, ON PURPOSE. Nothing in this step may fail the
+          # release.
           #
-          # An earlier revision asserted the lock was already in step
-          # instead of fixing it, and blocked the 0.0.3 release outright:
+          # Cargo.lock restates the workspace members' own versions, so a
+          # bump leaves it a version behind. That is derived data, and
+          # regenerating it belongs here rather than in a human's memory
+          # -- but it is also only bookkeeping: cargo recomputes those
+          # versions on any build, and the sdist installs cleanly either
+          # way. Two releases were already blocked by treating it as more
+          # than that. First by asserting the lock was in step:
           #
           #   error: cannot update the lock file ... because --locked was
           #   passed to prevent this
           #
-          # A version bump here is a one-line edit in the GitHub web UI,
-          # so demanding a `cargo update` alongside it made the file the
-          # bump depends on the one thing the bump could not produce.
+          # then by regenerating it with --offline, which works on a
+          # developer's machine and fails on a runner, whose cargo cache
+          # is cold and so cannot resolve anything from the index:
           #
-          # --workspace --offline: only the two path members change, so
-          # there is no index access and no dependency resolution. Every
-          # dependency pin is left exactly as it was.
-          cargo update --workspace --offline
+          #   error: no matching package named `crossbeam-queue` found
+          #   location searched: crates.io index
+          #
+          # Both were the same mistake in different clothes: a cosmetic
+          # detail given the power to stop a release. So this step tries,
+          # reports what happened, and gets out of the way.
+          give_up() {
+            echo "::warning::$1 Releasing anyway -- Cargo.lock only restates a version cargo recomputes on its own. Worth syncing by hand afterwards."
+            git reset --hard HEAD >/dev/null 2>&1 || true
+            exit 0
+          }
+
+          # --workspace re-resolves only the path members; every
+          # dependency pin is left exactly as it was. No --offline: the
+          # index has to be reachable to resolve the graph at all, and on
+          # a cold runner cache it is not otherwise.
+          cargo update --workspace || give_up "could not regenerate Cargo.lock."
 
           if git diff --quiet -- Cargo.lock; then
-            echo "Cargo.lock already matches $VERSION -- nothing to sync."
+            echo "Cargo.lock already records $VERSION -- nothing to sync."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.lock
-          git commit -m "Cargo.lock: sync to $VERSION"
+          git commit -m "Cargo.lock: sync to $VERSION" || give_up "could not commit the Cargo.lock sync."
 
-          # Push before tagging, so the tag names a commit that is
-          # actually on the branch rather than one invented here and
-          # reachable only through the tag.
-          #
-          # This can be refused -- branch protection, or a commit that
-          # landed while this run was going. Neither is worth failing a
-          # release over: a stale lock records a version cargo recomputes
-          # by itself, and the sdist stays installable either way. Fall
-          # back to tagging the commit the branch already has.
+          # Push before tagging, so the tag names a commit that is really
+          # on the branch rather than one invented here and reachable
+          # only through the tag. A refusal -- branch protection, or a
+          # commit landing mid-run -- falls back to tagging what the
+          # branch already has.
           ORIGINAL=$(git rev-parse HEAD~1)
           if git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"; then
             echo "Cargo.lock synced to $VERSION and pushed."
