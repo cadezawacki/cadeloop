@@ -83,11 +83,12 @@ should be edited — every other copy of the version is derived:
 What happens on merge to `main`:
 
 1. **`tag-release.yml`** reads the workspace version, and if no `vX.Y.Z`
-   tag exists for it, regenerates `Cargo.lock` (`cargo update --workspace
-   --offline` — only the two path members move, dependency pins are
-   untouched), commits that if it changed, and pushes a tag. If the tag
-   already exists the run is a no-op, so the workflow is safe on every
-   push and safe to re-run by hand.
+   tag exists for it, regenerates `Cargo.lock` (`cargo update
+   --workspace` — only the two path members move, dependency pins are
+   untouched), commits that if it changed, and pushes a tag. The lock
+   sync is best-effort and cannot fail the release; see below. If the
+   tag already exists the run is a no-op, so the workflow is safe on
+   every push and safe to re-run by hand.
 2. It then **dispatches `release.yml` at that tag**. This is explicit on
    purpose: a tag pushed with the default `GITHUB_TOKEN` does *not* fire
    `on: push: tags` — GitHub suppresses that to stop workflows recursing.
@@ -133,11 +134,29 @@ A version bump here is a one-line edit, often made in the GitHub web UI,
 and the lock is the one file that edit cannot produce. Asserting on
 derived data made the release depend on a human remembering to
 regenerate it — precisely the coupling the single source of truth is
-supposed to remove. The lock is now regenerated automatically, and
-nothing fails on it: a stale lock only restates a version cargo
-recomputes by itself, so it is not worth a red build, let alone a
-blocked release. If the sync commit cannot be pushed (branch protection,
-or a commit landing mid-run) the workflow warns and releases anyway.
+supposed to remove.
+
+Regenerating it instead, but with `--offline`, then blocked 0.0.3 a
+second time:
+
+```
+error: no matching package named `crossbeam-queue` found
+location searched: crates.io index
+```
+
+`--offline` had been added to justify "no index access". It holds on a
+developer's machine, whose cargo cache is already populated, and not on
+a runner, whose cache is cold — resolving the graph at all needs the
+index, even though only the two path members change.
+
+Both failures were the same mistake wearing different clothes: a
+cosmetic detail given the power to stop a release. So the sync is now
+**best-effort and cannot fail the run**. If `cargo update` fails, if the
+commit fails, or if the push is refused (branch protection, or a commit
+landing mid-run), the workflow warns, leaves the tree as it found it,
+and tags anyway. A stale lock only restates a version cargo recomputes
+by itself, and the sdist installs cleanly either way — that is worth a
+warning, never a blocked release.
 
 ## Release wheels (R-110/R-111)
 
