@@ -11,9 +11,18 @@
 # CPUs, which is an acceptable trade for someone who sought out a URL and
 # a wrong one to hand `pip install cadeloop`.
 #
-# workflow_dispatch runs carry no tag: they publish nothing, to either
-# destination, and stay run-artifact-only. That is how a build gets
-# spot-checked without shipping.
+# Publishing keys off the ref, not the trigger. Dispatched against a
+# branch there is no tag to hang a Release off, so the run publishes
+# nothing to either destination and stays run-artifact-only -- that is
+# how a build gets spot-checked without shipping. Dispatched against a
+# `v*` tag it publishes exactly as a tag push does, which is the route
+# tag-release.yml drives: a tag pushed by GITHUB_TOKEN cannot fire
+# `on: push: tags`, so that workflow cuts the tag and dispatches this one
+# at it.
+#
+# The version being built is never typed anywhere. It comes from
+# `[workspace.package] version` in the root Cargo.toml, and verify-version
+# below refuses to build anything whose tag disagrees with it.
 #
 # PyPI uploads are IRREVERSIBLE -- a filename, once used, can never be
 # reused for that project even after deletion -- so the PyPI job runs
@@ -34,7 +43,58 @@ permissions:
   contents: read
 
 jobs:
+  # First, and everything else waits on it. The version in every wheel
+  # filename comes from Cargo.toml while the tag comes from the ref, and
+  # when those disagree the build is worthless -- so find out in fifteen
+  # seconds rather than after the PGO matrix.
+  #
+  # That is not hypothetical: v0.0.2 was once pushed at a commit whose
+  # Cargo.toml still read 0.0.1. The full matrix ran, three
+  # `cadeloop-0.0.1-*` wheels were attached to the v0.0.2 Release, and the
+  # mismatch surfaced only in pypi-publish -- the last job of the run.
+  # The check that caught it lives on down there too, as the final guard
+  # before an irreversible upload; this one exists so it is never reached.
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: check
+        shell: bash
+        run: |
+          # tomllib, not grep: `version = ` also appears under
+          # [workspace.dependencies] and in every dependency table.
+          VERSION=$(python3 -c '
+          import pathlib, tomllib
+          print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])
+          ')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "workspace version: $VERSION"
+
+          # Cargo.lock ships inside the sdist with its own copy of the
+          # version. --locked fails on a stale lock instead of silently
+          # rewriting it, so the sdist cannot contradict the wheel.
+          cargo metadata --locked --format-version 1 >/dev/null
+
+          # No tag means a spot-check build that publishes nothing, so
+          # there is nothing for the version to disagree with.
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *) echo "no tag on this ref -- build publishes nothing, skipping tag check"; exit 0 ;;
+          esac
+
+          TAG="$GITHUB_REF_NAME"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match the workspace version $VERSION (expected tag v$VERSION)"
+            echo "Bump [workspace.package] version in Cargo.toml and let tag-release.yml cut the tag," >&2
+            echo "or delete this tag and re-cut it at a commit whose Cargo.toml reads ${TAG#v}." >&2
+            exit 1
+          fi
+          echo "tag $TAG matches the workspace version"
+
   wheel-windows-pgo:
+    needs: [verify-version]
     runs-on: windows-2022
     strategy:
       matrix:
@@ -155,6 +215,7 @@ jobs:
           path: dist/*.whl
 
   wheel-linux:
+    needs: [verify-version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -361,10 +422,13 @@ jobs:
           cp all/*linux*.whl dist/
           cp all/*.tar.gz dist/
 
-          # The version in these filenames comes from Cargo.toml, and the
-          # tag comes from whoever typed `git tag`. Nothing has forced
-          # those to agree until now -- and a mismatch is unfixable here,
-          # because the wrong version burns that filename on PyPI forever.
+          # verify-version already refused to build a tag that disagrees
+          # with Cargo.toml, so reaching here with a mismatch should be
+          # impossible. It is re-checked anyway: this is the last moment
+          # before an upload that cannot be undone -- a PyPI filename,
+          # once used, is burned for this project forever -- and a guard
+          # that costs nothing belongs on the irreversible side of the
+          # line, not only on the cheap one.
           VERSION="${TAG#v}"
           for f in dist/*; do
             case "$(basename "$f")" in
