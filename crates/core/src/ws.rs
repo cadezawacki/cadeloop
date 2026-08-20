@@ -24,10 +24,18 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         msg.push(0);
     }
     msg.extend_from_slice(&ml.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    // as_chunks, not chunks_exact: it yields `&[u8; N]` rather than a
+    // run-time-length slice, so from_be_bytes takes the array whole
+    // instead of re-indexing four times. The padding above makes both
+    // remainders provably empty -- msg is a multiple of 64 by
+    // construction, and 64 is a multiple of 4.
+    let (blocks, tail) = msg.as_chunks::<64>();
+    debug_assert!(tail.is_empty(), "padding should leave no partial block");
+    for chunk in blocks {
         let mut w = [0u32; 80];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, _) = chunk.as_chunks::<4>();
+        for (i, word) in words.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
