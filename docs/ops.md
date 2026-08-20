@@ -242,6 +242,25 @@ The environment also gives you a place to hang a required reviewer: add
 one under Settings → Environments → pypi and every publish pauses for
 manual approval.
 
+**`gh-action-pypi-publish` cannot be SHA-pinned.** Every other
+third-party action in this repository is pinned to a commit SHA, on the
+reasoning in `ci.yml`: a moving tag means what CI executes was decided
+by whoever last pushed there. This action is the exception, because it
+is a *Docker* action — it resolves to
+`ghcr.io/pypa/gh-action-pypi-publish:<ref>`, using the ref after the `@`
+as the image tag. Released images are published only under version tags
+(`v1`, `v1.14`, `v1.14.2` share one digest; no commit-SHA tag carries
+it), so a SHA pin does not tighten it, it breaks it:
+
+```
+docker: Error response from daemon: manifest unknown
+```
+
+That is how the v0.0.3 publish failed — after the wheels were built and
+the Release was already up. It is pinned to the patch tag `v1.14.2`,
+which is the tightest ref that resolves; `v1` and `v1.14` re-point on
+every release.
+
 ### Why the Windows wheels carry a build tag
 
 Both Windows legs produce the same PEP 427 filename — same project,
