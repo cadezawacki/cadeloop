@@ -235,6 +235,62 @@ jobs:
       # runner user. The reverse order leaves a root-owned directory
       # behind and this step fails writing into it.
       - run: pip install maturin && maturin sdist --out dist
+      - name: the sdist must contain every license file it declares
+        shell: bash
+        run: |
+          # PyPI (Metadata 2.4) rejects an sdist whose PKG-INFO names a
+          # License-File the archive does not actually contain. maturin
+          # writes `License-File: LICENSE` either way, but the sdist file
+          # list comes from `cargo package --list` against
+          # crates/pyshim/Cargo.toml, which cannot see a LICENSE at the
+          # repo root -- so the metadata promised a file the tarball did
+          # not have. The wheels are unaffected: maturin copies the
+          # license into `.dist-info/licenses/` itself.
+          #
+          # `twine check` does not catch this. It passed the exact tarball
+          # PyPI then refused, and 0.0.4 found out at the upload:
+          #
+          #   400 License-File LICENSE does not exist in distribution file
+          #   cadeloop-0.0.4.tar.gz at cadeloop-0.0.4/LICENSE
+          #
+          # which is the worst possible place to learn it -- both wheels
+          # were already up, so the version shipped half-published and
+          # those filenames are spent. Hence a check here, at the build,
+          # rather than trusting the upload to be the first reader of
+          # this metadata.
+          python3 - <<'EOF'
+          import glob, sys, tarfile
+
+          sdists = glob.glob("dist/*.tar.gz")
+          if len(sdists) != 1:
+              sys.exit(f"expected exactly 1 sdist, found {sdists}")
+
+          with tarfile.open(sdists[0]) as tf:
+              names = set(tf.getnames())
+              roots = {n.split("/", 1)[0] for n in names}
+              if len(roots) != 1:
+                  sys.exit(f"sdist has {len(roots)} top-level directories: {sorted(roots)}")
+              root = roots.pop()
+              member = tf.extractfile(f"{root}/PKG-INFO")
+              if member is None:
+                  sys.exit(f"sdist has no {root}/PKG-INFO")
+              metadata = member.read().decode()
+
+          declared = [
+              line.split(":", 1)[1].strip()
+              for line in metadata.splitlines()
+              if line.startswith("License-File:")
+          ]
+          missing = [f for f in declared if f"{root}/{f}" not in names]
+          if missing:
+              for f in missing:
+                  print(f"::error::PKG-INFO declares License-File: {f}, but {root}/{f} is not in the sdist")
+              sys.exit(
+                  "PyPI rejects this with a 400 at upload -- after the wheels have already gone up.\n"
+                  'Add the file under [tool.maturin] include, e.g. { path = "LICENSE", format = "sdist" }.'
+              )
+          print(f"sdist {sdists[0]}: all {len(declared)} declared license file(s) present {declared}")
+          EOF
       # Built inside the manylinux2014 container (glibc 2.17), not against
       # the runner's own glibc. A plain `maturin build` on ubuntu-latest
       # links 2.39 and gets tagged manylinux_2_39, which pip then refuses
