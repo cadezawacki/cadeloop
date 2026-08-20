@@ -3,8 +3,8 @@ resolver = "2"
 members = ["crates/core", "crates/pyshim"]
 
 [workspace.package]
-version = "0.0.1"
-edition = "2021"
+version = "0.0.2"
+edition = "2026"
 license = "MIT"
 repository = "https://github.com/cadezawacki/cadeloop"
 
