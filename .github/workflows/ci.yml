@@ -44,6 +44,13 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
       - run: cargo fmt --all --check
+      # Cargo.lock carries its own copy of the workspace version (the
+      # single source of truth is [workspace.package] version in the root
+      # Cargo.toml) and is shipped inside the sdist. Every other cargo
+      # invocation here would quietly rewrite a stale lock and move on,
+      # leaving the drift to surface at release time; --locked makes it a
+      # PR-time failure instead.
+      - run: cargo metadata --locked --format-version 1 > /dev/null
       - run: cargo clippy -p cadeloop-core --all-targets -- -D warnings
       # pyproject.toml has carried a [tool.ruff] section since the start
       # and nothing ever ran it. The rule set is bug-shaped (pyflakes,

@@ -63,6 +63,59 @@ Two caveats worth stating plainly:
   against `bytes_sent`, shows what corking is buying you.
 
 
+## Cutting a release
+
+**The version lives in exactly one place: `[workspace.package] version`
+in the root `Cargo.toml`.** Bump that line, merge it to `main`, and the
+rest happens on its own. Nothing else needs editing, and nothing else
+should be edited — every other copy of the version is derived:
+
+| where | how it gets the version |
+| --- | --- |
+| `crates/core`, `crates/pyshim` | `version.workspace = true` |
+| `cadeloop._core.__version__` | `env!("CARGO_PKG_VERSION")` at compile time |
+| `cadeloop.__version__` | re-exported from `_core` |
+| `pyproject.toml` | `dynamic = ["version"]` — maturin reads the crate |
+| wheel / sdist filenames | maturin, from the same crate metadata |
+| the `vX.Y.Z` git tag | `tag-release.yml`, from `Cargo.toml` |
+| `Cargo.lock` | cargo — CI runs `cargo metadata --locked` so it cannot drift |
+
+What happens on merge to `main`:
+
+1. **`tag-release.yml`** reads the workspace version, and if no `vX.Y.Z`
+   tag exists for it, creates and pushes one. If the tag already exists
+   the run is a no-op, so the workflow is safe on every push and safe to
+   re-run by hand.
+2. It then **dispatches `release.yml` at that tag**. This is explicit on
+   purpose: a tag pushed with the default `GITHUB_TOKEN` does *not* fire
+   `on: push: tags` — GitHub suppresses that to stop workflows recursing.
+   `workflow_dispatch` is a documented exception to that rule, and
+   dispatching at a tag ref leaves `github.ref` as `refs/tags/vX.Y.Z`, so
+   the run publishes exactly as a human-pushed tag would.
+3. **`release.yml`** verifies, builds, creates the GitHub Release, and
+   uploads to PyPI, as described below.
+
+Pushing a tag by hand still works and still triggers `release.yml` — but
+the tag now has to agree with `Cargo.toml` or the run fails in seconds
+(see `verify-version`). Prefer the bump.
+
+### The failure this replaced
+
+`v0.0.2` was tagged at a commit whose `Cargo.toml` still read `0.0.1`.
+Nothing checked, so the full PGO matrix ran, produced
+`cadeloop-0.0.1-*.whl`, attached those to the *v0.0.2* Release, and the
+disagreement finally surfaced in `pypi-publish` — the last job of the
+run:
+
+```
+tag v0.0.2 implies version 0.0.2, but built cadeloop-0.0.1-2-cp311-cp311-win_amd64.whl
+```
+
+Two changes make that unrepresentable. The tag is now *derived* from
+`Cargo.toml` rather than typed alongside it, and `verify-version` runs
+first and gates every other job, so a mismatched tag costs fifteen
+seconds instead of a full matrix plus a wrong Release.
+
 ## Release wheels (R-110/R-111)
 
 `release.yml` builds three artifacts on tag push (or dispatch):
@@ -91,9 +144,12 @@ pip install cadeloop                                    # PyPI
 pip install https://github.com/cadezawacki/cadeloop/releases/download/<tag>/<wheel>
 ```
 
-A **workflow_dispatch** run has no tag to hang a Release off, publishes
-to neither destination, and leaves its wheels as run artifacts only —
-that is the way to spot-check a build without shipping it.
+Publishing keys off the **ref**, not the trigger. A **workflow_dispatch
+against a branch** has no tag to hang a Release off, publishes to
+neither destination, and leaves its wheels as run artifacts only — that
+is the way to spot-check a build without shipping it. A dispatch
+**against a `v*` tag** publishes normally, which is how `tag-release.yml`
+drives the automated path.
 
 ### Things that will bite you on a release
 
@@ -101,8 +157,9 @@ that is the way to spot-check a build without shipping it.
 be reused for that project — deleting the release does not free it. The
 `pypi-publish` job therefore runs last, gated on `github-release`
 succeeding, and asserts that every file's version matches the tag before
-uploading. A tag that disagrees with `Cargo.toml`'s workspace version
-fails the job instead of burning the wrong filename forever.
+uploading. That assertion should now be unreachable — `verify-version`
+rejects a mismatched tag before anything is built — but it stays, because
+it is the last guard on the side of the line that cannot be undone.
 
 **The v3 wheel is withheld from PyPI on purpose.** pip's build-tag
 ordering already prefers the baseline, but "prefers" is the wrong

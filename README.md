@@ -73,8 +73,8 @@ glibc ≥ 2.17), plus a source distribution.
 
 ```bash
 python -c "import cadeloop; l = cadeloop.new_event_loop(); print(cadeloop.__version__, l.stats()['backend']); l.close()"
-# 0.0.1 iocp     (Windows)
-# 0.0.1 epoll-dev (Linux)
+# 0.0.2 iocp      (Windows)
+# 0.0.2 epoll-dev  (Linux)
 ```
 
 ---

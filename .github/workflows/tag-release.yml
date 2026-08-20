@@ -1,0 +1,199 @@
+# Cut a release tag when the workspace version moves.
+#
+# `[workspace.package] version` in the root Cargo.toml is the single
+# source of truth for this project's version -- both crates inherit it
+# with `version.workspace = true`, the extension re-exports it as
+# `cadeloop.__version__` via `env!("CARGO_PKG_VERSION")`, pyproject.toml
+# declares `dynamic = ["version"]` so maturin reads it from the crate
+# rather than carrying a second copy, and the wheel filenames fall out of
+# the same value. Bumping that one line is the whole release ceremony.
+#
+# This workflow closes the last manual gap. Before it, the tag was typed
+# by hand and nothing forced it to agree with Cargo.toml: `v0.0.2` got
+# pushed at a commit whose Cargo.toml still said 0.0.1, so the run built
+# `cadeloop-0.0.1-*.whl`, attached those to the v0.0.2 Release, and only
+# blew up in `pypi-publish` -- the last job, after the full PGO matrix had
+# already run. Deriving the tag from the file makes that disagreement
+# unrepresentable.
+#
+# Note on the dispatch at the end: a tag pushed with the default
+# GITHUB_TOKEN does NOT trigger `on: push: tags` -- GitHub suppresses it
+# to stop workflows recursing. `workflow_dispatch` and `repository_dispatch`
+# are the documented exceptions, so release.yml is started explicitly,
+# against the new tag. Dispatching at a tag ref leaves `github.ref` as
+# `refs/tags/vX.Y.Z`, which is what release.yml's publish gates key on,
+# so the run publishes exactly as a human-pushed tag would.
+name: tag-release
+
+on:
+  push:
+    branches: ["main"]
+  # Re-runnable by hand: if the tag push or the dispatch below failed
+  # (a transient API error, a permissions change), running this against
+  # main picks up wherever it left off -- an existing tag is a no-op.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two pushes to main in quick succession must not race to create the same
+# tag. Not cancel-in-progress: a superseded run here may be the one
+# holding the only bump, and cancelling it would drop the release.
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag
+      actions: write # dispatch release.yml
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Tags are needed to answer "has this version already shipped?",
+          # and checkout does not fetch them at the default depth.
+          fetch-depth: 0
+
+      - name: read the workspace version
+        id: version
+        shell: bash
+        run: |
+          # tomllib, not grep: `version = ` appears under [workspace.package],
+          # under [workspace.dependencies], and in every dependency table.
+          # A regex that picks the wrong one here mints a wrong tag, and a
+          # wrong tag burns a PyPI filename that can never be reclaimed.
+          VERSION=$(python3 -c '
+          import pathlib, tomllib
+          print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])
+          ')
+
+          # PEP 440 / semver overlap: X.Y.Z, optionally with a pre-release
+          # suffix. Anything else is a typo, and a typo'd tag is not
+          # recoverable downstream -- catch it before the tag exists.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "workspace version '$VERSION' is not a release version" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "workspace version: $VERSION"
+
+      - name: has this version already been tagged?
+        id: check
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Every push to main lands here, not just version bumps -- a
+          # path filter on Cargo.toml would be cheaper but silently misses
+          # a bump that arrives by a route the filter does not see, and a
+          # release that quietly did not happen is a worse failure than a
+          # ten-second job that finds nothing to do. The tag is the state:
+          # if it exists, this version has shipped and there is no work.
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG already exists -- nothing to release."
+
+            # One case where "already tagged" is not the same as "already
+            # released": a tag cut at a commit that predates the bump, so
+            # it names a version its own Cargo.toml does not contain. Such
+            # a tag can never produce a correct build -- verify-version
+            # will reject every run against it -- and because this job
+            # no-ops on any existing tag, it would sit there silently
+            # blocking the release forever. Say so instead.
+            TAGGED=$(git show "refs/tags/$TAG:Cargo.toml" 2>/dev/null \
+              | python3 -c '
+          import sys, tomllib
+          try:
+              print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])
+          except Exception:
+              print("<unreadable>")
+          ')
+            if [ "$TAGGED" != "$VERSION" ]; then
+              echo "::warning::$TAG points at a commit whose Cargo.toml reads '$TAGGED', not '$VERSION'. That tag cannot build a correct release."
+              {
+                echo "### :warning: \`$TAG\` is stale"
+                echo ""
+                echo "It points at a commit whose \`Cargo.toml\` reads \`$TAGGED\`, not \`$VERSION\`,"
+                echo "so \`release.yml\` will reject every run against it and no release can be cut"
+                echo "for this version until the tag is moved."
+                echo ""
+                echo "Re-cut it at the current commit (safe only while nothing for \`$VERSION\` has"
+                echo "reached PyPI -- a PyPI filename is never reclaimable):"
+                echo ""
+                echo '```bash'
+                echo "git push --delete origin $TAG"
+                echo "git tag -d $TAG"
+                echo "# then re-run this workflow, or bump to the next version"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$TAG does not exist yet -- cutting it."
+          fi
+
+      - name: sanity-check the tree before tagging
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Cargo.lock carries its own copy of the workspace version, and
+          # it is shipped inside the sdist. A stale lock means the sdist
+          # tells one story and the wheel another. `--locked` fails rather
+          # than quietly rewriting it, which is the point.
+          cargo metadata --locked --format-version 1 >/dev/null
+
+          # Belt and braces: confirm the version cargo actually resolves
+          # for the published package matches what was parsed above. If
+          # these ever disagree, the parse is wrong and the tag would be.
+          RESOLVED=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 -c '
+          import json, sys
+          pkgs = {p["name"]: p["version"] for p in json.load(sys.stdin)["packages"]}
+          print(pkgs["cadeloop-pyshim"])
+          ')
+          if [ "$RESOLVED" != "$VERSION" ]; then
+            echo "Cargo.toml says $VERSION but cargo resolves $RESOLVED" >&2
+            exit 1
+          fi
+          echo "cargo agrees: $RESOLVED"
+
+      - name: create and push the tag
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Annotated, not lightweight: the tag object records who cut the
+          # release and when, and `gh release create --verify-tag` and
+          # `git describe` both behave better against one.
+          git tag -a "$TAG" -m "cadeloop $TAG"
+          git push origin "$TAG"
+
+      - name: start the release build
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # See the header: the tag push above cannot trigger release.yml
+          # by itself, because it was made with GITHUB_TOKEN. This is the
+          # sanctioned way through.
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TAG"
+          echo "dispatched release.yml at $TAG"
+          echo "### Released \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag pushed and \`release.yml\` dispatched: wheels build, the GitHub Release is created, then PyPI." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GITHUB_REPOSITORY/actions/workflows/release.yml" >> "$GITHUB_STEP_SUMMARY"
