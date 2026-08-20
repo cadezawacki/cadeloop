@@ -203,6 +203,32 @@ uploading. That assertion should now be unreachable — `verify-version`
 rejects a mismatched tag before anything is built — but it stays, because
 it is the last guard on the side of the line that cannot be undone.
 
+**An sdist must contain the license file its metadata names.** PyPI
+implements Metadata 2.4, and rejects a distribution whose `PKG-INFO`
+declares a `License-File` the archive does not hold. maturin writes
+`License-File: LICENSE` from `pyproject.toml` either way, but the sdist's
+file list comes from `cargo package --list` against
+`crates/pyshim/Cargo.toml`, which cannot see a `LICENSE` at the repo
+root — so the metadata promised a file the tarball lacked. Wheels are
+unaffected: maturin copies the license into `.dist-info/licenses/`
+itself, which is why 0.0.4 uploaded both wheels and then failed:
+
+```
+400 License-File LICENSE does not exist in distribution file
+cadeloop-0.0.4.tar.gz at cadeloop-0.0.4/LICENSE
+```
+
+That is the worst place to learn it — the version ends up half
+published, and the wheel filenames are spent. `[tool.maturin] include`
+puts the file in the sdist, and `wheel-linux` now asserts at build time
+that every declared license file is really there. **`twine check` does
+not catch this**; it passed the exact tarball PyPI refused.
+
+Note that a rejected upload does *not* burn the filename — only a
+successful one does. But a half-published version cannot be completed by
+re-running the tag either, since the re-run builds from the tree at that
+tag, which still has the bug. Bump to the next version instead.
+
 **The v3 wheel is withheld from PyPI on purpose.** pip's build-tag
 ordering already prefers the baseline, but "prefers" is the wrong
 guarantee for an index everyone installs from without reading. It stays a

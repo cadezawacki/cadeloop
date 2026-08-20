@@ -54,6 +54,12 @@ Issues = "https://github.com/cadezawacki/cadeloop/issues"
 Changelog = "https://github.com/cadezawacki/cadeloop/releases"
 
 [tool.maturin]
+# LICENSE lives at the repo root, but the sdist file list comes from
+# `cargo package --list` against crates/pyshim/Cargo.toml, which never
+# sees it. maturin still writes `License-File: LICENSE` into the
+# metadata, and PyPI (Metadata 2.4) rejects an sdist whose declared
+# license file is not actually in the archive.
+include = [{ path = "LICENSE", format = "sdist" }]
 manifest-path = "crates/pyshim/Cargo.toml"
 python-source = "python"
 module-name = "cadeloop._core"
