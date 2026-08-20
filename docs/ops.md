@@ -78,14 +78,16 @@ should be edited — every other copy of the version is derived:
 | `pyproject.toml` | `dynamic = ["version"]` — maturin reads the crate |
 | wheel / sdist filenames | maturin, from the same crate metadata |
 | the `vX.Y.Z` git tag | `tag-release.yml`, from `Cargo.toml` |
-| `Cargo.lock` | cargo — CI runs `cargo metadata --locked` so it cannot drift |
+| `Cargo.lock` | `tag-release.yml` regenerates and commits it as part of cutting the tag |
 
 What happens on merge to `main`:
 
 1. **`tag-release.yml`** reads the workspace version, and if no `vX.Y.Z`
-   tag exists for it, creates and pushes one. If the tag already exists
-   the run is a no-op, so the workflow is safe on every push and safe to
-   re-run by hand.
+   tag exists for it, regenerates `Cargo.lock` (`cargo update --workspace
+   --offline` — only the two path members move, dependency pins are
+   untouched), commits that if it changed, and pushes a tag. If the tag
+   already exists the run is a no-op, so the workflow is safe on every
+   push and safe to re-run by hand.
 2. It then **dispatches `release.yml` at that tag**. This is explicit on
    purpose: a tag pushed with the default `GITHUB_TOKEN` does *not* fire
    `on: push: tags` — GitHub suppresses that to stop workflows recursing.
@@ -115,6 +117,27 @@ Two changes make that unrepresentable. The tag is now *derived* from
 `Cargo.toml` rather than typed alongside it, and `verify-version` runs
 first and gates every other job, so a mismatched tag costs fifteen
 seconds instead of a full matrix plus a wrong Release.
+
+### Why nothing asserts Cargo.lock is already in step
+
+A first attempt at the above had `tag-release.yml` and `verify-version`
+both run `cargo metadata --locked`, on the reasoning that the lock ships
+inside the sdist and should not contradict the wheel. That blocked the
+0.0.3 release outright:
+
+```
+error: cannot update the lock file ... because --locked was passed to prevent this
+```
+
+A version bump here is a one-line edit, often made in the GitHub web UI,
+and the lock is the one file that edit cannot produce. Asserting on
+derived data made the release depend on a human remembering to
+regenerate it — precisely the coupling the single source of truth is
+supposed to remove. The lock is now regenerated automatically, and
+nothing fails on it: a stale lock only restates a version cargo
+recomputes by itself, so it is not worth a red build, let alone a
+blocked release. If the sync commit cannot be pushed (branch protection,
+or a commit landing mid-run) the workflow warns and releases anyway.
 
 ## Release wheels (R-110/R-111)
 
