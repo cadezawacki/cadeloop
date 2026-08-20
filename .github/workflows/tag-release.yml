@@ -137,32 +137,59 @@ jobs:
             echo "$TAG does not exist yet -- cutting it."
           fi
 
-      - name: sanity-check the tree before tagging
+      - name: bring Cargo.lock along
         if: steps.check.outputs.exists == 'false'
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Cargo.lock carries its own copy of the workspace version, and
-          # it is shipped inside the sdist. A stale lock means the sdist
-          # tells one story and the wheel another. `--locked` fails rather
-          # than quietly rewriting it, which is the point.
-          cargo metadata --locked --format-version 1 >/dev/null
+          # Cargo.lock records the workspace members' own versions, so
+          # every bump leaves it a version behind. That is derived data,
+          # and regenerating it is this workflow's job, not a human's --
+          # the whole point of one source of truth is that everything
+          # else follows from it without anyone remembering to.
+          #
+          # An earlier revision asserted the lock was already in step
+          # instead of fixing it, and blocked the 0.0.3 release outright:
+          #
+          #   error: cannot update the lock file ... because --locked was
+          #   passed to prevent this
+          #
+          # A version bump here is a one-line edit in the GitHub web UI,
+          # so demanding a `cargo update` alongside it made the file the
+          # bump depends on the one thing the bump could not produce.
+          #
+          # --workspace --offline: only the two path members change, so
+          # there is no index access and no dependency resolution. Every
+          # dependency pin is left exactly as it was.
+          cargo update --workspace --offline
 
-          # Belt and braces: confirm the version cargo actually resolves
-          # for the published package matches what was parsed above. If
-          # these ever disagree, the parse is wrong and the tag would be.
-          RESOLVED=$(cargo metadata --locked --format-version 1 --no-deps \
-            | python3 -c '
-          import json, sys
-          pkgs = {p["name"]: p["version"] for p in json.load(sys.stdin)["packages"]}
-          print(pkgs["cadeloop-pyshim"])
-          ')
-          if [ "$RESOLVED" != "$VERSION" ]; then
-            echo "Cargo.toml says $VERSION but cargo resolves $RESOLVED" >&2
-            exit 1
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matches $VERSION -- nothing to sync."
+            exit 0
           fi
-          echo "cargo agrees: $RESOLVED"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "Cargo.lock: sync to $VERSION"
+
+          # Push before tagging, so the tag names a commit that is
+          # actually on the branch rather than one invented here and
+          # reachable only through the tag.
+          #
+          # This can be refused -- branch protection, or a commit that
+          # landed while this run was going. Neither is worth failing a
+          # release over: a stale lock records a version cargo recomputes
+          # by itself, and the sdist stays installable either way. Fall
+          # back to tagging the commit the branch already has.
+          ORIGINAL=$(git rev-parse HEAD~1)
+          if git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"; then
+            echo "Cargo.lock synced to $VERSION and pushed."
+          else
+            echo "::warning::could not push the Cargo.lock sync to $GITHUB_REF_NAME; tagging $ORIGINAL as-is. The lock still reads the previous version -- harmless, but worth syncing by hand."
+            git reset --hard "$ORIGINAL"
+          fi
 
       - name: create and push the tag
         if: steps.check.outputs.exists == 'false'

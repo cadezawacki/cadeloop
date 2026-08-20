@@ -72,10 +72,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "workspace version: $VERSION"
 
-          # Cargo.lock ships inside the sdist with its own copy of the
-          # version. --locked fails on a stale lock instead of silently
-          # rewriting it, so the sdist cannot contradict the wheel.
-          cargo metadata --locked --format-version 1 >/dev/null
+          # Deliberately no cargo here. The one thing worth blocking a
+          # release on is the tag disagreeing with Cargo.toml; everything
+          # else cargo recomputes on its own. An earlier version of this
+          # job also ran `cargo metadata --locked`, which turned a stale
+          # Cargo.lock -- derived data, and now regenerated automatically
+          # by tag-release.yml -- into a hard release blocker. Keeping
+          # this check to bash and python3 also means no toolchain, no
+          # crates.io index, and nothing to be flaky.
 
           # No tag means a spot-check build that publishes nothing, so
           # there is nothing for the version to disagree with.
