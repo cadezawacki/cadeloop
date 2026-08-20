@@ -445,7 +445,28 @@ jobs:
             esac
           done
           ls -l dist
-      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+      # The one third-party action here NOT pinned to a commit SHA. The
+      # exception is forced, not chosen: this is a Docker action, and it
+      # resolves itself to `ghcr.io/pypa/gh-action-pypi-publish:<ref>` --
+      # whatever follows the `@` is used as the *image tag*. Released
+      # images are published only under version tags: `v1`, `v1.14` and
+      # `v1.14.2` all resolve to one digest
+      # (sha256:5c2f7030fbef8308068eb4cc9080fd3c9e157ccf6d511924d69f8f4b23dc95c1)
+      # and no commit-SHA tag carries it. So a SHA pin here does not pin
+      # the action, it breaks it:
+      #
+      #   Unable to find image 'ghcr.io/pypa/gh-action-pypi-publish:a892a5a...'
+      #   docker: Error response from daemon: manifest unknown
+      #
+      # which is how the v0.0.3 publish failed -- after the wheels were
+      # built and the Release was already up.
+      #
+      # A patch tag is the tightest ref that actually resolves: `v1` and
+      # `v1.14` re-point on every release, `v1.14.2` does not. To pin
+      # content rather than a name, a step can name the digest directly
+      # with `uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:...`,
+      # at the cost of leaving the documented `uses:` path.
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           packages-dir: dist
           # An artifact re-download after a partial upload would otherwise
