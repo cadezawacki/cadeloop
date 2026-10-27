@@ -34,7 +34,7 @@ use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
 use cadeloop_core::http::{Limits, ParseError};
 use cadeloop_core::netsys;
 use cadeloop_core::opslab::OpId;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -49,9 +49,56 @@ const CORK_FLUSH_BYTES: usize = 64 * 1024;
 /// Recv slot class: 64 KiB reads.
 const RECV_CLASS: SizeClass = SizeClass::S64K;
 
+/// The OS's message for `code` -- what `os.strerror()` (or, on Windows,
+/// a socket.error) says -- without the " (os error N)" suffix that Rust's
+/// `io::Error` display appends.
+pub(crate) fn os_strerror(code: i32) -> String {
+    let mut s = io::Error::from_raw_os_error(code).to_string();
+    if let Some(i) = s.rfind(" (os error ") {
+        s.truncate(i);
+    }
+    // CPython trims FormatMessage's trailing period and line break.
+    #[cfg(windows)]
+    s.truncate(s.trim_end_matches(|c: char| c == '.' || c.is_whitespace()).len());
+    s
+}
+
+/// `OSError(code, msg)` built the way the socket module builds its own:
+/// `errno` and `strerror` set, and the subclass (ConnectionRefusedError,
+/// BrokenPipeError, ...) picked from the code by OSError itself.
+///
+/// PyO3's `From<io::Error>` keeps only the display string, so every
+/// native failure used to arrive with `errno=None` and a Rust-style
+/// "Connection refused (os error 111)" message -- and code that branches
+/// on `exc.errno` (asyncio's own create_server skipping an address family
+/// the host lacks, retry loops checking EADDRINUSE) never matched.
+pub(crate) fn os_error_msg(code: i32, msg: String) -> PyErr {
+    // The four-argument form sets `winerror`, from which OSError derives
+    // errno -- what socket.error carries on Windows.
+    #[cfg(windows)]
+    {
+        PyOSError::new_err((code, msg, Option::<i32>::None, code))
+    }
+    #[cfg(not(windows))]
+    {
+        PyOSError::new_err((code, msg))
+    }
+}
+
+pub(crate) fn os_error(code: i32) -> PyErr {
+    os_error_msg(code, os_strerror(code))
+}
+
+/// `io::Error` -> `OSError`, keeping the errno (see `os_error_msg`).
+pub(crate) fn io_error(e: io::Error) -> PyErr {
+    match e.raw_os_error() {
+        Some(code) => os_error(code),
+        None => e.into(),
+    }
+}
+
 pub(crate) fn os_err(py: Python<'_>, code: u32) -> Py<PyAny> {
-    let err: PyErr = io::Error::from_raw_os_error(code as i32).into();
-    err.into_value(py).into_any()
+    os_error(code as i32).into_value(py).into_any()
 }
 
 // --------------------------------------------------------------------- //
@@ -517,7 +564,7 @@ pub(crate) enum NetEvent {
     },
     ConnLost {
         connection_lost: Py<PyAny>,
-        err: Option<u32>,
+        err: LostReason,
     },
     ResumeWriting {
         resume_writing: Py<PyAny>,
@@ -662,6 +709,25 @@ fn cancel_dgram_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut Datagr
     }
 }
 
+/// What a stream transport's `connection_lost` receives.
+pub(crate) enum LostReason {
+    /// Orderly close: `None`.
+    Clean,
+    /// An OS error code, raised as the matching OSError subclass.
+    Os(u32),
+    /// A Python exception, delivered as is. This is how sslproto reports
+    /// a failed handshake, a corrupt record or an expired timeout (through
+    /// `_force_close(exc)`), and how a raising protocol callback is
+    /// reported -- the application learns why the connection died.
+    Exc(Py<PyAny>),
+}
+
+impl From<Option<u32>> for LostReason {
+    fn from(err: Option<u32>) -> Self {
+        err.map_or(LostReason::Clean, LostReason::Os)
+    }
+}
+
 /// Tear a connection down: cancel ops, close the socket, emit ConnLost.
 /// `err` None = orderly close. In-cell; entry moves to the graveyard.
 pub(crate) fn teardown_with(
@@ -671,11 +737,32 @@ pub(crate) fn teardown_with(
     tid: u64,
     err: Option<u32>,
 ) {
-    let Some(mut entry) = net.transports.remove(&tid) else { return };
+    teardown_reason(py, net, backend, tid, err.into());
+}
+
+/// `teardown_with` for any [`LostReason`]. In-cell: an exception that
+/// will not be delivered (the transport is already gone) goes to the
+/// graveyard rather than being dropped here.
+pub(crate) fn teardown_reason(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    tid: u64,
+    err: LostReason,
+) {
+    let Some(mut entry) = net.transports.remove(&tid) else {
+        if let LostReason::Exc(exc) = err {
+            net.graveyard_py.push(exc);
+        }
+        return;
+    };
     if let Some(sock) = entry.extra_sock.take() {
         net.graveyard_sockets.push(sock);
     }
     if entry.conn_lost {
+        if let LostReason::Exc(exc) = err {
+            net.graveyard_py.push(exc);
+        }
         net.graveyard_entries.push(entry);
         return;
     }
@@ -693,6 +780,9 @@ pub(crate) fn teardown_with(
             net.events.push(NetEvent::ConnLost { connection_lost: p.connection_lost.clone_ref(py), err });
         }
         ProtoKind::Http(conn) => {
+            if let LostReason::Exc(exc) = err {
+                net.graveyard_py.push(exc);
+            }
             conn.disconnected = true;
             let ws = conn.ws.is_some();
             if let Some(wsc) = conn.ws.as_ref() {
@@ -2246,8 +2336,9 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             },
             NetEvent::ConnLost { connection_lost, err } => {
                 let exc_obj = match err {
-                    Some(code) => os_err(py, code),
-                    None => py.None(),
+                    LostReason::Clean => py.None(),
+                    LostReason::Os(code) => os_err(py, code),
+                    LostReason::Exc(exc) => exc,
                 };
                 core.guard_protocol_call(py, connection_lost.call1(py, (exc_obj,)))?;
             }
@@ -2639,7 +2730,7 @@ pub(crate) fn wire_stream(
         // register_socket failed, so it is NOT associated: a bare close is
         // right here and a detach would be meaningless.
         netsys::close(sock);
-        return Err(e.into());
+        return Err(io_error(e));
     }
     let tid = core.with_net(|net, _| net.next_id())?;
     let transport = Py::new(py, Transport { core: slf.clone().unbind(), tid })?;
@@ -3096,10 +3187,34 @@ impl Transport {
     }
 
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
+        self._force_close(py, None)
+    }
+
+    /// Drop the connection now and hand `exc` to `connection_lost`.
+    ///
+    /// Private in asyncio, but part of the contract its stdlib
+    /// `sslproto.SSLProtocol` relies on: a failed handshake, a corrupt
+    /// record and both TLS timeouts all end in `transport._force_close(exc)`.
+    /// Without it each of those raised AttributeError instead -- the
+    /// handshake waiter was never failed, so `create_connection` returned
+    /// a `None` transport for an untrusted certificate, and the timeouts
+    /// never closed anything.
+    #[pyo3(signature = (exc=None))]
+    fn _force_close(&self, py: Python<'_>, exc: Option<Bound<'_, PyAny>>) -> PyResult<()> {
         let core = self.core_ref(py);
         let tid = self.tid;
-        core.with_net(|net, reactor| teardown_with(py, net, reactor.backend_mut(), tid, None))?;
+        let reason = match exc {
+            Some(e) if !e.is_none() => LostReason::Exc(e.unbind()),
+            _ => LostReason::Clean,
+        };
+        core.with_net(|net, reactor| teardown_reason(py, net, reactor.backend_mut(), tid, reason))?;
         core.drain_graveyards(py)
+    }
+
+    /// `loop.start_tls()` checks this before upgrading a transport.
+    #[classattr]
+    fn _start_tls_compatible() -> bool {
+        true
     }
 
     fn is_closing(&self, py: Python<'_>) -> PyResult<bool> {

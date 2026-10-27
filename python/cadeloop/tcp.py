@@ -8,13 +8,15 @@ replaces it in M4). Mixed into ``cadeloop.Loop``.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import errno
 import functools
+import itertools
 import os
 import socket
 import stat
 import sys
-from asyncio import sslproto, staggered
+from asyncio import sslproto, staggered, tasks
 from asyncio.base_events import _interleave_addrinfos
 
 try:
@@ -44,12 +46,17 @@ def _check_ssl_socket(sock):
 
 
 # socket()-creation failures that CPython's create_server treats as
-# "skip this address family" during multi-family resolution.
-# WSAEAFNOSUPPORT rides along because the native listener surfaces raw
-# Winsock codes on Windows.
+# "skip this address family" during multi-family resolution. The core
+# reports those by returning None (tcp_listen's skip_unavailable); this
+# covers one that raises instead. WSAEAFNOSUPPORT rides along because the
+# native listener surfaces raw Winsock codes on Windows.
 _AF_UNAVAILABLE = frozenset(
     {errno.EAFNOSUPPORT, getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT)}
 )
+
+# How the core words a bind failure (asyncio's wording).
+_BIND_ERROR_PREFIX = "error while attempting to bind on address"
+
 
 
 class Server(asyncio.AbstractServer):
@@ -238,7 +245,7 @@ class TcpSurface:
             host, port, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
         )
         if not infos:
-            raise OSError(f"getaddrinfo({host!r}) returned empty list")
+            raise OSError("getaddrinfo() returned empty list")
         laddr_infos = None
         if local_addr is not None:
             laddr_infos = await self.getaddrinfo(
@@ -246,46 +253,22 @@ class TcpSurface:
                 proto=proto, flags=flags,
             )
             if not laddr_infos:
-                raise OSError("getaddrinfo() returned empty list for local_addr")
+                raise OSError("getaddrinfo() returned empty list")
         if interleave:
             infos = _interleave_addrinfos(infos, interleave)
 
-        errors = []
+        # One list per attempt, flattened at the end -- the shape of
+        # base_events._connect_sock, so the error raised when every
+        # attempt fails is the one asyncio would raise.
+        exceptions = []
 
         async def attempt(address, af):
-            # The whole sockaddr, not host/port: an IPv6 one carries the
-            # flow info and interface scope in elements 2 and 3, and a
-            # link-local peer (fe80::...%eth0) is unreachable without the
-            # scope however cleanly it resolved.
-            local_sockaddr = None
-            if laddr_infos is not None:
-                for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
-                    if lfamily == af:
-                        local_sockaddr = laddr
-                        break
-                else:
-                    exc = OSError(f"no matching local address with family={af!r} found")
-                    errors.append(exc)
-                    raise exc
-            fut = self.create_future()
+            my_exceptions = []
+            exceptions.append(my_exceptions)
             try:
-                op = self._core.tcp_connect(address, fut, local_sockaddr)
+                return await self._connect_one(address, af, laddr_infos, my_exceptions)
             except OSError as exc:
-                errors.append(exc)
-                raise
-            try:
-                return await fut
-            except asyncio.CancelledError:
-                # Cancel the native op too. Every losing Happy Eyeballs
-                # attempt lands here, so without this each connection
-                # leaves N-1 sockets in a half-open connect until the OS
-                # times them out -- which can be minutes. The completion
-                # still arrives and closes the socket; this only brings
-                # that forward.
-                self._core.cancel_connect(op)
-                raise
-            except OSError as exc:
-                errors.append(exc)
+                my_exceptions.append(exc)
                 raise
 
         if happy_eyeballs_delay is None:
@@ -310,14 +293,65 @@ class TcpSurface:
                 loop=self,
             )
         if fd is None:
-            if len(errors) == 1:
-                raise errors[0]
-            raise OSError(
-                f"Multiple exceptions: {', '.join(str(e) for e in errors)}"
-            ) from (errors[0] if errors else None)
+            exceptions = [exc for sub in exceptions for exc in sub]
+            try:
+                if len(exceptions) == 1:
+                    raise exceptions[0]
+                # If they all have the same str(), raise one.
+                model = str(exceptions[0])
+                if all(str(exc) == model for exc in exceptions):
+                    raise exceptions[0]
+                raise OSError(
+                    "Multiple exceptions: {}".format(", ".join(str(exc) for exc in exceptions))
+                )
+            finally:
+                exceptions = None
         return await self._wrap_outgoing(
             fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
         )
+
+    async def _connect_one(self, address, af, laddr_infos, my_exceptions):
+        """One native connect to `address` (a full sockaddr: an IPv6 one
+        carries the interface scope a link-local peer needs), bound to the
+        first of `laddr_infos` of the same family that will bind."""
+        fut = self.create_future()
+        if laddr_infos is None:
+            op = self._core.tcp_connect(address, fut, None)
+        else:
+            op = None
+            for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
+                if lfamily != af:
+                    continue
+                try:
+                    op = self._core.tcp_connect(address, fut, laddr)
+                    break
+                except OSError as exc:
+                    # The core words a bind failure as asyncio does; any
+                    # other failure (no socket of this family) ends the
+                    # attempt, as socket() failing does in base_events.
+                    if not (exc.strerror or "").startswith(_BIND_ERROR_PREFIX):
+                        raise
+                    my_exceptions.append(exc)
+            if op is None:
+                if my_exceptions:
+                    raise my_exceptions.pop()
+                raise OSError(f"no matching local address with family={af!r} found")
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            # Cancel the native op too. Every losing Happy Eyeballs
+            # attempt lands here, so without this each connection
+            # leaves N-1 sockets in a half-open connect until the OS
+            # times them out -- which can be minutes. The completion
+            # still arrives and closes the socket; this only brings
+            # that forward.
+            self._core.cancel_connect(op)
+            raise
+        except OSError as exc:
+            if exc.errno is None:
+                raise
+            # base_events' wording, so the address that refused is named.
+            raise OSError(exc.errno, f"Connect call failed {address}") from None
 
     async def _wrap_outgoing(
         self,
@@ -362,6 +396,12 @@ class TcpSurface:
                 ssl_handshake_timeout=ssl_handshake_timeout,
                 ssl_shutdown_timeout=ssl_shutdown_timeout,
             )
+            # Taken now, as selector_events._make_ssl_transport does:
+            # SSLProtocol.connection_lost clears the attribute, so reading
+            # it after the handshake returned None for any connection that
+            # had already died -- a handshake that failed without failing
+            # the waiter came back as a successful `(None, protocol)`.
+            app_transport = protocol._app_transport
         except BaseException:
             self._core.discard_socket(fd)
             raise
@@ -377,7 +417,7 @@ class TcpSurface:
             # believes the connection attempt was abandoned.
             transport.close()
             raise
-        return protocol._app_transport, app_protocol
+        return app_transport, app_protocol
 
     async def connect_accepted_socket(
         self,
@@ -417,6 +457,18 @@ class TcpSurface:
         ssl_shutdown_timeout=None,
     ):
         """Upgrade an established transport to TLS (sslproto path)."""
+        if ssl_module is None:
+            raise RuntimeError("Python ssl module is not available")
+        # base_events.start_tls's checks. Without the first, a missing
+        # context reached SSLProtocol, which builds a default *client*
+        # context for it -- a server-side upgrade then waited out the
+        # handshake timeout instead of failing at the call.
+        if not isinstance(sslcontext, ssl_module.SSLContext):
+            raise TypeError(
+                f"sslcontext is expected to be an instance of ssl.SSLContext, got {sslcontext!r}"
+            )
+        if not getattr(transport, "_start_tls_compatible", False):
+            raise TypeError(f"transport {transport!r} is not supported by start_tls()")
         waiter = self.create_future()
         ssl_protocol = self._make_ssl_protocol(
             protocol,
@@ -445,9 +497,10 @@ class TcpSurface:
         if ssl_module is None:
             raise RuntimeError("stdlib ssl module is not available")
         if isinstance(ssl, bool):
-            if server_side:
-                raise ValueError("ssl=True is not supported server-side; pass an SSLContext")
-            return ssl_module.create_default_context()
+            # None: SSLProtocol builds the default context itself, exactly
+            # as asyncio does -- including dropping the hostname check for
+            # `server_hostname=''`, and refusing ssl=True server-side.
+            return None
         return ssl
 
     def _make_ssl_protocol(self, app_protocol, sslcontext, waiter, **kwargs):
@@ -489,13 +542,20 @@ class TcpSurface:
             raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
         if sock is not None:
             _check_ssl_socket(sock)
+        if host is not None or port is not None:
+            if sock is not None:
+                raise ValueError("host/port and sock can not be specified at the same time")
+        elif sock is None:
+            # Not a random port: asyncio refuses a call that names nothing
+            # to serve on, and binding something anyway hid the mistake.
+            raise ValueError("Neither host/port nor sock were specified")
+        elif sock.type != socket.SOCK_STREAM:
             # Checked before ownership transfers. A SOCK_DGRAM socket got
             # detached and registered as a listener, and then accept() on
             # it failed forever -- the listener rearms after each failure,
             # so the caller was handed an apparently serving Server that
             # only logged accept errors, instead of a ValueError here.
-            if sock.type != socket.SOCK_STREAM:
-                raise ValueError(f"a stream socket was expected, got {sock!r}")
+            raise ValueError(f"a stream socket was expected, got {sock!r}")
         if reuse_port and not hasattr(socket, "SO_REUSEPORT"):
             raise ValueError("reuse_port not supported by socket module")
 
@@ -517,8 +577,6 @@ class TcpSurface:
         entries = []
 
         if sock is not None:
-            if host is not None or port is not None:
-                raise ValueError("host/port and sock can not be specified at the same time")
             sock.setblocking(False)
             # stdlib create_server() accepts a bound-but-not-listening
             # socket and calls listen() itself. Without this the native
@@ -558,20 +616,32 @@ class TcpSurface:
             entries.append((lid, name, rawfd))
             return Server(self, entries, factory, accept_pool, start_serving)
 
-        if port is None:
-            port = 0
         if reuse_address is None:
             reuse_address = os.name == "posix" and sys.platform != "cygwin"
+        if host == "":
+            hosts = [None]
+        elif isinstance(host, str) or not isinstance(host, collections.abc.Iterable):
+            hosts = [host]
+        else:
+            hosts = host
 
-        hosts = [host] if (host is None or isinstance(host, str)) else list(host)
-        resolved = []
-        for h in hosts:
-            if h == "" or h is None:
-                h = None  # wildcard
+        async def resolve(h):
             infos = await self.getaddrinfo(
                 h, port, family=family, type=socket.SOCK_STREAM, flags=flags
             )
-            for af, _st, _pr, _cname, address in infos:
+            if not infos:
+                raise OSError(f"getaddrinfo({h!r}) returned empty list")
+            return infos
+
+        # Every host at once, then de-duplicated (several hosts can
+        # resolve to one address) -- base_events' rule. Ordered rather than
+        # a set, so which address binds first does not vary run to run.
+        resolved = await tasks.gather(*[resolve(h) for h in hosts])
+        infos = list(dict.fromkeys(itertools.chain.from_iterable(resolved)))
+
+        completed = False
+        try:
+            for af, _st, _pr, _cname, sa in infos:
                 if af not in (socket.AF_INET, socket.AF_INET6):
                     continue
                 # Keep the flow info and interface scope an IPv6 sockaddr
@@ -579,21 +649,11 @@ class TcpSurface:
                 # with a scope_id naming the interface, and dropping it
                 # bound with scope zero -- the wrong interface, or nothing
                 # at all, despite a clean resolution.
-                key = (address[0], address[1]) + tuple(address[2:4])
-                if key not in resolved:
-                    resolved.append(key)
-        if not resolved:
-            raise OSError(f"getaddrinfo({host!r}) returned empty list")
-
-        unavailable = None
-        try:
-            for entry in resolved:
-                ip, bind_port = entry[0], entry[1]
-                flowinfo, scope_id = (entry[2], entry[3]) if len(entry) == 4 else (0, 0)
+                flowinfo, scope_id = (sa[2], sa[3]) if len(sa) >= 4 else (0, 0)
                 try:
-                    lid, name, rawfd = self._core.tcp_listen(
-                        ip,
-                        bind_port,
+                    entry = self._core.tcp_listen(
+                        sa[0],
+                        sa[1],
                         factory,
                         backlog,
                         reuse_address,
@@ -602,26 +662,33 @@ class TcpSurface:
                         start_serving,
                         flowinfo,
                         scope_id,
+                        True,  # skip_unavailable
                     )
                 except OSError as exc:
-                    if exc.errno in _AF_UNAVAILABLE:
-                        # CPython skips families this host cannot create
-                        # a socket for -- a dual-stack resolution on a
-                        # v4-only host must still serve on v4, not fail
-                        # outright. Any OTHER error (EADDRINUSE, EACCES)
-                        # still aborts the whole call.
-                        unavailable = exc
+                    # EADDRNOTAVAIL: asyncio assumes the family is not
+                    # enabled on this host (bpo-30945) and moves on.
+                    if exc.errno == errno.EADDRNOTAVAIL or exc.errno in _AF_UNAVAILABLE:
+                        if self.get_debug():
+                            logger.warning("create_server() skipped %r: %s", sa, exc)
                         continue
                     raise
-                entries.append((lid, name, rawfd))
-        except BaseException:
-            for lid, _name, _fd in entries:
-                self._core.listener_close(lid)
-            raise
-        if not entries:
-            # Every resolved family was unavailable: that is an error,
-            # not an empty server.
-            raise unavailable
+                if entry is None:
+                    # No socket of this family can be made here (a host
+                    # without IPv6): skipped, as asyncio skips it, so a
+                    # wildcard server still serves on IPv4.
+                    if self.get_debug():
+                        logger.warning("create_server() could not create a socket for %r", sa)
+                    continue
+                entries.append(entry)
+            if not entries:
+                raise OSError(
+                    "could not bind on any address out of %r" % ([info[4] for info in infos],)
+                )
+            completed = True
+        finally:
+            if not completed:
+                for lid, _name, _fd in entries:
+                    self._core.listener_close(lid)
         return Server(self, entries, factory, accept_pool, start_serving)
 
     # -- AF_UNIX (delegates to create_connection/create_server's sock= ----
