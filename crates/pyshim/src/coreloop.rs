@@ -720,11 +720,32 @@ impl CoreLoop {
             net::reap_at_close(py, &mut st.net, st.reactor.backend_mut());
             dropped.extend(st.reactor.clear_pending());
             dropped.extend(std::mem::take(&mut st.net.ready_scratch).into_iter().map(HandleRef));
-            for (_, h) in st.net.readers.drain() {
+            // The backend's side of each watch goes with the callback. On
+            // IOCP a watch is a request the kernel owns until it is
+            // cancelled and reaped; left armed, it outlived the loop and
+            // completed into freed memory once the socket saw data.
+            for (fd, h) in st.net.readers.drain() {
+                let _ = st.reactor.backend_mut().set_watch(fd, false, false);
                 dropped.push(HandleRef(h));
             }
-            for (_, h) in st.net.writers.drain() {
+            for (fd, h) in st.net.writers.drain() {
+                let _ = st.reactor.backend_mut().set_watch(fd, false, false);
                 dropped.push(HandleRef(h));
+            }
+            // Events that will never be dispatched (a fatal error unwound
+            // the batch they were in) may carry the only reference to a
+            // socket: an accepted connection nobody wired, a connect whose
+            // future nobody resolved. Dropping the event dropped a raw
+            // descriptor -- an open connection the peer never saw close.
+            for ev in &st.net.events {
+                match *ev {
+                    NetEvent::Accepted { sock, .. } => netsys::close(sock),
+                    NetEvent::ConnectDone { sock, .. } => {
+                        st.reactor.backend_mut().detach_socket(sock);
+                        netsys::close(sock);
+                    }
+                    _ => {}
+                }
             }
             // ADR-5: NetEvent variants OWN Python references. Clearing the
             // vector here would decref them while `with` holds the exclusive
@@ -1673,7 +1694,7 @@ impl CoreLoop {
     // ---- introspection (R-103) --------------------------------------------
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (stats, ready, timers, netstats, ops, diag, live_name) = self.state.with(|st| {
+        let (stats, ready, timers, netstats, ops, diag, live_name, foreign) = self.state.with(|st| {
             (
                 st.reactor.stats.clone(),
                 st.reactor.ready_len(),
@@ -1697,6 +1718,7 @@ impl CoreLoop {
                 // Live, not the construction-time cache: RIO downgrades its
                 // name to "rio-polling" if RIONotify starts failing mid-run.
                 st.reactor.backend_name(),
+                st.reactor.backend_mut().foreign_completions(),
             )
         })?;
         let d = PyDict::new(py);
@@ -1742,6 +1764,11 @@ impl CoreLoop {
         by_target.set_item("dgram", ops.dgram)?;
         by_target.set_item("pipe", ops.pipe)?;
         d.set_item("ops_by_target", by_target)?;
+        // Completions that no live operation could own, dropped rather than
+        // dereferenced or misattributed: another process's OVERLAPPED on a
+        // shared handle (ADR-25), or a second packet for an operation the
+        // backend already completed inline. Zero in a correct run.
+        d.set_item("foreign_completions", foreign)?;
         if let Some((notifies, reaps)) = diag {
             d.set_item("rio_notifies", notifies)?;
             d.set_item("rio_watchdog_reaps", reaps)?;

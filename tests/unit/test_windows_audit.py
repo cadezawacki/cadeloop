@@ -10,6 +10,7 @@ iocp_util.rs.
 
 import asyncio
 import contextlib
+import gc
 import itertools
 import os
 import socket
@@ -233,3 +234,170 @@ def test_a_message_longer_than_the_read_buffer_arrives_whole(loop):
     finally:
         _winapi.CloseHandle(client)
         handle.close()
+
+
+# --------------------------------------------------------------------- #
+# W19: loop.close() and the sockets held by undispatched events         #
+# --------------------------------------------------------------------- #
+
+
+def test_close_closes_sockets_held_by_undispatched_events():
+    """W19. A fatal error out of one callback unwinds the dispatch batch and
+    puts its tail back on the event queue; loop.close() then dropped those
+    events. An Accepted event's socket was the only reference to an open
+    connection, so its peer was never told the server had gone: it waited
+    forever for data or EOF."""
+    lp = cadeloop.new_event_loop()
+    clients = []
+    try:
+
+        def factory():
+            raise KeyboardInterrupt
+
+        async def listen():
+            return [await lp.create_server(factory, "127.0.0.1", 0) for _ in range(2)]
+
+        servers = lp.run_until_complete(listen())
+        addrs = [s.sockets[0].getsockname()[:2] for s in servers]
+        # The loop is parked: both handshakes complete in the kernel, so the
+        # two accepts are reaped into one dispatch batch. The first factory
+        # call raises; the other Accepted event is left undispatched.
+        clients = [socket.create_connection(a, timeout=5) for a in addrs]
+        lp.call_later(2, lp.stop)
+        with pytest.raises(KeyboardInterrupt):
+            lp.run_forever()
+        for s in servers:
+            s.close()
+    finally:
+        lp.close()
+    try:
+        for c in clients:
+            c.settimeout(2)
+            try:
+                data = c.recv(1)
+            except ConnectionResetError:
+                data = b""
+            assert data == b"", "the server side of an accepted connection was never closed"
+    finally:
+        for c in clients:
+            c.close()
+
+
+# --------------------------------------------------------------------- #
+# W1: a refused connect must not poison the next socket                 #
+# --------------------------------------------------------------------- #
+
+
+@windows_only
+def test_a_refused_connect_does_not_poison_the_next_socket(loop):
+    """W1. The socket of a refused connect was closed without being
+    detached, leaving its handle value marked "skip mode set". Windows
+    reissues freed handle values at once, so the next socket inherited the
+    mark without the mode: its synchronous sends completed inline AND
+    queued a packet, which then completed whichever op had reused the slot
+    (data from freed buffers on the wire, misattributed completions, a
+    debug-build panic)."""
+
+    async def main():
+        server, addr = await _echo_server(loop)
+        with pytest.raises(OSError):
+            await loop.create_connection(asyncio.Protocol, "127.0.0.1", _closed_port())
+        for _ in range(20):
+            reader, writer = await asyncio.open_connection(*addr)
+            for i in range(10):
+                msg = bytes([i]) * 100
+                writer.write(msg)
+                await writer.drain()
+                assert await reader.readexactly(100) == msg
+            writer.close()
+            await writer.wait_closed()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(asyncio.wait_for(main(), 60))
+    assert loop.stats()["foreign_completions"] == 0
+
+
+# --------------------------------------------------------------------- #
+# W3/W6: what a closed loop leaves behind                               #
+# --------------------------------------------------------------------- #
+
+
+@windows_only
+def test_a_socket_a_closed_loop_watched_works_with_a_new_loop():
+    """W3. A watch associated the socket with the loop's completion port
+    for good (a Windows file object binds to one port for life) and left a
+    probe posted that nothing ever cancelled: once the loop closed, the
+    socket could not be used by any other loop, and data arriving later
+    completed the probe into freed memory."""
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    try:
+        lp1 = cadeloop.new_event_loop()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                lp1.run_until_complete(asyncio.wait_for(lp1.sock_recv(a, 10), 0.1))
+        finally:
+            lp1.close()
+        del lp1
+        gc.collect()
+        lp2 = cadeloop.new_event_loop()
+        try:
+
+            async def main():
+                # Parked before the data exists, so it goes through a watch
+                # (sock_recv's first, direct recv() would otherwise win).
+                task = lp2.create_task(lp2.sock_recv(a, 10))
+                await asyncio.sleep(0.1)
+                b.sendall(b"ping")
+                return await asyncio.wait_for(task, 5)
+
+            data = lp2.run_until_complete(main())
+        finally:
+            lp2.close()
+        assert data == b"ping"
+    finally:
+        a.close()
+        b.close()
+
+
+def _process_handle_count():
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.GetProcessHandleCount.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    n = wintypes.DWORD()
+    assert k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(n))
+    return n.value
+
+
+@windows_only
+def test_loop_close_releases_the_accept_pool():
+    """W6. Each listener keeps a pool of AcceptEx requests (64 by default),
+    each owning a pre-created accept socket. Closing the loop cancelled
+    them but never reaped the cancellations, so every one of those sockets
+    stayed open for the life of the process."""
+
+    def cycle(close_server_first):
+        lp = cadeloop.new_event_loop()
+        try:
+            server = lp.run_until_complete(lp.create_server(asyncio.Protocol, "127.0.0.1", 0))
+            if close_server_first:
+                server.close()
+                lp.run_until_complete(server.wait_closed())
+        finally:
+            lp.close()
+        server.close()
+
+    for first in (False, True):
+        cycle(first)  # one-time costs: Winsock, extension functions, ...
+    gc.collect()
+    before = _process_handle_count()
+    for _ in range(3):
+        for first in (False, True):
+            cycle(first)
+    gc.collect()
+    leaked = _process_handle_count() - before
+    assert leaked < 32, f"{leaked} handles leaked over 6 loops"
