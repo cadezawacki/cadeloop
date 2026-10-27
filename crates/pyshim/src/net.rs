@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap as HashMap;
 
-use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
+use cadeloop_core::backend::{
+    io_len, is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket, MAX_SEND_BYTES,
+};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
 use cadeloop_core::http::{Limits, ParseError};
 use cadeloop_core::netsys;
@@ -173,10 +175,10 @@ impl WriteBuf {
     fn slice(&self) -> IoSlice {
         match self {
             WriteBuf::Bytes { ptr, len, off, .. } => {
-                IoSlice { ptr: unsafe { ptr.add(*off) }, len: (len - off) as u32 }
+                IoSlice { ptr: unsafe { ptr.add(*off) }, len: io_len(len - off) }
             }
             WriteBuf::Owned { data, off } => {
-                IoSlice { ptr: unsafe { data.as_ptr().add(*off) }, len: (data.len() - off) as u32 }
+                IoSlice { ptr: unsafe { data.as_ptr().add(*off) }, len: io_len(data.len() - off) }
             }
         }
     }
@@ -577,7 +579,7 @@ pub(crate) enum NetEvent {
     DgramLost {
         connection_lost: Py<PyAny>,
         err: Option<u32>,
-        close_after: Option<Py<PyAny>>,
+        close_after: CloseOnDrop,
         immediate: bool,
     },
     /// R-087: a WS receive() waiter has a queued event to consume.
@@ -668,6 +670,24 @@ pub(crate) enum NetEvent {
     },
 }
 
+/// A socket object a dead transport still holds (the caller's own, or the
+/// duplicate behind `get_extra_info("socket")`), closed -- not merely
+/// dropped -- whenever it is let go: after connection_lost normally, but
+/// also when that never runs because the loop closed first, so a
+/// transport's close stays final either way. Dropped attached, outside
+/// the state cell, like every Python reference an event carries.
+pub(crate) struct CloseOnDrop(Option<Py<PyAny>>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(sock) = self.0.take() {
+            Python::attach(|py| {
+                let _ = sock.call_method0(py, intern!(py, "close"));
+            });
+        }
+    }
+}
+
 /// A stream transport's teardown, as asyncio's `_call_connection_lost`
 /// performs it. Boxed: it is rare, and the hot Data event should not pay
 /// for its size.
@@ -685,7 +705,7 @@ pub(crate) struct ConnLost {
     protocol: Py<PyAny>,
     /// Closed after connection_lost: the caller's socket object, or the
     /// duplicate behind `get_extra_info("socket")`.
-    close_after: Option<Py<PyAny>>,
+    close_after: CloseOnDrop,
     server: Option<Py<PyAny>>,
 }
 
@@ -708,8 +728,16 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
     }
     let mut slices: [IoSlice; 16] = [IoSlice { ptr: std::ptr::null(), len: 0 }; 16];
     let mut n = 0;
+    // Bounded by bytes as well as slices: the completion's count is 32-bit
+    // (see MAX_SEND_BYTES). What does not fit goes in the next post.
+    let mut total = 0usize;
     for buf in entry.wq.iter().take(16) {
-        slices[n] = buf.slice();
+        let slice = buf.slice();
+        if n > 0 && total + slice.len as usize > MAX_SEND_BYTES {
+            break;
+        }
+        total += slice.len as usize;
+        slices[n] = slice;
         n += 1;
     }
     let socket = entry.socket;
@@ -937,7 +965,7 @@ fn teardown_lost(
                 immediate,
                 transport: entry.pyobj.take(),
                 protocol: p.protocol.clone_ref(py),
-                close_after: entry.owner.take().or_else(|| entry.extra_sock.take()),
+                close_after: CloseOnDrop(entry.owner.take().or_else(|| entry.extra_sock.take())),
                 server: entry.server.take(),
             };
             net.events.push(NetEvent::ConnLost(Box::new(lost)));
@@ -1134,9 +1162,14 @@ pub(crate) fn reap_at_close(py: Python<'_>, net: &mut NetState, backend: Backend
     let mut comps: Vec<Completion> = Vec::new();
     let deadline = Instant::now() + CLOSE_REAP_BUDGET;
     loop {
-        let pipes_left =
-            net.ops.values().any(|t| matches!(t, OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. }));
-        if net.reap_guards.is_empty() && !pipes_left {
+        // Accepts too: a cancelled AcceptEx owns the socket it pre-created,
+        // and only reaping its completion closes it. Waiting on guards and
+        // pipes alone left every pooled accept socket of every listener the
+        // close tore down -- 64 apiece by default -- open for good.
+        let ops_left = net.ops.values().any(|t| {
+            matches!(t, OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. } | OpTarget::Accept(_))
+        });
+        if net.reap_guards.is_empty() && !ops_left {
             break;
         }
         comps.clear();
@@ -1564,7 +1597,7 @@ fn udp_teardown(
     net.events.push(NetEvent::DgramLost {
         connection_lost: entry.connection_lost.clone_ref(py),
         err,
-        close_after: entry.owner.take(),
+        close_after: CloseOnDrop(entry.owner.take()),
         immediate,
     });
     net.graveyard_py.push(entry.datagram_received);
@@ -1601,14 +1634,32 @@ fn http_conn_busy(entry: &TransportEntry) -> bool {
         || matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming)
 }
 
+/// Fallback reclaim deadline for a connection whose peer has gone while
+/// idle timeouts are disabled (`keepalive_idle=0`). A dead peer must never
+/// be pinned forever just because keep-alive was told to be unlimited, so
+/// the disconnect reclaim (H4) falls back to this when there is no idle
+/// deadline to borrow. Generous, because we cannot tell a full close from
+/// a half-close whose app is still producing a response.
+const DISCONNECTED_RECLAIM_FALLBACK_NS: u64 = 60 * 1_000_000_000;
+
+/// Sweep phases. `Dead` (peer disconnected, nothing left to send) is
+/// checked before `Busy`: an app parked on a non-receive() awaitable while
+/// its client is gone is "busy" by every other measure, and without this
+/// would pin the fd and its whole request state with no deadline at all.
+const PHASE_IDLE: u8 = 0;
+const PHASE_HEAD: u8 = 1;
+const PHASE_BUSY: u8 = 2;
+const PHASE_DEAD: u8 = 3;
+
 pub(crate) fn http_sweep(
     py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
     now_ns: u64,
-) -> (u32, u32) {
+) -> (u32, u32, Vec<Py<PyAny>>) {
     let mut expire_head: Vec<u64> = Vec::new();
     let mut expire_idle: Vec<u64> = Vec::new();
+    let mut expire_dead: Vec<u64> = Vec::new();
     for (&tid, entry) in net.transports.iter_mut() {
         if entry.conn_lost || entry.closing {
             continue;
@@ -1619,35 +1670,83 @@ pub(crate) fn http_sweep(
         // response was still going out, so a large body to a slow client
         // could be torn down mid-transmission by the idle sweep.
         let busy = http_conn_busy(entry);
+        // Nothing is queued or in flight for the peer (checked on `entry`,
+        // before the borrow of `entry.proto` below).
+        let nothing_to_send = entry.wq.is_empty() && entry.send_op.is_none();
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
         // `!saw_bytes` is the head phase too: a connection that has sent
         // nothing at all reports `in_head() == false`, and calling that
         // keep-alive idle exempted it from the head deadline it has never
         // yet satisfied. It must be BYTES rather than a finished request,
         // or a body upload counts as a head that never completes.
-        let phase: u8 = if busy {
-            2
+        let phase: u8 = if conn.disconnected && nothing_to_send {
+            // Peer EOF'd and we have nothing left to deliver. A well-behaved
+            // app observes http.disconnect through receive() and returns at
+            // once (its waiters were resolved at EOF); one parked on an
+            // unrelated awaitable would otherwise hold the fd, the AppTask
+            // and the coroutine frame indefinitely, since `busy` exempts an
+            // active request from every deadline. Reclaim it.
+            PHASE_DEAD
+        } else if busy {
+            PHASE_BUSY
         } else if conn.parser.in_head() || !conn.saw_bytes {
-            1
+            PHASE_HEAD
         } else {
-            0
+            PHASE_IDLE
         };
         let moved = conn.activity != conn.sweep_seen;
         conn.sweep_seen = conn.activity;
-        if phase != conn.sweep_phase || conn.sweep_anchor_ns == 0 || phase == 2 || (phase == 0 && moved) {
+        if phase != conn.sweep_phase
+            || conn.sweep_anchor_ns == 0
+            || phase == PHASE_BUSY
+            || (phase == PHASE_IDLE && moved)
+        {
             // New phase, first sighting, busy, or fresh idle activity:
             // (re)anchor. A head in progress deliberately does NOT
-            // re-anchor on activity — that is the slowloris rule.
+            // re-anchor on activity — that is the slowloris rule. PHASE_DEAD
+            // also does not re-anchor (the peer is gone; nothing it does
+            // can extend its grace).
             conn.sweep_phase = phase;
             conn.sweep_anchor_ns = now_ns;
             continue;
         }
         let elapsed = now_ns.saturating_sub(conn.sweep_anchor_ns);
         match phase {
-            1 if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => expire_head.push(tid),
-            0 if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => expire_idle.push(tid),
+            PHASE_HEAD if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => {
+                expire_head.push(tid)
+            }
+            PHASE_IDLE if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => {
+                expire_idle.push(tid)
+            }
+            PHASE_DEAD => {
+                let deadline = if conn.idle_timeout_ns > 0 {
+                    conn.idle_timeout_ns
+                } else {
+                    DISCONNECTED_RECLAIM_FALLBACK_NS
+                };
+                if elapsed >= deadline {
+                    expire_dead.push(tid);
+                }
+            }
             _ => {}
         }
+    }
+    // A disconnected connection whose eager app is still parked: tear it
+    // down (frees the fd and the transport entry) and hand its driver back
+    // to the caller to cancel OUTSIDE the state cell. Cancelling unwinds
+    // the coroutine (CancelledError into its awaited future), which both
+    // reclaims the AppTask + frame -- a plain `Py<AppTask>` is opaque to
+    // the cycle collector, so dropping `conn.driver` alone would not, the
+    // awaited future's `_wake` still references it -- and gives the app its
+    // `finally`/cancel-scope cleanup.
+    let mut cancel_drivers: Vec<Py<PyAny>> = Vec::new();
+    for &tid in &expire_dead {
+        if let Some(conn) = net.http_conn_mut(tid) {
+            if let Some(driver) = conn.driver.take() {
+                cancel_drivers.push(driver.into_any());
+            }
+        }
+        teardown_with(py, net, backend, tid, None);
     }
     for &tid in &expire_head {
         // A TLS session that never completed its handshake cannot be
@@ -1672,7 +1771,9 @@ pub(crate) fn http_sweep(
         // Idle keep-alive expiry closes silently (uvicorn-compatible).
         teardown_with(py, net, backend, tid, None);
     }
-    (expire_head.len() as u32, expire_idle.len() as u32)
+    // Disconnect reclaims count as idle closes for the facade's stats.
+    let idle = (expire_idle.len() + expire_dead.len()) as u32;
+    (expire_head.len() as u32, idle, cancel_drivers)
 }
 
 /// Graceful shutdown, phase 1 (R-092): end keep-alive everywhere, close
@@ -1714,14 +1815,35 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
         }
     }
     for tid in ws_closing {
+        // Send the 1012 close frame to the peer, then deliver
+        // websocket.disconnect(1012) to the application. Waking the app
+        // (rather than queuing the disconnect and tearing down here) does
+        // two things: the app actually RECEIVES the disconnect it is
+        // entitled to, and teardown moves to the normal path -- the app
+        // returns, `ws_app_done` closes after the frame has drained. The
+        // old code tore the connection down in the same tick it produced
+        // the frame; with the base's inline completions that could drop
+        // the socket before the just-written close frame was delivered,
+        // so the peer saw a bare TCP close and the app never saw its
+        // disconnect. If the app is NOT parked in receive(), there is no
+        // waiter to wake, so fall back to closing once the frame drains.
+        http_enqueue(py, net, backend, tid, cadeloop_core::ws::close_frame(1012, "server shutdown"));
+        let waiters = net.http_conn_mut(tid).map(|c| c.take_recv_waiters()).unwrap_or_default();
         if let Some(conn) = net.http_conn_mut(tid) {
             if let Some(wsc) = conn.ws.as_mut() {
                 wsc.closing = true;
-                wsc.inbox.push_back(crate::http::WsMsg::Disconnect(1012));
+                let m = crate::http::WsMsg::Disconnect(1012);
+                wsc.inbox_bytes += m.charge();
+                wsc.inbox.push_back(m);
             }
         }
-        http_enqueue(py, net, backend, tid, cadeloop_core::ws::close_frame(1012, "server shutdown"));
-        http_close_after_write(py, net, backend, tid);
+        if waiters.is_empty() {
+            http_close_after_write(py, net, backend, tid);
+        } else {
+            for fut in waiters {
+                net.events.push(NetEvent::WsWake { tid, fut });
+            }
+        }
     }
     for tid in idle {
         teardown_with(py, net, backend, tid, None);
@@ -2195,6 +2317,7 @@ fn on_recv_done(
     net.stats_bytes_rx += bytes as u64;
     debug_assert_eq!(entry.recv_slot, Some(slot), "op slot / transport slot mismatch");
     let mut parse_err = None;
+    let mut oversize_ws = false;
     let mut continue_owed = false;
     if entry.reading_paused && matches!(entry.proto, ProtoKind::Py(_)) {
         // A protocol that called pause_reading() did so to stop consuming;
@@ -2259,6 +2382,10 @@ fn on_recv_done(
                 // parser copies what it keeps, so the slot re-posts below.
                 match crate::http::conn_feed(conn, data) {
                     Ok(outcome) => {
+                        // Oversized pre-dispatch WS buffer (see conn_feed):
+                        // handled after the match, since teardown needs the
+                        // whole NetState and `conn` still borrows it here.
+                        oversize_ws = outcome.oversize_ws_trailing;
                         // R-085: stop reading while the pipeline budget is
                         // spent. The connection is flagged here and the
                         // recv is simply not reposted below; pump_requests
@@ -2281,6 +2408,14 @@ fn on_recv_done(
                 }
             }
         }
+    }
+    if oversize_ws {
+        // R-087: a client flooded ws_trailing past WS_MAX_MESSAGE before
+        // its upgrade was even dispatched. A 413 cannot be injected safely
+        // -- an unrelated request on this connection may be mid-response --
+        // so the abusive connection is simply dropped.
+        teardown_with(py, net, backend, tid, None);
+        return;
     }
     if let Some(err) = parse_err {
         // R-086: malformed request answered entirely in-cell -- in its
@@ -2801,13 +2936,18 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             NetEvent::ConnectDone { fut, sock, err } => {
                 let fut = fut.bind(py);
                 let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
-                if err != 0 {
+                if err != 0 || cancelled {
+                    // tcp_connect registered this socket, so detach before
+                    // closing (ADR-25). A bare close left the backend
+                    // describing a handle value the OS reissues at once --
+                    // on IOCP its skip-mode record then passed to the next
+                    // socket given that number, and that socket's
+                    // synchronous completions were delivered twice.
+                    core.with_net(|_net, reactor| reactor.backend_mut().detach_socket(sock))?;
                     netsys::close(sock);
-                    if !cancelled {
+                    if err != 0 && !cancelled {
                         let _ = fut.call_method1("set_exception", (os_err(py, err),));
                     }
-                } else if cancelled {
-                    netsys::close(sock);
                 } else {
                     let _ = fut.call_method1("set_result", (sock as u64,));
                 }
@@ -2864,9 +3004,7 @@ fn call_connection_lost(py: Python<'_>, lost: ConnLost) -> PyResult<()> {
         // collector cannot see.
         drop(t.get().set_losing(None));
     }
-    if let Some(sock) = close_after {
-        let _ = sock.call_method0(py, intern!(py, "close"));
-    }
+    drop(close_after); // closes it
     let detached = match server {
         Some(srv) => srv.call_method0(py, intern!(py, "_detach")).map(drop),
         None => Ok(()),
@@ -2883,7 +3021,7 @@ pub(crate) enum Lost {
     Datagram {
         connection_lost: Py<PyAny>,
         err: Option<u32>,
-        close_after: Option<Py<PyAny>>,
+        close_after: CloseOnDrop,
     },
 }
 
@@ -2898,21 +3036,9 @@ impl Lost {
                 };
                 let res = connection_lost.call1(py, (exc_obj,));
                 // After the callback, as asyncio's _call_connection_lost.
-                if let Some(sock) = close_after {
-                    let _ = sock.call_method0(py, intern!(py, "close"));
-                }
+                drop(close_after);
                 res.map(drop)
             }
-        }
-    }
-
-    fn close_socket(self, py: Python<'_>) {
-        let sock = match self {
-            Lost::Stream(lost) => lost.close_after,
-            Lost::Datagram { close_after, .. } => close_after,
-        };
-        if let Some(sock) = sock {
-            let _ = sock.call_method0(py, intern!(py, "close"));
         }
     }
 }
@@ -2928,11 +3054,9 @@ fn schedule_lost(py: Python<'_>, core: &CoreLoop, lost: Lost) -> PyResult<()> {
         core.require_owner().and_then(|owner| owner.call_method1(py, intern!(py, "call_soon"), (&call,)));
     if let Err(e) = scheduled {
         // The loop is closed (asyncio raises the same from _force_close).
-        // Nothing will ever run it, so the socket at least is closed now.
+        // Nothing will ever run it; dropping it closes the socket now.
         let pending = call.get().lost.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(lost) = pending {
-            lost.close_socket(py);
-        }
+        drop(pending);
         return Err(e);
     }
     Ok(())

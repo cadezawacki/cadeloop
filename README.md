@@ -442,16 +442,28 @@ leave shutdown hooks unrun.
 cadeloop.serve("myapp:app", "0.0.0.0", 8000, workers=0)   # 0 = one per CPU
 ```
 
+`workers=0` starts one worker per CPU the process may run on — its affinity
+mask (`taskset`, a container's cpuset), not the machine's CPU count.
+
 Two process models, chosen automatically:
 
 - **POSIX** — `fork` + `SO_REUSEPORT`; each worker has its own listener and the
-  kernel balances accepts.
-- **Windows** — `spawn` with a shared listener handed to children via
-  `WSADuplicateSocketW`.
+  kernel balances accepts. The application is imported once, in the supervisor,
+  and its heap is frozen there before forking (`gc_mode="freeze"`), so workers
+  share it instead of copying it. Starting a pool on a port something already
+  holds fails with `EADDRINUSE` rather than silently sharing the port.
+- **Windows** — `spawn`: the supervisor owns the listener and the accept loop
+  and hands each accepted connection to a worker (`WSADuplicateSocketW` per
+  connection); workers re-import the app (pass the `"module:attribute"`
+  string) using the supervisor's `sys.path`.
 
-Workers are supervised and restarted, with a fast-crash cutoff so a worker that
-dies immediately and repeatedly does not restart forever. `pin=True` (the
-default) pins each worker to a core.
+Workers are supervised and restarted. A worker slot that keeps dying without
+ever serving, or right after starting, gives up after five tries; a worker that
+served and then crashed is simply restarted. A worker stopped by a signal sent
+to it alone (recycling one bloated worker) is replaced; the application calling
+`loop.stop()` stops the pool. Workers also stop, gracefully, if the supervisor
+dies. `pin=True` pins each worker's event-loop thread to a CPU (opt-in: see
+`Config.pin`).
 
 ---
 
@@ -526,8 +538,9 @@ Two attributes worth knowing:
 ### `Config` — every tunable
 
 `cadeloop.Config` is a validated dataclass holding every server tunable.
-Validation is **eager**: bad values raise `ValueError` at construction, and
-unknown keyword arguments raise `TypeError`.
+Validation is **eager**: out-of-range values raise `ValueError` at construction;
+values of the wrong type (`access_log="false"`, `workers="4"`) and unknown keyword
+arguments raise `TypeError`.
 
 ```python
 from cadeloop import Config
@@ -570,7 +583,7 @@ cadeloop.serve(app, "0.0.0.0", 8000, **vars(cfg))
 |---|---|---|---|
 | `eager_tasks` | `bool` | `True` | Start tasks eagerly (run synchronously until first suspension). Turn off if a library depends on deferred-start semantics. |
 | `gc_mode` | `str` | `"freeze"` | `"default"`, `"freeze"` (call `gc.freeze()` after warmup so startup objects stop being traced), or `"disable"`. |
-| `warmup` | `int` | `1000` | Requests served before `gc.freeze()` runs. Must be ≥ 0. |
+| `warmup` | `int` | `1000` | With `gc_mode="freeze"`: requests served before a second `gc.freeze()` takes in what the first requests built lazily (route and template caches, compiled statements), so full collections stop re-walking them. `0` freezes at startup only. Must be ≥ 0. |
 
 #### HTTP engine
 
@@ -580,9 +593,8 @@ cadeloop.serve(app, "0.0.0.0", 8000, **vars(cfg))
 | `max_headers` | `int` | `100` | Maximum header count per request. Must be ≥ 1. |
 | `max_url` | `int` | `8192` | Maximum request-target length. Must be ≥ 1. |
 | `request_line_timeout` | `float` | `5.0` | Seconds a connection may stay silent before sending a complete request head. Guards slowloris. `0` disables. |
-| `keepalive_idle` | `float` | `75.0` | Seconds an idle keep-alive connection is held open. |
+| `keepalive_idle` | `float` | `75.0` | Seconds an idle keep-alive connection is held open. `0` disables the idle timeout: idle connections stay open until the client closes them. |
 | `max_body` | `int \| None` | `16777216` | Maximum request body bytes; over it → `413`. **Finite on purpose**: the engine buffers the whole body before dispatch, so `None` (unlimited) lets an unauthenticated client turn one request into unbounded memory. |
-| `reuse_scope` | `bool` | `False` | Reuse the ASGI scope dict between requests on a connection. Faster, but unsafe for apps that retain the scope past the response. |
 
 #### Transports
 
@@ -595,8 +607,8 @@ cadeloop.serve(app, "0.0.0.0", 8000, **vars(cfg))
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `workers` | `int` | `0` | Worker processes. `0` means one per physical core. Must be ≥ 0. |
-| `pin` | `bool` | `True` | Pin each worker to a CPU core. |
+| `workers` | `int` | `0` | Worker processes. `0` means one per CPU the process may run on (its affinity mask). Must be ≥ 0. |
+| `pin` | `bool` | `False` | Pin each worker's event-loop thread to one CPU of the process's affinity mask (threads it starts are not pinned). Off by default: on loopback it measured no gain, and it hurts on shared or virtualised CPUs. Worth it on dedicated hardware with RSS-aligned NIC queues. |
 | `grace` | `float` | `10.0` | Graceful-drain budget in seconds on shutdown. Must be finite and ≥ 0. |
 
 #### Observability
@@ -642,7 +654,7 @@ cadeloop.serve(app, host="127.0.0.1", port=8000, *,
 | `app` | callable or `str` | *required* | An ASGI 3.0 application, or a `"module:attribute"` spec. Use the string form with `workers > 1` on Windows. |
 | `host` | `str` | `"127.0.0.1"` | Bind address. Use `"0.0.0.0"` to accept external traffic. |
 | `port` | `int` | `8000` | Bind port. |
-| `workers` | `int` | `1` | Worker processes; `0` means one per CPU. |
+| `workers` | `int` | `1` | Worker processes; `0` means one per CPU the process may run on. |
 | `backend` | `str` | `"auto"` | Reactor backend, as in `Config.backend`. |
 | `ssl` | `ssl.SSLContext \| None` | `None` | Enables TLS. Must be an `SSLContext` — anything else raises `TypeError`. Its ALPN list is forced to `["http/1.1"]`. |
 | `latency_mode` | `str` | `"balanced"` | `"throughput"`, `"balanced"`, or `"spin"`. |
@@ -676,17 +688,19 @@ cadeloop APP [options]
 python -m cadeloop APP [options]
 ```
 
-`APP` is a required `module:attribute` spec. It is validated (imported) before
-anything binds, so a typo fails immediately rather than after the port is taken.
+`APP` is a required `module:attribute` spec, imported from the current directory
+(or `--app-dir`). It is validated before anything binds, so a typo fails
+immediately rather than after the port is taken.
 
 | flag | maps to | notes |
 |---|---|---|
+| `--app-dir DIR` | — | Directory to import the app from. Default: the current one. |
 | `--host HOST` | — | Bind address. |
 | `--port`, `-p PORT` | — | Bind port. |
 | `--workers`, `-w N` | `workers` | `0` = one per CPU. |
 | `--backend {auto,epoll}` | `backend` | Choices are platform-dependent (`iocp` on Windows). |
 | `--latency-mode {throughput,balanced,spin}` | `latency_mode` | |
-| `--access-log` | `access_log` | |
+| `--access-log` / `--no-access-log` | `access_log` | |
 | `--spin-us N` | `spin_us` | Accepts `none` to derive from `--latency-mode`. |
 | `--immediate-flush` / `--no-immediate-flush` | `immediate_flush` | |
 | `--accept-pool N` | `accept_pool` | |
@@ -704,7 +718,6 @@ anything binds, so a typo fails immediately rather than after the port is taken.
 | `--request-line-timeout S` | `request_line_timeout` | |
 | `--keepalive-idle S` | `keepalive_idle` | |
 | `--max-body N` | `max_body` | Accepts `none` to remove the cap. |
-| `--reuse-scope` / `--no-reuse-scope` | `reuse_scope` | |
 | `--write-high-water N`, `--write-low-water N` | watermarks | |
 | `--pin` / `--no-pin` | `pin` | |
 | `--grace S` | `grace` | |
@@ -745,7 +758,7 @@ print(loop.stats())
 | `completions` | I/O completions reaped. |
 | `callbacks_dispatched` | Callbacks run. |
 | `timers_fired` | Timers that fired. |
-| `xthread_items` | Items delivered via `call_soon_threadsafe`. |
+| `xthread_items` | Callbacks and timers other threads handed over while the loop was parked in its poll. Calls made while the loop is reachable -- including every `call_soon_threadsafe` from its own thread -- go straight to the ready queue and are not counted. |
 | `spin_hits` | Times the spin window found work without a blocking wait. |
 | `ready_len`, `timers_len` | Current ready-queue and timer-heap depth. |
 | `connections`, `listeners` | Live counts. |
@@ -908,6 +921,10 @@ cadeloop myapp:app -w 4 --grace 30
 
 `SIGTERM` starts a drain: existing connections finish, new ones stop being
 accepted, and a reserved slice of the budget guarantees `lifespan.shutdown` runs.
+A repeated `SIGTERM` (systemd's default `KillMode=control-group` signals every
+process of the unit, and the supervisor forwards its own) does not cut the drain
+short. A second Ctrl-C does: it stops waiting for in-flight requests (and in a
+worker pool, kills the workers), as uvicorn's force-quit does.
 
 ### Running alongside another loop
 

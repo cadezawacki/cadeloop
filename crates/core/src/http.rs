@@ -387,6 +387,10 @@ const SETTINGS: Settings = Settings {
 pub struct HttpParser {
     raw: Box<Llhttp>,
     acc: Box<Acc>,
+    /// The head completed an upgrade and llhttp paused (HPE_PAUSED_UPGRADE).
+    /// Every byte after that offset belongs to the upgraded protocol, not
+    /// HTTP, so no further `feed` may touch llhttp again.
+    upgraded: bool,
 }
 
 // SAFETY: thread-affine by loop contract; raw pointers reference the
@@ -414,7 +418,7 @@ impl HttpParser {
             llhttp_init(&mut *raw, HTTP_REQUEST, &SETTINGS);
             raw.data = (&mut *acc as *mut Acc).cast();
         }
-        HttpParser { raw, acc }
+        HttpParser { raw, acc, upgraded: false }
     }
 
     /// Feed bytes; completed requests become available via `next_request`.
@@ -422,10 +426,25 @@ impl HttpParser {
     /// upgrade head (HPE_PAUSED_UPGRADE): bytes from `offset` onward are
     /// NOT HTTP — they belong to the upgraded protocol's stream (R-087).
     pub fn feed(&mut self, data: &[u8]) -> Result<Option<usize>, ParseError> {
+        // Already upgraded: every byte is the upgraded protocol's. Calling
+        // llhttp again would only return the lingering HPE_PAUSED_UPGRADE
+        // WITHOUT refreshing `error_pos` (it short-circuits on the stored
+        // error), so the old code then read `error_pos` -- a pointer into a
+        // PREVIOUS feed's buffer -- and `offset_from`'d it against THIS
+        // buffer: undefined behaviour, and in practice a garbage split that
+        // dropped or truncated the first client frame to arrive in a later
+        // recv. Nothing resumes an upgraded parser (we never call
+        // llhttp_resume_after_upgrade), so skip it entirely.
+        if self.upgraded {
+            return Ok(Some(0));
+        }
         let rc = unsafe { llhttp_execute(&mut *self.raw, data.as_ptr().cast(), data.len()) };
         if rc == HPE_PAUSED_UPGRADE {
+            // First (and only) valid read of `error_pos`: llhttp set it to a
+            // position inside THIS buffer during this execute.
             let consumed = unsafe { (self.raw.error_pos).offset_from(data.as_ptr().cast()) };
             let consumed = consumed.clamp(0, data.len() as isize) as usize;
+            self.upgraded = true;
             return Ok(Some(consumed));
         }
         if rc != HPE_OK {

@@ -20,14 +20,22 @@
 //!     and if the condition it was waiting for now holds and it was NOT
 //!     cancelled-before-resolution, wake the next waiter so the wake is
 //!     not lost;
-//!   * `join()`/`task_done()` follow the unfinished-count contract, with
-//!     `join()` returning an already-done awaitable when the count is 0;
+//!   * `join()`/`task_done()` follow the unfinished-count contract
+//!     (`task_done` wakes join waiters in the order they joined, as
+//!     `Event.set()` does);
 //!   * `QueueFull`/`QueueEmpty` are asyncio's own exception classes.
 //!
-//! Thread affinity: loop-thread only, like every asyncio queue
-//! (`unsendable` enforces it). RefCell borrows are never held across a
-//! Python call -- waker and parker both pop/push first, call second --
-//! so re-entrancy through GC or callbacks cannot trip a double borrow.
+//! Threads: like asyncio.Queue, the queue is not thread-safe, but it is
+//! usable from whichever thread runs the loop that uses it -- including a
+//! thread other than the one that constructed it (a module-level queue
+//! built at import time on the main thread and driven by a loop on a
+//! worker thread is the ordinary case). It used to be `unsendable`, and
+//! under `panic = "abort"` the thread check that buys turned ANY call from
+//! another thread, even `qsize()`, into a SIGABRT of the whole
+//! interpreter. RefCell borrows are never held across a Python call --
+//! waker and parker both pop/push first, call second -- so re-entrancy
+//! through GC or callbacks (or a GIL switch inside one) cannot trip a
+//! double borrow.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -71,20 +79,25 @@ fn raise_empty(py: Python<'_>) -> PyErr {
 
 /// Resolve the first still-pending waiter with None. Pops before calling
 /// into Python (set_result can run arbitrary code re-entering the queue).
+///
+/// A wake counts only once a `set_result` has actually gone through. A
+/// waiter whose loop is already closed fails there ("Event loop is
+/// closed") -- a getter left parked by an earlier loop the queue outlived
+/// -- and treating that as delivered handed the wake to a dead future
+/// while the live waiter behind it hung with an item in the queue.
 fn wake_next(py: Python<'_>, waiters: &RefCell<VecDeque<Py<PyAny>>>) {
     loop {
         let fut = waiters.borrow_mut().pop_front();
         let Some(fut) = fut else { return };
         let done: bool =
             fut.bind(py).call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
-        if !done {
-            let _ = fut.bind(py).call_method1(intern!(py, "set_result"), (py.None(),));
+        if !done && fut.bind(py).call_method1(intern!(py, "set_result"), (py.None(),)).is_ok() {
             return;
         }
     }
 }
 
-#[pyclass(name = "FastQueue", module = "cadeloop._core", unsendable)]
+#[pyclass(name = "FastQueue", module = "cadeloop._core", frozen)]
 pub struct FastQueue {
     maxsize: i64,
     items: RefCell<VecDeque<Py<PyAny>>>,
@@ -93,6 +106,16 @@ pub struct FastQueue {
     unfinished: Cell<i64>,
     join_waiters: RefCell<Vec<Py<PyAny>>>,
 }
+
+// SAFETY: the interior state is only ever touched from the #[pymethods]
+// below, i.e. by a thread holding the GIL -- the fields are private to
+// this module and nothing hands out a reference to them. This crate builds
+// for CPython 3.11 only, where the GIL admits one thread at a time and its
+// release/acquire orders every access before the next thread's, so the
+// RefCell/Cell bookkeeping is never raced. No borrow is held across a call
+// into Python (where the GIL can switch threads), so two threads can never
+// hold overlapping borrows either.
+unsafe impl Sync for FastQueue {}
 
 impl FastQueue {
     fn is_full(&self) -> bool {
@@ -236,9 +259,12 @@ impl FastQueue {
         }
         self.unfinished.set(n - 1);
         if n == 1 {
-            loop {
-                let fut = self.join_waiters.borrow_mut().pop();
-                let Some(fut) = fut else { break };
+            // In join order, as Event.set() wakes its waiters: popping from
+            // the back of the Vec resumed the most recent join first. Taken
+            // whole before any Python runs, so a set_result that re-enters
+            // (a new join, an unjoin) sees a consistent, empty list.
+            let waiters = std::mem::take(&mut *self.join_waiters.borrow_mut());
+            for fut in waiters {
                 let done: bool =
                     fut.bind(py).call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
                 if !done {
@@ -249,27 +275,23 @@ impl FastQueue {
         Ok(())
     }
 
-    /// Await until every put item has had task_done() called for it.
-    /// Already-satisfied joins return a completed awaitable; otherwise the
-    /// loop future itself is returned (directly awaitable, resolved when
-    /// the count reaches zero -- the same observable behavior as the
-    /// stdlib's Event-based wait).
-    fn join(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if self.unfinished.get() == 0 {
-            return crate::http::value_awaitable(py, py.None());
-        }
-        let asyncio = py.import("asyncio")?;
-        let pyloop = asyncio.call_method0(intern!(py, "get_running_loop"))?;
-        let fut = pyloop.call_method0(intern!(py, "create_future"))?;
-        self.join_waiters.borrow_mut().push(fut.clone().unbind());
-        Ok(fut.unbind())
+    /// Items put but not yet marked done -- `join()` waits only while this
+    /// is non-zero, exactly like the stdlib's `_unfinished_tasks > 0` check.
+    fn unfinished(&self) -> i64 {
+        self.unfinished.get()
+    }
+
+    /// Park a join() waiter future created by the wrapper (which picks and
+    /// checks the loop, as for get/put); resolved when the count reaches 0.
+    fn park_joiner(&self, fut: Py<PyAny>) {
+        self.join_waiters.borrow_mut().push(fut);
     }
 
     /// The join-side removal Event.wait() does in its finally: a join
     /// whose await was cancelled must not stay parked until the count
     /// happens to reach zero (it may never), or repeated timed-out joins
-    /// retain one future each, without bound. No-op for the completed
-    /// fast-path awaitable and for waiters task_done already drained.
+    /// retain one future each, without bound. No-op for waiters task_done
+    /// already drained.
     fn unjoin(&self, py: Python<'_>, fut: Py<PyAny>) {
         let fut = fut.bind(py);
         let mut w = self.join_waiters.borrow_mut();

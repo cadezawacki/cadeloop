@@ -176,11 +176,22 @@ impl Wakeup for EpollWakeup {
 /// `HashMap` it replaces: every op post, every readiness event and every
 /// tick's `has_io_interest` did at least one hash of an `i32`, and the
 /// per-tick one was a measurable share of a pure-scheduling tick.
-#[derive(Default)]
 struct FdTable {
     slots: Vec<FdEntry>,
     /// Number of `present` slots.
     live: usize,
+    /// The signal-wakeup pipe's read end (R-052, `set_wake_only`; -1 if
+    /// none) and whether it is present. It is watched, but is not I/O
+    /// interest (see `has_io_interest`); tracked here so that per-tick
+    /// test reads one cache line instead of also indexing that fd's slot.
+    wake_fd: RawFd,
+    wake_present: bool,
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        FdTable { slots: Vec::new(), live: 0, wake_fd: -1, wake_present: false }
+    }
 }
 
 impl FdTable {
@@ -212,6 +223,7 @@ impl FdTable {
         if !e.present {
             *e = FdEntry { present: true, ..FdEntry::default() };
             self.live += 1;
+            self.wake_present |= fd == self.wake_fd;
         }
         e
     }
@@ -224,17 +236,26 @@ impl FdTable {
             return None;
         }
         self.live -= 1;
+        if fd == self.wake_fd {
+            self.wake_present = false;
+        }
         Some(std::mem::take(e))
+    }
+
+    fn set_wake_fd(&mut self, fd: Option<RawFd>) {
+        self.wake_fd = fd.unwrap_or(-1);
+        self.wake_present = fd.is_some_and(|fd| self.contains(fd));
+    }
+
+    /// Present entries other than the signal-wakeup fd.
+    #[inline]
+    fn interest_len(&self) -> usize {
+        self.live - usize::from(self.wake_present)
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
         self.live == 0
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.live
     }
 }
 
@@ -246,9 +267,6 @@ pub struct EpollBackend {
     /// Ops completed inline or cancelled, delivered on the next poll.
     inline_completions: Vec<Completion>,
     events: Vec<libc::epoll_event>,
-    /// The signal-wakeup pipe's read end (R-052): watched, but not
-    /// I/O interest -- see has_io_interest.
-    wake_only: Option<RawSocket>,
     pub syscalls_saved_inline: u64,
 }
 
@@ -269,7 +287,6 @@ impl EpollBackend {
             fds: FdTable::default(),
             inline_completions: Vec::with_capacity(32),
             events: vec![unsafe { zeroed() }; 1024],
-            wake_only: None,
             syscalls_saved_inline: 0,
         })
     }
@@ -567,8 +584,8 @@ impl Drop for EpollBackend {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.wake.eventfd);
-            libc::close(self.epfd);
         }
+        self.release_poller();
     }
 }
 
@@ -903,6 +920,13 @@ impl IoBackend for EpollBackend {
         }
     }
 
+    fn release_poller(&mut self) {
+        if self.epfd >= 0 {
+            unsafe { libc::close(self.epfd) };
+            self.epfd = -1; // later epoll_ctl/epoll_wait fail with EBADF, never hit a recycled fd
+        }
+    }
+
     fn has_io_interest(&self) -> bool {
         // A staged completion or an op the kernel may still finish is
         // always interest. Registered fds count too -- except the
@@ -913,10 +937,7 @@ impl IoBackend for EpollBackend {
         if !self.inline_completions.is_empty() || self.slab.in_flight() > 0 {
             return true;
         }
-        match self.wake_only {
-            Some(w) => self.fds.len() > usize::from(self.fds.contains(w as RawFd)),
-            None => !self.fds.is_empty(),
-        }
+        self.fds.interest_len() > 0
     }
 
     fn take_staged(&mut self, out: &mut Vec<Completion>) -> usize {
@@ -930,7 +951,7 @@ impl IoBackend for EpollBackend {
     }
 
     fn set_wake_only(&mut self, fd: Option<RawSocket>) {
-        self.wake_only = fd;
+        self.fds.set_wake_fd(fd.map(|w| w as RawFd));
     }
 
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {

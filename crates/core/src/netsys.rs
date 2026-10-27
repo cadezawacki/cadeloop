@@ -38,11 +38,19 @@ pub fn build_sockaddr(addr: SocketAddr) -> SockAddrBuf {
         }
         SocketAddr::V6(v6) => {
             out.family = AF_INET6;
-            // sockaddr_in6: u16 family, u16 port(BE), u32 flowinfo,
+            // sockaddr_in6: u16 family, u16 port(BE), u32 flowinfo(BE),
             // 16 addr, u32 scope_id — same layout both platforms.
+            //
+            // flowinfo is in network byte order in the struct (RFC 3493
+            // section 3.3; both kernels read it that way) but in host order
+            // in the Python 4-tuple, which CPython converts with htonl and
+            // ntohl. `SocketAddrV6::flowinfo` here carries the tuple's value,
+            // so it is byte-swapped on the way in and out -- written raw, a
+            // nonzero flow label went on the wire scrambled and came back
+            // to Python differing from socket.getpeername().
             out.buf[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
             out.buf[2..4].copy_from_slice(&v6.port().to_be_bytes());
-            out.buf[4..8].copy_from_slice(&v6.flowinfo().to_ne_bytes());
+            out.buf[4..8].copy_from_slice(&v6.flowinfo().to_be_bytes());
             out.buf[8..24].copy_from_slice(&v6.ip().octets());
             out.buf[24..28].copy_from_slice(&v6.scope_id().to_ne_bytes());
             out.len = 28;
@@ -104,7 +112,7 @@ pub fn parse_sockaddr(buf: &[u8]) -> Option<SocketAddr> {
     } else if family == AF_INET6 && buf.len() >= 28 {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&buf[8..24]);
-        let flowinfo = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let flowinfo = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let scope = u32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]);
         Some(SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::from(octets), port, flowinfo, scope)))
     } else {
@@ -317,11 +325,16 @@ mod imp {
     /// port-hijacking hole. POSIX SO_REUSEADDR only relaxes TIME_WAIT,
     /// which is what callers asking for it actually want.
     ///
-    /// So the flag is honoured by its INTENT rather than its name:
-    /// SO_EXCLUSIVEADDRUSE, which gives the TIME_WAIT relaxation without
-    /// letting anyone else in. `reuse_addr=false` leaves Winsock's
-    /// default, which is the permissive one, so exclusivity is set on
-    /// both branches.
+    /// So the flag maps to SO_EXCLUSIVEADDRUSE, which keeps the port out of
+    /// anyone else's reach. That is the security half of the intent only:
+    /// exclusive use is NOT a TIME_WAIT relaxation. Per Microsoft's "Using
+    /// SO_REUSEADDR and SO_EXCLUSIVEADDRUSE", an exclusive bind fails with
+    /// WSAEADDRINUSE while connections accepted through an earlier socket
+    /// on the port are still active, so a restart racing its predecessor's
+    /// lingering connections can fail where Winsock's default bind might
+    /// not. Hijack-proofing was judged worth that (hardening log, 7649432).
+    /// `on` is ignored: the default is the permissive one, so exclusivity
+    /// applies whichever way the caller asks.
     pub fn set_reuse_addr(sock: RawSocket, _on: bool) -> io::Result<()> {
         let v: u32 = 1;
         let rc = unsafe { setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (&v as *const u32).cast(), 4) };
@@ -464,6 +477,18 @@ mod tests {
         let addr: SocketAddr = "[::1]:443".parse().unwrap();
         let sa = build_sockaddr(addr);
         assert_eq!(parse_sockaddr(&sa.buf[..sa.len]), Some(addr));
+    }
+
+    #[test]
+    fn ipv6_flowinfo_is_network_order_in_the_struct() {
+        let addr = SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0x0001_2345, 7));
+        let sa = build_sockaddr(addr);
+        // As CPython's htonl writes it, and as the kernel reads it.
+        assert_eq!(sa.buf[4..8], [0x00, 0x01, 0x23, 0x45]);
+        // scope_id stays in host order on both sides.
+        assert_eq!(sa.buf[24..28], 7u32.to_ne_bytes());
+        let back = parse_sockaddr(&sa.buf[..sa.len]).unwrap();
+        assert_eq!(back, addr, "round trip keeps the tuple's flowinfo");
     }
 
     #[test]

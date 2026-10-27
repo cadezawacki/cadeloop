@@ -430,10 +430,10 @@ impl CoreLoop {
             }
             // Phase 2: translate completions (no Python execution).
             st.reactor.finish_poll_after(parked);
-            st.net.now_ns = st.reactor.time_cached();
             let mut comps = std::mem::take(&mut st.completions_scratch);
             st.reactor.drain_completions(&mut comps);
             if !comps.is_empty() {
+                st.net.now_ns = st.reactor.time_cached();
                 net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
                 comps.clear();
             }
@@ -444,8 +444,11 @@ impl CoreLoop {
             // completion ever arrives, so gating the retry on one left
             // the listener deaf for good. Cheap when nothing is
             // starved: one bool load and return.
-            let now = st.reactor.time_cached();
-            net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut(), now);
+            if st.net.any_starved_listener {
+                let now = st.reactor.time_cached();
+                st.net.now_ns = now; // the re-post's own failure path reads it
+                net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut(), now);
+            }
             st.completions_scratch = comps;
             // Readiness watch callbacks join the ready queue AND this tick's
             // batch, as asyncio runs an iteration's I/O callbacks in that
@@ -784,12 +787,36 @@ impl CoreLoop {
             net::reap_at_close(py, &mut st.net, st.reactor.backend_mut());
             dropped.extend(st.reactor.clear_pending());
             dropped.extend(std::mem::take(&mut st.net.ready_scratch).into_iter().map(HandleRef));
-            for (_, h) in st.net.readers.drain() {
+            // The backend's side of each watch goes with the callback. On
+            // IOCP a watch is a request the kernel owns until it is
+            // cancelled and reaped; left armed, it outlived the loop and
+            // completed into freed memory once the socket saw data.
+            for (fd, h) in st.net.readers.drain() {
+                let _ = st.reactor.backend_mut().set_watch(fd, false, false);
                 dropped.push(HandleRef(h));
             }
-            for (_, h) in st.net.writers.drain() {
+            for (fd, h) in st.net.writers.drain() {
+                let _ = st.reactor.backend_mut().set_watch(fd, false, false);
                 dropped.push(HandleRef(h));
             }
+            // Events that will never be dispatched (a fatal error unwound
+            // the batch they were in) may carry the only reference to a
+            // socket: an accepted connection nobody wired, a connect whose
+            // future nobody resolved. Dropping the event dropped a raw
+            // descriptor -- an open connection the peer never saw close.
+            for ev in &st.net.events {
+                match *ev {
+                    NetEvent::Accepted { sock, .. } => netsys::close(sock),
+                    NetEvent::ConnectDone { sock, .. } => {
+                        st.reactor.backend_mut().detach_socket(sock);
+                        netsys::close(sock);
+                    }
+                    _ => {}
+                }
+            }
+            // Last: everything above may still need the poller (unwatching
+            // is an epoll_ctl), and nothing after this point polls.
+            st.reactor.backend_mut().release_poller();
             // ADR-5: NetEvent variants OWN Python references. Clearing the
             // vector here would decref them while `with` holds the exclusive
             // &mut, and a finalizer reached by one of those decrefs can
@@ -865,7 +892,9 @@ impl CoreLoop {
         this.check_thread()?;
         let (deadline, when) = this.later_deadline(delay);
         let base =
-            this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_later")?;
+            // "call_at": asyncio's call_later is call_at(time() + delay),
+            // so its debug-mode callback errors name call_at().
+            this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_at")?;
         this.schedule_timer(py, deadline, when, base)
     }
 
@@ -1201,13 +1230,20 @@ impl CoreLoop {
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the
     /// facade server). Returns (head_timeouts, idle_closes) this pass.
     fn http_sweep(&self, py: Python<'_>) -> PyResult<(u32, u32)> {
-        let counts = self.with_net(|net, reactor| {
+        let (head, idle, cancel_drivers) = self.with_net(|net, reactor| {
             let now_ns = reactor.time_cached();
             let backend = reactor.backend_mut();
             net::http_sweep(py, net, backend, now_ns)
         })?;
         self.drain_graveyards(py)?;
-        Ok(counts)
+        // Cancel the drivers of reclaimed disconnected connections OUTSIDE
+        // the state cell (cancel() runs Python): unwinds each abandoned
+        // coroutine so its AppTask + frame are released. These are already
+        // included in the idle count reported to the facade.
+        for driver in cancel_drivers {
+            let _ = driver.bind(py).call_method0(intern!(py, "cancel"));
+        }
+        Ok((head, idle))
     }
 
     /// R-140: install (or clear) the access-log sink — a callable
@@ -1283,8 +1319,11 @@ impl CoreLoop {
 
     /// Start (or restart) accepting on a listener created with start=false.
     fn listener_start(&self, lid: u64) -> PyResult<()> {
-        self.with_net(|net, reactor| net::listener_start(net, reactor.backend_mut(), lid))?
-            .map_err(net::io_error)
+        let started = self.with_net(|net, reactor| {
+            net.now_ns = reactor.now_fresh(); // a failed first post backs off from now
+            net::listener_start(net, reactor.backend_mut(), lid)
+        })?;
+        started.map_err(net::io_error)
     }
 
     fn listener_close(&self, py: Python<'_>, lid: u64) -> PyResult<()> {
@@ -1805,7 +1844,7 @@ impl CoreLoop {
     // ---- introspection (R-103) --------------------------------------------
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (stats, ready, timers, netstats, ops, diag, live_name) = self.state.with(|st| {
+        let (stats, ready, timers, netstats, ops, diag, live_name, foreign) = self.state.with(|st| {
             (
                 st.reactor.stats.clone(),
                 st.reactor.ready_len(),
@@ -1829,6 +1868,7 @@ impl CoreLoop {
                 // Live, not the construction-time cache: RIO downgrades its
                 // name to "rio-polling" if RIONotify starts failing mid-run.
                 st.reactor.backend_name(),
+                st.reactor.backend_mut().foreign_completions(),
             )
         })?;
         let d = PyDict::new(py);
@@ -1874,6 +1914,11 @@ impl CoreLoop {
         by_target.set_item("dgram", ops.dgram)?;
         by_target.set_item("pipe", ops.pipe)?;
         d.set_item("ops_by_target", by_target)?;
+        // Completions that no live operation could own, dropped rather than
+        // dereferenced or misattributed: another process's OVERLAPPED on a
+        // shared handle (ADR-25), or a second packet for an operation the
+        // backend already completed inline. Zero in a correct run.
+        d.set_item("foreign_completions", foreign)?;
         if let Some((notifies, reaps)) = diag {
             d.set_item("rio_notifies", notifies)?;
             d.set_item("rio_watchdog_reaps", reaps)?;
@@ -1992,6 +2037,7 @@ impl CoreLoop {
             }
             let lid = net::listener_create(net, sock, kind, accept_pool, owner);
             if start {
+                net.now_ns = reactor.now_fresh(); // a failed first post backs off from now
                 if let Err(e) = net::listener_start(net, reactor.backend_mut(), lid) {
                     // listener_create already inserted it and the socket is
                     // registered, but no lid reaches the caller -- so the
@@ -2315,7 +2361,8 @@ unsafe fn fast_call_later(
         this.check_closed()?;
         this.check_thread()?;
         let (deadline, when) = this.later_deadline(delay);
-        let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_later")?;
+        // "call_at" in its error messages, as asyncio's (see call_later).
+        let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_at")?;
         Ok(this.schedule_timer(py, deadline, when, base)?.into_ptr())
     }
 }

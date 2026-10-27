@@ -137,8 +137,9 @@ impl<T: TimerPayload> Reactor<T> {
 
     // ---- time -----------------------------------------------------------
 
-    /// Cached tick timestamp (R-061). Refreshed by `prepare_tick`; callers
-    /// outside a running tick should use `now_fresh`.
+    /// The tick's timestamp (R-061): read on first use after
+    /// `prepare_tick` (see `time`); callers outside a running tick should
+    /// use `now_fresh`.
     #[inline]
     pub fn time_cached(&self) -> Ticks {
         self.clock.cached()
@@ -212,7 +213,7 @@ impl<T: TimerPayload> Reactor<T> {
 
     pub fn prepare_tick(&mut self) {
         self.stats.ticks += 1;
-        self.clock.refresh();
+        self.clock.invalidate();
         self.absorb_cancellations();
         self.drain_xthread();
         self.fire_expired_timers();
@@ -271,12 +272,13 @@ impl<T: TimerPayload> Reactor<T> {
 
     #[inline]
     fn fire_expired_timers(&mut self) {
-        let now = self.clock.cached();
         // Cheap reject before the pop loop: the top entry is a lower bound
-        // for every deadline in the heap (cancelled or not).
-        match self.timers.peek_deadline() {
-            Some(d) if d <= now => {}
-            _ => return,
+        // for every deadline in the heap (cancelled or not). An empty heap
+        // needs no clock read at all.
+        let Some(top) = self.timers.peek_deadline() else { return };
+        let now = self.clock.cached();
+        if top > now {
+            return;
         }
         while let Some(token) = self.timers.pop_expired(now) {
             self.ready.push(token);
@@ -290,10 +292,15 @@ impl<T: TimerPayload> Reactor<T> {
         if !self.ready.is_empty() {
             return Duration::ZERO;
         }
-        let now = self.clock.cached();
         match self.timers.next_deadline() {
-            Some(d) if d <= now => Duration::ZERO,
-            Some(d) => Duration::from_nanos(d - now).min(MAX_PARK),
+            Some(d) => {
+                let now = self.clock.cached();
+                if d <= now {
+                    Duration::ZERO
+                } else {
+                    Duration::from_nanos(d - now).min(MAX_PARK)
+                }
+            }
             None => MAX_PARK,
         }
     }
@@ -368,9 +375,10 @@ impl<T: TimerPayload> Reactor<T> {
     pub fn finish_poll_after(&mut self, parked: bool) -> &[Completion] {
         self.stats.completions += self.completions.len() as u64;
         if parked {
-            // Time passed and producers may have posted: refresh the tick
-            // clock, absorb, drain and fire so this tick dispatches them.
-            self.clock.refresh();
+            // Time passed and producers may have posted: a new tick
+            // reading (taken lazily), absorb, drain and fire so this tick
+            // dispatches them.
+            self.clock.invalidate();
             self.absorb_cancellations();
             self.drain_xthread();
             self.fire_expired_timers();

@@ -756,3 +756,49 @@ def test_signal_wakeup_pair_is_made_once_per_loop(loop):
     assert loop._signal_wakeup_pair is pair
     loop.close()
     assert pair[0].fileno() == -1 and pair[1].fileno() == -1
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/fd")
+def test_close_releases_the_epoll_instance():
+    """asyncio's close() closes its selector at once; the epoll fd used to
+    live until the loop object was garbage-collected."""
+
+    def nfds():
+        return len(os.listdir("/proc/self/fd"))
+
+    before = nfds()
+    lp = cadeloop.new_event_loop()
+    lp.run_until_complete(asyncio.sleep(0))
+    lp.close()
+    try:
+        # The eventfd stays until the loop is freed (other threads may
+        # still hold the wakeup); the epoll instance does not.
+        assert nfds() <= before + 1
+    finally:
+        del lp
+        gc.collect()
+    assert nfds() <= before
+
+
+def test_timer_handles_order_and_hash_like_asyncio(loop):
+    a = loop.call_at(100.0, print)
+    b = loop.call_at(200.0, print)
+    c = loop.call_at(100.0, print)
+    assert a < b and b > a and a <= c and a >= c and not (a < c)
+    assert a == c and a != b and hash(a) == hash(c) == hash(100.0)
+    assert sorted([b, a]) == [a, b]
+    c.cancel()
+    assert a != c  # cancellation is part of equality
+    for h in (a, b):
+        h.cancel()
+
+
+def test_call_later_coroutine_error_names_call_at(loop):
+    loop.set_debug(True)
+
+    async def coro_fn():
+        pass
+
+    # asyncio's call_later is call_at(time() + delay): its message says so.
+    with pytest.raises(TypeError, match=r"coroutines cannot be used with call_at\(\)"):
+        loop.call_later(1, coro_fn)

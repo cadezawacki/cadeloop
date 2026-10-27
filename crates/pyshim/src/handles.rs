@@ -31,6 +31,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cadeloop_core::timer::TimerPayload;
+use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyKeyboardInterrupt, PySystemExit};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -512,6 +513,47 @@ impl TimerHandle {
     #[getter]
     fn _when(&self) -> f64 {
         self.when
+    }
+
+    // asyncio.TimerHandle's ordering and hash: by `when`, with equality
+    // also comparing callback, arguments and cancellation.
+
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        pyo3::types::PyFloat::new(py, self.when).hash()
+    }
+
+    fn __richcmp__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let Ok(other) = other.cast::<TimerHandle>() else {
+            return Ok(py.NotImplemented());
+        };
+        let (a, b) = (slf.get().when, other.get().when);
+        let eq = || -> PyResult<bool> {
+            if a != b {
+                return Ok(false);
+            }
+            let (x, y) = (slf.as_super().get(), other.as_super().get());
+            if x.is_cancelled() != y.is_cancelled() {
+                return Ok(false);
+            }
+            let (xa, ya) = (x.callback_and_args(py)?, y.callback_and_args(py)?);
+            match (xa, ya) {
+                (None, None) => Ok(true),
+                (Some((xc, xs)), Some((yc, ys))) => {
+                    Ok(xc.bind(py).eq(yc.bind(py))? && xs.bind(py).eq(ys.bind(py))?)
+                }
+                _ => Ok(false),
+            }
+        };
+        let r = match op {
+            CompareOp::Lt => a < b,
+            CompareOp::Gt => a > b,
+            CompareOp::Le => a < b || eq()?,
+            CompareOp::Ge => a > b || eq()?,
+            CompareOp::Eq => eq()?,
+            CompareOp::Ne => !eq()?,
+        };
+        Ok(pyo3::types::PyBool::new(py, r).to_owned().into_any().unbind())
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
