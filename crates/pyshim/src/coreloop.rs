@@ -765,7 +765,6 @@ impl CoreLoop {
             // (queued response bodies, up to high_water per connection)
             // living as long as anything still references the dead loop.
             net::reap_at_close(py, &mut st.net, st.reactor.backend_mut());
-            st.reactor.backend_mut().release_poller();
             dropped.extend(st.reactor.clear_pending());
             dropped.extend(std::mem::take(&mut st.net.ready_scratch).into_iter().map(HandleRef));
             // The backend's side of each watch goes with the callback. On
@@ -795,6 +794,9 @@ impl CoreLoop {
                     _ => {}
                 }
             }
+            // Last: everything above may still need the poller (unwatching
+            // is an epoll_ctl), and nothing after this point polls.
+            st.reactor.backend_mut().release_poller();
             // ADR-5: NetEvent variants OWN Python references. Clearing the
             // vector here would decref them while `with` holds the exclusive
             // &mut, and a finalizer reached by one of those decrefs can
