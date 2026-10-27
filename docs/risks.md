@@ -5,7 +5,7 @@
 | OVERLAPPED/buffer UAF under cancellation | Implemented: pinned op slab, `{Free,Posted,Completed,Cancelled}` machine with debug-asserted transitions, recycle only after completion reap, generation-checked ids (`opslab.rs`); buffer slots refcounted with debug poison `0xDD` (`buffers.rs`); both proptested (R-121). |
 | `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` with LSPs | Implemented: `XP1_IFS_HANDLES` check per socket in `register_socket`; skip-modes not applied for non-IFS providers (R-031). |
 | RIO scaling cliffs (RQ sizing, CQ overflow) | Planned M3: CQ overflow = fatal-log + stop posting recvs (backpressure), never silent loss; `rio_cq_size`/`rio_rq_*` configurable (design in `rio.rs` header). |
-| GIL re-entry cost dominating small messages | Implemented: GIL released once per poll, re-acquired once per batch (R-021); 128-callback dispatch batches (R-054); vectorcall dispatch. Measure gil-held% via ETW in M1 perf work (R-133). |
+| GIL re-entry cost dominating small messages | Implemented: GIL released once per poll, re-acquired once per batch (R-021); one dispatch batch per tick (R-054); vectorcall dispatch. Measure gil-held% via ETW in M1 perf work (R-133). |
 | add_reader emulation semantic drift | Planned M1/M4: zero-byte probe emulation documented as level-triggered approximation; asyncpg-pattern conformance tests (R-057, R-124). |
 | Eager-task semantics breaking Task-identity assumptions | `cfg.eager_tasks=True` default with off switch already in Config (§16); interop suite to run both ways (M2). |
 | Loopback-only benchmark self-deception | Two-machine numbers authoritative (R-131); the Linux scheduling report in README is explicitly labeled non-acceptance; `SIO_LOOPBACK_FAST_PATH` disclosed wherever loopback numbers appear. |

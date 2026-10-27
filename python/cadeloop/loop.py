@@ -15,22 +15,27 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import os
-import reprlib
+import signal as signal_module
 import socket
 import stat
 import subprocess
 import sys
 import threading
+import traceback
 import warnings
 import weakref
-from asyncio import events, futures, tasks
+from asyncio import base_events, events, format_helpers, futures, tasks
+
+# asyncio's own logger, as uvloop uses it too: "Task exception was never
+# retrieved", exception-handler output and slow-callback warnings are
+# routed, filtered and silenced through logging.getLogger("asyncio") by
+# applications and test harnesses alike.
+from asyncio.log import logger
 
 from . import _core
-from .tcp import TcpSurface, _DatagramTransport
+from .tcp import TcpSurface, _DatagramTransport, _fileno
 
 __all__ = ["Loop"]
-
-logger = __import__("logging").getLogger("cadeloop")
 
 _MILESTONES = {
     "tcp": "TCP transports arrive with the IOCP backend in milestone M1",
@@ -114,6 +119,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._core = core
         self._accept_pool = accept_pool  # R-032
         self._signal_handlers = {}
+        self._signal_wakeup_pair = None  # R-052, made on first main-thread run
         self._console_ctrl_handler_ref = None  # R-052: keeps the ctypes callback alive
         core.set_error_hook(self._on_callback_error)
         core.set_net_error_hook(self._on_net_error)
@@ -129,18 +135,37 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # The scheduling four are raw METH_FASTCALL builtins (no generic
         # argument parsing, no per-call *args tuple); asyncio's C Task and
         # Future look `call_soon` up here on every step and done-callback.
+        # Not where a subclass overrides one: the instance attribute would
+        # shadow the override, which then silently never ran (see the
+        # class-level forms below).
+        fast = core.fast_methods()
         (
-            self.call_soon,
-            self.call_soon_threadsafe,
-            self.call_later,
-            self.call_at,
-        ) = core.fast_methods()
-        self.time = core.time
-        self.stop = core.stop
-        self.is_running = core.is_running
-        self.is_closed = core.is_closed
-        self.get_debug = core.get_debug
-        self.stats = core.stats  # R-103
+            self._fast_call_soon,
+            self._fast_call_soon_threadsafe,
+            self._fast_call_later,
+            self._fast_call_at,
+        ) = fast
+        natives = {
+            "call_soon": fast[0],
+            "call_soon_threadsafe": fast[1],
+            "call_later": fast[2],
+            "call_at": fast[3],
+            "time": core.time,
+            "stop": core.stop,
+            "is_running": core.is_running,
+            "is_closed": core.is_closed,
+            "get_debug": core.get_debug,
+            "stats": core.stats,  # R-103
+        }
+        cls = type(self)
+        overridden = {n for n in natives if getattr(cls, n) is not getattr(Loop, n)}
+        if overridden & {"time", "call_at"}:
+            # asyncio's call_later is call_at(time() + delay): an override
+            # of either must be honoured by it too.
+            overridden.add("call_later")
+        for name, native in natives.items():
+            if name not in overridden:
+                setattr(self, name, native)
 
         self._task_factory = None
         core.set_owner(self)
@@ -226,17 +251,32 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         immediately, so CTRL+C interrupts an idle loop at once. This is
         the proactor CTRL+C fix on Windows, and on POSIX it also closes
         the race of a signal landing between the tick's signal check and
-        the park. Main thread only (set_wakeup_fd's own rule)."""
+        the park. Main thread only (set_wakeup_fd's own rule).
+
+        The socket pair and its watch are made once per loop and kept until
+        close(): only the set_wakeup_fd swap is per run. Building and
+        tearing them down on every run_forever() -- a socketpair, two
+        fcntls, an epoll_ctl pair and two closes -- made
+        run_until_complete() over twice as slow as asyncio's."""
         if threading.current_thread() is not threading.main_thread():
             return None
-        import signal as signal_module
+        pair = self._signal_wakeup_pair
+        if pair is None:
+            pair = self._signal_wakeup_pair = self._make_signal_wakeup_pair()
+            if pair is None:
+                return None
+        try:
+            old_fd = signal_module.set_wakeup_fd(pair[1].fileno(), warn_on_full_buffer=False)
+        except (ValueError, OSError):
+            return None
+        return (old_fd,)
 
+    def _make_signal_wakeup_pair(self):
         try:
             rsock, csock = socket.socketpair()
             rsock.setblocking(False)
             csock.setblocking(False)
-            old_fd = signal_module.set_wakeup_fd(csock.fileno(), warn_on_full_buffer=False)
-        except (ValueError, OSError, AttributeError):
+        except OSError:
             return None
 
         def drain():
@@ -249,7 +289,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         try:
             self._core.add_reader(rsock.fileno(), drain)
         except OSError:
-            signal_module.set_wakeup_fd(old_fd)
             rsock.close()
             csock.close()
             return None
@@ -257,22 +296,25 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # without this, its permanent registration would keep the poll
         # elision (pure-scheduling fast path) from ever engaging.
         self._core.set_signal_wakeup_fd(rsock.fileno())
-        return (rsock, csock, old_fd)
+        return (rsock, csock)
 
     def _remove_signal_wakeup(self, wakeup):
         if wakeup is None:
             return
-        import signal as signal_module
+        try:
+            signal_module.set_wakeup_fd(wakeup[0])
+        except (ValueError, OSError):
+            pass
 
-        rsock, csock, old_fd = wakeup
+    def _close_signal_wakeup_pair(self):
+        pair, self._signal_wakeup_pair = self._signal_wakeup_pair, None
+        if pair is None:
+            return
+        rsock, csock = pair
         self._core.set_signal_wakeup_fd(None)
         try:
             self._core.remove_reader(rsock.fileno())
         except OSError:
-            pass
-        try:
-            signal_module.set_wakeup_fd(old_fd)
-        except (ValueError, OSError):
             pass
         rsock.close()
         csock.close()
@@ -327,6 +369,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             except (OSError, ValueError, RuntimeError):
                 self._signal_handlers.pop(sig, None)
         self._remove_console_ctrl_handler()
+        self._close_signal_wakeup_pair()
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None
@@ -399,6 +442,48 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 else:
                     set_name(name)
         return task
+
+    # Class-level forms of the fast paths __init__ binds per instance: what
+    # a subclass's super().call_soon(...) reaches, and what an instance of
+    # a subclass that overrides one of them runs for the others.
+
+    def call_soon(self, callback, *args, context=None):
+        return self._fast_call_soon(callback, *args, context=context)
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        return self._fast_call_soon_threadsafe(callback, *args, context=context)
+
+    def call_later(self, delay, callback, *args, context=None):
+        cls = type(self)
+        if cls.time is Loop.time and cls.call_at is Loop.call_at:
+            return self._fast_call_later(delay, callback, *args, context=context)
+        # asyncio's own definition, so an overridden time() or call_at()
+        # is honoured.
+        timer = self.call_at(self.time() + delay, callback, *args, context=context)
+        if timer._source_traceback:
+            del timer._source_traceback[-1]
+        return timer
+
+    def call_at(self, when, callback, *args, context=None):
+        return self._fast_call_at(when, callback, *args, context=context)
+
+    def time(self):
+        return self._core.time()
+
+    def stop(self):
+        self._core.stop()
+
+    def is_running(self):
+        return self._core.is_running()
+
+    def is_closed(self):
+        return self._core.is_closed()
+
+    def get_debug(self):
+        return self._core.get_debug()
+
+    def stats(self):
+        return self._core.stats()
 
     def _rebind_task_fastpath(self):
         """(Re)install the native create_task/create_future fast paths.
@@ -575,6 +660,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return self._exception_handler
 
     def default_exception_handler(self, context):
+        # asyncio's BaseEventLoop.default_exception_handler, line for line
+        # (less the `_current_handle` fallback: the native dispatcher does
+        # not track one; handles pass their traceback explicitly instead).
         message = context.get("message")
         if not message:
             message = "Unhandled exception in event loop"
@@ -587,7 +675,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         for key in sorted(context):
             if key in {"message", "exception"}:
                 continue
-            log_lines.append(f"{key}: {context[key]!r}")
+            value = context[key]
+            if key == "source_traceback":
+                tb = "".join(traceback.format_list(value))
+                value = "Object created at (most recent call last):\n"
+                value += tb.rstrip()
+            elif key == "handle_traceback":
+                tb = "".join(traceback.format_list(value))
+                value = "Handle created at (most recent call last):\n"
+                value += tb.rstrip()
+            else:
+                value = repr(value)
+            log_lines.append(f"{key}: {value}")
         logger.error("\n".join(log_lines), exc_info=exc_info)
 
     def call_exception_handler(self, context):
@@ -627,13 +726,16 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # Hooks invoked from the native dispatcher.
 
     def _on_callback_error(self, handle, exc):
-        self.call_exception_handler(
-            {
-                "message": f"Exception in callback {handle!r}",
-                "exception": exc,
-                "handle": handle,
-            }
-        )
+        # asyncio's Handle._run report, same message and keys.
+        cb = format_helpers._format_callback_source(handle._callback, handle._args)
+        context = {
+            "message": f"Exception in callback {cb}",
+            "exception": exc,
+            "handle": handle,
+        }
+        if handle._source_traceback:
+            context["source_traceback"] = handle._source_traceback
+        self.call_exception_handler(context)
 
     def _on_net_error(self, message, exc):
         self.call_exception_handler({"message": message, "exception": exc})
@@ -650,9 +752,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._slow_callback_duration = seconds
 
     def _on_slow_callback(self, handle, seconds):
-        # R-142: slow-callback warnings in debug mode (>100ms).
+        # R-142: slow-callback warnings in debug mode, worded and formatted
+        # as asyncio's (a Task step names the task, not its __step).
         logger.warning(
-            "Executing %s took %.3f seconds", reprlib.repr(handle), seconds
+            "Executing %s took %.3f seconds", base_events._format_handle(handle), seconds
         )
 
     # ------------------------------------------------------------------ #
@@ -1091,14 +1194,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # (IOCP backend) — see connect_read_pipe/connect_write_pipe/
     # _make_subprocess_transport below.
 
+    # The private pair returns the watch's Handle, as asyncio's does (the
+    # public add_* return None): stdlib code like _sock_read_done keeps it
+    # to tell its own watch from a newer one that replaced it -- a
+    # replaced or removed watch's handle is cancelled.
     def _add_reader(self, fd, callback, *args):
-        return self.add_reader(fd, callback, *args)
+        return self._core.add_reader(_fileno(fd), callback, *args)
 
     def _remove_reader(self, fd):
         return self.remove_reader(fd)
 
     def _add_writer(self, fd, callback, *args):
-        return self.add_writer(fd, callback, *args)
+        return self._core.add_writer(_fileno(fd), callback, *args)
 
     def _remove_writer(self, fd):
         return self.remove_writer(fd)

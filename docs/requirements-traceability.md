@@ -30,14 +30,14 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-051 | Subprocess gated (default off) | ✅ gate + message | config.py, loop.py |
 | R-052 | SIGINT/SIGBREAK handlers | 🔶 POSIX ✅ (EINTR-prompt); Windows SetConsoleCtrlHandler 📅 M4 | loop.py |
 | R-053 | 4-ary timer heap, tombstones, >50% compaction | ✅ (proptested) | timer.rs |
-| R-054 | 128-batch dispatch, vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, handles.rs, net.rs |
+| R-054 | snapshot-batch dispatch (asyncio `_run_once` semantics; the 128 cap is gone: it broke `stop()`), vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, reactor.rs, handles.rs, net.rs |
 | R-055 | DNS thread pool min(8,cpus) + 5s LRU cache | ✅ | loop.py |
 | R-056 | Eager task fast path, zero-Task completions | ✅ `PyIter_Send` stepping; non-suspending requests allocate no Task/Future; AppTask registers via `_enter_task` (anyio-compatible); `eager_tasks=False` stdlib path | http.rs (pyshim), config.py |
 | R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP zero-byte probes compile-verified (harden M4) | epoll.rs, iocp.rs, coreloop.rs |
 | R-058 | UDP endpoints | 📅 M4 | loop.py (gated) |
 | R-059 | Native TLS (memory BIOs), SSLContext compat | 🔶 sslproto MemoryBIO fallback ✅ (spec-sanctioned, tested); native engine 📅 M4 | tcp.py |
 | R-060 | Spin-then-park + latency_mode presets | ✅ | reactor.rs, config.py |
-| R-061 | QPC clock, cached per tick | ✅ (via std Instant=QPC; documented) | time.rs |
+| R-061 | monotonic clock = `time.monotonic()`'s (CLOCK_MONOTONIC on Linux; QPC aligned at creation on Windows); per-tick reading for expiry, fresh for `loop.time()`/`call_later` | ✅ | time.rs |
 | R-070 | mimalloc global allocator | ✅ | pyshim/src/lib.rs |
 | R-071 | Slabs {4K,16K,64K}, VirtualAlloc, large pages, thread-affine | ✅ | buffers.rs |
 | R-072 | Zero-copy memoryview via BufferedProtocol | 🔶 BufferedProtocol supported (single copy into app buffer); recv-into-app-buffer zero-copy 📅 | net.rs |

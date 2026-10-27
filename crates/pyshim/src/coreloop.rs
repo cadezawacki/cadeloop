@@ -28,7 +28,7 @@ use cadeloop_core::http::Limits;
 use cadeloop_core::netsys;
 use cadeloop_core::reactor::{Reactor, ReactorConfig};
 use cadeloop_core::ready::CrossThreadQueue;
-use cadeloop_core::time::{secs_f64_to_ticks, ticks_to_secs_f64, Ticks};
+use cadeloop_core::time::{raw_now, secs_f64_to_ticks, ticks_to_secs_f64, Ticks, RAW_IS_PYTHON_MONOTONIC};
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::intern;
@@ -85,9 +85,10 @@ pub struct CoreLoop {
     closed: AtomicBool,
     stopping: AtomicBool,
     debug: AtomicBool,
-    /// `loop.time()` cache, updated once per tick (R-061), readable from
-    /// any thread without touching loop state.
-    cached_time_ns: AtomicU64,
+    /// Added to `raw_now()` to read the loop clock (0 on Linux, where the
+    /// raw clock already is Python's monotonic one; see core::time).
+    /// Immutable, so `loop.time()` needs no loop state and no atomics.
+    clock_offset: i64,
     /// Tick counter for the throttled signal check. Loop-thread only:
     /// advanced with a plain load + store, never a locked `fetch_add` (an
     /// atomic RMW on every tick was the single hottest instruction of a
@@ -125,6 +126,19 @@ impl CoreLoop {
         } else {
             Ok(())
         }
+    }
+
+    /// asyncio's debug-mode `_check_thread` for call_soon/call_later/
+    /// call_at. Outside debug mode those calls are accepted from any
+    /// thread (gil_boundary), as asyncio accepts them.
+    #[inline]
+    fn check_thread(&self) -> PyResult<()> {
+        if self.debug.load(Ordering::Relaxed) && self.state.owned_by_other_thread() {
+            return Err(PyRuntimeError::new_err(
+                "Non-thread-safe operation invoked on an event loop other than the current one",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn require_owner(&self) -> PyResult<&Py<PyAny>> {
@@ -165,12 +179,11 @@ impl CoreLoop {
         slow.call((owner, coro), Some(&kw)).map(Bound::unbind)
     }
 
-    fn now_ns(&self) -> PyResult<Ticks> {
-        if self.state.is_claimed() {
-            Ok(self.cached_time_ns.load(Ordering::Acquire))
-        } else {
-            self.state.with(|st| st.reactor.now_fresh())
-        }
+    /// A fresh loop-clock reading (core::time module docs): one vDSO
+    /// clock read, safe from any thread.
+    #[inline]
+    fn fresh_ns(&self) -> Ticks {
+        raw_now().saturating_add_signed(self.clock_offset)
     }
 
     /// Exclusive access to (net, reactor) — see gil_boundary contract.
@@ -198,10 +211,17 @@ impl CoreLoop {
                 std::mem::take(&mut st.net.graveyard_handles),
             )
         })?;
-        // Watch handles the loop no longer owns give up their references
-        // first (handles.rs module docs).
+        // Watch handles the loop no longer owns -- removed, or displaced by
+        // a newer add_reader/add_writer on the fd -- are CANCELLED, as
+        // asyncio's remove_reader and _add_reader cancel them: a copy may
+        // still sit in this tick's batch, and code like sock_recv's
+        // cleanup tells "my watch" from "a newer call's watch" by
+        // `handle.cancelled()`. Then they give up their references
+        // (handles.rs module docs).
         for h in &handles {
-            h.get().release(py);
+            let h = h.get();
+            h.do_cancel();
+            h.release(py);
         }
         // Sockets handed out by `get_extra_info("socket")` are CLOSED, not
         // merely dropped. Each holds its own duplicate of the connection,
@@ -308,7 +328,21 @@ impl CoreLoop {
             Some(c) if !c.is_none() => c.clone().unbind(),
             _ => copy_context(py)?,
         };
-        Handle::new(py, callback.clone().unbind(), args, context, self.debug.load(Ordering::Relaxed))
+        let debug = self.debug.load(Ordering::Relaxed);
+        // asyncio's debug-mode `_source_traceback`. No frame is pushed for
+        // this native call, so extract_stack()'s default -- its caller's
+        // caller -- is the Python code that called call_soon & co, exactly
+        // the frame asyncio trims its own scheduling frames down to.
+        let source_tb = if debug {
+            Some(
+                py.import(intern!(py, "asyncio.format_helpers"))?
+                    .call_method0(intern!(py, "extract_stack"))?
+                    .unbind(),
+            )
+        } else {
+            None
+        };
+        Handle::new(py, callback.clone().unbind(), args, context, debug, source_tb)
     }
 
     /// Flush transports whose writes were corked (R-035). Returns pending
@@ -347,7 +381,6 @@ impl CoreLoop {
                 }
             }
             st.reactor.prepare_tick();
-            self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
             let timeout = if stopping || !st.net.events.is_empty() {
                 Duration::ZERO
             } else if st.net.any_starved_listener {
@@ -377,9 +410,6 @@ impl CoreLoop {
             }
             // Phase 2: translate completions (no Python execution).
             st.reactor.finish_poll_after(parked);
-            if parked {
-                self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
-            }
             st.net.now_ns = st.reactor.time_cached();
             let mut comps = std::mem::take(&mut st.completions_scratch);
             st.reactor.drain_completions(&mut comps);
@@ -397,11 +427,14 @@ impl CoreLoop {
             let now = st.reactor.time_cached();
             net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut(), now);
             st.completions_scratch = comps;
-            // Readiness watch callbacks join the ordinary ready queue.
+            // Readiness watch callbacks join the ready queue AND this tick's
+            // batch, as asyncio runs an iteration's I/O callbacks in that
+            // same iteration (see `absorb_into_batch`).
             if !st.net.ready_scratch.is_empty() {
-                for h in std::mem::take(&mut st.net.ready_scratch) {
+                for h in st.net.ready_scratch.drain(..) {
                     st.reactor.push_ready(HandleRef(h));
                 }
+                st.reactor.absorb_into_batch();
             }
             let events = std::mem::take(&mut st.net.events);
             if events.is_empty() {
@@ -591,6 +624,7 @@ impl CoreLoop {
                         tfo=false, loopback_fast_path=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         backend: &str,
         spin_us: u64,
         high_water: usize,
@@ -606,9 +640,19 @@ impl CoreLoop {
                 "invalid backend {backend:?}: expected 'auto', 'iocp', 'rio' or 'epoll'"
             ))
         })?;
+        // Align the loop clock with time.monotonic() where the raw platform
+        // clock is not already the same one (core::time module docs).
+        let clock_offset = if RAW_IS_PYTHON_MONOTONIC {
+            0
+        } else {
+            let py_now: i64 =
+                py.import(intern!(py, "time"))?.call_method0(intern!(py, "monotonic_ns"))?.extract()?;
+            py_now.saturating_sub(raw_now() as i64)
+        };
         let cfg = ReactorConfig {
             backend: kind,
             spin_us,
+            clock_offset_ns: clock_offset,
             backend_opts: cadeloop_core::backend::BackendOptions { rio_cq_size, rio_rq_recv, rio_rq_send },
             ..Default::default()
         };
@@ -627,7 +671,7 @@ impl CoreLoop {
             closed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             debug: AtomicBool::new(false),
-            cached_time_ns: AtomicU64::new(0),
+            clock_offset,
             tick_no: AtomicU64::new(0),
             error_hook: OnceLock::new(),
             net_error_hook: OnceLock::new(),
@@ -647,7 +691,7 @@ impl CoreLoop {
         let this = slf.get();
         this.check_closed()?;
         let guard = this.state.claim()?;
-        let mut batch: Vec<HandleRef> = Vec::with_capacity(cadeloop_core::ready::DISPATCH_BATCH);
+        let mut batch: Vec<HandleRef> = Vec::with_capacity(cadeloop_core::ready::INITIAL_BATCH_CAPACITY);
         let result = loop {
             match this.tick(slf, py, &mut batch) {
                 Err(e) => break Err(e),
@@ -745,8 +789,8 @@ impl CoreLoop {
 
     // ---- time (R-061) ----------------------------------------------------
 
-    fn time(&self) -> PyResult<f64> {
-        Ok(ticks_to_secs_f64(self.now_ns()?))
+    fn time(&self) -> f64 {
+        ticks_to_secs_f64(self.fresh_ns())
     }
 
     // ---- scheduling ------------------------------------------------------
@@ -760,12 +804,14 @@ impl CoreLoop {
         context: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
+        self.check_thread()?;
         let handle =
             self.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_soon")?;
         self.enqueue_soon(py, handle)
     }
 
-    /// Thread-safe variant (R-022): lock-free queue push + single wakeup.
+    /// Thread-safe variant (R-022): see `enqueue_soon` for when it takes
+    /// the lock-free queue and a wakeup.
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon_threadsafe(
         &self,
@@ -782,7 +828,7 @@ impl CoreLoop {
             context.as_ref(),
             "call_soon_threadsafe",
         )?;
-        self.enqueue_threadsafe(py, handle)
+        self.enqueue_soon(py, handle)
     }
 
     #[pyo3(signature = (delay, callback, *args, context=None))]
@@ -796,7 +842,8 @@ impl CoreLoop {
     ) -> PyResult<Py<TimerHandle>> {
         let this = self;
         this.check_closed()?;
-        let (deadline, when) = this.later_deadline(delay)?;
+        this.check_thread()?;
+        let (deadline, when) = this.later_deadline(delay);
         let base =
             this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_later")?;
         this.schedule_timer(py, deadline, when, base)
@@ -813,6 +860,7 @@ impl CoreLoop {
     ) -> PyResult<Py<TimerHandle>> {
         let this = self;
         this.check_closed()?;
+        this.check_thread()?;
         let base =
             this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_at")?;
         this.schedule_timer(py, secs_f64_to_ticks(when), when, base)
@@ -1789,33 +1837,64 @@ impl CoreLoop {
                 .unbind(),
         );
         payload.get().mark_scheduled();
-        self.state.with(move |st| st.reactor.schedule_timer(deadline_ns, payload))?;
+        if let Err(f) = self.state.try_with(move |st| st.reactor.schedule_timer(deadline_ns, payload)) {
+            // Another thread, while the loop is parked in its poll (the
+            // only time the state is out of reach -- gil_boundary): hand
+            // the timer over and wake the loop, which may need to park
+            // for less time now. asyncio accepts call_later from other
+            // threads outside debug mode; the timer just waits for the
+            // loop's next iteration there.
+            drop(f);
+            // SAFETY: as above.
+            let payload = HandleRef(
+                unsafe { Bound::from_owned_ptr(py, handle.clone_ref(py).into_ptr()).cast_into_unchecked() }
+                    .unbind(),
+            );
+            if self.xqueue.push_timer(deadline_ns, payload) {
+                self.waker.wake();
+            }
+        }
         Ok(handle)
     }
 
     /// `(deadline_ns, when_secs)` for `call_later(delay)`.
     #[inline]
-    fn later_deadline(&self, delay: f64) -> PyResult<(Ticks, f64)> {
-        let now = self.now_ns()?;
-        let deadline =
-            if delay <= 0.0 || delay.is_nan() { now } else { now.saturating_add(secs_f64_to_ticks(delay)) };
-        Ok((deadline, ticks_to_secs_f64(now) + delay))
+    fn later_deadline(&self, delay: f64) -> (Ticks, f64) {
+        // asyncio: call_at(self.time() + delay), on a FRESH clock -- the
+        // tick's cached time went stale behind every callback that ran
+        // (or blocked) before this one. The deadline comes from `when`
+        // itself, exactly as call_at computes it, so the heap orders
+        // timers by the `when()` they report -- past-due ones from a
+        // negative delay included, which a clamp to `now` had collapsed
+        // into FIFO order.
+        let now = self.fresh_ns();
+        let when = ticks_to_secs_f64(now) + delay;
+        let deadline = if delay.is_nan() { now } else { secs_f64_to_ticks(when) };
+        (deadline, when)
     }
 
     /// Push a freshly built handle on the ready queue; returns it.
+    ///
+    /// Serves `call_soon` and `call_soon_threadsafe` alike. Whenever the
+    /// state is reachable -- the loop thread itself, a loop that is not
+    /// running, or another thread while the loop thread is outside its
+    /// poll -- the callback goes straight onto the ready queue, behind
+    /// everything scheduled before it. That is asyncio's order: one
+    /// `_ready` deque for both calls. A separate queue for the threadsafe
+    /// call, drained at the next tick, ran `call_soon_threadsafe(a);
+    /// call_soon(b)` as b, a -- and charged an eventfd write per call even
+    /// on the loop's own thread. Only a loop parked in its poll needs the
+    /// cross-thread queue and a wakeup (gil_boundary): there, nothing was
+    /// scheduled between the park and this call, so FIFO order holds too.
     #[inline]
     fn enqueue_soon(&self, py: Python<'_>, handle: Handle) -> PyResult<Py<Handle>> {
         let handle = Py::new(py, handle)?;
         let token = HandleRef(handle.clone_ref(py));
-        self.state.with(move |st| st.reactor.push_ready(token))?;
-        Ok(handle)
-    }
-
-    #[inline]
-    fn enqueue_threadsafe(&self, py: Python<'_>, handle: Handle) -> PyResult<Py<Handle>> {
-        let handle = Py::new(py, handle)?;
-        if self.xqueue.push(HandleRef(handle.clone_ref(py))) {
-            self.waker.wake();
+        if let Err(f) = self.state.try_with(move |st| st.reactor.push_ready(token)) {
+            drop(f);
+            if self.xqueue.push(HandleRef(handle.clone_ref(py))) {
+                self.waker.wake();
+            }
         }
         Ok(handle)
     }
@@ -2115,6 +2194,7 @@ unsafe fn fast_call_soon(
         }
         let context = sched_context_kw(py, args, nargs, kwnames, "call_soon")?;
         this.check_closed()?;
+        this.check_thread()?;
         let handle = raw_handle(py, this, args, nargs, context, "call_soon")?;
         Ok(this.enqueue_soon(py, handle)?.into_ptr())
     }
@@ -2137,7 +2217,7 @@ unsafe fn fast_call_soon_threadsafe(
         let context = sched_context_kw(py, args, nargs, kwnames, "call_soon_threadsafe")?;
         this.check_closed()?;
         let handle = raw_handle(py, this, args, nargs, context, "call_soon_threadsafe")?;
-        Ok(this.enqueue_threadsafe(py, handle)?.into_ptr())
+        Ok(this.enqueue_soon(py, handle)?.into_ptr())
     }
 }
 
@@ -2161,7 +2241,8 @@ unsafe fn fast_call_later(
         let context = sched_context_kw(py, args, nargs, kwnames, "call_later")?;
         let delay = arg_f64(py, *args)?;
         this.check_closed()?;
-        let (deadline, when) = this.later_deadline(delay)?;
+        this.check_thread()?;
+        let (deadline, when) = this.later_deadline(delay);
         let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_later")?;
         Ok(this.schedule_timer(py, deadline, when, base)?.into_ptr())
     }
@@ -2187,6 +2268,7 @@ unsafe fn fast_call_at(
         let context = sched_context_kw(py, args, nargs, kwnames, "call_at")?;
         let when = arg_f64(py, *args)?;
         this.check_closed()?;
+        this.check_thread()?;
         let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_at")?;
         Ok(this.schedule_timer(py, secs_f64_to_ticks(when), when, base)?.into_ptr())
     }
