@@ -51,6 +51,8 @@ pub enum OpKind {
     /// ops, distinguished only by which Win32 result-fetch call applies).
     PipeRead,
     PipeWrite,
+    /// R-057 readiness poll for a watched socket (IOCTL_AFD_POLL on IOCP).
+    Poll,
 }
 
 /// Stable identifier for an in-flight op: slot index + generation.

@@ -24,6 +24,7 @@ use crate::opslab::OpId;
 pub mod epoll;
 #[cfg(windows)]
 pub mod iocp;
+pub mod iocp_util;
 #[cfg(not(any(windows, target_os = "linux")))]
 pub mod portable;
 #[cfg(windows)]
@@ -191,8 +192,9 @@ pub trait IoBackend {
 
     /// Arm/disarm level-triggered readiness watches for a raw fd (R-057).
     /// `readable`/`writable` express the DESIRED watch set (both false =
-    /// fully unwatched). On IOCP this is emulated with zero-byte probe ops;
-    /// on epoll it is native interest.
+    /// fully unwatched). On IOCP it is an `IOCTL_AFD_POLL` request issued
+    /// through a socket of the backend's own; on epoll it is native
+    /// interest.
     fn set_watch(&mut self, _socket: RawSocket, _readable: bool, _writable: bool) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "set_watch"))
     }
