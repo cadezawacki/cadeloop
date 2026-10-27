@@ -19,14 +19,16 @@ import sys
 from asyncio import sslproto, staggered, tasks
 from asyncio.base_events import _interleave_addrinfos
 
+# Everything logged here is a message asyncio itself logs, so it goes to
+# asyncio's logger, where applications already route it.
+from asyncio.log import logger
+
 try:
     import ssl as ssl_module
 except ImportError:  # pragma: no cover
     ssl_module = None
 
 __all__ = ["TcpSurface", "Server"]
-
-logger = __import__("logging").getLogger("cadeloop")
 
 
 def _fileno(fd):
@@ -641,7 +643,7 @@ class TcpSurface:
 
         completed = False
         try:
-            for af, _st, _pr, _cname, sa in infos:
+            for af, socktype, proto, _cname, sa in infos:
                 if af not in (socket.AF_INET, socket.AF_INET6):
                     continue
                 # Keep the flow info and interface scope an IPv6 sockaddr
@@ -669,7 +671,7 @@ class TcpSurface:
                     # enabled on this host (bpo-30945) and moves on.
                     if exc.errno == errno.EADDRNOTAVAIL or exc.errno in _AF_UNAVAILABLE:
                         if self.get_debug():
-                            logger.warning("create_server() skipped %r: %s", sa, exc)
+                            logger.warning(exc.strerror)
                         continue
                     raise
                 if entry is None:
@@ -677,7 +679,12 @@ class TcpSurface:
                     # without IPv6): skipped, as asyncio skips it, so a
                     # wildcard server still serves on IPv4.
                     if self.get_debug():
-                        logger.warning("create_server() could not create a socket for %r", sa)
+                        logger.warning(
+                            "create_server() failed to create socket.socket(%r, %r, %r)",
+                            af,
+                            socktype,
+                            proto,
+                        )
                     continue
                 entries.append(entry)
             if not entries:
