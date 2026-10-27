@@ -1164,13 +1164,20 @@ impl CoreLoop {
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the
     /// facade server). Returns (head_timeouts, idle_closes) this pass.
     fn http_sweep(&self, py: Python<'_>) -> PyResult<(u32, u32)> {
-        let counts = self.with_net(|net, reactor| {
+        let (head, idle, cancel_drivers) = self.with_net(|net, reactor| {
             let now_ns = reactor.time_cached();
             let backend = reactor.backend_mut();
             net::http_sweep(py, net, backend, now_ns)
         })?;
         self.drain_graveyards(py)?;
-        Ok(counts)
+        // Cancel the drivers of reclaimed disconnected connections OUTSIDE
+        // the state cell (cancel() runs Python): unwinds each abandoned
+        // coroutine so its AppTask + frame are released. These are already
+        // included in the idle count reported to the facade.
+        for driver in cancel_drivers {
+            let _ = driver.bind(py).call_method0(intern!(py, "cancel"));
+        }
+        Ok((head, idle))
     }
 
     /// R-140: install (or clear) the access-log sink — a callable

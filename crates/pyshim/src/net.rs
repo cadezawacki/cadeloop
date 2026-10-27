@@ -1280,14 +1280,32 @@ fn http_conn_busy(entry: &TransportEntry) -> bool {
         || matches!(conn.resp, crate::http::RespPhase::Started | crate::http::RespPhase::Streaming)
 }
 
+/// Fallback reclaim deadline for a connection whose peer has gone while
+/// idle timeouts are disabled (`keepalive_idle=0`). A dead peer must never
+/// be pinned forever just because keep-alive was told to be unlimited, so
+/// the disconnect reclaim (H4) falls back to this when there is no idle
+/// deadline to borrow. Generous, because we cannot tell a full close from
+/// a half-close whose app is still producing a response.
+const DISCONNECTED_RECLAIM_FALLBACK_NS: u64 = 60 * 1_000_000_000;
+
+/// Sweep phases. `Dead` (peer disconnected, nothing left to send) is
+/// checked before `Busy`: an app parked on a non-receive() awaitable while
+/// its client is gone is "busy" by every other measure, and without this
+/// would pin the fd and its whole request state with no deadline at all.
+const PHASE_IDLE: u8 = 0;
+const PHASE_HEAD: u8 = 1;
+const PHASE_BUSY: u8 = 2;
+const PHASE_DEAD: u8 = 3;
+
 pub(crate) fn http_sweep(
     py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
     now_ns: u64,
-) -> (u32, u32) {
+) -> (u32, u32, Vec<Py<PyAny>>) {
     let mut expire_head: Vec<u64> = Vec::new();
     let mut expire_idle: Vec<u64> = Vec::new();
+    let mut expire_dead: Vec<u64> = Vec::new();
     for (&tid, entry) in net.transports.iter_mut() {
         if entry.conn_lost || entry.closing {
             continue;
@@ -1298,35 +1316,83 @@ pub(crate) fn http_sweep(
         // response was still going out, so a large body to a slow client
         // could be torn down mid-transmission by the idle sweep.
         let busy = http_conn_busy(entry);
+        // Nothing is queued or in flight for the peer (checked on `entry`,
+        // before the borrow of `entry.proto` below).
+        let nothing_to_send = entry.wq.is_empty() && entry.send_op.is_none();
         let ProtoKind::Http(conn) = &mut entry.proto else { continue };
         // `!saw_bytes` is the head phase too: a connection that has sent
         // nothing at all reports `in_head() == false`, and calling that
         // keep-alive idle exempted it from the head deadline it has never
         // yet satisfied. It must be BYTES rather than a finished request,
         // or a body upload counts as a head that never completes.
-        let phase: u8 = if busy {
-            2
+        let phase: u8 = if conn.disconnected && nothing_to_send {
+            // Peer EOF'd and we have nothing left to deliver. A well-behaved
+            // app observes http.disconnect through receive() and returns at
+            // once (its waiters were resolved at EOF); one parked on an
+            // unrelated awaitable would otherwise hold the fd, the AppTask
+            // and the coroutine frame indefinitely, since `busy` exempts an
+            // active request from every deadline. Reclaim it.
+            PHASE_DEAD
+        } else if busy {
+            PHASE_BUSY
         } else if conn.parser.in_head() || !conn.saw_bytes {
-            1
+            PHASE_HEAD
         } else {
-            0
+            PHASE_IDLE
         };
         let moved = conn.activity != conn.sweep_seen;
         conn.sweep_seen = conn.activity;
-        if phase != conn.sweep_phase || conn.sweep_anchor_ns == 0 || phase == 2 || (phase == 0 && moved) {
+        if phase != conn.sweep_phase
+            || conn.sweep_anchor_ns == 0
+            || phase == PHASE_BUSY
+            || (phase == PHASE_IDLE && moved)
+        {
             // New phase, first sighting, busy, or fresh idle activity:
             // (re)anchor. A head in progress deliberately does NOT
-            // re-anchor on activity — that is the slowloris rule.
+            // re-anchor on activity — that is the slowloris rule. PHASE_DEAD
+            // also does not re-anchor (the peer is gone; nothing it does
+            // can extend its grace).
             conn.sweep_phase = phase;
             conn.sweep_anchor_ns = now_ns;
             continue;
         }
         let elapsed = now_ns.saturating_sub(conn.sweep_anchor_ns);
         match phase {
-            1 if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => expire_head.push(tid),
-            0 if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => expire_idle.push(tid),
+            PHASE_HEAD if conn.head_timeout_ns > 0 && elapsed >= conn.head_timeout_ns => {
+                expire_head.push(tid)
+            }
+            PHASE_IDLE if conn.idle_timeout_ns > 0 && elapsed >= conn.idle_timeout_ns => {
+                expire_idle.push(tid)
+            }
+            PHASE_DEAD => {
+                let deadline = if conn.idle_timeout_ns > 0 {
+                    conn.idle_timeout_ns
+                } else {
+                    DISCONNECTED_RECLAIM_FALLBACK_NS
+                };
+                if elapsed >= deadline {
+                    expire_dead.push(tid);
+                }
+            }
             _ => {}
         }
+    }
+    // A disconnected connection whose eager app is still parked: tear it
+    // down (frees the fd and the transport entry) and hand its driver back
+    // to the caller to cancel OUTSIDE the state cell. Cancelling unwinds
+    // the coroutine (CancelledError into its awaited future), which both
+    // reclaims the AppTask + frame -- a plain `Py<AppTask>` is opaque to
+    // the cycle collector, so dropping `conn.driver` alone would not, the
+    // awaited future's `_wake` still references it -- and gives the app its
+    // `finally`/cancel-scope cleanup.
+    let mut cancel_drivers: Vec<Py<PyAny>> = Vec::new();
+    for &tid in &expire_dead {
+        if let Some(conn) = net.http_conn_mut(tid) {
+            if let Some(driver) = conn.driver.take() {
+                cancel_drivers.push(driver.into_any());
+            }
+        }
+        teardown_with(py, net, backend, tid, None);
     }
     for &tid in &expire_head {
         // A TLS session that never completed its handshake cannot be
@@ -1351,7 +1417,9 @@ pub(crate) fn http_sweep(
         // Idle keep-alive expiry closes silently (uvicorn-compatible).
         teardown_with(py, net, backend, tid, None);
     }
-    (expire_head.len() as u32, expire_idle.len() as u32)
+    // Disconnect reclaims count as idle closes for the facade's stats.
+    let idle = (expire_idle.len() + expire_dead.len()) as u32;
+    (expire_head.len() as u32, idle, cancel_drivers)
 }
 
 /// Graceful shutdown, phase 1 (R-092): end keep-alive everywhere, close
@@ -1393,14 +1461,35 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
         }
     }
     for tid in ws_closing {
+        // Send the 1012 close frame to the peer, then deliver
+        // websocket.disconnect(1012) to the application. Waking the app
+        // (rather than queuing the disconnect and tearing down here) does
+        // two things: the app actually RECEIVES the disconnect it is
+        // entitled to, and teardown moves to the normal path -- the app
+        // returns, `ws_app_done` closes after the frame has drained. The
+        // old code tore the connection down in the same tick it produced
+        // the frame; with the base's inline completions that could drop
+        // the socket before the just-written close frame was delivered,
+        // so the peer saw a bare TCP close and the app never saw its
+        // disconnect. If the app is NOT parked in receive(), there is no
+        // waiter to wake, so fall back to closing once the frame drains.
+        http_enqueue(py, net, backend, tid, cadeloop_core::ws::close_frame(1012, "server shutdown"));
+        let waiters = net.http_conn_mut(tid).map(|c| c.take_recv_waiters()).unwrap_or_default();
         if let Some(conn) = net.http_conn_mut(tid) {
             if let Some(wsc) = conn.ws.as_mut() {
                 wsc.closing = true;
-                wsc.inbox.push_back(crate::http::WsMsg::Disconnect(1012));
+                let m = crate::http::WsMsg::Disconnect(1012);
+                wsc.inbox_bytes += m.charge();
+                wsc.inbox.push_back(m);
             }
         }
-        http_enqueue(py, net, backend, tid, cadeloop_core::ws::close_frame(1012, "server shutdown"));
-        http_close_after_write(py, net, backend, tid);
+        if waiters.is_empty() {
+            http_close_after_write(py, net, backend, tid);
+        } else {
+            for fut in waiters {
+                net.events.push(NetEvent::WsWake { tid, fut });
+            }
+        }
     }
     for tid in idle {
         teardown_with(py, net, backend, tid, None);
@@ -1842,6 +1931,7 @@ fn on_recv_done(
     net.stats_bytes_rx += bytes as u64;
     debug_assert_eq!(entry.recv_slot, Some(slot), "op slot / transport slot mismatch");
     let mut parse_err = None;
+    let mut oversize_ws = false;
     let mut continue_owed = false;
     if entry.reading_paused && matches!(entry.proto, ProtoKind::Py(_)) {
         // A protocol that called pause_reading() did so to stop consuming;
@@ -1906,6 +1996,10 @@ fn on_recv_done(
                 // parser copies what it keeps, so the slot re-posts below.
                 match crate::http::conn_feed(conn, data) {
                     Ok(outcome) => {
+                        // Oversized pre-dispatch WS buffer (see conn_feed):
+                        // handled after the match, since teardown needs the
+                        // whole NetState and `conn` still borrows it here.
+                        oversize_ws = outcome.oversize_ws_trailing;
                         // R-085: stop reading while the pipeline budget is
                         // spent. The connection is flagged here and the
                         // recv is simply not reposted below; pump_requests
@@ -1928,6 +2022,14 @@ fn on_recv_done(
                 }
             }
         }
+    }
+    if oversize_ws {
+        // R-087: a client flooded ws_trailing past WS_MAX_MESSAGE before
+        // its upgrade was even dispatched. A 413 cannot be injected safely
+        // -- an unrelated request on this connection may be mid-response --
+        // so the abusive connection is simply dropped.
+        teardown_with(py, net, backend, tid, None);
+        return;
     }
     if let Some(err) = parse_err {
         // R-086: malformed request answered entirely in-cell -- in its
