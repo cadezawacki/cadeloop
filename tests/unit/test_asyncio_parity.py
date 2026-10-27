@@ -1847,3 +1847,21 @@ def test_connection_lost_exception_is_reported_like_a_callback(loop):
         await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+def test_datagram_connection_lost_runs_in_call_soon_order(loop):
+    async def main():
+        order = []
+
+        class P(asyncio.DatagramProtocol):
+            def connection_lost(self, exc):
+                order.append("lost")
+
+        transport, _ = await loop.create_datagram_endpoint(P, local_addr=("127.0.0.1", 0))
+        loop.call_soon(order.append, "before")
+        transport.close()
+        loop.call_soon(order.append, "after")
+        await asyncio.sleep(0.05)
+        assert order == ["before", "lost", "after"]
+
+    loop.run_until_complete(main())

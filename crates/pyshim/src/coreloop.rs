@@ -1194,7 +1194,8 @@ impl CoreLoop {
         self.with_net(|net, reactor| {
             net::udp_close(py, net, reactor.backend_mut(), did, abort);
         })?;
-        self.drain_graveyards(py)
+        self.drain_graveyards(py)?;
+        net::schedule_pending_lost(py, self)
     }
 
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the

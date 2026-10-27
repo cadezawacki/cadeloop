@@ -572,11 +572,13 @@ pub(crate) enum NetEvent {
         err: u32,
     },
     /// R-058: datagram endpoint torn down. `close_after`: its socket
-    /// object, closed once connection_lost has run.
+    /// object, closed once connection_lost has run; `immediate` as for
+    /// `ConnLost` (asyncio's `_sendto_ready` finishing a close).
     DgramLost {
         connection_lost: Py<PyAny>,
         err: Option<u32>,
         close_after: Option<Py<PyAny>>,
+        immediate: bool,
     },
     /// R-087: a WS receive() waiter has a queued event to consume.
     /// R-084 ASGI write backpressure: the native `send()` returned a
@@ -1404,7 +1406,7 @@ fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did
     }
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
     if entry.closing && !entry.conn_lost && entry.send_op.is_none() {
-        udp_teardown(py, net, backend, did, None);
+        udp_teardown(py, net, backend, did, None, true);
     }
 }
 
@@ -1513,7 +1515,7 @@ pub(crate) fn udp_close(py: Python<'_>, net: &mut NetState, backend: Backend<'_>
         entry.send_queue.clear();
     }
     if entry.send_op.is_none() && entry.send_queue.is_empty() {
-        udp_teardown(py, net, backend, did, None);
+        udp_teardown(py, net, backend, did, None, false);
     }
     // else: on_dgram_send_done finishes the close once the queue drains.
 }
@@ -1537,7 +1539,14 @@ pub(crate) fn udp_teardown_at_close(net: &mut NetState, backend: Backend<'_>, di
     net.graveyard_py.push(entry.connection_lost);
 }
 
-fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u64, err: Option<u32>) {
+fn udp_teardown(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    did: u64,
+    err: Option<u32>,
+    immediate: bool,
+) {
     let Some(mut entry) = net.datagrams.remove(&did) else { return };
     if entry.conn_lost {
         return;
@@ -1556,6 +1565,7 @@ fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u
         connection_lost: entry.connection_lost.clone_ref(py),
         err,
         close_after: entry.owner.take(),
+        immediate,
     });
     net.graveyard_py.push(entry.datagram_received);
     net.graveyard_py.push(entry.error_received);
@@ -2604,7 +2614,7 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                     let res = call_connection_lost(py, *lost);
                     core.guard_protocol_call(py, res)?;
                 } else {
-                    schedule_connection_lost(py, core, lost)?;
+                    schedule_lost(py, core, Lost::Stream(lost))?;
                 }
             }
             NetEvent::DgramData { datagram_received, payload, addr } => {
@@ -2615,17 +2625,14 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 let exc_obj = os_err(py, err);
                 core.guard_protocol_call(py, error_received.call1(py, (exc_obj,)))?;
             }
-            NetEvent::DgramLost { connection_lost, err, close_after } => {
-                let exc_obj = match err {
-                    Some(code) => os_err(py, code),
-                    None => py.None(),
-                };
-                let res = connection_lost.call1(py, (exc_obj,));
-                // After the callback, as asyncio's _call_connection_lost.
-                if let Some(sock) = close_after {
-                    let _ = sock.call_method0(py, intern!(py, "close"));
+            NetEvent::DgramLost { connection_lost, err, close_after, immediate } => {
+                let lost = Lost::Datagram { connection_lost, err, close_after };
+                if immediate {
+                    let res = lost.call(py);
+                    core.guard_protocol_call(py, res)?;
+                } else {
+                    schedule_lost(py, core, lost)?;
                 }
-                core.guard_protocol_call(py, res)?;
             }
             NetEvent::ResumeWriting { tid, resume_writing } => {
                 let res =
@@ -2868,12 +2875,54 @@ fn call_connection_lost(py: Python<'_>, lost: ConnLost) -> PyResult<()> {
     detached
 }
 
+/// A torn-down transport's pending connection_lost.
+pub(crate) enum Lost {
+    Stream(Box<ConnLost>),
+    /// The datagram transport's `_connection_lost` and the socket object
+    /// to close after it.
+    Datagram {
+        connection_lost: Py<PyAny>,
+        err: Option<u32>,
+        close_after: Option<Py<PyAny>>,
+    },
+}
+
+impl Lost {
+    fn call(self, py: Python<'_>) -> PyResult<()> {
+        match self {
+            Lost::Stream(lost) => call_connection_lost(py, *lost),
+            Lost::Datagram { connection_lost, err, close_after } => {
+                let exc_obj = match err {
+                    Some(code) => os_err(py, code),
+                    None => py.None(),
+                };
+                let res = connection_lost.call1(py, (exc_obj,));
+                // After the callback, as asyncio's _call_connection_lost.
+                if let Some(sock) = close_after {
+                    let _ = sock.call_method0(py, intern!(py, "close"));
+                }
+                res.map(drop)
+            }
+        }
+    }
+
+    fn close_socket(self, py: Python<'_>) {
+        let sock = match self {
+            Lost::Stream(lost) => lost.close_after,
+            Lost::Datagram { close_after, .. } => close_after,
+        };
+        if let Some(sock) = sock {
+            let _ = sock.call_method0(py, intern!(py, "close"));
+        }
+    }
+}
+
 /// A deferred connection_lost, as asyncio defers it: `call_soon` on the
 /// facade loop, so it runs after what was already scheduled and before
 /// what the caller schedules next. Handed to the loop as the callable
 /// below; a failure in connection_lost is then reported the way any
 /// failing callback is.
-fn schedule_connection_lost(py: Python<'_>, core: &CoreLoop, lost: Box<ConnLost>) -> PyResult<()> {
+fn schedule_lost(py: Python<'_>, core: &CoreLoop, lost: Lost) -> PyResult<()> {
     let call = Py::new(py, LostCall { lost: Mutex::new(Some(lost)) })?;
     let scheduled =
         core.require_owner().and_then(|owner| owner.call_method1(py, intern!(py, "call_soon"), (&call,)));
@@ -2882,9 +2931,7 @@ fn schedule_connection_lost(py: Python<'_>, core: &CoreLoop, lost: Box<ConnLost>
         // Nothing will ever run it, so the socket at least is closed now.
         let pending = call.get().lost.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(lost) = pending {
-            if let Some(sock) = lost.close_after {
-                let _ = sock.call_method0(py, intern!(py, "close"));
-            }
+            lost.close_socket(py);
         }
         return Err(e);
     }
@@ -2897,15 +2944,22 @@ fn schedule_connection_lost(py: Python<'_>, core: &CoreLoop, lost: Box<ConnLost>
 /// whatever the caller schedules next. Left in the event queue they
 /// would wait for the next tick's dispatch -- a tick late.
 pub(crate) fn schedule_pending_lost(py: Python<'_>, core: &CoreLoop) -> PyResult<()> {
+    fn deferred(e: &NetEvent) -> bool {
+        matches!(e, NetEvent::ConnLost(l) if !l.immediate)
+            || matches!(e, NetEvent::DgramLost { immediate: false, .. })
+    }
     let lost = core.with_net(|net, _| {
-        if !net.events.iter().any(|e| matches!(e, NetEvent::ConnLost(l) if !l.immediate)) {
+        if !net.events.iter().any(deferred) {
             return Vec::new();
         }
         let mut lost = Vec::new();
         let mut keep = Vec::with_capacity(net.events.len());
         for event in net.events.drain(..) {
             match event {
-                NetEvent::ConnLost(l) if !l.immediate => lost.push(l),
+                NetEvent::ConnLost(l) if !l.immediate => lost.push(Lost::Stream(l)),
+                NetEvent::DgramLost { connection_lost, err, close_after, immediate: false } => {
+                    lost.push(Lost::Datagram { connection_lost, err, close_after })
+                }
                 other => keep.push(other),
             }
         }
@@ -2913,16 +2967,15 @@ pub(crate) fn schedule_pending_lost(py: Python<'_>, core: &CoreLoop) -> PyResult
         lost
     })?;
     for l in lost {
-        schedule_connection_lost(py, core, l)?;
+        schedule_lost(py, core, l)?;
     }
     Ok(())
 }
 
-/// The callable behind a deferred connection_lost (see
-/// `schedule_connection_lost`).
+/// The callable behind a deferred connection_lost (see `schedule_lost`).
 #[pyclass(frozen, module = "cadeloop._core")]
 pub struct LostCall {
-    lost: Mutex<Option<Box<ConnLost>>>,
+    lost: Mutex<Option<Lost>>,
 }
 
 #[pymethods]
@@ -2930,7 +2983,7 @@ impl LostCall {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
         let lost = self.lost.lock().unwrap_or_else(|p| p.into_inner()).take();
         match lost {
-            Some(lost) => call_connection_lost(py, *lost),
+            Some(lost) => lost.call(py),
             None => Ok(()),
         }
     }
