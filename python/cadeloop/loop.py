@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import warnings
 import weakref
@@ -539,14 +540,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             raise TypeError("executor must be ThreadPoolExecutor instance")
         self._default_executor = executor
 
-    def _dns_pool(self):
-        # R-055: fixed internal pool, size = min(8, cpus).
-        if self._dns_executor is None:
-            self._dns_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, os.cpu_count() or 1),
-                thread_name_prefix="cadeloop-dns",
-            )
-        return self._dns_executor
+    # Lookups run in the default executor, as asyncio's do, so that
+    # set_default_executor() governs them too (a private pool ignored it:
+    # an application sizing or instrumenting its executor saw no DNS
+    # work there). Callers skip them altogether for numeric hosts
+    # (TcpSurface._ensure_resolved).
 
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
         key = (host, port, family, type, proto, flags)
@@ -554,23 +552,40 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             hit = self._dns_cache.get(key)
             if hit is not None and hit[0] > self.time():
                 return hit[1]
-        result = await futures.wrap_future(
-            self._dns_pool().submit(
-                socket.getaddrinfo, host, port, family, type, proto, flags
-            ),
-            loop=self,
-        )
+        getaddr_func = self._getaddrinfo_debug if self.get_debug() else socket.getaddrinfo
+        result = await self.run_in_executor(None, getaddr_func, host, port, family, type, proto, flags)
         if self._dns_cache_enabled:
             if len(self._dns_cache) > 1024:
                 self._dns_cache.clear()
             self._dns_cache[key] = (self.time() + self._dns_cache_ttl, result)
         return result
 
+    def _getaddrinfo_debug(self, host, port, family, type, proto, flags):
+        # base_events' debug-mode lookup log. Runs in the executor, so it
+        # times itself with time.monotonic() rather than the loop's clock.
+        msg = [f"{host}:{port!r}"]
+        if family:
+            msg.append(f"family={family!r}")
+        if type:
+            msg.append(f"type={type!r}")
+        if proto:
+            msg.append(f"proto={proto!r}")
+        if flags:
+            msg.append(f"flags={flags!r}")
+        msg = ", ".join(msg)
+        logger.debug("Get address info %s", msg)
+        t0 = time.monotonic()
+        addrinfo = socket.getaddrinfo(host, port, family, type, proto, flags)
+        dt = time.monotonic() - t0
+        msg = f"Getting address info {msg} took {dt * 1e3:.3f}ms: {addrinfo!r}"
+        if dt >= self.slow_callback_duration:
+            logger.info(msg)
+        else:
+            logger.debug(msg)
+        return addrinfo
+
     async def getnameinfo(self, sockaddr, flags=0):
-        return await futures.wrap_future(
-            self._dns_pool().submit(socket.getnameinfo, sockaddr, flags),
-            loop=self,
-        )
+        return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
 
     async def shutdown_default_executor(self):
         self._executor_shutdown_called = True
@@ -839,9 +854,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 for key, addr in (("local", local_addr), ("remote", remote_addr)):
                     if not addr:
                         continue
-                    infos = await self.getaddrinfo(
-                        addr[0],
-                        addr[1],
+                    infos = await self._ensure_resolved(
+                        addr,
                         family=family,
                         type=socket_module.SOCK_DGRAM,
                         proto=proto,

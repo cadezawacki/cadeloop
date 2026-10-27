@@ -1433,3 +1433,69 @@ def test_set_protocol_does_not_carry_a_pause_over(cade_loop):
         await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+# --------------------------------------------------------------------- #
+# 17. resolution                                                        #
+# --------------------------------------------------------------------- #
+
+
+def test_numeric_hosts_skip_the_resolver(loop):
+    """An IP literal needs no getaddrinfo(); each one cost an executor
+    round trip (three for this create_server/create_connection/
+    create_datagram_endpoint trio, where asyncio and uvloop make none)."""
+    calls = []
+    real = loop.getaddrinfo
+
+    async def counting(*args, **kwargs):
+        calls.append(args)
+        return await real(*args, **kwargs)
+
+    loop.getaddrinfo = counting
+
+    async def main():
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        transport, _ = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", port, local_addr=("127.0.0.1", 0)
+        )
+        udp, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0), remote_addr=("127.0.0.1", port)
+        )
+        sock = socket.socket()
+        sock.setblocking(False)
+        with sock:
+            await loop.sock_connect(sock, ("127.0.0.1", port))
+        udp.close()
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+    assert calls == []
+
+
+def test_default_executor_runs_the_lookups(loop):
+    """set_default_executor() governs getaddrinfo/getnameinfo, as in
+    asyncio; cadeloop resolved on a private pool that ignored it."""
+    import concurrent.futures
+
+    submitted = []
+
+    class Recording(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, fn, *args, **kwargs):
+            submitted.append(getattr(fn, "__name__", fn))
+            return super().submit(fn, *args, **kwargs)
+
+    executor = Recording(max_workers=1)
+    loop.set_default_executor(executor)
+
+    async def main():
+        await loop.getaddrinfo("localhost", 80, type=socket.SOCK_STREAM)
+        await loop.getnameinfo(("127.0.0.1", 80))
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        executor.shutdown(wait=True)
+    assert submitted == ["getaddrinfo", "getnameinfo"]

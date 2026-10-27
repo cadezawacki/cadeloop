@@ -461,9 +461,10 @@ def test_datagram_endpoint_resolves_each_address_once(loop):
                 P, remote_addr=("localhost", port)
             )
             try:
-                # Resolved exactly once per supplied address; bind/connect
-                # must not have gone back to the resolver.
-                assert calls == [("127.0.0.1", 0), ("localhost", port)], calls
+                # Resolved at most once per supplied address (an IP literal
+                # not at all, as in asyncio); bind/connect must not have
+                # gone back to the resolver.
+                assert calls == [("localhost", port)], calls
                 peer = client.get_extra_info("peername")
                 assert peer is not None and peer[0] != "localhost", peer
             finally:

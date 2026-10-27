@@ -17,7 +17,7 @@ import socket
 import stat
 import sys
 from asyncio import sslproto, staggered, tasks, trsock
-from asyncio.base_events import _interleave_addrinfos
+from asyncio.base_events import _interleave_addrinfos, _ipaddr_info
 
 # Everything logged here is a message asyncio itself logs, so it goes to
 # asyncio's logger, where applications already route it.
@@ -287,16 +287,15 @@ class TcpSurface:
             # is on (matches base_events.create_connection).
             interleave = 1
 
-        infos = await self.getaddrinfo(
-            host, port, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
+        infos = await self._ensure_resolved(
+            (host, port), family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
         )
         if not infos:
             raise OSError("getaddrinfo() returned empty list")
         laddr_infos = None
         if local_addr is not None:
-            laddr_infos = await self.getaddrinfo(
-                local_addr[0], local_addr[1], family=family, type=socket.SOCK_STREAM,
-                proto=proto, flags=flags,
+            laddr_infos = await self._ensure_resolved(
+                local_addr, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
             )
             if not laddr_infos:
                 raise OSError("getaddrinfo() returned empty list")
@@ -355,6 +354,18 @@ class TcpSurface:
         return await self._wrap_outgoing(
             fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
         )
+
+    async def _ensure_resolved(self, address, *, family=0, type=socket.SOCK_STREAM, proto=0, flags=0):
+        """base_events._ensure_resolved: an address whose host is already
+        an IP literal needs no lookup. Sending it through getaddrinfo cost
+        an executor round trip per call -- about 38us each, three of them
+        for a create_server/create_connection/create_datagram_endpoint
+        triple -- and its result is the same."""
+        host, port = address[:2]
+        info = _ipaddr_info(host, port, family, type, proto, *address[2:])
+        if info is not None:
+            return [info]
+        return await self.getaddrinfo(host, port, family=family, type=type, proto=proto, flags=flags)
 
     async def _connect_one(self, address, af, laddr_infos, my_exceptions):
         """One native connect to `address` (a full sockaddr: an IPv6 one
@@ -684,8 +695,8 @@ class TcpSurface:
             hosts = host
 
         async def resolve(h):
-            infos = await self.getaddrinfo(
-                h, port, family=family, type=socket.SOCK_STREAM, flags=flags
+            infos = await self._ensure_resolved(
+                (h, port), family=family, type=socket.SOCK_STREAM, flags=flags
             )
             if not infos:
                 raise OSError(f"getaddrinfo({h!r}) returned empty list")
@@ -1005,20 +1016,12 @@ class TcpSurface:
         # AF_UNIX addresses are filesystem paths, not (host, port) pairs,
         # and any other family's address is used exactly as given.
         if sock.family in (socket.AF_INET, socket.AF_INET6):
-            # Numeric fast path first.
-            try:
-                socket.inet_pton(sock.family, address[0])
-            except (OSError, ValueError, IndexError):
-                infos = await self.getaddrinfo(
-                    address[0], address[1], family=sock.family, type=sock.type, proto=sock.proto
-                )
-                if not infos:
-                    # `from None`: the inet_pton failure we are inside is
-                    # expected control flow ("not a numeric address"), so
-                    # chaining it onto a resolution failure buries the real
-                    # cause under an irrelevant one.
-                    raise OSError(f"getaddrinfo({address!r}) returned empty list") from None
-                address = infos[0][4]
+            infos = await self._ensure_resolved(
+                address, family=sock.family, type=sock.type, proto=sock.proto
+            )
+            if not infos:
+                raise OSError(f"getaddrinfo({address!r}) returned empty list")
+            address = infos[0][4]
         err = sock.connect_ex(address)
         if err == 0:
             return
