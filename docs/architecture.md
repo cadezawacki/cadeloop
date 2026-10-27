@@ -28,8 +28,17 @@ tick:
 2. **GIL released** (the only release point): backend poll —
    spin-then-park (R-060), then `GetQueuedCompletionStatusEx` batch 256.
 3. **GIL re-acquired once per batch** (not per event): translate
-   completions, then dispatch up to 128 ready callbacks (R-054) via
-   `PyObject_VectorcallMethod` on `context.run(callback, *args)`.
+   completions -- readiness watches the poll reported join this tick's
+   batch -- then dispatch every callback that was ready when the tick
+   began (R-054; asyncio's `_run_once` snapshot, so `stop()` takes effect
+   after the whole iteration), each via a direct vectorcall inside
+   `PyContext_Enter`/`Exit`.
+
+The loop clock is `CLOCK_MONOTONIC` -- `time.monotonic()`'s clock -- on
+Linux, and aligned to it at loop creation elsewhere (R-061). The reactor
+keeps one reading per tick for timer expiry and poll timeouts;
+`loop.time()` and every `call_later` deadline read it fresh, as asyncio
+does.
 
 ### The state-cell protocol (why no lock)
 
@@ -37,10 +46,15 @@ Loop state lives in an `UnsafeCell` guarded by thread-affinity + the GIL
 rather than a mutex (see `gil_boundary.rs`). Holding a lock across the
 GIL-released poll would deadlock with any GIL-holding thread blocking on
 that lock (poll thread needs the GIL back; GIL holder waits on the lock).
-The affinity protocol raises asyncio's standard "non-thread-safe operation"
-error instead of blocking, making the deadlock structurally impossible.
-Cross-thread paths (`call_soon_threadsafe`, `stop`, `time`, `is_running`)
-touch only atomics and the lock-free MPSC queue (R-022).
+The protocol raises asyncio's standard "non-thread-safe operation" error
+instead of blocking, making the deadlock structurally impossible. Only one
+state is unreachable from another thread: the loop parked in its poll, which
+holds its borrow across the GIL release. At any other moment the GIL
+serializes access, so other threads may call into the loop as asyncio
+allows (outside debug mode); `call_soon`, `call_soon_threadsafe`,
+`call_later` and `call_at` reach even a parked loop by handing the callback
+or timer over the lock-free MPSC queue and waking it (R-022). `stop`, `time`
+and `is_running` touch only atomics.
 
 ### Python-reference hygiene
 

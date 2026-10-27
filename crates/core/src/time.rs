@@ -1,48 +1,99 @@
-//! Monotonic clock with per-tick caching (R-061).
+//! The loop's monotonic clock (R-061).
 //!
-//! On Windows, `std::time::Instant` is implemented with
-//! `QueryPerformanceCounter`, which satisfies R-061's clock-source
-//! requirement without a direct Win32 call; the conversion to nanoseconds is
-//! done once per read. `loop.time()` at the Python layer returns the value
-//! cached at the top of the current tick — reduced granularity within a tick
-//! is documented behavior.
+//! Ticks are nanoseconds on the clock behind Python's `time.monotonic()`,
+//! so `loop.time()` and `time.monotonic()` agree the way they do under
+//! asyncio and uvloop: deadlines computed from either one (`call_at`,
+//! `asyncio.timeout_at`) mean the same instant. On Linux that is
+//! `CLOCK_MONOTONIC` itself (a vDSO read, no syscall). Elsewhere the
+//! platform reading is `Instant`-based (QueryPerformanceCounter on
+//! Windows) and the binding layer aligns it to Python's clock once, at
+//! loop creation, through [`Clock::with_offset`].
+//!
+//! The reactor keeps one reading per tick ([`Clock::cached`]) for its own
+//! bookkeeping -- timer expiry, poll timeouts, connection deadlines --
+//! where per-tick granularity is the asyncio contract (`_run_once` reads
+//! the clock once to decide which timers are due). Anything user-visible
+//! reads the clock fresh ([`Clock::now`]): `loop.time()`, and the base of
+//! every `call_later` deadline. A per-tick value there was frozen for the
+//! whole tick: after a callback that blocked for 200ms,
+//! `asyncio.sleep(0.1)` returned at once, and `loop.time()` deltas
+//! measured inside a callback were 0.
 
-use std::time::Instant;
-
-/// Nanoseconds since the loop's epoch (loop creation).
+/// Nanoseconds on the loop clock (see the module docs).
 pub type Ticks = u64;
+
+/// One read of the platform's monotonic clock, in nanoseconds.
+#[inline]
+pub fn raw_now() -> Ticks {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: valid out-pointer; CLOCK_MONOTONIC always exists on Linux.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        (ts.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(ts.tv_nsec as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as Ticks
+    }
+}
+
+/// Whether [`raw_now`] already reads the clock behind `time.monotonic()`,
+/// so no alignment offset is needed.
+pub const RAW_IS_PYTHON_MONOTONIC: bool = cfg!(target_os = "linux");
 
 #[derive(Debug)]
 pub struct Clock {
-    epoch: Instant,
+    /// Added to every platform reading (0 when it is Python's clock).
+    offset: i64,
     cached: Ticks,
 }
 
 impl Clock {
     pub fn new() -> Self {
-        let epoch = Instant::now();
-        Clock { epoch, cached: 0 }
+        Self::with_offset(0)
     }
 
-    /// Read the hardware clock and refresh the per-tick cache.
+    /// A clock reading `raw_now() + offset`, e.g. aligned to another
+    /// monotonic clock by `offset = other_now - raw_now()`.
+    pub fn with_offset(offset: i64) -> Self {
+        let mut c = Clock { offset, cached: 0 };
+        c.refresh();
+        c
+    }
+
+    /// A fresh reading; leaves the per-tick cache alone.
+    #[inline]
+    pub fn now(&self) -> Ticks {
+        raw_now().saturating_add_signed(self.offset)
+    }
+
+    /// Read the clock and refresh the per-tick cache.
     /// Called at least once per reactor tick.
+    #[inline]
     pub fn refresh(&mut self) -> Ticks {
-        self.cached = self.epoch.elapsed().as_nanos() as Ticks;
+        self.cached = self.now();
         self.cached
     }
 
-    /// The value cached by the last `refresh()`. This is what
-    /// `loop.time()` reports (R-061).
+    /// The value cached by the last `refresh()`: the reactor's per-tick
+    /// time.
     #[inline]
     pub fn cached(&self) -> Ticks {
         self.cached
     }
 
-    /// An uncached read, for callers that need a fresh timestamp without
-    /// touching the tick cache (e.g. computing poll timeouts).
+    /// Alias of [`Clock::now`], kept for the reactor's call sites.
     #[inline]
     pub fn now_uncached(&self) -> Ticks {
-        self.epoch.elapsed().as_nanos() as Ticks
+        self.now()
+    }
+
+    pub fn offset(&self) -> i64 {
+        self.offset
     }
 }
 
@@ -61,7 +112,7 @@ pub fn ticks_to_secs_f64(t: Ticks) -> f64 {
 
 #[inline]
 pub fn secs_f64_to_ticks(s: f64) -> Ticks {
-    if s <= 0.0 {
+    if s <= 0.0 || s.is_nan() {
         return 0;
     }
     // Saturate rather than wrap for absurd deadlines.
@@ -97,10 +148,44 @@ mod tests {
     }
 
     #[test]
+    fn now_is_fresh_and_leaves_the_cache() {
+        let mut c = Clock::new();
+        let a = c.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(c.now() >= a + 2_000_000);
+        assert_eq!(c.cached(), a);
+    }
+
+    #[test]
+    fn offset_shifts_readings() {
+        let base = Clock::new();
+        let ahead = Clock::with_offset(5_000_000_000);
+        let (x, y) = (base.now(), ahead.now());
+        assert!(y >= x + 5_000_000_000 && y < x + 6_000_000_000);
+        // A negative offset larger than the reading saturates at 0.
+        assert_eq!(Clock::with_offset(i64::MIN).now(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_clock_is_clock_monotonic() {
+        // Same clock as Python's time.monotonic(): readings bracket one
+        // taken straight from the kernel interface.
+        let a = raw_now();
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        let mid = ts.tv_sec as u64 * NANOS_PER_SEC + ts.tv_nsec as u64;
+        let b = raw_now();
+        assert!(a <= mid && mid <= b);
+    }
+
+    #[test]
     fn secs_roundtrip() {
         let t = secs_f64_to_ticks(1.5);
         assert_eq!(t, 1_500_000_000);
         assert!((ticks_to_secs_f64(t) - 1.5).abs() < 1e-9);
         assert_eq!(secs_f64_to_ticks(-1.0), 0);
+        assert_eq!(secs_f64_to_ticks(f64::NAN), 0);
+        assert_eq!(secs_f64_to_ticks(f64::INFINITY), u64::MAX);
     }
 }

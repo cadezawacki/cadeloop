@@ -292,25 +292,67 @@ impl EpollBackend {
         if lazy && interest & !entry.kernel == 0 {
             return Ok(()); // kernel is a superset: leave it armed
         }
-        let mut ev = libc::epoll_event { events: interest, u64: fd as u64 };
-        if entry.registered {
-            if interest == 0 {
-                cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) })?;
-                entry.registered = false;
-                entry.kernel = 0;
-                self.fds.remove(fd);
-            } else {
-                cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) })?;
-                entry.kernel = interest;
-            }
-        } else if interest != 0 {
-            cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) })?;
-            entry.registered = true;
-            entry.kernel = interest;
-        } else {
+        let registered = entry.registered;
+        let epfd = self.epfd;
+        if registered && interest == 0 {
+            // ENOENT/EBADF: the kernel already dropped the registration
+            // -- epoll forgets an fd once its file is closed, which is what
+            // close()-then-remove_reader() does. The entry must go anyway:
+            // failing here kept it, the fd number got recycled, and the
+            // next add_reader matched the stale kernel mask and skipped the
+            // EPOLL_CTL_ADD the new file needed, so it never fired.
+            let rc = Self::ctl(epfd, libc::EPOLL_CTL_DEL, fd, 0);
             self.fds.remove(fd);
+            return match rc {
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::EBADF)) => Ok(()),
+                other => other,
+            };
         }
-        Ok(())
+        if interest == 0 {
+            self.fds.remove(fd);
+            return Ok(());
+        }
+        let rc = if registered {
+            match Self::ctl(epfd, libc::EPOLL_CTL_MOD, fd, interest) {
+                // Registration gone (file closed, number possibly reused by
+                // a file never added): add the file now behind the number.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    Self::ctl(epfd, libc::EPOLL_CTL_ADD, fd, interest)
+                }
+                other => other,
+            }
+        } else {
+            match Self::ctl(epfd, libc::EPOLL_CTL_ADD, fd, interest) {
+                // Already in the set (the table lost track): adopt it.
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    Self::ctl(epfd, libc::EPOLL_CTL_MOD, fd, interest)
+                }
+                other => other,
+            }
+        };
+        let Some(entry) = self.fds.get_mut(fd) else { return rc };
+        match rc {
+            Ok(()) => {
+                entry.registered = true;
+                entry.kernel = interest;
+                Ok(())
+            }
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::EBADF) {
+                    // Nothing open behind the number: nothing is
+                    // registered either, whatever the table believed.
+                    entry.registered = false;
+                    entry.kernel = 0;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    #[inline]
+    fn ctl(epfd: RawFd, op: i32, fd: RawFd, events: u32) -> io::Result<()> {
+        let mut ev = libc::epoll_event { events, u64: fd as u64 };
+        cvt(unsafe { libc::epoll_ctl(epfd, op, fd, &mut ev) }).map(drop)
     }
 
     /// Park an op on the fd's read or write side. Readiness is per-fd here,
@@ -803,18 +845,42 @@ impl IoBackend for EpollBackend {
             // entry just to delete it again.
             return Ok(());
         }
-        {
+        let prev = {
             let entry = self.fds.entry(fd);
+            let prev = (entry.watch_r, entry.watch_w);
+            if (readable && prev.0) || (writable && prev.1) {
+                // Re-adding a watch the table already holds: the fd may
+                // have been closed and its number recycled without a
+                // remove_* in between, leaving a kernel mask that matches
+                // on paper for a registration that no longer exists. Force
+                // the epoll_ctl (MOD, falling back to ADD) instead of
+                // trusting it; replacing a watcher is rare, the syscall
+                // cheap next to a callback that never fires.
+                entry.kernel = 0;
+            }
             entry.watch_r = readable;
             entry.watch_w = writable;
-        }
+            prev
+        };
         // Watches sync EAGERLY. Lazy removal would let an entry outlive
         // remove_reader() + close(); when the kernel recycles the fd
         // number, the next add_reader would see desired == stale kernel
         // mask and silently skip the epoll_ctl the new fd needs. The lazy
         // path is reserved for transport ops, whose teardown always
         // detaches (removing the entry) before close.
-        self.sync_interest(fd, false)
+        let res = self.sync_interest(fd, false);
+        if res.is_err() {
+            // Leave the table saying what the caller still believes: it
+            // rolls its own watcher maps back on error.
+            if let Some(entry) = self.fds.get_mut(fd) {
+                entry.watch_r = prev.0;
+                entry.watch_w = prev.1;
+                if entry.interest() == 0 && !entry.registered {
+                    self.fds.remove(fd);
+                }
+            }
+        }
+        res
     }
 
     fn detach_socket(&mut self, socket: RawSocket) {

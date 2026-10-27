@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::{self, BackendKind, Completion, IoBackend, Wakeup};
-use crate::ready::{CrossThreadQueue, ReadyQueue, DISPATCH_BATCH};
+use crate::ready::{CrossThreadQueue, ReadyQueue};
 use crate::time::{Clock, Ticks};
 use crate::timer::{TimerHeap, TimerPayload};
 
@@ -47,6 +47,9 @@ pub struct ReactorConfig {
     pub poll_batch: usize,
     /// R-041/R-042: RIO completion/request queue sizing.
     pub backend_opts: backend::BackendOptions,
+    /// Added to the platform clock so ticks line up with Python's
+    /// `time.monotonic()` (0 where they already do; see `time`).
+    pub clock_offset_ns: i64,
 }
 
 impl Default for ReactorConfig {
@@ -56,6 +59,7 @@ impl Default for ReactorConfig {
             spin_us: 20,
             poll_batch: 256,
             backend_opts: backend::BackendOptions::default(),
+            clock_offset_ns: 0,
         }
     }
 }
@@ -105,7 +109,7 @@ impl<T: TimerPayload> Reactor<T> {
         let backend = backend::create(cfg.backend, &cfg.backend_opts)?;
         let wakeup = backend.wakeup_handle();
         Ok(Reactor {
-            clock: Clock::new(),
+            clock: Clock::with_offset(cfg.clock_offset_ns),
             timers: TimerHeap::new(),
             ready: ReadyQueue::new(),
             xthread: Arc::new(CrossThreadQueue::new()),
@@ -215,10 +219,32 @@ impl<T: TimerPayload> Reactor<T> {
         self.snapshot_batch();
     }
 
+    /// Make this tick's dispatch batch everything queued right now.
+    ///
+    /// No cap: asyncio's `_run_once` runs every callback that was ready
+    /// when the iteration began, and `stop()` takes effect only once that
+    /// iteration is over. The 128-callback cap this replaced made
+    /// `run_forever` return after 127 of 300 callbacks queued behind a
+    /// `call_soon(loop.stop)`, where asyncio and uvloop run all 300.
     #[inline]
     fn snapshot_batch(&mut self) {
         self.ready_snapshot = self.ready.len();
-        self.batch_left = DISPATCH_BATCH.min(self.ready_snapshot);
+        self.batch_left = self.ready_snapshot;
+    }
+
+    /// Fold callbacks queued since the snapshot -- the readiness watches
+    /// this tick's poll just reported -- into the current batch, BEFORE any
+    /// of it is dispatched.
+    ///
+    /// asyncio appends an iteration's I/O callbacks to the ready queue and
+    /// runs them in that same iteration. Left for the next tick instead,
+    /// they ran one tick late, and that tick's poll found the fd still
+    /// readable (nothing had read it yet) and queued the watch a second
+    /// time: one readiness event, two calls -- a reader that drained its
+    /// socket on the first call hit `BlockingIOError` on the second.
+    pub fn absorb_into_batch(&mut self) {
+        debug_assert_eq!(self.batch_left, self.ready_snapshot, "absorb after dispatch began");
+        self.snapshot_batch();
     }
 
     #[inline]
@@ -238,7 +264,9 @@ impl<T: TimerPayload> Reactor<T> {
 
     #[inline]
     fn drain_xthread(&mut self) {
-        self.stats.xthread_items += self.xthread.drain_into(&mut self.ready) as u64;
+        let timers = &mut self.timers;
+        let n = self.xthread.drain_into(&mut self.ready, |deadline, token| timers.schedule(deadline, token));
+        self.stats.xthread_items += n as u64;
     }
 
     #[inline]
@@ -369,9 +397,9 @@ impl<T: TimerPayload> Reactor<T> {
         self.completions.clear();
     }
 
-    /// Pop the next token of the current dispatch batch (R-054: max 128 per
-    /// drain; never more than were queued when the batch started, matching
-    /// asyncio's `_run_once` snapshot semantics).
+    /// Pop the next token of the current dispatch batch (R-054: never more
+    /// than were queued when the batch started, matching asyncio's
+    /// `_run_once` snapshot semantics).
     pub fn pop_ready_batched(&mut self) -> Option<T> {
         if self.batch_left == 0 {
             return None;
@@ -410,10 +438,13 @@ impl<T: TimerPayload> Reactor<T> {
             out.push(t);
         }
         let mut scratch = ReadyQueue::new();
-        self.xthread.drain_into(&mut scratch);
+        let timers = &mut self.timers;
+        self.xthread.drain_into(&mut scratch, |deadline, token| timers.schedule(deadline, token));
         while let Some(t) = scratch.pop() {
             out.push(t);
         }
+        // drain_all marks every timer unscheduled -- the cross-thread ones
+        // just moved into the heap included.
         out.extend(self.timers.drain_all());
         out
     }
@@ -544,15 +575,31 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_batch_caps_at_128() {
+    fn dispatch_batch_is_the_whole_snapshot() {
         let mut r = reactor();
         for i in 0..300 {
             r.push_ready(tok(i));
         }
-        let first = run_tick(&mut r);
-        assert_eq!(first.len(), DISPATCH_BATCH);
-        assert_eq!(run_tick(&mut r).len(), DISPATCH_BATCH);
-        assert_eq!(run_tick(&mut r).len(), 300 - 2 * DISPATCH_BATCH);
+        assert_eq!(run_tick(&mut r), (0..300).collect::<Vec<_>>());
+        assert!(run_tick(&mut r).is_empty());
+    }
+
+    #[test]
+    fn absorbed_pushes_join_the_current_batch() {
+        let mut r = reactor();
+        r.push_ready(tok(1));
+        r.prepare_tick();
+        r.poll(Duration::ZERO).unwrap();
+        r.finish_poll();
+        r.push_ready(tok(2)); // e.g. a readiness watch reported by the poll
+        r.absorb_into_batch();
+        let mut out = Vec::new();
+        while let Some(tok) = r.pop_ready_batched() {
+            out.push(tok.value);
+            r.push_ready(tok.clone()); // scheduled during dispatch: next tick
+        }
+        assert_eq!(out, vec![1, 2]);
+        assert_eq!(run_tick(&mut r), vec![1, 2]);
     }
 
     #[test]

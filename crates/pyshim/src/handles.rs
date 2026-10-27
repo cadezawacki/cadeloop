@@ -133,18 +133,26 @@ impl<T> GilCell<T> {
 
 /// What a handle references while the loop owns it.
 ///
-/// Four pointer-sized slots, nothing else: handles are allocated per
-/// `call_soon`, and with many in flight their size is memory traffic.
+/// Five pointer-sized slots, nothing else: handles are allocated per
+/// `call_soon`, and with many in flight their size is memory traffic. (The
+/// fifth slot is free in practice: it takes a Handle from 56 to 64 bytes
+/// and a TimerHandle from 72 to 80, the pymalloc size classes both
+/// already occupied.)
 ///
 /// * arguments: none (`a0`, `a1` empty), one (`a0`), two (`a0`, `a1`), or
 ///   more (`a0` = the argument tuple, `a1` = [`many_marker`]);
 /// * released (module docs): `context` is None. In debug mode `callback`
-///   then holds the released callback's repr (a `str`) for `__repr__`.
+///   then holds the released callback's formatted source (a `str`) for
+///   `__repr__`, as asyncio's debug-mode `cancel()` saves `_repr`;
+/// * `source_tb`: asyncio's `_source_traceback`, captured in debug mode
+///   only. Not released: asyncio keeps it for the handle's life, and it
+///   references frame summaries, never the objects a cycle runs through.
 struct Refs {
     callback: Option<Py<PyAny>>,
     context: Option<Py<PyAny>>,
     a0: Option<Py<PyAny>>,
     a1: Option<Py<PyAny>>,
+    source_tb: Option<Py<PyAny>>,
 }
 
 /// A private sentinel in `Refs::a1` meaning "`a0` is the argument tuple".
@@ -157,14 +165,32 @@ fn many_marker(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
 }
 
 impl Refs {
-    fn new(py: Python<'_>, callback: Py<PyAny>, args: CallArgs, context: Py<PyAny>) -> PyResult<Refs> {
+    fn new(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        args: CallArgs,
+        context: Py<PyAny>,
+        source_tb: Option<Py<PyAny>>,
+    ) -> PyResult<Refs> {
         let (a0, a1) = match args {
             CallArgs::Zero => (None, None),
             CallArgs::One(a) => (Some(a), None),
             CallArgs::Two(a, b) => (Some(a), Some(b)),
             CallArgs::Many(t) => (Some(t.into_any()), Some(many_marker(py)?.clone_ref(py))),
         };
-        Ok(Refs { callback: Some(callback), context: Some(context), a0, a1 })
+        Ok(Refs { callback: Some(callback), context: Some(context), a0, a1, source_tb })
+    }
+
+    /// The arguments as asyncio's `Handle._args` tuple (None once released).
+    fn args_tuple(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if self.context.is_none() {
+            return Ok(None);
+        }
+        if self.is_many(py) {
+            return Ok(self.a0.as_ref().map(|t| t.clone_ref(py)));
+        }
+        let items: Vec<&Py<PyAny>> = [&self.a0, &self.a1].into_iter().flatten().collect();
+        Ok(Some(PyTuple::new(py, items)?.into_any().unbind()))
     }
 
     #[inline]
@@ -201,9 +227,10 @@ impl Handle {
         args: CallArgs,
         context: Py<PyAny>,
         debug: bool,
+        source_tb: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         Ok(Handle {
-            refs: GilCell::new(Refs::new(py, callback, args, context)?),
+            refs: GilCell::new(Refs::new(py, callback, args, context, source_tb)?),
             cancelled: AtomicBool::new(false),
             scheduled: AtomicBool::new(false),
             persistent: false,
@@ -244,17 +271,18 @@ impl Handle {
     /// this handle (see the module docs). Must be called OUTSIDE the loop
     /// state cell -- the drops can run arbitrary Python. Idempotent.
     pub(crate) fn release(&self, py: Python<'_>) {
-        // In debug mode the callback's repr survives the release. repr()
-        // is Python code, so it is computed before the cell is entered.
+        // In debug mode the callback's formatted source survives the
+        // release (asyncio's debug cancel() saves `_repr` the same way).
+        // Formatting is Python code, so it runs before the cell is entered.
         let repr = if self.debug {
-            let cb = self.refs.with(py, |r| match r.context {
-                Some(_) => r.callback.as_ref().map(|c| c.clone_ref(py)),
-                None => None, // already released
-            });
-            cb.map(|cb| match cb.bind(py).repr() {
-                Ok(s) => s.into_any().unbind(),
-                Err(_) => pyo3::types::PyString::new(py, "<callback>").into_any().unbind(),
-            })
+            match self.callback_and_args(py) {
+                Ok(Some((cb, args))) => {
+                    let text = format_callback_source(py, cb.bind(py), args.bind(py))
+                        .unwrap_or_else(|_| "<callback>".to_owned());
+                    Some(pyo3::types::PyString::new(py, &text).into_any().unbind())
+                }
+                _ => None, // released already
+            }
         } else {
             None
         };
@@ -289,6 +317,50 @@ impl Handle {
             visit.call(slot)?;
         }
         Ok(())
+    }
+
+    /// `(callback, args tuple)` while the handle still holds them.
+    fn callback_and_args(&self, py: Python<'_>) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
+        let (cb, args) = self.refs.with(py, |r| {
+            if r.context.is_none() {
+                return Ok::<_, PyErr>((None, None));
+            }
+            Ok((r.callback.as_ref().map(|c| c.clone_ref(py)), r.args_tuple(py)?))
+        })?;
+        Ok(cb.zip(args))
+    }
+
+    /// asyncio's `Handle._repr_info()`, joined: `Handle`/`TimerHandle`,
+    /// `cancelled`, `when=` (timers), the callback's formatted source, and
+    /// `created at file:line` when a source traceback was captured.
+    fn repr_text(&self, py: Python<'_>, kind: &str, when: Option<f64>) -> PyResult<String> {
+        let mut info = vec![kind.to_owned()];
+        if self.is_cancelled() {
+            info.push("cancelled".to_owned());
+        }
+        if let Some(when) = when {
+            info.push(format!("when={}", pyo3::types::PyFloat::new(py, when).repr()?));
+        }
+        let (saved, tb) = self.refs.with(py, |r| {
+            let saved = match (&r.context, &r.callback) {
+                (None, Some(text)) => Some(text.clone_ref(py)), // debug-mode saved source
+                _ => None,
+            };
+            (saved, r.source_tb.as_ref().map(|t| t.clone_ref(py)))
+        });
+        if let Some(text) = saved {
+            info.push(text.bind(py).str()?.to_string());
+        } else if let Some((cb, args)) = self.callback_and_args(py)? {
+            info.push(format_callback_source(py, cb.bind(py), args.bind(py))?);
+        }
+        if let Some(tb) = tb {
+            let tb = tb.bind(py);
+            if tb.len()? > 0 {
+                let frame = tb.get_item(-1)?;
+                info.push(format!("created at {}:{}", frame.get_item(0)?.str()?, frame.get_item(1)?.str()?));
+            }
+        }
+        Ok(format!("<{}>", info.join(" ")))
     }
 
     /// Release after a dispatch, unless this is a persistent watch.
@@ -347,20 +419,50 @@ impl Handle {
         self.is_cancelled()
     }
 
-    fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        let py = slf.py();
-        let h = slf.get();
-        let (cb, released) =
-            h.refs.with(py, |r| (r.callback.as_ref().map(|c| c.clone_ref(py)), r.context.is_none()));
-        let state = if h.is_cancelled() { " cancelled" } else { "" };
-        let cb = match cb {
-            // Released in debug mode: the slot holds the callback's repr.
-            Some(text) if released => format!(" {}", text.bind(py).str()?),
-            Some(cb) => format!(" {}", cb.bind(py).repr()?),
-            None => String::new(),
-        };
-        Ok(format!("<{}{}{}>", slf.get_type().qualname()?, state, cb))
+    // asyncio's private attributes, read by asyncio itself (the slow-
+    // callback report's `_format_handle`, `_source_traceback` in debug
+    // messages) and by introspection tools.
+
+    #[getter]
+    fn _callback(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.refs.with(py, |r| match r.context {
+            Some(_) => r.callback.as_ref().map(|c| c.clone_ref(py)),
+            None => None,
+        })
     }
+
+    #[getter]
+    fn _args(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.refs.with(py, |r| r.args_tuple(py))
+    }
+
+    #[getter]
+    fn _cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+
+    #[getter]
+    fn _source_traceback(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.refs.with(py, |r| r.source_tb.as_ref().map(|t| t.clone_ref(py)))
+    }
+
+    fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
+        slf.get().repr_text(slf.py(), &slf.get_type().qualname()?.to_string(), None)
+    }
+}
+
+/// `asyncio.format_helpers._format_callback_source(callback, args)`: the
+/// callback's name with its arguments, plus its definition site.
+fn format_callback_source(
+    py: Python<'_>,
+    callback: &Bound<'_, PyAny>,
+    args: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    static FMT: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let f = FMT.get_or_try_init(py, || {
+        Ok::<_, PyErr>(py.import("asyncio.format_helpers")?.getattr("_format_callback_source")?.unbind())
+    })?;
+    f.call1(py, (callback, args))?.extract(py)
 }
 
 /// asyncio.TimerHandle equivalent. Cancellation tombstones the heap entry
@@ -405,6 +507,16 @@ impl TimerHandle {
     /// Absolute deadline in `loop.time()` seconds.
     fn when(&self) -> f64 {
         self.when
+    }
+
+    #[getter]
+    fn _when(&self) -> f64 {
+        self.when
+    }
+
+    fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
+        let me = slf.borrow();
+        me.as_super().repr_text(slf.py(), &slf.get_type().qualname()?.to_string(), Some(me.when))
     }
 }
 
