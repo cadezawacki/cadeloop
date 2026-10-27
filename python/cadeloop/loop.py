@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
+import errno
 import os
 import signal as signal_module
 import socket
@@ -1099,6 +1101,70 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         manager controls, which that mechanism does not reach."""
         import signal as signal_module
 
+        if (
+            asyncio.iscoroutine(callback)
+            or asyncio.iscoroutinefunction(callback)
+        ):
+            raise TypeError("coroutines cannot be used with add_signal_handler()")
+        self._check_signal(sig)
+        self._check_closed()
+        if sys.platform == "win32":
+            self._install_console_ctrl_handler()
+        # The callback runs in the context current HERE, as asyncio's
+        # does (its Handle is built now): not in whatever context the main
+        # thread happens to be in when the signal arrives.
+        self._signal_handlers[sig] = (callback, args, contextvars.copy_context())
+
+        def _dispatch(signum, frame):
+            entry = self._signal_handlers.get(signum)
+            if entry is None or self.is_closed():
+                return
+            cb, cb_args, ctx = entry
+            self.call_soon_threadsafe(cb, *cb_args, context=ctx)
+
+        try:
+            signal_module.signal(sig, _dispatch)
+            if hasattr(signal_module, "siginterrupt"):
+                # SA_RESTART, as asyncio sets it: fewer EINTRs elsewhere.
+                signal_module.siginterrupt(sig, False)
+        except (OSError, ValueError) as exc:
+            # Nothing was installed, so nothing may stay registered: a
+            # stale entry made the next remove_signal_handler() raise
+            # instead of answering False.
+            del self._signal_handlers[sig]
+            if isinstance(exc, ValueError):
+                # Not the main thread: asyncio reports a RuntimeError.
+                raise RuntimeError(str(exc)) from None
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f"sig {sig:d} cannot be caught") from None
+            raise
+
+    def remove_signal_handler(self, sig):
+        import signal as signal_module
+
+        self._check_signal(sig)
+        try:
+            del self._signal_handlers[sig]
+        except KeyError:
+            return False
+        if sig == signal_module.SIGINT:
+            handler = signal_module.default_int_handler
+        else:
+            handler = signal_module.SIG_DFL
+        try:
+            signal_module.signal(sig, handler)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f"sig {sig:d} cannot be caught") from None
+            raise
+        return True
+
+    def _check_signal(self, sig):
+        """unix_events' validation, shared by add and remove: TypeError
+        for a non-int, ValueError for a number this platform cannot
+        deliver."""
+        import signal as signal_module
+
         if not isinstance(sig, int):
             raise TypeError(f"sig must be an int, not {sig!r}")
         if sys.platform == "win32":
@@ -1107,37 +1173,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 allowed.add(signal_module.SIGBREAK)
             if sig not in allowed:
                 raise ValueError(f"signal {sig!r} not supported on this platform")
-            self._install_console_ctrl_handler()
         elif sig not in signal_module.valid_signals():
             raise ValueError(f"invalid signal number {sig}")
-        if (
-            asyncio.iscoroutine(callback)
-            or asyncio.iscoroutinefunction(callback)
-        ):
-            raise TypeError("coroutines cannot be used with add_signal_handler()")
-        self._check_closed()
-        self._signal_handlers[sig] = (callback, args)
-
-        def _dispatch(signum, frame):
-            entry = self._signal_handlers.get(signum)
-            if entry is None or self.is_closed():
-                return
-            cb, cb_args = entry
-            self.call_soon_threadsafe(cb, *cb_args)
-
-        signal_module.signal(sig, _dispatch)
-
-    def remove_signal_handler(self, sig):
-        import signal as signal_module
-
-        if sig not in self._signal_handlers:
-            return False
-        del self._signal_handlers[sig]
-        if sig == signal_module.SIGINT:
-            signal_module.signal(sig, signal_module.default_int_handler)
-        else:
-            signal_module.signal(sig, signal_module.SIG_DFL)
-        return True
 
     # Console control events SetConsoleCtrlHandler treats as a stop
     # request; CTRL_C_EVENT (0) is deliberately excluded — Python's own
@@ -1187,9 +1224,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             ):
                 entry = self._signal_handlers.get(candidate) if candidate is not None else None
                 if entry is not None:
-                    cb, cb_args = entry
+                    cb, cb_args, ctx = entry
                     try:
-                        self.call_soon_threadsafe(cb, *cb_args)
+                        self.call_soon_threadsafe(cb, *cb_args, context=ctx)
                     except RuntimeError:
                         pass  # loop already closing/closed
                     return 1

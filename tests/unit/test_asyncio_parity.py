@@ -10,6 +10,7 @@ need cadeloop internals use `cade_loop` instead.
 import asyncio
 import errno
 import os
+import signal
 import socket
 import ssl
 import struct
@@ -1499,3 +1500,76 @@ def test_default_executor_runs_the_lookups(loop):
     finally:
         executor.shutdown(wait=True)
     assert submitted == ["getaddrinfo", "getnameinfo"]
+
+
+# --------------------------------------------------------------------- #
+# 20. signal handlers                                                   #
+# --------------------------------------------------------------------- #
+
+_posix_only = pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="POSIX signals")
+
+
+@_posix_only
+def test_signal_handler_argument_checks(loop):
+    """CPython's test_add_signal_handler error checks: SIGKILL is a
+    RuntimeError that leaves nothing registered (so removing it answers
+    False instead of raising), and remove validates like add."""
+
+    def cb():
+        pass
+
+    with pytest.raises(TypeError):
+        loop.add_signal_handler("boom", cb)
+    with pytest.raises(TypeError):
+        loop.remove_signal_handler("boom")
+    for bad in (signal.NSIG + 1, 0, -1):
+        with pytest.raises(ValueError):
+            loop.add_signal_handler(bad, cb)
+        with pytest.raises(ValueError):
+            loop.remove_signal_handler(bad)
+    with pytest.raises(RuntimeError, match=f"sig {int(signal.SIGKILL)} cannot be caught"):
+        loop.add_signal_handler(signal.SIGKILL, cb)
+    assert loop.remove_signal_handler(signal.SIGKILL) is False
+
+
+@_posix_only
+def test_signal_handler_from_another_thread_is_a_runtime_error(loop):
+    import threading
+
+    raised = []
+
+    def worker():
+        try:
+            loop.add_signal_handler(signal.SIGUSR1, lambda: None)
+        except Exception as exc:  # inspected below
+            raised.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(5)
+    assert len(raised) == 1 and type(raised[0]) is RuntimeError, raised
+    assert loop.remove_signal_handler(signal.SIGUSR1) is False
+
+
+@_posix_only
+def test_signal_callback_runs_in_the_context_of_add_signal_handler(loop):
+    import contextvars
+
+    var = contextvars.ContextVar("var", default="unset")
+    seen = []
+
+    async def main():
+        var.set("at add time")
+        loop.add_signal_handler(signal.SIGUSR1, lambda: seen.append(var.get()))
+        var.set("at signal time")
+        os.kill(os.getpid(), signal.SIGUSR1)
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.remove_signal_handler(signal.SIGUSR1)
+    assert seen == ["at add time"]
