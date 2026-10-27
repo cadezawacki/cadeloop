@@ -758,7 +758,7 @@ print(loop.stats())
 | `completions` | I/O completions reaped. |
 | `callbacks_dispatched` | Callbacks run. |
 | `timers_fired` | Timers that fired. |
-| `xthread_items` | Items delivered via `call_soon_threadsafe`. |
+| `xthread_items` | Callbacks and timers other threads handed over while the loop was parked in its poll. Calls made while the loop is reachable -- including every `call_soon_threadsafe` from its own thread -- go straight to the ready queue and are not counted. |
 | `spin_hits` | Times the spin window found work without a blocking wait. |
 | `ready_len`, `timers_len` | Current ready-queue and timer-heap depth. |
 | `connections`, `listeners` | Live counts. |

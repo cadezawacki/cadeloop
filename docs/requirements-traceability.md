@@ -33,7 +33,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-054 | snapshot-batch dispatch (asyncio `_run_once` semantics; the 128 cap is gone: it broke `stop()`), vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, reactor.rs, handles.rs, net.rs |
 | R-055 | DNS thread pool min(8,cpus) + 5s LRU cache | ✅ | loop.py |
 | R-056 | Eager task fast path, zero-Task completions | ✅ `PyIter_Send` stepping; non-suspending requests allocate no Task/Future; AppTask registers via `_enter_task` (anyio-compatible); `eager_tasks=False` stdlib path | http.rs (pyshim), config.py |
-| R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP zero-byte probes compile-verified (harden M4) | epoll.rs, iocp.rs, coreloop.rs |
+| R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP `IOCTL_AFD_POLL` readiness (ADR-30), compile-verified pending Windows CI | epoll.rs, iocp.rs, iocp_util.rs, coreloop.rs |
 | R-058 | UDP endpoints | 📅 M4 | loop.py (gated) |
 | R-059 | Native TLS (memory BIOs), SSLContext compat | 🔶 sslproto MemoryBIO fallback ✅ (spec-sanctioned, tested); native engine 📅 M4 | tcp.py |
 | R-060 | Spin-then-park + latency_mode presets | ✅ | reactor.rs, config.py |
@@ -87,5 +87,5 @@ Deviations from spec text (owner-approved or forced):
    in ci.yml.
 4. **R-074**: bytes-backed memoryviews are copied (not zero-copy retained)
    pending a cheap detection path; plain `bytes` follow the spec rule.
-5. **R-057 on Windows**: probe-based emulation is compile-verified only
-   until Windows CI runs it (Linux uses native epoll interest).
+5. **R-057 on Windows**: AFD-poll readiness (ADR-30) is compile-verified
+   only until Windows CI runs it (Linux uses native epoll interest).

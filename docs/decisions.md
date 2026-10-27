@@ -205,8 +205,8 @@ observable drop-in behavior (R-013).
 Owner-directed: implement RIO (R-040..R-044) even though this
 environment cannot execute it. Shape: RIO has no accept/connect/cancel
 and no readiness story, so the backend wraps the IOCP backend — AcceptEx
-(accept sockets now created WSA_FLAG_REGISTERED_IO), ConnectEx, probes,
-and the PQCS wakeup stay IOCP; recv/send flow through per-socket request
+(accept sockets now created WSA_FLAG_REGISTERED_IO), ConnectEx, readiness
+watches (probes then, AFD polls since ADR-30) and the PQCS wakeup stay IOCP; recv/send flow through per-socket request
 queues into ONE completion queue whose notification posts to the same
 IOCP port (KEY_RIO), so the loop keeps a single park point and the spin
 phase drains RIODequeueCompletion syscall-free (R-041/R-060). Sockets
@@ -430,3 +430,79 @@ The one piece kept is the op-target breakdown, now permanent as
 `stats()["ops_by_target"]` — it is what distinguishes "a connect
 completion was never delivered" from "a recv was orphaned", and a loop
 stuck either way looks healthy on every other counter.
+
+## ADR-27: Handles release their references instead of being GC-tracked
+A handle that is part of a reference cycle -- `self._t =
+loop.call_later(t, self._tick)`, the shape of every protocol that keeps its
+own timer -- was uncollectable: handles were opaque to the collector, so
+every object that armed a timer on itself leaked for the life of the
+process, fired or cancelled. asyncio and uvloop GC-track their handles;
+doing the same here measured ~35% slower on loops with many callbacks or
+timers in flight, because every collection traverses every pending handle.
+
+Instead a handle drops its callback, arguments and context the moment the
+loop gives it up: after a one-shot dispatch, on `cancel()` (what asyncio's
+`Handle.cancel()` does anyway), when a watch is removed or displaced, and
+at close. A handle that still references anything is therefore reachable
+through its loop, which reports exactly those pending handles from its own
+`tp_traverse` (only while its state is quiescent: under-reporting is safe,
+inconsistent reporting within one pass is not) and releases them from
+`tp_clear`, so even an abandoned, unclosed loop whose timers point back at
+it is collected. The handle types stay out of the GC: 56 and 72 bytes, the
+pymalloc classes they always occupied.
+
+## ADR-28: The loop clock is time.monotonic()'s, read fresh where users see it
+R-061 asked for a clock cached per tick. In practice that broke asyncio's
+contract twice: `loop.time()` started at 0 per loop, so deadlines computed
+from `time.monotonic()` (`call_at`, `asyncio.timeout_at`) were meaningless;
+and the value was frozen for the whole tick, so a `call_later` made after a
+callback had blocked for 200ms counted those 200ms against its delay, and
+`loop.time()` deltas taken inside a callback were 0.
+
+Ticks are now `CLOCK_MONOTONIC` on Linux (the clock behind
+`time.monotonic()`, a vDSO read) and QPC aligned to `time.monotonic()` at
+loop creation on Windows. `loop.time()` and every `call_later` read it
+fresh, as asyncio does; the reactor keeps one reading per tick for timer
+expiry and poll timeouts, taken lazily on the tick's first use, so a
+pure-scheduling tick reads no clock at all. Cost: ~23ns per `call_later`
+(what asyncio and uvloop pay); the lazy tick reading paid it back on the
+callback paths (+4%).
+
+## ADR-29: Other threads may call into a loop that is not parked
+asyncio's loops accept `call_soon`, `call_later`, `create_task` and
+`Future.set_result` from other threads outside debug mode; uvloop does too.
+The state cell refused every call from a thread other than the running
+loop's -- and `set_result` raised only AFTER marking the future done, so
+its callbacks were lost and the awaiting task never woke.
+
+The cell now admits any GIL holder unless a borrow is live. The only borrow
+that spans a GIL release is the loop's own poll, so a foreign thread is
+refused exactly while the loop is parked; the scheduling calls then hand
+their callback or timer over the lock-free queue (R-022) and wake the loop,
+and anything else raises asyncio's non-thread-safe error. Debug mode keeps
+asyncio's `_check_thread` refusal. The same rule gave `call_soon_threadsafe`
+and `call_soon` one FIFO: whenever the state is reachable both push onto the
+ready queue directly (asyncio's single `_ready` deque); the cross-thread
+queue, drained a tick later, had run `call_soon_threadsafe(a);
+call_soon(b)` as b, a, and paid an eventfd write even on the loop's thread.
+A re-entered borrow is refused too, which turns a would-be aliased `&mut`
+into a RuntimeError.
+
+## ADR-30: IOCP readiness is IOCTL_AFD_POLL, not zero-byte probes
+`add_reader`/`add_writer` on IOCP were emulated with zero-byte overlapped
+reads and writes on the watched socket. On UDP a zero-byte read CONSUMED
+the datagram it was meant to detect and a zero-byte write sent an empty
+datagram; on a listener or a connecting socket the probe failed at once and
+was re-posted in a busy loop; and the probe tied the socket to the loop's
+completion port for good.
+
+Watches are now `IOCTL_AFD_POLL` requests issued through a helper socket
+the backend owns -- the undocumented-but-stable mechanism libuv, mio and
+wepoll are built on -- so the watched socket is never associated with the
+port, read or written, and readiness has `select()` semantics: a listener
+is readable when a connection is waiting, a connecting socket writable once
+the connect resolves. Removing a watch cancels and reaps its request; the
+backend's `Drop` reaps whatever is still in flight before freeing the slab
+the kernel writes into. Compile-verified on Linux; the Windows tests
+(`test_windows_audit.py`, the `#[cfg(windows)]` Rust tests) run in Windows
+CI.
