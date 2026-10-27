@@ -113,6 +113,22 @@ pub struct IoSlice {
 
 pub const MAX_GATHER: usize = 16;
 
+/// The most bytes one send post carries (R-035).
+///
+/// IoSlice lengths are u32 and a completion reports a DWORD count: a slice
+/// of a 4 GiB+ buffer was truncated to `len mod 2^32` -- ZERO for an exact
+/// multiple, a zero-byte send that completed, advanced nothing and was
+/// re-posted forever -- and a gather past 4 GiB wrapped the count the
+/// transport advances its queue by. Bigger writes go out in parts through
+/// the partial-send resumption every backend already performs.
+pub const MAX_SEND_BYTES: usize = 1 << 30;
+
+/// `len` as an [`IoSlice`] length, capped at [`MAX_SEND_BYTES`].
+#[inline]
+pub fn io_len(len: usize) -> u32 {
+    len.min(MAX_SEND_BYTES) as u32
+}
+
 /// R-020 op surface. Ops return an `OpId` whose completion is later
 /// delivered by `poll`. Backends that cannot support an op return
 /// `io::ErrorKind::Unsupported`.
@@ -364,6 +380,22 @@ pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn Io
     {
         let _ = (kind, opts);
         Ok(Box::new(portable::PortableBackend::new()))
+    }
+}
+
+#[cfg(test)]
+mod io_len_tests {
+    use super::{io_len, MAX_SEND_BYTES};
+
+    #[test]
+    fn huge_lengths_are_capped_never_wrapped() {
+        assert_eq!(io_len(7), 7);
+        assert_eq!(io_len(MAX_SEND_BYTES), MAX_SEND_BYTES as u32);
+        // `as u32` made these 0 and 1 GiB short of the truth respectively:
+        // the first never advanced at all.
+        assert_eq!(io_len(1usize << 32), MAX_SEND_BYTES as u32);
+        assert_eq!(io_len((5usize << 30) + 3), MAX_SEND_BYTES as u32);
+        assert!(MAX_SEND_BYTES as u64 * 16 > u32::MAX as u64, "callers must cap the gather total too");
     }
 }
 

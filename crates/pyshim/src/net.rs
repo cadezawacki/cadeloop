@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap as HashMap;
 
-use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
+use cadeloop_core::backend::{
+    io_len, is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket, MAX_SEND_BYTES,
+};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
 use cadeloop_core::http::{Limits, ParseError};
 use cadeloop_core::netsys;
@@ -124,10 +126,10 @@ impl WriteBuf {
     fn slice(&self) -> IoSlice {
         match self {
             WriteBuf::Bytes { ptr, len, off, .. } => {
-                IoSlice { ptr: unsafe { ptr.add(*off) }, len: (len - off) as u32 }
+                IoSlice { ptr: unsafe { ptr.add(*off) }, len: io_len(len - off) }
             }
             WriteBuf::Owned { data, off } => {
-                IoSlice { ptr: unsafe { data.as_ptr().add(*off) }, len: (data.len() - off) as u32 }
+                IoSlice { ptr: unsafe { data.as_ptr().add(*off) }, len: io_len(data.len() - off) }
             }
         }
     }
@@ -579,8 +581,16 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
     }
     let mut slices: [IoSlice; 16] = [IoSlice { ptr: std::ptr::null(), len: 0 }; 16];
     let mut n = 0;
+    // Bounded by bytes as well as slices: the completion's count is 32-bit
+    // (see MAX_SEND_BYTES). What does not fit goes in the next post.
+    let mut total = 0usize;
     for buf in entry.wq.iter().take(16) {
-        slices[n] = buf.slice();
+        let slice = buf.slice();
+        if n > 0 && total + slice.len as usize > MAX_SEND_BYTES {
+            break;
+        }
+        total += slice.len as usize;
+        slices[n] = slice;
         n += 1;
     }
     let socket = entry.socket;
