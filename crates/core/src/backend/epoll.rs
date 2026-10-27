@@ -567,8 +567,8 @@ impl Drop for EpollBackend {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.wake.eventfd);
-            libc::close(self.epfd);
         }
+        self.release_poller();
     }
 }
 
@@ -900,6 +900,13 @@ impl IoBackend for EpollBackend {
                     os_error: libc::ECANCELED as u32,
                 });
             }
+        }
+    }
+
+    fn release_poller(&mut self) {
+        if self.epfd >= 0 {
+            unsafe { libc::close(self.epfd) };
+            self.epfd = -1; // later epoll_ctl/epoll_wait fail with EBADF, never hit a recycled fd
         }
     }
 

@@ -756,3 +756,25 @@ def test_signal_wakeup_pair_is_made_once_per_loop(loop):
     assert loop._signal_wakeup_pair is pair
     loop.close()
     assert pair[0].fileno() == -1 and pair[1].fileno() == -1
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/self/fd")
+def test_close_releases_the_epoll_instance():
+    """asyncio's close() closes its selector at once; the epoll fd used to
+    live until the loop object was garbage-collected."""
+
+    def nfds():
+        return len(os.listdir("/proc/self/fd"))
+
+    before = nfds()
+    lp = cadeloop.new_event_loop()
+    lp.run_until_complete(asyncio.sleep(0))
+    lp.close()
+    try:
+        # The eventfd stays until the loop is freed (other threads may
+        # still hold the wakeup); the epoll instance does not.
+        assert nfds() <= before + 1
+    finally:
+        del lp
+        gc.collect()
+    assert nfds() <= before

@@ -765,6 +765,7 @@ impl CoreLoop {
             // (queued response bodies, up to high_water per connection)
             // living as long as anything still references the dead loop.
             net::reap_at_close(py, &mut st.net, st.reactor.backend_mut());
+            st.reactor.backend_mut().release_poller();
             dropped.extend(st.reactor.clear_pending());
             dropped.extend(std::mem::take(&mut st.net.ready_scratch).into_iter().map(HandleRef));
             for (_, h) in st.net.readers.drain() {

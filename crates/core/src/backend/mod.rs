@@ -184,6 +184,14 @@ pub trait IoBackend {
         Err(io::Error::new(io::ErrorKind::Unsupported, "named pipes unsupported on this backend"))
     }
 
+    /// The loop is closed and will never poll again: release the OS object
+    /// only the poll needs (the epoll instance) now, as asyncio's close()
+    /// closes its selector, instead of when the loop is garbage-collected.
+    /// The wakeup object is NOT released: other threads may still hold a
+    /// handle to it, and a closed fd number could be recycled under their
+    /// write. Idempotent; a no-op where nothing can safely go early.
+    fn release_poller(&mut self) {}
+
     /// Request cancellation of an in-flight op. MUST tolerate the op having
     /// already completed (ERROR_NOT_FOUND) — the completion is still
     /// delivered via `poll` either way (R-037).
