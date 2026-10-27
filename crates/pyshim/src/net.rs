@@ -699,6 +699,54 @@ fn finish_after_resume(py: Python<'_>, net: &mut NetState, backend: Backend<'_>,
     }
 }
 
+/// asyncio's `_maybe_pause_protocol` for a queue that just grew, or a
+/// high-water mark that just dropped: returns the protocol's
+/// pause_writing to call (outside the cell) when the queue is over the
+/// mark. In-cell.
+///
+/// asyncio writes to the socket at once and pauses only for what the
+/// kernel would not take. Here a write is queued first, so before
+/// deciding, the queue is pushed out and any send the backend finished
+/// inline (epoll's writev at post time) is applied. Without that, one
+/// large write to an idle socket paused the protocol -- and a tick later
+/// resumed it -- although the kernel had taken every byte. The common
+/// write, under the mark, costs one lookup.
+fn maybe_pause(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) -> Option<Py<PyAny>> {
+    let e = net.transports.get(&tid)?;
+    if e.proto_paused || e.queued_bytes <= e.high_water {
+        return None;
+    }
+    if e.send_op.is_none() {
+        flush_pending(py, net, backend, tid);
+    }
+    settle_inline(py, net, backend);
+    let e = net.transports.get_mut(&tid)?;
+    if e.proto_paused || e.queued_bytes <= e.high_water {
+        return None;
+    }
+    e.proto_paused = true;
+    match &e.proto {
+        ProtoKind::Py(p) => Some(p.pause_writing.clone_ref(py)),
+        ProtoKind::Http(_) => None,
+    }
+}
+
+/// Apply the completions the backend already holds in user space (inline
+/// successes; see `IoBackend::take_staged`) now rather than at the next
+/// poll. A completed send can post the next, which can complete inline
+/// in turn, hence the (bounded) loop. In-cell, like the tick's own
+/// translate.
+fn settle_inline(py: Python<'_>, net: &mut NetState, backend: Backend<'_>) {
+    let mut staged = Vec::new();
+    for _ in 0..8 {
+        if backend.take_staged(&mut staged) == 0 {
+            return;
+        }
+        translate(py, net, backend, &staged);
+        staged.clear();
+    }
+}
+
 /// eof/close finalization once the write queue is drained. In-cell.
 fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
@@ -3322,14 +3370,7 @@ impl Transport {
                     net.flush_list.push(tid);
                 }
             }
-            if let Some(entry) = net.transports.get_mut(&tid) {
-                if entry.queued_bytes > entry.high_water && !entry.proto_paused {
-                    entry.proto_paused = true;
-                    if let ProtoKind::Py(p) = &entry.proto {
-                        pause = Some(p.pause_writing.clone_ref(py));
-                    }
-                }
-            }
+            pause = maybe_pause(py, net, reactor.backend_mut(), tid);
             dirty |= !net.graveyard_bufs.is_empty() || !net.graveyard_entries.is_empty();
         })?;
         if dirty {
@@ -3379,12 +3420,7 @@ impl Transport {
     }
 
     #[pyo3(signature = (high=None, low=None))]
-    fn set_write_buffer_limits(
-        &self,
-        py: Python<'_>,
-        high: Option<usize>,
-        low: Option<usize>,
-    ) -> PyResult<()> {
+    fn set_write_buffer_limits(&self, py: Python<'_>, high: Option<i64>, low: Option<i64>) -> PyResult<()> {
         let core = self.core_ref(py);
         // asyncio's rule: high defaults to 4 * low when only `low` is
         // supplied (not a fixed 64 KiB, which rejected low > 64 KiB
@@ -3392,39 +3428,30 @@ impl Transport {
         // loop for smaller values).
         let (high, low) = match (high, low) {
             (Some(h), Some(l)) => (h, l),
-            (Some(h), None) => (h, h / 4),
-            (None, Some(l)) => (l * 4, l),
+            (Some(h), None) => (h, h.div_euclid(4)),
+            (None, Some(l)) => (l.saturating_mul(4), l),
             (None, None) => (64 * 1024, 16 * 1024),
         };
-        if low > high {
-            return Err(pyo3::exceptions::PyValueError::new_err("high must be >= low must be >= 0"));
+        if !(high >= low && low >= 0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "high ({high}) must be >= low ({low}) must be >= 0"
+            )));
         }
-        // Applying the limits is not enough: the queue already has a
-        // depth, and the pause/resume decision has to be re-taken against
-        // the new marks. Lowering `high` under an existing backlog left
-        // the protocol unpaused until its next write; raising the limits
-        // on a paused transport could leave it paused indefinitely if no
-        // further write completion arrived.
-        let action = core.with_net(|net, _| {
+        // The queue already has a depth, so the pause decision is re-taken
+        // against the new mark, as asyncio's _maybe_pause_protocol does:
+        // lowering `high` under an existing backlog pauses now. Raising
+        // the limits does not resume here -- asyncio resumes a paused
+        // protocol as its buffer drains below the low mark, from the send
+        // completion, never from inside this call.
+        let pause = core.with_net(|net, reactor| {
             let e = net.transports.get_mut(&self.tid)?;
-            e.high_water = high;
-            e.low_water = low;
-            if !e.proto_paused && e.queued_bytes > e.high_water {
-                e.proto_paused = true;
-                if let ProtoKind::Py(p) = &e.proto {
-                    return Some((true, p.pause_writing.clone_ref(py)));
-                }
-            } else if e.proto_paused && e.queued_bytes <= e.low_water {
-                e.proto_paused = false;
-                if let ProtoKind::Py(p) = &e.proto {
-                    return Some((false, p.resume_writing.clone_ref(py)));
-                }
-            }
-            None
+            e.high_water = high as usize;
+            e.low_water = low as usize;
+            maybe_pause(py, net, reactor.backend_mut(), self.tid)
         })?;
-        if let Some((pausing, cb)) = action {
-            let what = if pausing { PAUSE_WRITING_FAILED } else { RESUME_WRITING_FAILED };
-            report_flow_control_error(py, core, self.tid, cb.call0(py), what)?;
+        core.drain_graveyards(py)?;
+        if let Some(pause_writing) = pause {
+            report_flow_control_error(py, core, self.tid, pause_writing.call0(py), PAUSE_WRITING_FAILED)?;
         }
         Ok(())
     }
@@ -3551,6 +3578,13 @@ impl Transport {
                 // no Transport pyobj exists for HTTP conns) in
                 // graveyard_protos.
                 let old = std::mem::replace(&mut entry.proto, ProtoKind::Py(refs));
+                // A new protocol starts unpaused: pause_writing and
+                // resume_writing come in pairs per protocol, and handing
+                // the new one the resume owed to the old one's pause
+                // broke start_tls (sslproto's resume_writing asserts it
+                // was paused). If the queue is still over the mark, the
+                // next write pauses the new protocol properly.
+                entry.proto_paused = false;
                 match old {
                     ProtoKind::Py(old) => {
                         net.graveyard_py.push(old.protocol);

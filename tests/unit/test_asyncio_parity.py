@@ -1280,3 +1280,156 @@ def test_wait_closed_after_close_returns_at_once(loop):
         transport.close()
 
     loop.run_until_complete(main())
+
+
+# --------------------------------------------------------------------- #
+# 10. flow control                                                      #
+# --------------------------------------------------------------------- #
+
+
+class _FlowRecorder(asyncio.Protocol):
+    def __init__(self):
+        self.events = []
+
+    def pause_writing(self):
+        self.events.append("pause")
+
+    def resume_writing(self):
+        self.events.append("resume")
+
+
+def test_large_write_to_an_idle_socket_does_not_pause(loop):
+    """asyncio sends at once and pauses only for what the kernel would not
+    take. cadeloop counted the whole write until its send was reaped, so
+    any write over the high-water mark paused and then resumed."""
+
+    async def main():
+        server, transport, protocol = await _pair(loop, _FlowRecorder)
+        transport.write(b"x" * (100 * 1024))
+        await asyncio.sleep(0.05)
+        assert protocol.events == []
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_write_buffer_limits_follow_asyncio(loop):
+    async def main():
+        server, transport, protocol = await _pair(loop, _FlowRecorder)
+        with pytest.raises(ValueError, match=r"high \(-1\) must be >= low \(-1\) must be >= 0"):
+            transport.set_write_buffer_limits(high=-1)
+        with pytest.raises(ValueError, match=r"high \(1\) must be >= low \(2\) must be >= 0"):
+            transport.set_write_buffer_limits(high=1, low=2)
+        transport.set_write_buffer_limits(low=1000)
+        assert transport.get_write_buffer_limits() == (1000, 4000)
+        transport.set_write_buffer_limits(high=8000)
+        assert transport.get_write_buffer_limits() == (2000, 8000)
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_start_tls_after_a_large_write(loop):
+    """CPython's test_start_tls_client_reg_proto_1: a 100 KiB write and
+    then start_tls. The eager pause handed SSLProtocol a resume_writing
+    for the plain protocol's pause, and sslproto asserts on that."""
+    import threading
+
+    server_ctx, client_ctx = _tls_contexts()
+    payload = b"1" * (100 * 1024)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    errors = []
+
+    def recv_all(sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+            conn.settimeout(10)
+            assert len(recv_all(conn, len(payload))) == len(payload)
+            tls = server_ctx.wrap_socket(conn, server_side=True)
+            tls.sendall(b"O")
+            assert len(recv_all(tls, len(payload))) == len(payload)
+            tls.close()
+        except Exception as exc:  # reported below
+            errors.append(exc)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    reported = _quiet(loop)
+
+    async def main():
+        on_data = loop.create_future()
+
+        class Client(_FlowRecorder):
+            def data_received(self, data):
+                if not on_data.done():
+                    on_data.set_result(data)
+
+        transport, protocol = await loop.create_connection(Client, *listener.getsockname())
+        transport.write(payload)
+        assert protocol.events == []  # the kernel took it all: no pause
+        tls = await asyncio.wait_for(
+            loop.start_tls(transport, protocol, client_ctx, server_hostname="localhost"), 10
+        )
+        assert await asyncio.wait_for(on_data, 10) == b"O"
+        tls.write(payload)
+        await asyncio.sleep(0.1)
+        tls.close()
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        thread.join(5)
+        listener.close()
+    assert errors == []
+    assert not [c for c in reported if "AssertionError" in repr(c.get("exception"))]
+
+
+def test_set_protocol_does_not_carry_a_pause_over(cade_loop):
+    """pause_writing/resume_writing come in pairs per protocol: a protocol
+    installed with set_protocol() while the old one was paused must not
+    be resumed for a pause it never saw. (Kept stricter than asyncio,
+    whose selector transport keeps the flag.)"""
+    loop = cade_loop
+
+    async def main():
+        conns = []
+
+        class Sink(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.pause_reading()
+                conns.append(transport)
+
+        server, transport, first = await _pair(loop, _FlowRecorder, Sink)
+        while not conns:
+            await asyncio.sleep(0.01)
+        while "pause" not in first.events:
+            transport.write(b"x" * (1 << 20))
+        second = _FlowRecorder()
+        transport.set_protocol(second)
+        conns[0].resume_reading()
+        for _ in range(200):
+            if transport.get_write_buffer_size() == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert first.events == ["pause"]
+        assert second.events == []
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
