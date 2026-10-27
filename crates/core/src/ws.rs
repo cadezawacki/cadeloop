@@ -157,6 +157,9 @@ pub enum WsEvent {
 /// message (1009 beyond it).
 pub struct WsRx {
     buf: Vec<u8>,
+    /// Bytes of `buf` already parsed into events. Compacted away once per
+    /// `push`, not per frame (see `push`).
+    pos: usize,
     frag_op: Option<u8>,
     frag: Vec<u8>,
     pub max_message: usize,
@@ -165,7 +168,7 @@ pub struct WsRx {
 
 impl WsRx {
     pub fn new(max_message: usize) -> Self {
-        WsRx { buf: Vec::new(), frag_op: None, frag: Vec::new(), max_message, failed: false }
+        WsRx { buf: Vec::new(), pos: 0, frag_op: None, frag: Vec::new(), max_message, failed: false }
     }
 
     pub fn push(&mut self, data: &[u8], out: &mut Vec<WsEvent>) {
@@ -175,22 +178,36 @@ impl WsRx {
         self.buf.extend_from_slice(data);
         loop {
             match self.parse_one() {
-                ParseOne::NeedMore => return,
+                ParseOne::NeedMore => break,
                 ParseOne::Event(ev) => {
                     let fail = matches!(ev, WsEvent::Fail(..));
                     out.push(ev);
                     if fail {
                         self.failed = true;
+                        // Nothing more will be parsed; drop the buffer.
+                        self.buf = Vec::new();
+                        self.pos = 0;
                         return;
                     }
                 }
                 ParseOne::Continue => {}
             }
         }
+        // Compact ONCE per push: drop the prefix consumed this call so
+        // `buf` holds only the unparsed tail. `parse_one` advances a cursor
+        // instead of draining per frame -- draining per frame was
+        // O(remaining) each, i.e. O(n^2) for a buffer full of small frames.
+        // A single 64 KiB recv of ~10,900 empty frames cost ~115 ms of
+        // in-cell parse CPU (vs ~0.36 ms fed one frame at a time), stalling
+        // the whole worker; the cursor makes it linear.
+        if self.pos != 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
     }
 
     fn parse_one(&mut self) -> ParseOne {
-        let b = &self.buf;
+        let b = &self.buf[self.pos..];
         if b.len() < 2 {
             return ParseOne::NeedMore;
         }
@@ -250,7 +267,7 @@ impl WsRx {
         for (i, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[i & 3];
         }
-        self.buf.drain(..off + len);
+        self.pos += off + len;
 
         match opcode {
             OP_PING => ParseOne::Event(WsEvent::Ping(payload)),
@@ -366,6 +383,53 @@ mod tests {
         rx.push(&client_frame(OP_TEXT, b"frag", false), &mut out);
         rx.push(&client_frame(OP_CONT, b"mented", true), &mut out);
         assert_eq!(out, vec![WsEvent::Text("fragmented".into())]);
+    }
+
+    #[test]
+    fn many_frames_in_one_push_are_all_parsed_and_compacted() {
+        // One buffer packed with many complete frames: every one must be
+        // delivered, in order, and the cursor must leave `buf` empty
+        // afterwards (the compaction that keeps this linear rather than
+        // O(n^2) -- see `push`).
+        let mut rx = WsRx::new(1 << 20);
+        let mut buf = Vec::new();
+        let n = 5000;
+        for i in 0..n {
+            buf.extend_from_slice(&client_frame(OP_BINARY, &[(i & 0xff) as u8], true));
+        }
+        let mut out = Vec::new();
+        rx.push(&buf, &mut out);
+        assert_eq!(out.len(), n);
+        for (i, ev) in out.iter().enumerate() {
+            assert_eq!(*ev, WsEvent::Binary(vec![(i & 0xff) as u8]));
+        }
+        // Fully consumed: no bytes retained, cursor reset.
+        assert!(rx.buf.is_empty());
+        assert_eq!(rx.pos, 0);
+    }
+
+    #[test]
+    fn cursor_survives_a_frame_split_across_pushes() {
+        // A frame that straddles a push boundary, interleaved with whole
+        // frames, must reassemble correctly with the cursor in play.
+        let mut rx = WsRx::new(1 << 20);
+        let whole = client_frame(OP_TEXT, b"a", true);
+        let split = client_frame(OP_BINARY, b"split-payload", true);
+        let (head, tail) = split.split_at(3);
+        let mut out = Vec::new();
+        rx.push(&whole, &mut out);
+        rx.push(head, &mut out); // incomplete: retained
+        rx.push(tail, &mut out);
+        rx.push(&whole, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                WsEvent::Text("a".into()),
+                WsEvent::Binary(b"split-payload".to_vec()),
+                WsEvent::Text("a".into()),
+            ]
+        );
+        assert!(rx.buf.is_empty());
     }
 
     #[test]
