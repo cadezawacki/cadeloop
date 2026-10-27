@@ -410,10 +410,10 @@ impl CoreLoop {
             }
             // Phase 2: translate completions (no Python execution).
             st.reactor.finish_poll_after(parked);
-            st.net.now_ns = st.reactor.time_cached();
             let mut comps = std::mem::take(&mut st.completions_scratch);
             st.reactor.drain_completions(&mut comps);
             if !comps.is_empty() {
+                st.net.now_ns = st.reactor.time_cached();
                 net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
                 comps.clear();
             }
@@ -424,8 +424,11 @@ impl CoreLoop {
             // completion ever arrives, so gating the retry on one left
             // the listener deaf for good. Cheap when nothing is
             // starved: one bool load and return.
-            let now = st.reactor.time_cached();
-            net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut(), now);
+            if st.net.any_starved_listener {
+                let now = st.reactor.time_cached();
+                st.net.now_ns = now; // the re-post's own failure path reads it
+                net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut(), now);
+            }
             st.completions_scratch = comps;
             // Readiness watch callbacks join the ready queue AND this tick's
             // batch, as asyncio runs an iteration's I/O callbacks in that
@@ -1214,7 +1217,10 @@ impl CoreLoop {
 
     /// Start (or restart) accepting on a listener created with start=false.
     fn listener_start(&self, lid: u64) -> PyResult<()> {
-        self.with_net(|net, reactor| net::listener_start(net, reactor.backend_mut(), lid))??;
+        self.with_net(|net, reactor| {
+            net.now_ns = reactor.now_fresh(); // a failed first post backs off from now
+            net::listener_start(net, reactor.backend_mut(), lid)
+        })??;
         Ok(())
     }
 
@@ -1901,6 +1907,7 @@ impl CoreLoop {
             }
             let lid = net::listener_create(net, sock, kind, accept_pool);
             if start {
+                net.now_ns = reactor.now_fresh(); // a failed first post backs off from now
                 if let Err(e) = net::listener_start(net, reactor.backend_mut(), lid) {
                     // listener_create already inserted it and the socket is
                     // registered, but no lid reaches the caller -- so the

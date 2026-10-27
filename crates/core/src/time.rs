@@ -12,12 +12,18 @@
 //! The reactor keeps one reading per tick ([`Clock::cached`]) for its own
 //! bookkeeping -- timer expiry, poll timeouts, connection deadlines --
 //! where per-tick granularity is the asyncio contract (`_run_once` reads
-//! the clock once to decide which timers are due). Anything user-visible
+//! the clock once to decide which timers are due). That reading is taken
+//! lazily, on the tick's first use: a tick with no timer pending and no
+//! I/O to time has no use for the clock at all, and the read it used to
+//! pay regardless was ~4% of a pure-scheduling tick (task steps, future
+//! chains). Anything user-visible
 //! reads the clock fresh ([`Clock::now`]): `loop.time()`, and the base of
 //! every `call_later` deadline. A per-tick value there was frozen for the
 //! whole tick: after a callback that blocked for 200ms,
 //! `asyncio.sleep(0.1)` returned at once, and `loop.time()` deltas
 //! measured inside a callback were 0.
+
+use std::cell::Cell;
 
 /// Nanoseconds on the loop clock (see the module docs).
 pub type Ticks = u64;
@@ -49,7 +55,9 @@ pub const RAW_IS_PYTHON_MONOTONIC: bool = cfg!(target_os = "linux");
 pub struct Clock {
     /// Added to every platform reading (0 when it is Python's clock).
     offset: i64,
-    cached: Ticks,
+    cached: Cell<Ticks>,
+    /// The tick moved on since `cached` was read: re-read on next use.
+    stale: Cell<bool>,
 }
 
 impl Clock {
@@ -60,7 +68,7 @@ impl Clock {
     /// A clock reading `raw_now() + offset`, e.g. aligned to another
     /// monotonic clock by `offset = other_now - raw_now()`.
     pub fn with_offset(offset: i64) -> Self {
-        let mut c = Clock { offset, cached: 0 };
+        let c = Clock { offset, cached: Cell::new(0), stale: Cell::new(true) };
         c.refresh();
         c
     }
@@ -71,19 +79,30 @@ impl Clock {
         raw_now().saturating_add_signed(self.offset)
     }
 
-    /// Read the clock and refresh the per-tick cache.
-    /// Called at least once per reactor tick.
+    /// Read the clock now and make that the per-tick reading.
     #[inline]
-    pub fn refresh(&mut self) -> Ticks {
-        self.cached = self.now();
-        self.cached
+    pub fn refresh(&self) -> Ticks {
+        let t = self.now();
+        self.cached.set(t);
+        self.stale.set(false);
+        t
     }
 
-    /// The value cached by the last `refresh()`: the reactor's per-tick
-    /// time.
+    /// A new tick began: the next [`Clock::cached`] reads the clock.
+    #[inline]
+    pub fn invalidate(&self) {
+        self.stale.set(true);
+    }
+
+    /// The reactor's per-tick time: read on the tick's first use, then
+    /// the same value until the next [`Clock::invalidate`].
     #[inline]
     pub fn cached(&self) -> Ticks {
-        self.cached
+        if self.stale.get() {
+            self.refresh()
+        } else {
+            self.cached.get()
+        }
     }
 
     /// Alias of [`Clock::now`], kept for the reactor's call sites.
@@ -129,8 +148,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_is_read_lazily_after_invalidate() {
+        let c = Clock::new();
+        let a = c.cached();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(c.cached(), a, "stable until invalidated");
+        c.invalidate();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = c.cached();
+        assert!(b >= a + 4_000_000, "read on first use after the invalidate, not at it");
+        assert_eq!(c.cached(), b);
+    }
+
+    #[test]
     fn cached_is_stable_between_refreshes() {
-        let mut c = Clock::new();
+        let c = Clock::new();
         let a = c.refresh();
         let b = c.cached();
         let d = c.cached();
@@ -140,7 +172,7 @@ mod tests {
 
     #[test]
     fn refresh_is_monotonic() {
-        let mut c = Clock::new();
+        let c = Clock::new();
         let a = c.refresh();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = c.refresh();
@@ -149,7 +181,7 @@ mod tests {
 
     #[test]
     fn now_is_fresh_and_leaves_the_cache() {
-        let mut c = Clock::new();
+        let c = Clock::new();
         let a = c.refresh();
         std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(c.now() >= a + 2_000_000);
