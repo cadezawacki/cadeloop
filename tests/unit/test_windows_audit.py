@@ -393,14 +393,21 @@ def test_loop_close_releases_the_accept_pool():
             lp.close()
         server.close()
 
+    def settle():
+        # Each loop's resolver threads exit after close(), not during it.
+        for t in threading.enumerate():
+            if t.name.startswith("cadeloop-dns"):
+                t.join(5)
+        gc.collect()
+
     for first in (False, True):
         cycle(first)  # one-time costs: Winsock, extension functions, ...
-    gc.collect()
+    settle()
     before = _process_handle_count()
     for _ in range(3):
         for first in (False, True):
             cycle(first)
-    gc.collect()
+    settle()
     leaked = _process_handle_count() - before
     assert leaked < 32, f"{leaked} handles leaked over 6 loops"
 
