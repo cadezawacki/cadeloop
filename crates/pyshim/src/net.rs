@@ -25,6 +25,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -34,10 +35,11 @@ use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
 use cadeloop_core::http::{Limits, ParseError};
 use cadeloop_core::netsys;
 use cadeloop_core::opslab::OpId;
-use pyo3::exceptions::{PyOSError, PyRuntimeError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyOSError, PyRuntimeError, PySystemExit};
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict};
 
 use crate::coreloop::CoreLoop;
@@ -231,10 +233,21 @@ pub(crate) struct TransportEntry {
     /// memory, and handing it another read defeats exactly that.
     /// Delivered by `resume_reading`.
     paused_recv: Option<Vec<u8>>,
-    /// `get_extra_info("socket")`, built on first ask and kept. Moved to
-    /// `graveyard_sockets` at teardown to be closed, not merely dropped
-    /// -- see the note there.
+    /// The duplicate behind `get_extra_info("socket")` of a transport
+    /// that has no socket object of its own (see `Transport::trsock`),
+    /// built on first ask. Closed, not merely dropped, at teardown -- see
+    /// `graveyard_sockets`.
     pub extra_sock: Option<Py<PyAny>>,
+    /// The caller's own socket object, for a transport built from one
+    /// (`sock=`). It owns the descriptor, as in asyncio: teardown closes
+    /// it (through Python, once connection_lost has run) instead of
+    /// closing the descriptor out from under it, and until then the
+    /// caller's object keeps working.
+    pub owner: Option<Py<PyAny>>,
+    /// The asyncio-level Server whose listener accepted this connection:
+    /// told `_detach()` once connection_lost has run, which is what
+    /// `Server.wait_closed()` waits for.
+    pub server: Option<Py<PyAny>>,
 }
 
 /// What an accepted connection turns into.
@@ -266,6 +279,13 @@ pub(crate) enum ListenerKind {
 pub(crate) struct ListenerEntry {
     pub socket: RawSocket,
     pub kind: ListenerKind,
+    /// The caller's listening socket object (`create_server(sock=...)`),
+    /// which owns the descriptor and is closed through Python at
+    /// teardown -- see `TransportEntry::owner`.
+    pub owner: Option<Py<PyAny>>,
+    /// The asyncio Server facade, handed to each accepted transport so it
+    /// can count live connections (`listener_set_server`).
+    pub server: Option<Py<PyAny>>,
     accept_ops: Vec<OpId>,
     target: usize,
     closing: bool,
@@ -303,6 +323,10 @@ fn accept_error_is_transient(code: u32) -> bool {
 /// outstanding recv, serialized sends).
 pub(crate) struct DatagramEntry {
     pub socket: RawSocket,
+    /// The socket object the endpoint was opened on. It owns the
+    /// descriptor, as asyncio's datagram transport's socket does: the
+    /// endpoint closes it (through Python) after connection_lost.
+    pub owner: Option<Py<PyAny>>,
     pub datagram_received: Py<PyAny>,
     pub error_received: Py<PyAny>,
     pub connection_lost: Py<PyAny>,
@@ -514,10 +538,12 @@ pub(crate) enum NetEvent {
         error_received: Py<PyAny>,
         err: u32,
     },
-    /// R-058: datagram endpoint torn down.
+    /// R-058: datagram endpoint torn down. `close_after`: its socket
+    /// object, closed once connection_lost has run.
     DgramLost {
         connection_lost: Py<PyAny>,
         err: Option<u32>,
+        close_after: Option<Py<PyAny>>,
     },
     /// R-087: a WS receive() waiter has a queued event to consume.
     /// R-084 ASGI write backpressure: the native `send()` returned a
@@ -562,10 +588,7 @@ pub(crate) enum NetEvent {
         eof_received: Py<PyAny>,
         transport: Py<Transport>,
     },
-    ConnLost {
-        connection_lost: Py<PyAny>,
-        err: LostReason,
-    },
+    ConnLost(Box<ConnLost>),
     /// `resume_writing`, then -- if that left the queue empty -- the
     /// close or write_eof that was waiting for the drain.
     ResumeWriting {
@@ -608,6 +631,22 @@ pub(crate) enum NetEvent {
         bytes: u32,
         err: u32,
     },
+}
+
+/// A stream transport's teardown, as asyncio's `_call_connection_lost`
+/// performs it. Boxed: it is rare, and the hot Data event should not pay
+/// for its size.
+pub(crate) struct ConnLost {
+    connection_lost: Py<PyAny>,
+    err: LostReason,
+    /// The facade transport and its protocol: `get_protocol()` keeps
+    /// answering while connection_lost runs, as asyncio's does.
+    transport: Option<Py<Transport>>,
+    protocol: Py<PyAny>,
+    /// Closed after connection_lost: the caller's socket object, or the
+    /// duplicate behind `get_extra_info("socket")`.
+    close_after: Option<Py<PyAny>>,
+    server: Option<Py<PyAny>>,
 }
 
 // --------------------------------------------------------------------- //
@@ -769,20 +808,17 @@ pub(crate) fn teardown_reason(
         }
         return;
     };
-    if let Some(sock) = entry.extra_sock.take() {
-        net.graveyard_sockets.push(sock);
-    }
     if entry.conn_lost {
         if let LostReason::Exc(exc) = err {
             net.graveyard_py.push(exc);
         }
+        retire_sockets(net, &mut entry);
         net.graveyard_entries.push(entry);
         return;
     }
     entry.conn_lost = true;
     cancel_transport_ops(net, backend, &mut entry);
-    backend.detach_socket(entry.socket);
-    netsys::close(entry.socket);
+    release_socket(backend, &entry);
     if let Some(slot) = entry.recv_slot.take() {
         // The transport's own reference. The posted op holds a second one
         // (R-073) that only the reap releases.
@@ -790,7 +826,15 @@ pub(crate) fn teardown_reason(
     }
     match &mut entry.proto {
         ProtoKind::Py(p) => {
-            net.events.push(NetEvent::ConnLost { connection_lost: p.connection_lost.clone_ref(py), err });
+            let lost = ConnLost {
+                connection_lost: p.connection_lost.clone_ref(py),
+                err,
+                transport: entry.pyobj.take(),
+                protocol: p.protocol.clone_ref(py),
+                close_after: entry.owner.take().or_else(|| entry.extra_sock.take()),
+                server: entry.server.take(),
+            };
+            net.events.push(NetEvent::ConnLost(Box::new(lost)));
         }
         ProtoKind::Http(conn) => {
             if let LostReason::Exc(exc) = err {
@@ -816,10 +860,33 @@ pub(crate) fn teardown_reason(
             }
         }
     }
+    retire_sockets(net, &mut entry);
+    net.graveyard_entries.push(entry);
+}
+
+/// Deregister a dead transport's descriptor and close it -- unless the
+/// caller's socket object owns it: that is closed through Python instead
+/// (`retire_sockets`, or after connection_lost), never under it.
+fn release_socket(backend: Backend<'_>, entry: &TransportEntry) {
+    backend.detach_socket(entry.socket);
+    if entry.owner.is_none() {
+        netsys::close(entry.socket);
+    }
+}
+
+/// Socket objects a dead transport still holds, closed outside the cell
+/// (`graveyard_sockets`): closing, not dropping, is what makes the
+/// transport's close final for a socket the application may still hold.
+fn retire_sockets(net: &mut NetState, entry: &mut TransportEntry) {
+    if let Some(sock) = entry.owner.take() {
+        net.graveyard_sockets.push(sock);
+    }
     if let Some(sock) = entry.extra_sock.take() {
         net.graveyard_sockets.push(sock);
     }
-    net.graveyard_entries.push(entry);
+    if let Some(server) = entry.server.take() {
+        net.graveyard_py.push(server);
+    }
 }
 
 /// Used by CoreLoop::close (no Python available for events — they are
@@ -828,14 +895,11 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     let Some(mut entry) = net.transports.remove(&tid) else { return };
     entry.conn_lost = true;
     cancel_transport_ops(net, backend, &mut entry);
-    backend.detach_socket(entry.socket);
-    netsys::close(entry.socket);
+    release_socket(backend, &entry);
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
-    if let Some(sock) = entry.extra_sock.take() {
-        net.graveyard_sockets.push(sock);
-    }
+    retire_sockets(net, &mut entry);
     net.graveyard_entries.push(entry);
 }
 
@@ -1045,7 +1109,9 @@ pub(crate) fn http_enqueue_raw(
 // --------------------------------------------------------------------- //
 
 /// Wire a bound (and possibly connected) UDP socket as a datagram
-/// endpoint. The engine owns the socket from here.
+/// endpoint. Without an `owner` object the engine owns the descriptor
+/// from here; with one, that object does, and a failure here leaves it
+/// open for the caller.
 pub(crate) fn udp_wire(
     net: &mut NetState,
     backend: Backend<'_>,
@@ -1053,13 +1119,23 @@ pub(crate) fn udp_wire(
     datagram_received: Py<PyAny>,
     error_received: Py<PyAny>,
     connection_lost: Py<PyAny>,
+    owner: Option<Py<PyAny>>,
 ) -> io::Result<u64> {
-    backend.register_socket(sock)?;
+    if let Err(e) = backend.register_socket(sock) {
+        net.graveyard_py.push(datagram_received);
+        net.graveyard_py.push(error_received);
+        net.graveyard_py.push(connection_lost);
+        if let Some(owner) = owner {
+            net.graveyard_py.push(owner);
+        }
+        return Err(e);
+    }
     let did = net.next_id();
     net.datagrams.insert(
         did,
         DatagramEntry {
             socket: sock,
+            owner,
             datagram_received,
             error_received,
             connection_lost,
@@ -1080,7 +1156,10 @@ pub(crate) fn udp_wire(
         if let Some(mut entry) = net.datagrams.remove(&did) {
             cancel_dgram_ops(net, backend, &mut entry);
             backend.detach_socket(entry.socket);
-            netsys::close(entry.socket);
+            match entry.owner.take() {
+                Some(owner) => net.graveyard_py.push(owner), // still the caller's
+                None => netsys::close(entry.socket),
+            }
             if let Some(slot) = entry.recv_slot.take() {
                 net.buffers.release(slot);
             }
@@ -1327,7 +1406,10 @@ pub(crate) fn udp_teardown_at_close(net: &mut NetState, backend: Backend<'_>, di
     let Some(mut entry) = net.datagrams.remove(&did) else { return };
     cancel_dgram_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
-    netsys::close(entry.socket);
+    match entry.owner.take() {
+        Some(owner) => net.graveyard_sockets.push(owner),
+        None => netsys::close(entry.socket),
+    }
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
@@ -1344,11 +1426,17 @@ fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u
     entry.conn_lost = true;
     cancel_dgram_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
-    netsys::close(entry.socket);
+    if entry.owner.is_none() {
+        netsys::close(entry.socket);
+    }
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
-    net.events.push(NetEvent::DgramLost { connection_lost: entry.connection_lost.clone_ref(py), err });
+    net.events.push(NetEvent::DgramLost {
+        connection_lost: entry.connection_lost.clone_ref(py),
+        err,
+        close_after: entry.owner.take(),
+    });
     net.graveyard_py.push(entry.datagram_received);
     net.graveyard_py.push(entry.error_received);
     net.graveyard_py.push(entry.connection_lost);
@@ -1646,13 +1734,21 @@ impl NetState {
     }
 }
 
-pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: ListenerKind, target: usize) -> u64 {
+pub(crate) fn listener_create(
+    net: &mut NetState,
+    sock: RawSocket,
+    kind: ListenerKind,
+    target: usize,
+    owner: Option<Py<PyAny>>,
+) -> u64 {
     let lid = net.next_id();
     net.listeners.insert(
         lid,
         ListenerEntry {
             socket: sock,
             kind,
+            owner,
+            server: None,
             accept_ops: Vec::new(),
             target: target.max(1),
             closing: false,
@@ -1661,6 +1757,16 @@ pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: Listene
         },
     );
     lid
+}
+
+/// Attach the asyncio Server facade to a listener (see
+/// `ListenerEntry::server`). Returns the previous one, for the caller to
+/// drop outside the cell.
+pub(crate) fn listener_set_server(net: &mut NetState, lid: u64, server: Py<PyAny>) -> Option<Py<PyAny>> {
+    match net.listeners.get_mut(&lid) {
+        Some(l) => l.server.replace(server),
+        None => Some(server),
+    }
 }
 
 /// Arm a listener's accept pool. Fails loudly when not a single accept
@@ -1742,6 +1848,13 @@ pub(crate) fn starved_retry_in(net: &NetState, now_ns: u64) -> Duration {
 }
 
 pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u64) {
+    listener_remove(net, backend, lid, true);
+}
+
+/// `listener_teardown`, except that `close_owner: false` leaves the
+/// caller's socket object open: a create_server(sock=...) that failed
+/// hands the socket back untouched, as asyncio does.
+pub(crate) fn listener_remove(net: &mut NetState, backend: Backend<'_>, lid: u64, close_owner: bool) {
     let Some(mut listener) = net.listeners.remove(&lid) else { return };
     listener.closing = true;
     for op in listener.accept_ops.drain(..) {
@@ -1751,7 +1864,14 @@ pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u
         // but only if the completion still resolves to this lid.
     }
     backend.detach_socket(listener.socket);
-    netsys::close(listener.socket);
+    match listener.owner {
+        Some(owner) if close_owner => net.graveyard_sockets.push(owner),
+        Some(owner) => net.graveyard_py.push(owner),
+        None => netsys::close(listener.socket),
+    }
+    if let Some(server) = listener.server {
+        net.graveyard_py.push(server);
+    }
     match listener.kind {
         ListenerKind::Factory(factory) => net.graveyard_py.push(factory),
         ListenerKind::Http { app, pyloop, state, .. } => {
@@ -2324,18 +2444,24 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
         match event {
             NetEvent::Data { tid, data_received, payload } => {
                 let res = data_received.call1(py, (payload,));
-                fatal_protocol_error(py, core, tid, res)?;
+                if res.is_err() {
+                    fatal_protocol_error(py, core, tid, res, DATA_RECEIVED_FAILED)?;
+                }
             }
             NetEvent::BufDataOwned { tid, get_buffer, buffer_updated, data } => {
                 let res = copy_into_app_buffer(py, &get_buffer, &buffer_updated, data.as_ptr(), data.len());
-                fatal_protocol_error(py, core, tid, res)?;
+                if let Err((message, e)) = res {
+                    fatal_protocol_error::<()>(py, core, tid, Err(e), message)?;
+                }
             }
             NetEvent::BufData { tid, get_buffer, buffer_updated, slot, len } => {
                 let res = fill_app_buffer(py, core, &get_buffer, &buffer_updated, slot, len);
                 core.with_net(|net, _| {
                     net.buffers.release(slot);
                 })?;
-                fatal_protocol_error(py, core, tid, res)?;
+                if let Err((message, e)) = res {
+                    fatal_protocol_error::<()>(py, core, tid, Err(e), message)?;
+                }
             }
             NetEvent::Eof { eof_received, transport } => match eof_received.call0(py) {
                 Ok(keep_open) => {
@@ -2349,17 +2475,39 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                     // transport left open here is half-open forever unless
                     // the application happens to close it -- and it has
                     // just told us it cannot handle the event.
-                    core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
-                    transport.bind(py).get().close(py)?;
+                    let tid = transport.get().tid;
+                    fatal_protocol_error::<()>(py, core, tid, Err(e), EOF_RECEIVED_FAILED)?;
                 }
             },
-            NetEvent::ConnLost { connection_lost, err } => {
+            NetEvent::ConnLost(lost) => {
+                let ConnLost { connection_lost, err, transport, protocol, close_after, server } = *lost;
                 let exc_obj = match err {
                     LostReason::Clean => py.None(),
                     LostReason::Os(code) => os_err(py, code),
                     LostReason::Exc(exc) => exc,
                 };
-                core.guard_protocol_call(py, connection_lost.call1(py, (exc_obj,)))?;
+                // asyncio's _call_connection_lost: get_protocol() still
+                // answers while connection_lost runs; afterwards the
+                // socket is closed and the server forgets the connection.
+                if let Some(t) = &transport {
+                    t.get().set_losing(Some(protocol));
+                }
+                let res = connection_lost.call1(py, (exc_obj,));
+                if let Some(t) = &transport {
+                    // Dropped here, attached and outside the cell. Holding
+                    // it longer would make protocol -> transport -> protocol
+                    // a cycle the collector cannot see.
+                    drop(t.get().set_losing(None));
+                }
+                if let Some(sock) = close_after {
+                    let _ = sock.call_method0(py, intern!(py, "close"));
+                }
+                let detached = match server {
+                    Some(srv) => srv.call_method0(py, intern!(py, "_detach")).map(drop),
+                    None => Ok(()),
+                };
+                core.guard_protocol_call(py, res)?;
+                core.guard_protocol_call(py, detached)?;
             }
             NetEvent::DgramData { datagram_received, payload, addr } => {
                 let addr_obj = any_addr_tuple(py, addr).unwrap_or_else(|| py.None());
@@ -2369,22 +2517,28 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 let exc_obj = os_err(py, err);
                 core.guard_protocol_call(py, error_received.call1(py, (exc_obj,)))?;
             }
-            NetEvent::DgramLost { connection_lost, err } => {
+            NetEvent::DgramLost { connection_lost, err, close_after } => {
                 let exc_obj = match err {
                     Some(code) => os_err(py, code),
                     None => py.None(),
                 };
-                core.guard_protocol_call(py, connection_lost.call1(py, (exc_obj,)))?;
+                let res = connection_lost.call1(py, (exc_obj,));
+                // After the callback, as asyncio's _call_connection_lost.
+                if let Some(sock) = close_after {
+                    let _ = sock.call_method0(py, intern!(py, "close"));
+                }
+                core.guard_protocol_call(py, res)?;
             }
             NetEvent::ResumeWriting { tid, resume_writing } => {
-                let res = core.guard_protocol_call(py, resume_writing.call0(py));
+                let res =
+                    report_flow_control_error(py, core, tid, resume_writing.call0(py), RESUME_WRITING_FAILED);
                 core.with_net(|net, reactor| finish_after_resume(py, net, reactor.backend_mut(), tid))?;
                 core.drain_graveyards(py)?;
                 res?;
             }
             NetEvent::Accepted { lid, sock } => {
                 enum Action {
-                    Factory(Py<PyAny>),
+                    Factory(Py<PyAny>, Option<Py<PyAny>>),
                     Http {
                         app: Py<PyAny>,
                         pyloop: Py<PyAny>,
@@ -2397,7 +2551,9 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 }
                 let action = core.with_net(|net, _| {
                     net.listeners.get(&lid).map(|l| match &l.kind {
-                        ListenerKind::Factory(f) => Action::Factory(f.clone_ref(py)),
+                        ListenerKind::Factory(f) => {
+                            Action::Factory(f.clone_ref(py), l.server.as_ref().map(|s| s.clone_ref(py)))
+                        }
                         ListenerKind::Http { app, pyloop, state, limits, eager, tuning, tls } => {
                             Action::Http {
                                 app: app.clone_ref(py),
@@ -2413,9 +2569,10 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 })?;
                 match action {
                     None => netsys::close(sock),
-                    Some(Action::Factory(factory)) => match factory.call0(py) {
+                    Some(Action::Factory(factory, server)) => match factory.call0(py) {
                         Ok(protocol) => {
-                            if let Err(e) = wire_stream(py, slf, sock, protocol.into_bound(py)) {
+                            if let Err(e) = wire_stream(py, slf, sock, protocol.into_bound(py), None, server)
+                            {
                                 core.guard_protocol_call::<Py<PyAny>>(py, Err(e))?;
                             }
                         }
@@ -2598,8 +2755,8 @@ fn fill_app_buffer(
     buffer_updated: &Py<PyAny>,
     slot: SlotId,
     len: usize,
-) -> PyResult<Py<PyAny>> {
-    let src = core.with_net(|net, _| net.buffers.slot_ptr(slot))?;
+) -> Result<(), (&'static str, PyErr)> {
+    let src = core.with_net(|net, _| net.buffers.slot_ptr(slot)).map_err(|e| (GET_BUFFER_FAILED, e))?;
     copy_into_app_buffer(py, get_buffer, buffer_updated, src, len)
 }
 
@@ -2610,34 +2767,41 @@ fn fill_app_buffer(
 /// SAFETY: `src` must be valid for `len` bytes and must stay valid across
 /// the `get_buffer`/`buffer_updated` calls -- either a live pool slot the
 /// caller still owns, or a `Vec` the caller keeps alive.
+///
+/// The error names the callback that failed, in asyncio's wording.
 fn copy_into_app_buffer(
     py: Python<'_>,
     get_buffer: &Py<PyAny>,
     buffer_updated: &Py<PyAny>,
     src: *const u8,
     len: usize,
-) -> PyResult<Py<PyAny>> {
+) -> Result<(), (&'static str, PyErr)> {
     let mut copied = 0usize;
     while copied < len {
-        let buf_obj = get_buffer.call1(py, (len - copied,))?;
+        // -1, as asyncio passes: "no preference". A buffer of any size
+        // works -- a smaller one just takes another round.
+        let buf_obj = get_buffer.call1(py, (-1,)).map_err(|e| (GET_BUFFER_FAILED, e))?;
         let mut view: ffi::Py_buffer = unsafe { std::mem::zeroed() };
         let rc = unsafe { ffi::PyObject_GetBuffer(buf_obj.as_ptr(), &mut view, ffi::PyBUF_WRITABLE) };
         if rc != 0 {
-            return Err(PyErr::fetch(py));
+            return Err((GET_BUFFER_FAILED, PyErr::fetch(py)));
         }
         let chunk = (view.len as usize).min(len - copied);
         if chunk == 0 {
             unsafe { ffi::PyBuffer_Release(&mut view) };
-            return Err(PyRuntimeError::new_err("get_buffer() returned a zero-sized buffer"));
+            return Err((
+                GET_BUFFER_FAILED,
+                PyRuntimeError::new_err("get_buffer() returned an empty buffer"),
+            ));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(src.add(copied), view.buf.cast::<u8>(), chunk);
             ffi::PyBuffer_Release(&mut view);
         }
         copied += chunk;
-        buffer_updated.call1(py, (chunk,))?;
+        buffer_updated.call1(py, (chunk,)).map_err(|e| (BUFFER_UPDATED_FAILED, e))?;
     }
-    Ok(py.None())
+    Ok(())
 }
 
 /// Cache protocol callbacks (R-054 bound-method cache). Phase-2 only.
@@ -2708,23 +2872,34 @@ fn addr_tuple(py: Python<'_>, addr: Option<std::net::SocketAddr>) -> Option<Py<P
 }
 
 /// Wire an accepted/connected socket into a live transport. Phase-2.
+///
+/// `owner`: the caller's socket object, when the descriptor is that
+/// object's (`sock=`). It stays the owner -- see `TransportEntry::owner`
+/// -- and a failure here leaves it with the caller, as asyncio does.
+/// `server`: the asyncio Server whose listener accepted the connection;
+/// told `_attach()` now and `_detach()` after connection_lost.
 pub(crate) fn wire_stream(
     py: Python<'_>,
     slf: &Bound<'_, CoreLoop>,
     sock: RawSocket,
     protocol: Bound<'_, PyAny>,
+    owner: Option<Py<PyAny>>,
+    server: Option<Py<PyAny>>,
 ) -> PyResult<Py<Transport>> {
     let core = slf.get();
+    let owned = owner.is_none();
     // Everything up to the transport insert is transactional: on any
-    // failure the socket has no owner (the caller detached it, or it came
-    // back from tcp_connect), so it must be released here or it leaks.
+    // failure a socket with no owner object (it came back from
+    // tcp_connect or an accept) must be released here or it leaks.
     // Detach-then-close, never bare close: tcp_connect registered it, and
     // closing a registered socket leaves the backend listing a handle
     // value the OS will reissue, so the next socket to reuse it looks
     // already-associated and its completions are never queued (ADR-25).
     let discard = |core: &CoreLoop| {
-        let _ = core.with_net(|_net, reactor| reactor.backend_mut().detach_socket(sock));
-        netsys::close(sock);
+        if owned {
+            let _ = core.with_net(|_net, reactor| reactor.backend_mut().detach_socket(sock));
+            netsys::close(sock);
+        }
     };
     let proto = match cache_proto(py, &protocol) {
         Ok(p) => p,
@@ -2751,11 +2926,17 @@ pub(crate) fn wire_stream(
     if let Err(e) = reg {
         // register_socket failed, so it is NOT associated: a bare close is
         // right here and a detach would be meaningless.
-        netsys::close(sock);
+        if owned {
+            netsys::close(sock);
+        }
         return Err(io_error(e));
     }
     let tid = core.with_net(|net, _| net.next_id())?;
-    let transport = Py::new(py, Transport { core: slf.clone().unbind(), tid })?;
+    let transport = Py::new(py, Transport::new(slf.clone().unbind(), tid, peer, name))?;
+    if let Some(server) = &server {
+        // asyncio counts the connection from the transport's creation.
+        core.guard_protocol_call(py, server.call_method0(py, intern!(py, "_attach")))?;
+    }
     core.with_net(|net, _| {
         net.transports.insert(
             tid,
@@ -2779,8 +2960,12 @@ pub(crate) fn wire_stream(
                 flush_scheduled: false,
                 paused_recv: None,
                 extra_sock: None,
-                peername: peer,
-                sockname: name,
+                owner,
+                server,
+                // Kept on the Transport itself (they outlive the entry);
+                // the entry's copies serve the native HTTP engine.
+                peername: None,
+                sockname: None,
             },
         );
     })?;
@@ -2853,6 +3038,8 @@ pub(crate) fn wire_http(
                 flush_scheduled: false,
                 paused_recv: None,
                 extra_sock: None,
+                owner: None,
+                server: None,
                 peername: peer,
                 sockname: name,
             },
@@ -2871,82 +3058,178 @@ pub(crate) fn wire_http(
 pub struct Transport {
     pub(crate) core: Py<CoreLoop>,
     pub(crate) tid: u64,
+    /// Captured at creation: asyncio's extra info outlives the
+    /// connection (connection_lost may still log the peer), and reading
+    /// it needs no trip into the state cell.
+    peername: Option<Py<PyAny>>,
+    sockname: Option<Py<PyAny>>,
+    /// `get_extra_info("socket")`: an `asyncio.trsock.TransportSocket`,
+    /// built on first ask and kept for the transport's whole life.
+    trsock: PyOnceLock<Py<PyAny>>,
+    /// The protocol while its connection_lost runs (see `ConnLost`).
+    losing: Mutex<Option<Py<PyAny>>>,
+}
+
+/// `asyncio.trsock.TransportSocket`, looked up once.
+static TRANSPORT_SOCKET: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Wrap `sock` the way asyncio hands out transport sockets. The wrapper
+/// refuses what would break the transport -- close(), detach(), and
+/// above all setblocking(True): on a plain socket object that switched
+/// the shared descriptor to blocking mode, and the engine's next large
+/// write then blocked the whole process inside writev with the GIL held.
+pub(crate) fn transport_socket(py: Python<'_>, sock: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let cls = TRANSPORT_SOCKET
+        .get_or_try_init(py, || py.import("asyncio.trsock")?.getattr("TransportSocket").map(Bound::unbind))?;
+    cls.call1(py, (sock,))
 }
 
 impl Transport {
+    pub(crate) fn new(
+        core: Py<CoreLoop>,
+        tid: u64,
+        peername: Option<Py<PyAny>>,
+        sockname: Option<Py<PyAny>>,
+    ) -> Self {
+        Transport { core, tid, peername, sockname, trsock: PyOnceLock::new(), losing: Mutex::new(None) }
+    }
+
     fn core_ref<'a>(&'a self, py: Python<'a>) -> &'a CoreLoop {
         self.core.bind(py).get()
+    }
+
+    /// Install (or clear) the protocol `get_protocol()` reports once the
+    /// entry is gone; returns the previous one for the caller to drop.
+    fn set_losing(&self, protocol: Option<Py<PyAny>>) -> Option<Py<PyAny>> {
+        let mut slot = self.losing.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *slot, protocol)
     }
 
     /// `get_extra_info("socket")`.
     ///
     /// Protocols and libraries reach for this through the standard
     /// transport API to read the address family, inspect socket options,
-    /// or set one such as keepalive. Returning `None` for a live
-    /// connection made them either fail or silently skip that setup.
+    /// or set one such as keepalive. A transport built from the caller's
+    /// socket (`sock=`) wraps that very object, as asyncio does.
     ///
-    /// The object owns a `dup()` rather than the engine's descriptor,
-    /// because two Python-visible owners of one descriptor means a double
-    /// close, and by the second one the OS may have handed that number to
-    /// an unrelated connection (ADR-25's hazard, reached from the other
-    /// side). But a duplicate is still an *owner* of the connection: if
-    /// the application keeps the object, the peer gets no EOF when the
-    /// transport closes. So teardown closes it explicitly -- see
-    /// `graveyard_sockets` -- which makes the transport's close final
-    /// whether or not anyone kept a reference.
-    ///
-    /// Built on first ask (nothing pays for it otherwise) and kept on the
-    /// entry, so repeated calls return the same object rather than
-    /// leaking one duplicate per call.
-    fn extra_socket(&self, py: Python<'_>, core: &CoreLoop) -> PyResult<Option<Py<PyAny>>> {
-        let (cached, raw) = core.with_net(|net, _| match net.transports.get(&self.tid) {
-            Some(e) => (e.extra_sock.as_ref().map(|s| s.clone_ref(py)), Some(e.socket)),
-            None => (None, None),
-        })?;
-        if cached.is_some() {
-            return Ok(cached);
+    /// Otherwise the engine owns the only descriptor, so the wrapper holds
+    /// a `dup()` rather than a second owner of the engine's: two owners of
+    /// one descriptor means a double close, and by the second one the OS
+    /// may have handed that number to an unrelated connection (ADR-25's
+    /// hazard, reached from the other side). The duplicate is closed at
+    /// teardown (`ConnLost`), which keeps the transport's close final.
+    fn transport_socket(&self, py: Python<'_>, core: &CoreLoop) -> PyResult<Option<Py<PyAny>>> {
+        if let Some(ts) = self.trsock.get(py) {
+            return Ok(Some(ts.clone_ref(py)));
         }
-        let Some(raw) = raw else { return Ok(None) };
-        let obj = build_transport_socket(py, raw)?;
-        // Only ever set from None (the cached branch above returns
-        // first), so nothing is dropped inside the cell -- ADR-5.
-        core.with_net(|net, _| {
-            if let Some(e) = net.transports.get_mut(&self.tid) {
-                e.extra_sock = Some(obj.clone_ref(py));
-            }
+        let found = core.with_net(|net, _| {
+            net.transports.get(&self.tid).map(|e| (e.owner.as_ref().map(|o| o.clone_ref(py)), e.socket))
         })?;
-        Ok(Some(obj))
+        // Gone before anyone asked: there is no socket left to describe.
+        let Some((owner, raw)) = found else { return Ok(None) };
+        let sock = match owner {
+            Some(owner) => owner,
+            None => {
+                let dup = build_transport_socket(py, raw)?;
+                let kept = core.with_net(|net, _| match net.transports.get_mut(&self.tid) {
+                    Some(e) if e.extra_sock.is_none() => {
+                        e.extra_sock = Some(dup.clone_ref(py));
+                        true
+                    }
+                    _ => false,
+                })?;
+                if !kept {
+                    // Torn down meanwhile: nothing would ever close it.
+                    let _ = dup.call_method0(py, intern!(py, "close"));
+                    return Ok(None);
+                }
+                dup
+            }
+        };
+        let ts = transport_socket(py, sock)?;
+        let _ = self.trsock.set(py, ts);
+        Ok(self.trsock.get(py).map(|t| t.clone_ref(py)))
     }
 }
 
-/// Report an exception out of a receive callback and close the
-/// connection it arrived on.
+/// A transport's facade object and its protocol, as error context.
+type ErrorContext = (Option<Py<PyAny>>, Option<Py<PyAny>>);
+
+/// The facade transport and protocol of a Python-protocol transport, for
+/// the context asyncio's transport error reports carry.
+fn context_objects(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<ErrorContext> {
+    core.with_net(|net, _| match net.transports.get(&tid) {
+        Some(TransportEntry { proto: ProtoKind::Py(p), pyobj, .. }) => {
+            (pyobj.as_ref().map(|t| t.clone_ref(py).into_any()), Some(p.protocol.clone_ref(py)))
+        }
+        _ => (None, None),
+    })
+}
+
+/// asyncio's `_fatal_error` for a protocol callback that raised: report
+/// it under asyncio's message with the transport and protocol (an OSError
+/// is not reported -- asyncio only debug-logs those), then close the
+/// connection and hand the exception to connection_lost.
 ///
 /// The receive for the next chunk has already been posted by the time the
-/// callback runs, so merely reporting the exception (which is what the
-/// generic `guard_protocol_call` does) left the connection open and kept
-/// feeding bytes to a protocol whose state may be inconsistent. The
-/// stdlib's socket transport treats this as fatal and closes; so does
-/// this, and the Windows pipe transport already did.
-fn fatal_protocol_error<T>(py: Python<'_>, core: &CoreLoop, tid: u64, res: PyResult<T>) -> PyResult<()> {
-    if res.is_ok() {
-        return Ok(());
+/// callback runs, so merely reporting the exception left the connection
+/// open and kept feeding bytes to a protocol whose state may be
+/// inconsistent. And connection_lost(None) told the protocol the close
+/// was orderly, hiding why its connection died.
+fn fatal_protocol_error<T>(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    res: PyResult<T>,
+    message: &str,
+) -> PyResult<()> {
+    let err = match res {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
+        return Err(err);
     }
-    core.guard_protocol_call(py, res)?;
-    core.with_net(|net, reactor| {
-        teardown_with(py, net, reactor.backend_mut(), tid, None);
-    })?;
+    let exc = err.into_value(py).into_any();
+    if !exc.bind(py).is_instance_of::<PyOSError>() {
+        let (transport, protocol) = context_objects(py, core, tid)?;
+        core.report_transport_error(py, message, exc.clone_ref(py), transport, protocol)?;
+    }
+    core.with_net(|net, reactor| teardown_reason(py, net, reactor.backend_mut(), tid, LostReason::Exc(exc)))?;
     core.drain_graveyards(py)
 }
 
-/// A plain `socket.socket` over a duplicate of `raw`.
-///
-/// Not wrapped in `asyncio.trsock.TransportSocket`: that wrapper's whole
-/// job is to stop callers closing a descriptor the transport owns, and
-/// here the descriptor is a duplicate the *engine* must be able to close
-/// at teardown. A real socket object is also the more useful thing to
-/// hand back -- `.family`, `.getsockopt`, `.setsockopt` and the rest are
-/// what libraries actually reach for, and they work on it directly.
+/// asyncio's report for a raising pause_writing/resume_writing: the
+/// connection stays up, but the handler hears which callback failed and
+/// on which transport.
+fn report_flow_control_error(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    res: PyResult<Py<PyAny>>,
+    what: &str,
+) -> PyResult<()> {
+    let err = match res {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
+        return Err(err);
+    }
+    let (transport, protocol) = context_objects(py, core, tid)?;
+    core.report_transport_error(py, what, err.into_value(py).into_any(), transport, protocol)
+}
+
+const DATA_RECEIVED_FAILED: &str = "Fatal error: protocol.data_received() call failed.";
+const EOF_RECEIVED_FAILED: &str = "Fatal error: protocol.eof_received() call failed.";
+const GET_BUFFER_FAILED: &str = "Fatal error: protocol.get_buffer() call failed.";
+const BUFFER_UPDATED_FAILED: &str = "Fatal error: protocol.buffer_updated() call failed.";
+const PAUSE_WRITING_FAILED: &str = "protocol.pause_writing() failed";
+const RESUME_WRITING_FAILED: &str = "protocol.resume_writing() failed";
+
+/// A plain `socket.socket` over a duplicate of `raw`: the object the
+/// engine closes at teardown. Callers see it only through a
+/// `TransportSocket` (see `Transport::transport_socket`).
 fn build_transport_socket(py: Python<'_>, raw: RawSocket) -> PyResult<Py<PyAny>> {
     let socket_mod = py.import("socket")?;
     // socket.dup(), not os.dup(): on Windows a SOCKET is not a file
@@ -3057,7 +3340,7 @@ impl Transport {
             return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
         }
         if let Some(pause_writing) = pause {
-            core.guard_protocol_call(py, pause_writing.call0(py))?;
+            report_flow_control_error(py, core, tid, pause_writing.call0(py), PAUSE_WRITING_FAILED)?;
         }
         Ok(())
     }
@@ -3139,8 +3422,9 @@ impl Transport {
             }
             None
         })?;
-        if let Some((_pausing, cb)) = action {
-            core.guard_protocol_call(py, cb.call0(py))?;
+        if let Some((pausing, cb)) = action {
+            let what = if pausing { PAUSE_WRITING_FAILED } else { RESUME_WRITING_FAILED };
+            report_flow_control_error(py, core, self.tid, cb.call0(py), what)?;
         }
         Ok(())
     }
@@ -3152,7 +3436,7 @@ impl Transport {
         let tid = self.tid;
         let _ = tid;
         core.with_net(|net, _reactor| {
-            if let Some(entry) = net.transports.get_mut(&tid) {
+            if let Some(entry) = net.transports.get_mut(&tid).filter(|e| !e.closing) {
                 // The in-flight recv is left to complete -- cancelling
                 // races the completion and the slot reuse, and on Windows
                 // the bytes have already left the kernel buffer, so they
@@ -3170,7 +3454,9 @@ impl Transport {
         let core = self.core_ref(py);
         let tid = self.tid;
         core.with_net(|net, reactor| {
-            if let Some(entry) = net.transports.get_mut(&tid) {
+            // A closing transport reads no more (asyncio ignores both calls
+            // once close() has run).
+            if let Some(entry) = net.transports.get_mut(&tid).filter(|e| !e.closing) {
                 if entry.reading_paused {
                     entry.reading_paused = false;
                     // Anything that completed while paused goes out first,
@@ -3188,8 +3474,10 @@ impl Transport {
 
     fn is_reading(&self, py: Python<'_>) -> PyResult<bool> {
         let core = self.core_ref(py);
+        // asyncio: a closing transport has stopped reading, even while
+        // its output is still draining.
         core.with_net(|net, _| {
-            net.transports.get(&self.tid).is_some_and(|e| !e.reading_paused && !e.conn_lost)
+            net.transports.get(&self.tid).is_some_and(|e| !e.reading_paused && !e.closing && !e.conn_lost)
         })
     }
 
@@ -3291,10 +3579,15 @@ impl Transport {
 
     fn get_protocol(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| match net.transports.get(&self.tid) {
-            Some(TransportEntry { proto: ProtoKind::Py(p), .. }) => p.protocol.clone_ref(py),
-            _ => py.None(),
-        })
+        let live = core.with_net(|net, _| match net.transports.get(&self.tid) {
+            Some(TransportEntry { proto: ProtoKind::Py(p), .. }) => Some(p.protocol.clone_ref(py)),
+            _ => None,
+        })?;
+        if let Some(protocol) = live {
+            return Ok(protocol);
+        }
+        let slot = self.losing.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(slot.as_ref().map_or_else(|| py.None(), |p| p.clone_ref(py)))
     }
 
     /// The transport's raw socket handle, BORROWED (the transport still
@@ -3309,21 +3602,18 @@ impl Transport {
         })?
     }
 
+    /// asyncio's socket transports always carry `socket`, `sockname` and
+    /// `peername` (None when unavailable) and keep them after the
+    /// connection is gone; `default` applies to any other name.
     #[pyo3(signature = (name, default=None))]
     fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let core = self.core_ref(py);
-        if name == "socket" {
-            let out = self.extra_socket(py, core)?;
-            return Ok(out.or(default).unwrap_or_else(|| py.None()));
-        }
-        let out = core.with_net(|net, _| {
-            net.transports.get(&self.tid).and_then(|e| match name {
-                "peername" => e.peername.as_ref().map(|p| p.clone_ref(py)),
-                "sockname" => e.sockname.as_ref().map(|p| p.clone_ref(py)),
-                _ => None,
-            })
-        })?;
-        Ok(out.or(default).unwrap_or_else(|| py.None()))
+        let value = match name {
+            "peername" => self.peername.as_ref().map(|p| p.clone_ref(py)),
+            "sockname" => self.sockname.as_ref().map(|p| p.clone_ref(py)),
+            "socket" => self.transport_socket(py, self.core_ref(py))?,
+            _ => return Ok(default.unwrap_or_else(|| py.None())),
+        };
+        Ok(value.unwrap_or_else(|| py.None()))
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {

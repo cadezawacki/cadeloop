@@ -737,8 +737,15 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             context["source_traceback"] = handle._source_traceback
         self.call_exception_handler(context)
 
-    def _on_net_error(self, message, exc):
-        self.call_exception_handler({"message": message, "exception": exc})
+    def _on_net_error(self, message, exc, transport=None, protocol=None):
+        context = {"message": message, "exception": exc}
+        # A transport's own failures carry these, as asyncio's
+        # _fatal_error and flow-control reports do.
+        if transport is not None:
+            context["transport"] = transport
+        if protocol is not None:
+            context["protocol"] = protocol
+        self.call_exception_handler(context)
 
     @property
     def slow_callback_duration(self):

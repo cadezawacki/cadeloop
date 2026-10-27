@@ -16,7 +16,7 @@ import os
 import socket
 import stat
 import sys
-from asyncio import sslproto, staggered, tasks
+from asyncio import sslproto, staggered, tasks, trsock
 from asyncio.base_events import _interleave_addrinfos
 
 # Everything logged here is a message asyncio itself logs, so it goes to
@@ -64,7 +64,7 @@ _BIND_ERROR_PREFIX = "error while attempting to bind on address"
 class Server(asyncio.AbstractServer):
     """asyncio.AbstractServer implementation over native listeners."""
 
-    def __init__(self, loop, entries, factory, accept_pool, serving):
+    def __init__(self, loop, entries, factory, accept_pool, serving, sock=None):
         # entries: list of (lid, sockname, rawfd)
         self._loop = loop
         self._entries = entries
@@ -72,10 +72,35 @@ class Server(asyncio.AbstractServer):
         self._accept_pool = accept_pool
         self._serving = serving
         self._closed = False
-        self._close_waiters = []
-        self._sockets = None
+        # create_server(sock=...): the caller's socket, which the listener
+        # uses (and closes) itself rather than a detached descriptor.
+        self._sock = sock
+        # Duplicates behind `sockets` for listeners the core created.
+        self._dups = None
+        # Connections accepted and not yet lost (asyncio's _active_count):
+        # wait_closed() waits for them, not merely for close().
+        self._active_count = 0
+        self._waiters = []
         # The future serve_forever() parks on, so close() can wake it.
         self._serving_forever = None
+        for lid, _name, _fd in entries:
+            loop._core.listener_set_server(lid, self)
+
+    # -- connection accounting (called by the core) -----------------------
+
+    def _attach(self):
+        self._active_count += 1
+
+    def _detach(self):
+        self._active_count -= 1
+        if self._active_count == 0 and self._closed:
+            self._wakeup()
+
+    def _wakeup(self):
+        waiters, self._waiters = self._waiters, None
+        for waiter in waiters or ():
+            if not waiter.done():
+                waiter.set_result(waiter)
 
     # -- introspection ----------------------------------------------------
 
@@ -87,7 +112,11 @@ class Server(asyncio.AbstractServer):
             # closed -- raising EBADF, or worse, handing back a duplicate
             # of whatever unrelated socket has since reused the number.
             return ()
-        if self._sockets is None:
+        # TransportSockets, as asyncio returns: they refuse close() and
+        # setblocking(True), either of which would break the listener.
+        if self._sock is not None:
+            return (trsock.TransportSocket(self._sock),)
+        if self._dups is None:
             socks = []
             for _lid, _name, fd in self._entries:
                 # Duplicate so the reporting socket's lifetime is
@@ -103,8 +132,8 @@ class Server(asyncio.AbstractServer):
                         tmp.detach()  # never close the native listener
                 else:
                     socks.append(socket.socket(fileno=os.dup(fd)))
-            self._sockets = socks
-        return tuple(self._sockets)
+            self._dups = socks
+        return tuple(trsock.TransportSocket(s) for s in self._dups)
 
     def get_loop(self):
         return self._loop
@@ -116,17 +145,17 @@ class Server(asyncio.AbstractServer):
 
     async def start_serving(self):
         if self._closed:
-            raise RuntimeError("server is closed")
+            raise RuntimeError(f"server {self!r} is closed")
         if not self._serving:
             self._serving = True
             for lid, _name, _fd in self._entries:
                 self._loop._core.listener_start(lid)
 
     async def serve_forever(self):
-        if self._closed:
-            raise RuntimeError("server is closed")
         if self._serving_forever is not None:
-            raise RuntimeError("server is already being awaited on serve_forever()")
+            raise RuntimeError(f"server {self!r} is already being awaited on serve_forever()")
+        if self._closed:
+            raise RuntimeError(f"server {self!r} is closed")
         await self.start_serving()
         # Held, not anonymous. An anonymous future is unreachable from
         # close(), so a server closed by another task left this coroutine
@@ -135,9 +164,14 @@ class Server(asyncio.AbstractServer):
         self._serving_forever = self._loop.create_future()
         try:
             await self._serving_forever
+        except asyncio.CancelledError:
+            try:
+                self.close()
+                await self.wait_closed()
+            finally:
+                raise
         finally:
             self._serving_forever = None
-            self.close()
 
     def close(self):
         if self._closed:
@@ -149,26 +183,27 @@ class Server(asyncio.AbstractServer):
                 self._loop._core.listener_close(lid)
             except RuntimeError:
                 pass  # loop already closed
-        if self._sockets:
-            for s in self._sockets:
+        if self._dups:
+            for s in self._dups:
                 s.close()
-        self._sockets = ()
+        self._dups = None
         self._entries = []  # the raw descriptors are gone; do not reuse them
         # Cancelled rather than resolved, matching the stdlib: serve_forever
         # raises CancelledError when its server is closed underneath it.
         fut, self._serving_forever = self._serving_forever, None
         if fut is not None and not fut.done():
             fut.cancel()
-        for waiter in self._close_waiters:
-            if not waiter.done():
-                waiter.set_result(None)
-        self._close_waiters.clear()
+        if self._active_count == 0:
+            self._wakeup()
 
     async def wait_closed(self):
-        if self._closed:
+        # Python 3.11's semantics, exactly: a call made before close()
+        # waits for close() AND for every connection the server accepted
+        # to be lost; a call made after close() returns at once.
+        if self._closed or self._waiters is None:
             return
         waiter = self._loop.create_future()
-        self._close_waiters.append(waiter)
+        self._waiters.append(waiter)
         await waiter
 
     async def __aenter__(self):
@@ -179,8 +214,7 @@ class Server(asyncio.AbstractServer):
         await self.wait_closed()
 
     def __repr__(self):
-        names = [name for _lid, name, _fd in self._entries]
-        return f"<cadeloop.Server sockets={names} serving={self.is_serving()}>"
+        return f"<{self.__class__.__name__} sockets={self.sockets!r}>"
 
 
 class TcpSurface:
@@ -230,9 +264,19 @@ class TcpSurface:
             # destination.
             if sock.type != socket.SOCK_STREAM:
                 raise ValueError(f"a stream socket was expected, got {sock!r}")
-            fd = sock.detach()
+            # Not detached: the caller's socket keeps owning the
+            # descriptor, so it stays usable (getsockname(), options) while
+            # the transport lives, and the transport's close closes it --
+            # asyncio's contract.
+            sock.setblocking(False)
             return await self._wrap_outgoing(
-                fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
+                sock.fileno(),
+                protocol_factory,
+                ssl,
+                server_hostname,
+                ssl_handshake_timeout,
+                ssl_shutdown_timeout,
+                owner=sock,
             )
 
         if host is None or port is None:
@@ -365,19 +409,25 @@ class TcpSurface:
         ssl_shutdown_timeout,
         *,
         server_side=False,
+        owner=None,
     ):
-        # Until attach_stream() takes it, this descriptor has no owner:
-        # it came back from a native connect, or from a `sock=` the caller
-        # already detached. A protocol_factory that raises (or an
-        # SSLContext that will not build) therefore leaked one connected
-        # socket per failure -- invisible until the process ran out.
+        # Without an `owner` socket object, nothing owns this descriptor
+        # until attach_stream() takes it: it came back from a native
+        # connect. A protocol_factory that raises (or an SSLContext that
+        # will not build) therefore leaked one connected socket per failure
+        # -- invisible until the process ran out. A caller's own socket
+        # (`owner`) is left to the caller on failure, as asyncio leaves it.
+        def discard():
+            if owner is None:
+                self._core.discard_socket(fd)
+
         if not ssl:
             try:
                 protocol = protocol_factory()
             except BaseException:
-                self._core.discard_socket(fd)
+                discard()
                 raise
-            transport = self._core.attach_stream(fd, protocol)
+            transport = self._core.attach_stream(fd, protocol, owner)
             return transport, protocol
         # Everything up to attach_stream() belongs in the rollback, not
         # just the factory calls: `_make_ssl_context` hands back anything
@@ -405,9 +455,9 @@ class TcpSurface:
             # the waiter came back as a successful `(None, protocol)`.
             app_transport = protocol._app_transport
         except BaseException:
-            self._core.discard_socket(fd)
+            discard()
             raise
-        transport = self._core.attach_stream(fd, protocol)
+        transport = self._core.attach_stream(fd, protocol, owner)
         try:
             await waiter  # handshake
         except BaseException:
@@ -442,9 +492,16 @@ class TcpSurface:
         if ssl_shutdown_timeout is not None and not ssl:
             raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
         _check_ssl_socket(sock)
-        fd = sock.detach()
+        sock.setblocking(False)
         return await self._wrap_outgoing(
-            fd, protocol_factory, ssl, None, ssl_handshake_timeout, ssl_shutdown_timeout, server_side=True
+            sock.fileno(),
+            protocol_factory,
+            ssl,
+            None,
+            ssl_handshake_timeout,
+            ssl_shutdown_timeout,
+            server_side=True,
+            owner=sock,
         )
 
     async def start_tls(
@@ -607,16 +664,15 @@ class TcpSurface:
                     raise ValueError(
                         f"A listening socket was expected, got a connected socket {sock!r}"
                     ) from exc
-            fd = sock.detach()
-            # No cleanup here on failure: the native listen_fd owns the
-            # descriptor from this point and closes it on every one of
-            # its error paths. Closing it here as well was a double
-            # close -- in a threaded process another thread can reuse
-            # the number between the two, and the second close lands on
-            # an unrelated descriptor.
-            lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)
+            # Not detached: the listener uses the caller's socket, which
+            # stays usable while the server runs (asyncio's contract) and
+            # is closed by Server.close(). On failure it is left open for
+            # the caller.
+            lid, name, rawfd = self._core.listen_fd(
+                sock.fileno(), factory, accept_pool, start_serving, sock
+            )
             entries.append((lid, name, rawfd))
-            return Server(self, entries, factory, accept_pool, start_serving)
+            return Server(self, entries, factory, accept_pool, start_serving, sock=sock)
 
         if reuse_address is None:
             reuse_address = os.name == "posix" and sys.platform != "cygwin"
@@ -1252,9 +1308,12 @@ class TcpSurface:
 class _DatagramTransport(asyncio.DatagramTransport):
     """R-058 datagram transport over the native endpoint (core `udp_*`).
 
-    The socket is detached into the engine at `_open`; sends are copied
-    into the core (fire-and-forget, serialized per endpoint), receives
-    arrive via protocol.datagram_received from the event dispatch.
+    The engine drives the socket's descriptor from `_open`, while the
+    socket object keeps owning it (asyncio's contract: the caller's
+    socket stays usable, and the transport closes it after
+    connection_lost); sends are copied into the core (fire-and-forget,
+    serialized per endpoint), receives arrive via
+    protocol.datagram_received from the event dispatch.
     """
 
     def __init__(self, loop, sock, protocol, remote_addr):
@@ -1267,35 +1326,37 @@ class _DatagramTransport(asyncio.DatagramTransport):
         self._extra = {}
 
     def _open(self):
-        self._extra["sockname"] = self._sock_obj.getsockname()
+        sock = self._sock_obj
+        # asyncio's extra info for a datagram transport -- 'socket' is what
+        # multicast setups reach for to set their options.
+        self._extra["socket"] = trsock.TransportSocket(sock)
         try:
-            self._extra["peername"] = self._sock_obj.getpeername()
+            self._extra["sockname"] = sock.getsockname()
+        except OSError:
+            self._extra["sockname"] = None
+        try:
+            self._extra["peername"] = sock.getpeername()
         except OSError:
             self._extra["peername"] = None
-        fd = self._sock_obj.detach()
-        try:
-            self._did = self._loop._core.udp_open(
-                fd,
-                self._protocol.datagram_received,
-                self._protocol.error_received,
-                self._connection_lost,
-            )
-        except BaseException:
-            # detach() has already run, so neither the caller nor
-            # create_datagram_endpoint's cleanup holds a socket object
-            # that owns this descriptor any more.
-            self._loop._core.discard_socket(fd)
-            raise
+        # On failure the socket object still owns its descriptor, so the
+        # caller's (or create_datagram_endpoint's) cleanup closes it.
+        self._did = self._loop._core.udp_open(
+            sock.fileno(),
+            self._protocol.datagram_received,
+            self._protocol.error_received,
+            self._connection_lost,
+            sock,
+        )
         # Synchronous: guarantees connection_made precedes any
         # datagram_received (those dispatch only from future loop ticks).
         try:
             self._protocol.connection_made(self)
         except BaseException:
-            # udp_open already detached the socket and installed the native
-            # endpoint, so the caller's cleanup (which only closes the now-
-            # detached Python socket) would leave the descriptor, its
-            # outstanding receive and the protocol callbacks alive until the
-            # whole loop closed. Tear the endpoint down before propagating.
+            # udp_open already installed the native endpoint, so the
+            # caller's cleanup (which only closes the Python socket) would
+            # leave its outstanding receive and the protocol callbacks
+            # alive until the whole loop closed. Tear the endpoint down
+            # before propagating.
             did, self._did = self._did, None
             if did is not None:
                 try:

@@ -1706,7 +1706,7 @@ def test_data_received_exception_closes_the_transport(loop):
             assert seen, "the protocol never received anything"
             assert lost, "connection_lost never ran; the transport stayed open"
             assert transport.is_closing()
-            assert any("protocol callback" in m for m in reported), reported
+            assert any("protocol.data_received() call failed" in m for m in reported), reported
         finally:
             server.close()
             await server.wait_closed()

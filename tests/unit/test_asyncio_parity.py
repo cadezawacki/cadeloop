@@ -857,3 +857,426 @@ def test_tls_close_notify_survives_write_backpressure(loop):
         thread.join(5)
         listener.close()
     assert result.get("server") == ("close_notify", total)
+
+
+# --------------------------------------------------------------------- #
+# 7. sock= keeps the caller's socket; 18. TransportSocket semantics     #
+# --------------------------------------------------------------------- #
+
+
+def test_create_server_sock_keeps_the_callers_socket(loop):
+    """The caller's listening socket stays usable while the server runs,
+    `server.sockets` wraps that very socket, and close() closes it. It was
+    detached: getsockname() raised EBADF from the start."""
+
+    async def main():
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        name = sock.getsockname()
+        server = await asyncio.start_server(lambda r, w: w.close(), sock=sock)
+        assert sock.getsockname() == name
+        assert [s.fileno() for s in server.sockets] == [sock.fileno()]
+        reader, writer = await asyncio.open_connection(*name)
+        assert await reader.read() == b""
+        writer.close()
+        server.close()
+        await server.wait_closed()
+        assert sock.fileno() == -1
+
+    loop.run_until_complete(main())
+
+
+def test_create_connection_sock_keeps_the_callers_socket(loop):
+    async def main():
+        lost = loop.create_future()
+
+        class P(asyncio.Protocol):
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        sock = socket.create_connection(server.sockets[0].getsockname())
+        name = sock.getsockname()
+        transport, _ = await loop.create_connection(P, sock=sock)
+        assert sock.getsockname() == name
+        assert transport.get_extra_info("socket").fileno() == sock.fileno()
+        transport.close()
+        await asyncio.wait_for(lost, 5)
+        assert sock.fileno() == -1
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_connect_accepted_socket_keeps_the_callers_socket(loop):
+    async def main():
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        client = socket.create_connection(listener.getsockname())
+        accepted, _ = listener.accept()
+        with listener, client:
+            transport, _ = await loop.connect_accepted_socket(asyncio.Protocol, accepted)
+            assert accepted.getpeername() == client.getsockname()
+            assert transport.get_extra_info("socket").fileno() == accepted.fileno()
+            transport.close()
+            for _ in range(100):
+                if accepted.fileno() == -1:
+                    break
+                await asyncio.sleep(0.01)
+            assert accepted.fileno() == -1
+
+    loop.run_until_complete(main())
+
+
+def test_datagram_transport_socket_extra_and_ownership(loop):
+    """get_extra_info('socket') on a datagram transport (multicast setup
+    reaches for it); with sock= it is the caller's socket, which stays
+    usable and is closed with the transport."""
+
+    async def main():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        lost = loop.create_future()
+
+        class P(asyncio.DatagramProtocol):
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        transport, _ = await loop.create_datagram_endpoint(P, sock=sock)
+        extra = transport.get_extra_info("socket")
+        assert isinstance(extra, asyncio.trsock.TransportSocket)
+        assert extra.fileno() == sock.fileno() != -1
+        extra.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        transport.close()
+        await asyncio.wait_for(lost, 5)
+        assert sock.fileno() == -1
+
+        transport, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0)
+        )
+        assert isinstance(transport.get_extra_info("socket"), asyncio.trsock.TransportSocket)
+        transport.close()
+
+    loop.run_until_complete(main())
+
+
+def test_extra_socket_is_a_transport_socket(loop):
+    """A TransportSocket refuses what would break the transport. A plain
+    socket accepted setblocking(True), after which the next large write
+    blocked inside writev with the GIL held and froze the process."""
+
+    async def main():
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        transport, _ = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", server.sockets[0].getsockname()[1]
+        )
+        sock = transport.get_extra_info("socket")
+        assert isinstance(sock, asyncio.trsock.TransportSocket)
+        assert transport.get_extra_info("socket") is sock
+        with pytest.raises(ValueError, match="cannot be blocking"):
+            sock.setblocking(True)
+        with pytest.raises(ValueError):
+            sock.settimeout(1.0)
+        assert not hasattr(sock, "close")
+        assert sock.family == socket.AF_INET
+        assert sock.getsockname() == transport.get_extra_info("sockname")
+        assert all(isinstance(s, asyncio.trsock.TransportSocket) for s in server.sockets)
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+# --------------------------------------------------------------------- #
+# 11. protocol exceptions, error context, introspection after teardown   #
+# --------------------------------------------------------------------- #
+
+
+async def _pair(loop, client_factory, server_factory=asyncio.Protocol):
+    server = await loop.create_server(server_factory, "127.0.0.1", 0)
+    transport, protocol = await loop.create_connection(
+        client_factory, "127.0.0.1", server.sockets[0].getsockname()[1]
+    )
+    return server, transport, protocol
+
+
+def test_data_received_exception_reaches_connection_lost(loop):
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+    boom = ZeroDivisionError("boom")
+
+    async def main():
+        lost = loop.create_future()
+
+        class Boom(asyncio.Protocol):
+            def data_received(self, data):
+                raise boom
+
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        class Greeter(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.write(b"hello")
+
+        server, transport, protocol = await _pair(loop, Boom, Greeter)
+        assert await asyncio.wait_for(lost, 5) is boom
+        (ctx,) = reported
+        assert ctx["message"] == "Fatal error: protocol.data_received() call failed."
+        assert ctx["exception"] is boom
+        assert ctx["transport"] is transport
+        assert ctx["protocol"] is protocol
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_eof_received_exception_reaches_connection_lost(loop):
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+    boom = ValueError("eof")
+
+    async def main():
+        lost = loop.create_future()
+
+        class Boom(asyncio.Protocol):
+            def eof_received(self):
+                raise boom
+
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        class Closer(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.write_eof()
+
+        server, _transport, _ = await _pair(loop, Boom, Closer)
+        assert await asyncio.wait_for(lost, 5) is boom
+        assert [c["message"] for c in reported] == [
+            "Fatal error: protocol.eof_received() call failed."
+        ]
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_oserror_from_a_callback_is_not_reported_but_reaches_connection_lost(loop):
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+    boom = ConnectionResetError("app-level")
+
+    async def main():
+        lost = loop.create_future()
+
+        class Boom(asyncio.Protocol):
+            def data_received(self, data):
+                raise boom
+
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        class Greeter(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.write(b"hello")
+
+        server, _transport, _ = await _pair(loop, Boom, Greeter)
+        assert await asyncio.wait_for(lost, 5) is boom
+        assert reported == []
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_buffered_protocol_gets_no_size_hint_and_empty_buffers_are_fatal(loop):
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+
+    async def main():
+        hints = []
+        lost = loop.create_future()
+
+        class Buffered(asyncio.BufferedProtocol):
+            def get_buffer(self, sizehint):
+                hints.append(sizehint)
+                return bytearray(0)
+
+            def buffer_updated(self, nbytes):
+                pass
+
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        class Greeter(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.write(b"hello")
+
+        server, _transport, _ = await _pair(loop, Buffered, Greeter)
+        exc = await asyncio.wait_for(lost, 5)
+        assert hints == [-1]
+        assert isinstance(exc, RuntimeError)
+        assert str(exc) == "get_buffer() returned an empty buffer"
+        assert [c["message"] for c in reported] == ["Fatal error: protocol.get_buffer() call failed."]
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_pause_writing_failure_is_reported_with_the_transport(loop):
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+
+    async def main():
+        conns = []
+
+        class Sink(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.pause_reading()
+                conns.append(transport)
+
+        class Boom(asyncio.Protocol):
+            def pause_writing(self):
+                raise RuntimeError("pause")
+
+        server, transport, protocol = await _pair(loop, Boom, Sink)
+        for _ in range(64):
+            if reported:
+                break
+            transport.write(b"x" * (1 << 20))
+        (ctx,) = reported
+        assert ctx["message"] == "protocol.pause_writing() failed"
+        assert ctx["transport"] is transport
+        assert ctx["protocol"] is protocol
+        assert not transport.is_closing()
+        transport.abort()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_introspection_during_and_after_connection_lost(loop):
+    """In connection_lost the protocol is still the transport's, and the
+    peer/local names (and the socket) remain readable afterwards; they all
+    read None once the entry was gone."""
+
+    async def main():
+        seen = {}
+        lost = loop.create_future()
+
+        class P(asyncio.Protocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def connection_lost(self, exc):
+                seen["protocol"] = self.transport.get_protocol()
+                seen["peername"] = self.transport.get_extra_info("peername")
+                lost.set_result(None)
+
+        server, transport, protocol = await _pair(loop, P)
+        peer = transport.get_extra_info("peername")
+        local = transport.get_extra_info("sockname")
+        assert peer == server.sockets[0].getsockname()
+        transport.close()
+        await asyncio.wait_for(lost, 5)
+        assert seen == {"protocol": protocol, "peername": peer}
+        assert transport.get_extra_info("peername") == peer
+        assert transport.get_extra_info("sockname") == local
+        assert transport.get_extra_info("missing", "dflt") == "dflt"
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_is_reading_is_false_once_closing(loop):
+    async def main():
+        conns = []
+
+        class Sink(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.pause_reading()
+                conns.append(transport)
+
+        server, transport, _ = await _pair(loop, asyncio.Protocol, Sink)
+        while not conns:
+            await asyncio.sleep(0.01)
+        while transport.get_write_buffer_size() == 0:
+            transport.write(b"x" * (1 << 20))
+        assert transport.is_reading()
+        transport.close()
+        assert not transport.is_reading()
+        transport.resume_reading()  # ignored once closing
+        assert not transport.is_reading()
+        transport.abort()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+# --------------------------------------------------------------------- #
+# 19. Server.wait_closed (Python 3.11 semantics)                        #
+# --------------------------------------------------------------------- #
+
+
+def test_wait_closed_waits_for_live_connections(loop):
+    """wait_closed() called before close() returns only once every
+    accepted connection is gone; it used to return at close()."""
+
+    async def main():
+        conns = []
+
+        class Keep(asyncio.Protocol):
+            def connection_made(self, transport):
+                conns.append(transport)
+
+        server = await loop.create_server(Keep, "127.0.0.1", 0)
+        transport, _ = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", server.sockets[0].getsockname()[1]
+        )
+        while not conns:
+            await asyncio.sleep(0.01)
+        waiter = asyncio.ensure_future(server.wait_closed())
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        server.close()
+        await asyncio.sleep(0.05)
+        assert not waiter.done(), "returned with a connection still open"
+        conns[0].close()
+        await asyncio.wait_for(waiter, 5)
+        transport.close()
+
+    loop.run_until_complete(main())
+
+
+def test_wait_closed_after_close_returns_at_once(loop):
+    """3.11's quirk, kept for parity: after close(), wait_closed() does
+    not wait for the remaining connections."""
+
+    async def main():
+        conns = []
+
+        class Keep(asyncio.Protocol):
+            def connection_made(self, transport):
+                conns.append(transport)
+
+        server = await loop.create_server(Keep, "127.0.0.1", 0)
+        transport, _ = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", server.sockets[0].getsockname()[1]
+        )
+        while not conns:
+            await asyncio.sleep(0.01)
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), 1)
+        conns[0].close()
+        transport.close()
+
+    loop.run_until_complete(main())
