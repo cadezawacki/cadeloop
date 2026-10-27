@@ -226,6 +226,9 @@ pub(crate) struct TransportEntry {
     eof_wanted: bool,
     eof_sent: bool,
     flush_scheduled: bool,
+    /// loop.sendfile() owns the socket: write() raises, as asyncio's does
+    /// while its sendfile's empty-waiter is set.
+    sendfile_active: bool,
     pub peername: Option<Py<PyAny>>,
     pub sockname: Option<Py<PyAny>>,
     /// Bytes that completed while `reading_paused` was set (R-034).
@@ -410,6 +413,10 @@ pub(crate) struct NetState {
     /// R-058 datagram endpoints (separate from stream transports: no
     /// write-queue/backpressure machinery, per-packet semantics).
     pub datagrams: HashMap<u64, DatagramEntry>,
+    /// Which transport or datagram endpoint drives each descriptor, so
+    /// add_reader()/add_writer() can refuse a transport's fd as asyncio
+    /// does: a watch on it would fight the transport's own registration.
+    pub fd_users: HashMap<RawSocket, FdUser>,
     /// R-140 access-log sink (a Python callable) — None disables logging
     /// with a single branch on the request-completion path.
     pub access_sink: Option<Py<PyAny>>,
@@ -513,6 +520,32 @@ impl NetState {
                 (e.peername.as_ref().map(|p| p.clone_ref(py)), e.sockname.as_ref().map(|p| p.clone_ref(py)))
             }
             None => (None, None),
+        }
+    }
+}
+
+/// What a descriptor in `NetState::fd_users` belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum FdUser {
+    Stream(u64),
+    Datagram(u64),
+}
+
+impl NetState {
+    /// What uses `fd`, if a live transport does: `(false, facade)` for a
+    /// stream transport, `(true, connection_lost)` for a datagram
+    /// endpoint, whose transport is that bound method's `__self__` (read
+    /// by the caller, outside the cell).
+    pub(crate) fn transport_for_fd(&self, py: Python<'_>, fd: RawSocket) -> Option<(bool, Py<PyAny>)> {
+        match *self.fd_users.get(&fd)? {
+            FdUser::Stream(tid) => {
+                let e = self.transports.get(&tid)?;
+                e.pyobj.as_ref().map(|t| (false, t.clone_ref(py).into_any()))
+            }
+            FdUser::Datagram(did) => {
+                let e = self.datagrams.get(&did)?;
+                Some((true, e.connection_lost.clone_ref(py)))
+            }
         }
     }
 }
@@ -867,6 +900,7 @@ pub(crate) fn teardown_reason(
     entry.conn_lost = true;
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
+    forget_fd(net, entry.socket, tid);
     if let Some(slot) = entry.recv_slot.take() {
         // The transport's own reference. The posted op holds a second one
         // (R-073) that only the reap releases.
@@ -912,6 +946,17 @@ pub(crate) fn teardown_reason(
     net.graveyard_entries.push(entry);
 }
 
+/// Drop `fd` from `fd_users` if `id` (a tid or did) still owns it: a
+/// descriptor number the OS has already handed to a newer transport
+/// must keep its entry.
+fn forget_fd(net: &mut NetState, fd: RawSocket, id: u64) {
+    if let Some(FdUser::Stream(owner) | FdUser::Datagram(owner)) = net.fd_users.get(&fd) {
+        if *owner == id {
+            net.fd_users.remove(&fd);
+        }
+    }
+}
+
 /// Deregister a dead transport's descriptor and close it -- unless the
 /// caller's socket object owns it: that is closed through Python instead
 /// (`retire_sockets`, or after connection_lost), never under it.
@@ -944,6 +989,7 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     entry.conn_lost = true;
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
+    forget_fd(net, entry.socket, tid);
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
@@ -1179,6 +1225,7 @@ pub(crate) fn udp_wire(
         return Err(e);
     }
     let did = net.next_id();
+    net.fd_users.insert(sock, FdUser::Datagram(did));
     net.datagrams.insert(
         did,
         DatagramEntry {
@@ -1204,6 +1251,7 @@ pub(crate) fn udp_wire(
         if let Some(mut entry) = net.datagrams.remove(&did) {
             cancel_dgram_ops(net, backend, &mut entry);
             backend.detach_socket(entry.socket);
+            forget_fd(net, entry.socket, did);
             match entry.owner.take() {
                 Some(owner) => net.graveyard_py.push(owner), // still the caller's
                 None => netsys::close(entry.socket),
@@ -1454,6 +1502,7 @@ pub(crate) fn udp_teardown_at_close(net: &mut NetState, backend: Backend<'_>, di
     let Some(mut entry) = net.datagrams.remove(&did) else { return };
     cancel_dgram_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
+    forget_fd(net, entry.socket, did);
     match entry.owner.take() {
         Some(owner) => net.graveyard_sockets.push(owner),
         None => netsys::close(entry.socket),
@@ -1474,6 +1523,7 @@ fn udp_teardown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did: u
     entry.conn_lost = true;
     cancel_dgram_ops(net, backend, &mut entry);
     backend.detach_socket(entry.socket);
+    forget_fd(net, entry.socket, did);
     if entry.owner.is_none() {
         netsys::close(entry.socket);
     }
@@ -3006,6 +3056,7 @@ pub(crate) fn wire_stream(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
+                sendfile_active: false,
                 paused_recv: None,
                 extra_sock: None,
                 owner,
@@ -3016,6 +3067,7 @@ pub(crate) fn wire_stream(
                 sockname: None,
             },
         );
+        net.fd_users.insert(sock, FdUser::Stream(tid));
     })?;
     // connection_made BEFORE the first recv is posted: no data callback can
     // possibly precede it.
@@ -3084,6 +3136,7 @@ pub(crate) fn wire_http(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
+                sendfile_active: false,
                 paused_recv: None,
                 extra_sock: None,
                 owner: None,
@@ -3275,6 +3328,22 @@ const BUFFER_UPDATED_FAILED: &str = "Fatal error: protocol.buffer_updated() call
 const PAUSE_WRITING_FAILED: &str = "protocol.pause_writing() failed";
 const RESUME_WRITING_FAILED: &str = "protocol.resume_writing() failed";
 
+/// asyncio's write() contract: bytes, bytearray or memoryview, nothing
+/// else (an array.array or other buffer exporter is a TypeError there).
+fn check_write_type(data: &Bound<'_, PyAny>) -> PyResult<()> {
+    let ptr = data.as_ptr();
+    let ok = unsafe {
+        ffi::PyBytes_Check(ptr) != 0 || ffi::PyByteArray_Check(ptr) != 0 || ffi::PyMemoryView_Check(ptr) != 0
+    };
+    if ok {
+        return Ok(());
+    }
+    let name = data.get_type().name().map(|n| n.to_string()).unwrap_or_else(|_| "?".to_owned());
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "data argument must be a bytes-like object, not '{name}'"
+    )))
+}
+
 /// A plain `socket.socket` over a duplicate of `raw`: the object the
 /// engine closes at teardown. Callers see it only through a
 /// `TransportSocket` (see `Transport::transport_socket`).
@@ -3294,8 +3363,8 @@ impl Transport {
 
     fn write(&self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
         let core = self.core_ref(py);
-        // R-074 retention: exact bytes -> zero-copy retain; any other
-        // buffer exporter -> copy now.
+        // R-074 retention: exact bytes -> zero-copy retain; bytearray and
+        // memoryview -> copy now.
         let buf: WriteBuf = if let Ok(b) = data.cast::<PyBytes>() {
             let len = b.as_bytes().len();
             if len == 0 {
@@ -3303,6 +3372,7 @@ impl Transport {
             }
             WriteBuf::Bytes { ptr: b.as_bytes().as_ptr(), len, off: 0, _keep: b.clone().into_any().unbind() }
         } else {
+            check_write_type(&data)?;
             let mut view: ffi::Py_buffer = unsafe { std::mem::zeroed() };
             let rc = unsafe { ffi::PyObject_GetBuffer(data.as_ptr(), &mut view, ffi::PyBUF_SIMPLE) };
             if rc != 0 {
@@ -3325,6 +3395,7 @@ impl Transport {
         let mut pause: Option<Py<PyAny>> = None;
         let mut dirty = false;
         let mut eof_misuse = false;
+        let mut in_sendfile = false;
         core.with_net(|net, reactor| {
             let Some(entry) = net.transports.get_mut(&tid) else {
                 net.graveyard_bufs.push(buf);
@@ -3334,6 +3405,13 @@ impl Transport {
             if entry.conn_lost {
                 net.graveyard_bufs.push(buf);
                 dirty = true;
+                return;
+            }
+            if entry.sendfile_active {
+                // Bytes written now would land in the middle of the file.
+                net.graveyard_bufs.push(buf);
+                dirty = true;
+                in_sendfile = true;
                 return;
             }
             if entry.eof_wanted {
@@ -3380,6 +3458,9 @@ impl Transport {
         if eof_misuse {
             return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
         }
+        if in_sendfile {
+            return Err(PyRuntimeError::new_err("unable to write; sendfile is in progress"));
+        }
         if let Some(pause_writing) = pause {
             report_flow_control_error(py, core, tid, pause_writing.call0(py), PAUSE_WRITING_FAILED)?;
         }
@@ -3387,10 +3468,35 @@ impl Transport {
     }
 
     fn writelines(&self, py: Python<'_>, list_of_data: Bound<'_, PyAny>) -> PyResult<()> {
-        for item in list_of_data.try_iter()? {
-            self.write(py, item?)?;
+        // All or nothing, as asyncio's (which joins the items first): a
+        // bad item must not leave the ones before it already queued.
+        let items = list_of_data.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        for item in &items {
+            if !item.is_instance_of::<PyBytes>() {
+                check_write_type(item)?;
+            }
+        }
+        for item in items {
+            self.write(py, item)?;
         }
         Ok(())
+    }
+
+    /// loop.sendfile()'s claim on the socket (see `sendfile_active`).
+    fn _set_sendfile_active(&self, py: Python<'_>, active: bool) -> PyResult<()> {
+        self.core_ref(py).with_net(|net, _| {
+            if let Some(e) = net.transports.get_mut(&self.tid) {
+                e.sendfile_active = active;
+            }
+        })
+    }
+
+    /// asyncio.constants._SendfileMode.TRY_NATIVE: loop.sendfile() may use
+    /// os.sendfile on this transport's socket.
+    #[classattr]
+    fn _sendfile_compatible(py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let mode = py.import("asyncio.constants")?.getattr("_SendfileMode")?.getattr("TRY_NATIVE")?;
+        Ok(mode.unbind())
     }
 
     fn write_eof(&self, py: Python<'_>) -> PyResult<()> {

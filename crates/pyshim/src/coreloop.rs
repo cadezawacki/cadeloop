@@ -1254,6 +1254,17 @@ impl CoreLoop {
         )
     }
 
+    /// The live transport whose descriptor `fd` is, if any (asyncio's
+    /// `_ensure_fd_no_transport`, for add_reader and friends).
+    fn transport_for_fd(&self, py: Python<'_>, fd: u64) -> PyResult<Option<Py<PyAny>>> {
+        let found = self.with_net(|net, _| net.transport_for_fd(py, fd as RawSocket))?;
+        Ok(match found {
+            Some((false, transport)) => Some(transport),
+            Some((true, connection_lost)) => connection_lost.getattr(py, "__self__").ok(),
+            None => None,
+        })
+    }
+
     /// Give a listener its asyncio Server facade, so every connection it
     /// accepts is counted (`_attach`/`_detach`) for `Server.wait_closed()`.
     fn listener_set_server(&self, lid: u64, server: Bound<'_, PyAny>) -> PyResult<()> {

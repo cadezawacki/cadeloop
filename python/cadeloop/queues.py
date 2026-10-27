@@ -15,7 +15,9 @@ stdlib gets from overridable _put/_get would put Python back on the hot
 path, which is the entire cost being removed.
 """
 
+import math
 from asyncio import events
+from types import GenericAlias
 
 from . import _core
 
@@ -24,19 +26,34 @@ __all__ = ["Queue"]
 _MISSING = object()
 
 
+def _native_bound(maxsize):
+    """The integer bound with asyncio's `full()` semantics -- full when
+    `qsize() >= maxsize`, unbounded when `maxsize <= 0` -- for any real
+    maxsize asyncio accepts (2.5 holds 3 items; inf and nan, none)."""
+    if isinstance(maxsize, int):
+        return maxsize
+    if not maxsize > 0 or math.isinf(maxsize):
+        return 0
+    return math.ceil(maxsize)
+
+
 class Queue:
     """Drop-in for asyncio.Queue (FIFO), native hot paths."""
 
-    __slots__ = ("_q",)
+    __slots__ = ("_q", "_maxsize")
 
     def __init__(self, maxsize=0):
-        self._q = _core.FastQueue(maxsize)
+        self._q = _core.FastQueue(_native_bound(maxsize))
+        self._maxsize = maxsize
+
+    # `Queue[int]` in annotations, as asyncio.Queue allows.
+    __class_getitem__ = classmethod(GenericAlias)
 
     # -- inspection (delegated, one native call each) -------------------
 
     @property
     def maxsize(self):
-        return self._q.maxsize
+        return self._maxsize
 
     def qsize(self):
         return self._q.qsize()
@@ -57,7 +74,15 @@ class Queue:
         self._q.task_done()
 
     def __repr__(self):
-        return f"<cadeloop.Queue maxsize={self._q.maxsize} qsize={self._q.qsize()}>"
+        return f"<{type(self).__name__} at {id(self):#x} {self._format()}>"
+
+    def __str__(self):
+        return f"<{type(self).__name__} {self._format()}>"
+
+    def _format(self):
+        # asyncio's leading fields; the queued items and waiters live in
+        # the native core.
+        return f"maxsize={self._maxsize!r} qsize={self._q.qsize()}"
 
     # -- awaitable surface ----------------------------------------------
 

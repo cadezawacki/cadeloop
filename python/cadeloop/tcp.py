@@ -32,9 +32,19 @@ __all__ = ["TcpSurface", "Server"]
 
 
 def _fileno(fd):
+    """selectors' _fileobj_to_fd: an int, or an object with fileno();
+    anything else is a ValueError, not an AttributeError/OverflowError
+    from deeper down."""
     if isinstance(fd, int):
-        return fd
-    return fd.fileno()
+        fileno = fd
+    else:
+        try:
+            fileno = int(fd.fileno())
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError(f"Invalid file object: {fd!r}") from None
+    if fileno < 0:
+        raise ValueError(f"Invalid file descriptor: {fileno}")
+    return fileno
 
 
 def _check_ssl_socket(sock):
@@ -134,6 +144,14 @@ class Server(asyncio.AbstractServer):
                     socks.append(socket.socket(fileno=os.dup(fd)))
             self._dups = socks
         return tuple(trsock.TransportSocket(s) for s in self._dups)
+
+    @property
+    def _sockets(self):
+        # asyncio's attribute (code and tests read it): the listening
+        # socket objects, None once the server is closed.
+        if self._closed:
+            return None
+        return [s._sock for s in self.sockets]
 
     def get_loop(self):
         return self._loop
@@ -889,16 +907,32 @@ class TcpSurface:
     # -- readiness callbacks (R-057) ---------------------------------------
 
     def add_reader(self, fd, callback, *args):
-        self._core.add_reader(_fileno(fd), callback, *args)
+        self._core.add_reader(self._ensure_fd_no_transport(fd), callback, *args)
 
     def remove_reader(self, fd):
-        return self._core.remove_reader(_fileno(fd))
+        return self._core.remove_reader(self._ensure_fd_no_transport(fd))
 
     def add_writer(self, fd, callback, *args):
-        self._core.add_writer(_fileno(fd), callback, *args)
+        self._core.add_writer(self._ensure_fd_no_transport(fd), callback, *args)
 
     def remove_writer(self, fd):
-        return self._core.remove_writer(_fileno(fd))
+        return self._core.remove_writer(self._ensure_fd_no_transport(fd))
+
+    def _ensure_fd_no_transport(self, fd):
+        """base_events' guard: a descriptor a live transport drives is not
+        the application's to watch -- a watch on it fights the transport's
+        own registration. Returns the descriptor number."""
+        fileno = _fileno(fd)
+        transport = self._core.transport_for_fd(fileno)
+        if transport is not None and not transport.is_closing():
+            raise RuntimeError(f"File descriptor {fd!r} is used by transport {transport!r}")
+        return fileno
+
+    def _check_sock(self, sock):
+        # base_events' preamble for every sock_* method.
+        _check_ssl_socket(sock)
+        if self.get_debug() and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
 
     # -- sock_* (readiness-based; cold path by design) ---------------------
 
@@ -922,6 +956,7 @@ class TcpSurface:
                 pass
 
     async def sock_recv(self, sock, n):
+        self._check_sock(sock)
         try:
             return sock.recv(n)
         except (BlockingIOError, InterruptedError):
@@ -950,6 +985,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recv_into(self, sock, buf):
+        self._check_sock(sock)
         try:
             return sock.recv_into(buf)
         except (BlockingIOError, InterruptedError):
@@ -978,6 +1014,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_sendall(self, sock, data):
+        self._check_sock(sock)
         try:
             n = sock.send(data)
         except (BlockingIOError, InterruptedError):
@@ -1012,6 +1049,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_writer, fd)
 
     async def sock_connect(self, sock, address):
+        self._check_sock(sock)
         # Resolution only applies to AF_INET/AF_INET6 (matches stdlib):
         # AF_UNIX addresses are filesystem paths, not (host, port) pairs,
         # and any other family's address is used exactly as given.
@@ -1060,6 +1098,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_writer, fd)
 
     async def sock_accept(self, sock):
+        self._check_sock(sock)
         try:
             conn, addr = sock.accept()
         except (BlockingIOError, InterruptedError):
@@ -1097,6 +1136,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recvfrom(self, sock, bufsize):
+        self._check_sock(sock)
         try:
             return sock.recvfrom(bufsize)
         except (BlockingIOError, InterruptedError):
@@ -1125,6 +1165,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recvfrom_into(self, sock, buf, nbytes=0):
+        self._check_sock(sock)
         if not nbytes:
             nbytes = len(buf)
         try:
@@ -1155,6 +1196,7 @@ class TcpSurface:
             self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_sendto(self, sock, data, address):
+        self._check_sock(sock)
         try:
             return sock.sendto(data, address)
         except (BlockingIOError, InterruptedError):
@@ -1215,6 +1257,9 @@ class TcpSurface:
         `_check_sendfile_params`; this previously always took the chunked
         path regardless of fallback= and skipped every one of these
         checks."""
+        if self.get_debug() and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+        _check_ssl_socket(sock)
         self._check_sendfile_params(file, offset, count)
         if sock.type != socket.SOCK_STREAM:
             raise ValueError("only SOCK_STREAM type sockets are supported")
@@ -1308,7 +1353,7 @@ class TcpSurface:
             file.seek(offset + total)
 
 
-class _DatagramTransport(asyncio.DatagramTransport):
+class _DatagramTransport(asyncio.DatagramTransport, asyncio.Transport):
     """R-058 datagram transport over the native endpoint (core `udp_*`).
 
     The engine drives the socket's descriptor from `_open`, while the
@@ -1375,6 +1420,10 @@ class _DatagramTransport(asyncio.DatagramTransport):
     # ---- asyncio.DatagramTransport surface ----------------------------
 
     def sendto(self, data, addr=None):
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__!r}")
+        if not data:
+            return  # Python 3.11 sends no empty datagram
         if self._closing:
             return
         if self._remote_addr is not None:
@@ -1386,8 +1435,21 @@ class _DatagramTransport(asyncio.DatagramTransport):
                 # explicit sendto address -- a plain send() on an
                 # unconnected socket is EDESTADDRREQ.
                 addr = self._remote_addr
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__}")
+        family = self._sock_obj.family
+        if (
+            isinstance(addr, tuple)
+            and len(addr) >= 2
+            and family in (socket.AF_INET, socket.AF_INET6)
+            and _ipaddr_info(addr[0], addr[1], family, socket.SOCK_DGRAM, 0) is None
+        ):
+            # A host name, which the socket module's sendto() resolves
+            # (synchronously) for asyncio; the native send takes a sockaddr.
+            try:
+                addr = socket.getaddrinfo(addr[0], addr[1], family, socket.SOCK_DGRAM)[0][4]
+            except OSError as exc:
+                # Where asyncio's sendto() delivers that lookup's failure.
+                self._protocol.error_received(exc)
+                return
         self._loop._core.udp_sendto(self._did, bytes(data), addr)
 
     def close(self):

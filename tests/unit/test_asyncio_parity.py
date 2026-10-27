@@ -1573,3 +1573,216 @@ def test_signal_callback_runs_in_the_context_of_add_signal_handler(loop):
     finally:
         loop.remove_signal_handler(signal.SIGUSR1)
     assert seen == ["at add time"]
+
+
+# --------------------------------------------------------------------- #
+# 21. smaller API differences                                           #
+# --------------------------------------------------------------------- #
+
+
+def test_sendfile_dispatches_on_the_transport_mode(loop, tmp_path):
+    """loop.sendfile() follows the transport's _sendfile_compatible mode:
+    a datagram transport is a RuntimeError, not an AttributeError from the
+    fallback path."""
+    path = tmp_path / "data.bin"
+    path.write_bytes(b"x" * 1000)
+
+    async def main():
+        udp, _ = await loop.create_datagram_endpoint(asyncio.DatagramProtocol, family=socket.AF_INET)
+        with open(path, "rb") as f:
+            with pytest.raises(RuntimeError, match="not supported"):
+                await loop.sendfile(udp, f)
+            assert f.tell() == 0
+        udp.close()
+
+    loop.run_until_complete(main())
+
+
+def test_write_during_sendfile_raises(loop, tmp_path):
+    """CPython's test_sendfile_prevents_bare_write: bytes written while a
+    native sendfile runs would land in the middle of the file."""
+    path = tmp_path / "data.bin"
+    data = b"0123456789" * 100_000
+    path.write_bytes(data)
+
+    async def main():
+        received = bytearray()
+        done = loop.create_future()
+
+        class Sink(asyncio.Protocol):
+            def data_received(self, chunk):
+                received.extend(chunk)
+                if len(received) >= len(data) and not done.done():
+                    done.set_result(None)
+
+        server, transport, _ = await _pair(loop, asyncio.Protocol, Sink)
+        started = loop.create_future()
+
+        async def send():
+            started.set_result(None)
+            with open(path, "rb") as f:
+                return await loop.sendfile(transport, f)
+
+        task = asyncio.ensure_future(send())
+        await started
+        with pytest.raises(RuntimeError, match="sendfile is in progress"):
+            transport.write(b"data")
+        assert await asyncio.wait_for(task, 10) == len(data)
+        await asyncio.wait_for(done, 10)
+        assert bytes(received) == data
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_sock_methods_check_their_socket(loop):
+    async def main():
+        a, b = socket.socketpair()
+        with a, b:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            wrapped = ctx.wrap_socket(socket.socket(), do_handshake_on_connect=False)
+            with wrapped:
+                with pytest.raises(TypeError, match="SSLSocket"):
+                    await loop.sock_recv(wrapped, 1)
+            loop.set_debug(True)
+            try:
+                a.setblocking(True)
+                with pytest.raises(ValueError, match="must be non-blocking"):
+                    await loop.sock_recv(a, 1)
+                with pytest.raises(ValueError, match="must be non-blocking"):
+                    await loop.sock_sendall(a, b"x")
+            finally:
+                loop.set_debug(False)
+
+    loop.run_until_complete(main())
+
+
+def test_add_reader_checks_its_descriptor(loop):
+    """A non-file object is a ValueError, as in asyncio (it was an
+    AttributeError/OverflowError from deeper down)."""
+    with pytest.raises(ValueError, match="Invalid file object"):
+        loop.add_reader(object(), lambda: None)
+    with pytest.raises(ValueError, match="Invalid file object"):
+        loop.add_writer(object(), lambda: None)
+    with pytest.raises(ValueError, match="Invalid file object"):
+        loop.remove_reader(object())
+    with pytest.raises(ValueError, match="Invalid file object"):
+        loop.remove_writer(object())
+
+
+def test_add_reader_refuses_a_transport_socket(loop):
+    """CPython's test_add_reader_or_writer_transport_fd."""
+
+    async def main():
+        rsock, wsock = socket.socketpair()
+        with rsock, wsock:
+            transport, _ = await loop.create_connection(asyncio.Protocol, sock=rsock)
+            try:
+                for call in (
+                    lambda: loop.add_reader(rsock, lambda: None),
+                    lambda: loop.add_reader(rsock.fileno(), lambda: None),
+                    lambda: loop.remove_reader(rsock),
+                    lambda: loop.add_writer(rsock.fileno(), lambda: None),
+                    lambda: loop.remove_writer(rsock.fileno()),
+                ):
+                    with pytest.raises(RuntimeError, match="is used by transport"):
+                        call()
+            finally:
+                transport.close()
+                await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+
+
+def test_udp_sendto_details(loop):
+    """3.11 sends no empty datagram; a host name is resolved as the
+    socket module's sendto() would; a datagram transport is an
+    asyncio.Transport."""
+
+    async def main():
+        got = asyncio.Queue()
+
+        class Rx(asyncio.DatagramProtocol):
+            def datagram_received(self, data, addr):
+                got.put_nowait(data)
+
+        errors = []
+
+        class Tx(asyncio.DatagramProtocol):
+            def error_received(self, exc):
+                errors.append(exc)
+
+        rx, _ = await loop.create_datagram_endpoint(Rx, local_addr=("127.0.0.1", 0))
+        port = rx.get_extra_info("sockname")[1]
+        tx, _ = await loop.create_datagram_endpoint(Tx, family=socket.AF_INET)
+        assert isinstance(tx, asyncio.Transport)
+        tx.sendto(b"", ("127.0.0.1", port))
+        tx.sendto(b"first", ("localhost", port))
+        assert await asyncio.wait_for(got.get(), 5) == b"first"
+        with pytest.raises(TypeError):
+            tx.sendto("text", ("127.0.0.1", port))
+        tx.sendto(b"x", ("name.invalid", port))
+        await asyncio.sleep(0.05)
+        assert len(errors) == 1 and isinstance(errors[0], OSError), errors
+        tx.close()
+        rx.close()
+
+    loop.run_until_complete(main())
+
+
+def test_datagram_endpoint_argument_checks(loop):
+    async def main():
+        with pytest.raises(ValueError, match="unexpected address family"):
+            await loop.create_datagram_endpoint(asyncio.DatagramProtocol)
+        with pytest.raises(TypeError, match="2-tuple is expected"):
+            await loop.create_datagram_endpoint(
+                asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0, 0, 0)
+            )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        with sock:
+            with pytest.raises(ValueError, match="socket modifier keyword arguments"):
+                await loop.create_datagram_endpoint(
+                    asyncio.DatagramProtocol, sock=sock, local_addr=("127.0.0.1", 0)
+                )
+
+    loop.run_until_complete(main())
+
+
+def test_write_takes_bytes_like_objects_only(loop):
+    import array
+
+    async def main():
+        got = bytearray()
+
+        class Sink(asyncio.Protocol):
+            def data_received(self, data):
+                got.extend(data)
+
+        server, transport, _ = await _pair(loop, asyncio.Protocol, Sink)
+        with pytest.raises(TypeError, match="bytes-like"):
+            transport.write(array.array("b", [1, 2]))
+        with pytest.raises(TypeError):
+            transport.writelines([b"first", "second"])
+        transport.write(memoryview(b"ok"))
+        await asyncio.sleep(0.1)
+        # writelines() rejected the whole list: "first" was never queued.
+        assert bytes(got) == b"ok"
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_queue_matches_asyncio_queue_construction(cade_loop):
+    assert cadeloop.Queue[int] is not None
+    fast, ref = cadeloop.Queue(2.5), asyncio.Queue(2.5)
+    for _ in range(3):
+        fast.put_nowait(1)
+        ref.put_nowait(1)
+    assert fast.full() and ref.full()
+    assert fast.maxsize == ref.maxsize == 2.5
+    assert str(cadeloop.Queue()).startswith("<Queue maxsize=0")

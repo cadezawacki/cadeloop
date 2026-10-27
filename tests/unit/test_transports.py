@@ -1648,8 +1648,12 @@ def test_sendto_rejects_a_malformed_address_tuple(loop):
                 transport.sendto(b"x", ("127.0.0.1", 9, 0, 0))
             with pytest.raises(ValueError, match="2 elements"):
                 transport.sendto(b"x", ("127.0.0.1", 9, 0))
-            with pytest.raises(ValueError, match="invalid IP address"):
-                transport.sendto(b"x", ("not-an-ip", 9))
+            # A host name is resolved, as by the socket module's sendto();
+            # a failed lookup goes to error_received, as in asyncio.
+            errors = []
+            transport.get_protocol().error_received = errors.append
+            transport.sendto(b"x", ("name.invalid", 9))
+            assert len(errors) == 1 and isinstance(errors[0], OSError), errors
         finally:
             transport.close()
             await asyncio.sleep(0.05)

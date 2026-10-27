@@ -16,6 +16,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import errno
+import io
 import os
 import signal as signal_module
 import socket
@@ -27,7 +28,7 @@ import time
 import traceback
 import warnings
 import weakref
-from asyncio import base_events, events, format_helpers, futures, tasks
+from asyncio import base_events, constants, events, format_helpers, futures, tasks
 
 # asyncio's own logger, as uvloop uses it too: "Task exception was never
 # retrieved", exception-handler output and slow-callback warnings are
@@ -808,15 +809,32 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
         local_res = remote_res = None
         if sock is not None:
-            if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
-                raise ValueError("sock is mutually exclusive with address/options")
-            if sock.type != socket_module.SOCK_DGRAM:
-                # Otherwise a stream socket is detached into the datagram
+            if sock.type == socket_module.SOCK_STREAM:
+                # Otherwise a stream socket is driven by the datagram
                 # machinery, which then applies recvfrom/sendto semantics
                 # and datagram callbacks to a byte stream.
                 raise ValueError(f"A datagram socket was expected, got {sock!r}")
+            opts = dict(
+                local_addr=local_addr,
+                remote_addr=remote_addr,
+                family=family,
+                proto=proto,
+                flags=flags,
+                reuse_port=reuse_port,
+                allow_broadcast=allow_broadcast,
+            )
+            problems = ", ".join(f"{k}={v}" for k, v in opts.items() if v)
+            if problems:
+                raise ValueError(
+                    "socket modifier keyword arguments can not be used "
+                    f"when sock is specified. ({problems})"
+                )
             udp_sock = sock
         else:
+            if not (local_addr or remote_addr) and family == 0:
+                # asyncio refuses to guess: there is no address to take a
+                # family from.
+                raise ValueError("unexpected address family")
             fam = family or socket_module.AF_INET
             # Resolve BOTH addresses here and keep the sockaddrs, rather
             # than resolving one to pick a family and throwing the result
@@ -856,6 +874,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 for key, addr in (("local", local_addr), ("remote", remote_addr)):
                     if not addr:
                         continue
+                    if not (isinstance(addr, tuple) and len(addr) == 2):
+                        raise TypeError("2-tuple is expected")
                     infos = await self._ensure_resolved(
                         addr,
                         family=family,
@@ -932,7 +952,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         os.sendfile straight on the borrowed socket fd (zero-copy).
         TransmitFile on Windows is the remaining native refinement; there
         (and for SSL transports, which have no raw fd) the chunked
-        transport-write fallback applies."""
+        transport-write fallback applies.
+
+        Dispatch follows base_events: the transport's
+        `_sendfile_compatible` mode says whether to try the native path,
+        fall back, or refuse (a datagram or pipe transport)."""
         # Validated BEFORE a path is chosen, and by the same helper
         # sock_sendfile uses: without it `count=0` quietly returned zero
         # instead of raising, a text-mode file went straight to
@@ -941,27 +965,43 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._check_sendfile_params(file, offset, count)
         if transport.is_closing():
             raise RuntimeError("Transport is closing")
-        fileno = getattr(transport, "fileno", None)
-        can_native = (
-            fileno is not None and hasattr(os, "sendfile") and hasattr(file, "fileno")
-        )
-        if can_native:
+        mode = getattr(transport, "_sendfile_compatible", constants._SendfileMode.UNSUPPORTED)
+        if mode is constants._SendfileMode.UNSUPPORTED:
+            raise RuntimeError(f"sendfile is not supported for transport {transport!r}")
+        if mode is constants._SendfileMode.TRY_NATIVE:
             try:
-                file.fileno()
-            except (OSError, AttributeError, ValueError):
-                can_native = False
-        if not can_native:
-            if not fallback:
-                raise asyncio.SendfileNotAvailableError(
-                    "sendfile is not available for this transport/file"
-                )
-            return await self._sendfile_fallback(transport, file, offset, count)
-        # No byte may interleave: wait out writes already queued in the
-        # engine before bypassing it (concurrent app writes during a
-        # sendfile are user error, as in stdlib asyncio).
-        while transport.get_write_buffer_size() > 0:
-            await tasks.sleep(0.001)
-        return await self._sendfile_native_fd(transport, file, offset, count)
+                return await self._sendfile_native(transport, file, offset, count)
+            except asyncio.SendfileNotAvailableError:
+                if not fallback:
+                    raise
+        if not fallback:
+            raise RuntimeError(
+                "fallback is disabled and native sendfile is not supported "
+                f"for transport {transport!r}"
+            )
+        return await self._sendfile_fallback(transport, file, offset, count)
+
+    async def _sendfile_native(self, transport, file, offset, count):
+        # base_events' contract: SendfileNotAvailableError when the syscall
+        # cannot serve this transport/file pair; the caller decides whether
+        # to fall back.
+        fileno = getattr(transport, "fileno", None)
+        if fileno is None or not hasattr(os, "sendfile"):
+            raise asyncio.SendfileNotAvailableError("os.sendfile() is not available")
+        try:
+            os.fstat(file.fileno())
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            raise asyncio.SendfileNotAvailableError("not a regular file") from None
+        # No byte may interleave: write() raises until the transfer ends
+        # (asyncio's "sendfile is in progress"), and writes already queued
+        # in the engine go out first.
+        transport._set_sendfile_active(True)
+        try:
+            while transport.get_write_buffer_size() > 0:
+                await tasks.sleep(0.001)
+            return await self._sendfile_native_fd(transport, file, offset, count)
+        finally:
+            transport._set_sendfile_active(False)
 
     async def _sendfile_native_fd(self, transport, file, offset, count):
         in_fd = file.fileno()
@@ -998,6 +1038,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     break  # end of file
                 if sent is not None:
                     total += sent
+                    # Let the loop run between chunks, as asyncio's
+                    # writer-driven sendfile does: a fast peer would
+                    # otherwise hold the loop for the whole file.
+                    await tasks.sleep(0)
                     continue
                 # Socket buffer full: wait for writability.
                 fut = self.create_future()
