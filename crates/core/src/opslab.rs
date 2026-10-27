@@ -85,6 +85,9 @@ const CHUNK: usize = 256;
 /// a reaped-but-unreleased (Completed) slot is no longer in flight.
 pub struct OpSlab<D> {
     chunks: Vec<Box<[OpSlot<D>; CHUNK]>>,
+    /// (base address, chunk index) for every chunk, sorted by address: the
+    /// pointer screen's binary search (`contains_data_ptr`).
+    by_addr: Vec<(usize, usize)>,
     freelist: Vec<u32>,
     in_flight: usize,
     make_default: fn() -> D,
@@ -92,7 +95,7 @@ pub struct OpSlab<D> {
 
 impl<D> OpSlab<D> {
     pub fn new(make_default: fn() -> D) -> Self {
-        OpSlab { chunks: Vec::new(), freelist: Vec::new(), in_flight: 0, make_default }
+        OpSlab { chunks: Vec::new(), by_addr: Vec::new(), freelist: Vec::new(), in_flight: 0, make_default }
     }
 
     pub fn in_flight(&self) -> usize {
@@ -111,6 +114,9 @@ impl<D> OpSlab<D> {
             .collect();
         let chunk: Box<[OpSlot<D>; CHUNK]> =
             chunk.into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!());
+        let addr = chunk.as_ptr() as usize;
+        let at = self.by_addr.partition_point(|&(a, _)| a < addr);
+        self.by_addr.insert(at, (addr, self.chunks.len()));
         self.chunks.push(chunk);
         // Push in reverse so low indices are handed out first.
         for i in (0..CHUNK as u32).rev() {
@@ -174,30 +180,30 @@ impl<D> OpSlab<D> {
     /// pointer here turns that from a wild read into a dropped completion.
     ///
     /// Chunks are boxed and never reallocated (R-037 pinning), so their
-    /// address ranges are stable for the life of the slab.
+    /// address ranges are stable for the life of the slab. It runs once per
+    /// dequeued completion, so it binary-searches the chunks by address
+    /// rather than scanning them: a scan cost O(chunks) per completion, ~400
+    /// comparisons each at 100k ops in flight.
     pub fn contains_data_ptr(&self, ptr: *const u8) -> bool {
         let stride = core::mem::size_of::<OpSlot<D>>();
         if stride == 0 {
             return false;
         }
         let addr = ptr as usize;
-        for chunk in &self.chunks {
-            let base = chunk.as_ptr() as usize;
-            let Some(offset) = addr.checked_sub(base) else { continue };
-            if offset >= stride * CHUNK {
-                continue;
-            }
-            // Must land exactly on a slot's `data`, not merely inside the
-            // chunk: a pointer to any other field (or mid-struct) is not
-            // something we ever handed out.
-            let idx = offset / stride;
-            let data_off =
-                (&chunk[idx].data as *const D as usize) - (&chunk[idx] as *const OpSlot<D> as usize);
-            if offset % stride == data_off {
-                return true;
-            }
+        // The last chunk starting at or below `addr` is the only candidate.
+        let at = self.by_addr.partition_point(|&(base, _)| base <= addr);
+        let Some(&(base, ci)) = at.checked_sub(1).and_then(|i| self.by_addr.get(i)) else { return false };
+        let offset = addr - base;
+        if offset >= stride * CHUNK {
+            return false;
         }
-        false
+        // Must land exactly on a slot's `data`, not merely inside the
+        // chunk: a pointer to any other field (or mid-struct) is not
+        // something we ever handed out.
+        let chunk = &self.chunks[ci];
+        let idx = offset / stride;
+        let data_off = (&chunk[idx].data as *const D as usize) - (&chunk[idx] as *const OpSlot<D> as usize);
+        offset % stride == data_off
     }
 
     pub fn get_mut(&mut self, id: OpId) -> Option<&mut OpSlot<D>> {
@@ -486,6 +492,25 @@ mod adr25_ptr_screen {
         // Null, and a wildly out-of-range address.
         assert!(!s.contains_data_ptr(core::ptr::null()));
         assert!(!s.contains_data_ptr(usize::MAX as *const u8));
+    }
+
+    #[test]
+    fn screens_pointers_across_many_chunks() {
+        // Enough chunks that their heap addresses interleave arbitrarily
+        // with the order they were created in: the index must stay sorted.
+        let mut s = slab();
+        let ids: Vec<OpId> = (0..CHUNK * 40).map(|_| s.post(OpKind::Recv)).collect();
+        for &id in ids.iter().step_by(37) {
+            let p = (&mut s.get_mut(id).unwrap().data) as *mut u64 as *const u8;
+            assert!(s.contains_data_ptr(p));
+            assert!(!s.contains_data_ptr(unsafe { p.add(1) }), "mid-slot");
+        }
+        // One past the end of each chunk is never a slot.
+        for (base, _) in s.by_addr.clone() {
+            let end = base + core::mem::size_of::<OpSlot<u64>>() * CHUNK;
+            assert!(!s.contains_data_ptr(end as *const u8) || s.by_addr.iter().any(|&(b, _)| b == end));
+        }
+        assert!(s.by_addr.windows(2).all(|w| w[0].0 < w[1].0), "index sorted by address");
     }
 
     #[test]
