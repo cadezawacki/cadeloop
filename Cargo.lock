@@ -37,6 +37,7 @@ dependencies = [
  "crossbeam-queue",
  "libc",
  "proptest",
+ "rustc-hash",
  "windows-sys 0.59.0",
 ]
 

@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap as HashMap;
 
-use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
+use cadeloop_core::backend::{
+    io_len, is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket, MAX_SEND_BYTES,
+};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
 use cadeloop_core::http::{Limits, ParseError};
 use cadeloop_core::netsys;
@@ -124,10 +126,10 @@ impl WriteBuf {
     fn slice(&self) -> IoSlice {
         match self {
             WriteBuf::Bytes { ptr, len, off, .. } => {
-                IoSlice { ptr: unsafe { ptr.add(*off) }, len: (len - off) as u32 }
+                IoSlice { ptr: unsafe { ptr.add(*off) }, len: io_len(len - off) }
             }
             WriteBuf::Owned { data, off } => {
-                IoSlice { ptr: unsafe { data.as_ptr().add(*off) }, len: (data.len() - off) as u32 }
+                IoSlice { ptr: unsafe { data.as_ptr().add(*off) }, len: io_len(data.len() - off) }
             }
         }
     }
@@ -579,8 +581,16 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
     }
     let mut slices: [IoSlice; 16] = [IoSlice { ptr: std::ptr::null(), len: 0 }; 16];
     let mut n = 0;
+    // Bounded by bytes as well as slices: the completion's count is 32-bit
+    // (see MAX_SEND_BYTES). What does not fit goes in the next post.
+    let mut total = 0usize;
     for buf in entry.wq.iter().take(16) {
-        slices[n] = buf.slice();
+        let slice = buf.slice();
+        if n > 0 && total + slice.len as usize > MAX_SEND_BYTES {
+            break;
+        }
+        total += slice.len as usize;
+        slices[n] = slice;
         n += 1;
     }
     let socket = entry.socket;
@@ -849,9 +859,14 @@ pub(crate) fn reap_at_close(py: Python<'_>, net: &mut NetState, backend: Backend
     let mut comps: Vec<Completion> = Vec::new();
     let deadline = Instant::now() + CLOSE_REAP_BUDGET;
     loop {
-        let pipes_left =
-            net.ops.values().any(|t| matches!(t, OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. }));
-        if net.reap_guards.is_empty() && !pipes_left {
+        // Accepts too: a cancelled AcceptEx owns the socket it pre-created,
+        // and only reaping its completion closes it. Waiting on guards and
+        // pipes alone left every pooled accept socket of every listener the
+        // close tore down -- 64 apiece by default -- open for good.
+        let ops_left = net.ops.values().any(|t| {
+            matches!(t, OpTarget::PipeRead { .. } | OpTarget::PipeWrite { .. } | OpTarget::Accept(_))
+        });
+        if net.reap_guards.is_empty() && !ops_left {
             break;
         }
         comps.clear();
@@ -2528,13 +2543,18 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             NetEvent::ConnectDone { fut, sock, err } => {
                 let fut = fut.bind(py);
                 let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
-                if err != 0 {
+                if err != 0 || cancelled {
+                    // tcp_connect registered this socket, so detach before
+                    // closing (ADR-25). A bare close left the backend
+                    // describing a handle value the OS reissues at once --
+                    // on IOCP its skip-mode record then passed to the next
+                    // socket given that number, and that socket's
+                    // synchronous completions were delivered twice.
+                    core.with_net(|_net, reactor| reactor.backend_mut().detach_socket(sock))?;
                     netsys::close(sock);
-                    if !cancelled {
+                    if err != 0 && !cancelled {
                         let _ = fut.call_method1("set_exception", (os_err(py, err),));
                     }
-                } else if cancelled {
-                    netsys::close(sock);
                 } else {
                     let _ = fut.call_method1("set_result", (sock as u64,));
                 }

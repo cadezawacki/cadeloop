@@ -3,7 +3,7 @@
 //!
 //! Division of labor:
 //! * IOCP (inner): accepts (AcceptEx), connects (ConnectEx), disconnect
-//!   recycling, readiness probes (R-057), and the cross-thread wakeup —
+//!   recycling, readiness polls (R-057), and the cross-thread wakeup —
 //!   RIO has no equivalents for any of these.
 //! * RIO: recv/send on connected sockets that carry a request queue.
 //!   Accept sockets are created with `WSA_FLAG_REGISTERED_IO` (see the
@@ -59,7 +59,7 @@ use std::collections::HashMap;
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, WAIT_TIMEOUT};
@@ -75,7 +75,7 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::IO::{GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY};
 
-use super::iocp::{IocpBackend, KEY_RIO, POLL_BATCH};
+use super::iocp::{IocpBackend, DROP_DRAIN_BUDGET, KEY_RIO, POLL_BATCH};
 use super::rio_util::{CqLedger, RegionMap, StagingLedger};
 use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup};
 use crate::netsys;
@@ -245,8 +245,9 @@ pub struct RioBackend {
     entries: Box<[OVERLAPPED_ENTRY; POLL_BATCH]>,
     /// Keeps mswsock's per-process RIO state alive (see AnchorSocket).
     /// Field drop runs after the explicit `Drop` impl closes the CQ, so
-    /// RIO state outlives every RIO handle owned by this backend.
-    _anchor: AnchorSocket,
+    /// RIO state outlives every RIO handle owned by this backend. An
+    /// Option only so a teardown that must leak RIO state can keep it.
+    anchor: Option<AnchorSocket>,
 }
 
 // SAFETY: thread-affine by the loop contract (see gil_boundary); raw
@@ -329,7 +330,7 @@ impl RioBackend {
             slab: OpSlab::new(empty_op),
             results: Box::new(unsafe { zeroed() }),
             entries: Box::new(unsafe { zeroed() }),
-            _anchor: anchor,
+            anchor: Some(anchor),
         };
         backend.grow_staging()?;
         Ok(backend)
@@ -401,6 +402,32 @@ impl RioBackend {
 
 impl Drop for RioBackend {
     fn drop(&mut self) {
+        // RIO has no cancellation: an outstanding request ends only when
+        // data moves or its socket closes (closesocket flushes it through
+        // the CQ), and until then the kernel may still write the registered
+        // buffer it names. loop.close() closes every RQ socket first, so the
+        // requests are normally all in the CQ already: reap them.
+        let deadline = Instant::now() + DROP_DRAIN_BUDGET;
+        let mut sink: Vec<Completion> = Vec::new();
+        while self.inflight > 0 {
+            if self.drain_cq(&mut sink).is_err() {
+                break;
+            }
+            sink.clear();
+            if self.inflight == 0 || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if self.inflight > 0 {
+            // Still outstanding: the CQ, the staging memory, every
+            // registration -- and the anchor keeping RIO's per-process state
+            // alive -- must outlive us, or the kernel completes into freed
+            // memory. Leak them rather than free them.
+            std::mem::forget(self.anchor.take());
+            std::mem::forget(std::mem::replace(&mut self._notify_overlapped, Box::new(unsafe { zeroed() })));
+            return;
+        }
         unsafe {
             if let Some(close_cq) = self.t.RIOCloseCompletionQueue {
                 if self.cq != RIO_INVALID_CQ {
@@ -410,6 +437,14 @@ impl Drop for RioBackend {
             if let Some(dereg) = self.t.RIODeregisterBuffer {
                 for r in &self.staging_regions {
                     dereg(r.id);
+                }
+                // The recv-slab regions too (R-043). Nothing else ever
+                // deregistered them, and the buffer pool frees them right
+                // after the backend drops: each loop leaked the locked
+                // pages of every 2 MiB region it registered, and freed
+                // memory still registered with the kernel.
+                for cookie in self.regions.cookies() {
+                    dereg(cookie as RIO_BUFFERID);
                 }
             }
             for r in &self.staging_regions {
@@ -421,7 +456,7 @@ impl Drop for RioBackend {
 
 impl IoBackend for RioBackend {
     fn register_socket(&mut self, socket: RawSocket) -> io::Result<()> {
-        // Port binding + skip-modes for the IOCP-side ops (probes etc.).
+        // Port binding + skip-modes for the IOCP-side ops (accept, connect).
         self.inner.register_socket(socket)?;
         // R-042: attach a request queue. CQ capacity is reserved per RQ,
         // growing the CQ by doubling when needed (R-041).
@@ -598,9 +633,9 @@ impl IoBackend for RioBackend {
     }
 
     fn set_watch(&mut self, socket: RawSocket, readable: bool, writable: bool) -> io::Result<()> {
-        // Readiness probes are overlapped ops — unavailable on
-        // REGISTERED_IO sockets. Ours are only accept sockets, which the
-        // transport layer never watches; user fds lack the flag and work.
+        // The inner backend's AFD poll, issued through its own helper
+        // socket: nothing is posted on the watched socket itself, so a
+        // REGISTERED_IO socket can be watched like any other.
         self.inner.set_watch(socket, readable, writable)
     }
 
@@ -665,7 +700,7 @@ impl IoBackend for RioBackend {
         }
         let mut timeout_ms: u32 = match timeout {
             _ if out.len() > before => 0,
-            Some(t) => crate::backend::wait_millis(t).min(u32::MAX as u128) as u32,
+            Some(t) => crate::backend::wait_millis(t).min(u32::MAX as u128 - 1) as u32,
             None => 0,
         };
         if self.polling_only && self.inflight > 0 {
@@ -693,6 +728,9 @@ impl IoBackend for RioBackend {
                 timeout_ms = timeout_ms.min(1);
             }
         }
+        // The inner backend's quarantine is released on THIS dequeue: it is
+        // the one that drains the shared port.
+        let mark = self.inner.quarantine_mark();
         let mut n: u32 = 0;
         let ok = unsafe {
             GetQueuedCompletionStatusEx(
@@ -707,6 +745,7 @@ impl IoBackend for RioBackend {
         if ok == 0 {
             let err = unsafe { GetLastError() };
             if err == WAIT_TIMEOUT {
+                self.inner.port_drained(mark, 0);
                 return Ok(out.len() - before);
             }
             return Err(io::Error::from_raw_os_error(err as i32));
@@ -721,6 +760,7 @@ impl IoBackend for RioBackend {
                 self.inner.translate_entry(&entry, out);
             }
         }
+        self.inner.port_drained(mark, n as usize);
         Ok(out.len() - before)
     }
 
