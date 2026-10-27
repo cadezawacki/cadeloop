@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import os
+import signal as signal_module
 import socket
 import stat
 import subprocess
@@ -118,6 +119,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._core = core
         self._accept_pool = accept_pool  # R-032
         self._signal_handlers = {}
+        self._signal_wakeup_pair = None  # R-052, made on first main-thread run
         self._console_ctrl_handler_ref = None  # R-052: keeps the ctypes callback alive
         core.set_error_hook(self._on_callback_error)
         core.set_net_error_hook(self._on_net_error)
@@ -249,17 +251,32 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         immediately, so CTRL+C interrupts an idle loop at once. This is
         the proactor CTRL+C fix on Windows, and on POSIX it also closes
         the race of a signal landing between the tick's signal check and
-        the park. Main thread only (set_wakeup_fd's own rule)."""
+        the park. Main thread only (set_wakeup_fd's own rule).
+
+        The socket pair and its watch are made once per loop and kept until
+        close(): only the set_wakeup_fd swap is per run. Building and
+        tearing them down on every run_forever() -- a socketpair, two
+        fcntls, an epoll_ctl pair and two closes -- made
+        run_until_complete() over twice as slow as asyncio's."""
         if threading.current_thread() is not threading.main_thread():
             return None
-        import signal as signal_module
+        pair = self._signal_wakeup_pair
+        if pair is None:
+            pair = self._signal_wakeup_pair = self._make_signal_wakeup_pair()
+            if pair is None:
+                return None
+        try:
+            old_fd = signal_module.set_wakeup_fd(pair[1].fileno(), warn_on_full_buffer=False)
+        except (ValueError, OSError):
+            return None
+        return (old_fd,)
 
+    def _make_signal_wakeup_pair(self):
         try:
             rsock, csock = socket.socketpair()
             rsock.setblocking(False)
             csock.setblocking(False)
-            old_fd = signal_module.set_wakeup_fd(csock.fileno(), warn_on_full_buffer=False)
-        except (ValueError, OSError, AttributeError):
+        except OSError:
             return None
 
         def drain():
@@ -272,7 +289,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         try:
             self._core.add_reader(rsock.fileno(), drain)
         except OSError:
-            signal_module.set_wakeup_fd(old_fd)
             rsock.close()
             csock.close()
             return None
@@ -280,22 +296,25 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # without this, its permanent registration would keep the poll
         # elision (pure-scheduling fast path) from ever engaging.
         self._core.set_signal_wakeup_fd(rsock.fileno())
-        return (rsock, csock, old_fd)
+        return (rsock, csock)
 
     def _remove_signal_wakeup(self, wakeup):
         if wakeup is None:
             return
-        import signal as signal_module
+        try:
+            signal_module.set_wakeup_fd(wakeup[0])
+        except (ValueError, OSError):
+            pass
 
-        rsock, csock, old_fd = wakeup
+    def _close_signal_wakeup_pair(self):
+        pair, self._signal_wakeup_pair = self._signal_wakeup_pair, None
+        if pair is None:
+            return
+        rsock, csock = pair
         self._core.set_signal_wakeup_fd(None)
         try:
             self._core.remove_reader(rsock.fileno())
         except OSError:
-            pass
-        try:
-            signal_module.set_wakeup_fd(old_fd)
-        except (ValueError, OSError):
             pass
         rsock.close()
         csock.close()
@@ -350,6 +369,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             except (OSError, ValueError, RuntimeError):
                 self._signal_handlers.pop(sig, None)
         self._remove_console_ctrl_handler()
+        self._close_signal_wakeup_pair()
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None

@@ -739,3 +739,20 @@ def test_subclass_overrides_of_the_fast_paths_are_called():
         assert "call_soon" not in lp.__dict__
     finally:
         lp.close()
+
+
+def test_signal_wakeup_pair_is_made_once_per_loop(loop):
+    """run_forever() built and tore down a socket pair, its watch and two
+    fcntls on every call: run_until_complete() cost 2.3x asyncio's."""
+
+    async def noop():
+        pass
+
+    loop.run_until_complete(noop())
+    pair = loop._signal_wakeup_pair
+    assert pair is not None
+    for _ in range(20):
+        loop.run_until_complete(noop())
+    assert loop._signal_wakeup_pair is pair
+    loop.close()
+    assert pair[0].fileno() == -1 and pair[1].fileno() == -1
