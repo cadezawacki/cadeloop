@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import gc
 import itertools
+import logging
 import os
 import socket
 import sys
@@ -20,6 +21,7 @@ import time
 
 import cadeloop
 import pytest
+from cadeloop import _winpipes
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="IOCP backend (win32 only)")
 
@@ -401,3 +403,117 @@ def test_loop_close_releases_the_accept_pool():
     gc.collect()
     leaked = _process_handle_count() - before
     assert leaked < 32, f"{leaked} handles leaked over 6 loops"
+
+
+# --------------------------------------------------------------------- #
+# W7: pipe short writes                                                 #
+# --------------------------------------------------------------------- #
+
+
+class _CappedPipeCore:
+    """Stands in for CoreLoop's pipe calls: each write completes on a later
+    loop iteration having written at most `cap` bytes, as a WriteFile does
+    once the backend caps one write (MAX_PIPE_WRITE in iocp.rs)."""
+
+    def __init__(self, loop, cap):
+        self._loop = loop
+        self.cap = cap
+        self.written = bytearray()
+        self.writes = 0
+
+    def pipe_register(self, handle):
+        pass
+
+    def pipe_write(self, handle, data, fut):
+        n = min(len(data), self.cap)
+        self.written += data[:n]
+        self.writes += 1
+        self._loop.call_soon(fut.set_result, n)
+
+
+class _Handle:
+    def fileno(self):
+        return 1234
+
+    def close(self):
+        pass
+
+
+def test_pipe_short_writes_are_finished_not_dropped():
+    """W7. The write pipe transport ignored the byte count its WriteFile
+    completed with. WriteFile takes a DWORD, so a write of 4 GiB or more
+    went out truncated to len mod 2**32 and the rest was silently lost; the
+    backend now caps each write at 1 GiB, so the transport must send what
+    is left. Driven on a stdlib loop with a capped stand-in core, since the
+    transport logic is plain Python."""
+    lp = asyncio.new_event_loop()
+    try:
+        core = lp._core = _CappedPipeCore(lp, cap=1000)
+        lost = lp.create_future()
+
+        class Proto(asyncio.Protocol):
+            def connection_lost(self, exc):
+                lost.set_result(exc)
+
+        payload = bytes(range(256)) * 20
+
+        async def main():
+            t = _winpipes._BaseWritePipeTransport(lp, _Handle(), Proto())
+            await asyncio.sleep(0)
+            t.write(payload[:3000])
+            t.write(payload[3000:])  # buffered behind the in-flight write
+            assert t.get_write_buffer_size() == len(payload)
+            t.close()
+            assert await asyncio.wait_for(lost, 5) is None
+            assert t.get_write_buffer_size() == 0
+
+        lp.run_until_complete(main())
+        assert bytes(core.written) == payload, "bytes were dropped or reordered"
+        assert core.writes == 6  # 3000 in three parts, then 2120 in three
+    finally:
+        lp.close()
+
+
+# --------------------------------------------------------------------- #
+# W17: a subprocess that outlives its loop                              #
+# --------------------------------------------------------------------- #
+
+
+def test_exit_status_for_a_closed_loop_is_logged_not_raised(caplog):
+    """W17. The exit-waiter thread called call_soon_threadsafe on a loop
+    that had closed while the child ran, and the RuntimeError escaped the
+    daemon thread as a traceback per child. stdlib's ThreadedChildWatcher
+    logs a warning in the same situation."""
+    lp = cadeloop.new_event_loop()
+    got = []
+    try:
+        _winpipes._deliver_exit(lp, 1, got.append, 7)
+        lp.run_until_complete(asyncio.sleep(0))
+        assert got == [7], "an open loop gets the status"
+    finally:
+        lp.close()
+    with caplog.at_level(logging.WARNING, logger="asyncio"):
+        _winpipes._deliver_exit(lp, 4321, got.append, 0)
+    assert got == [7]
+    assert "4321" in caplog.text and "is closed" in caplog.text
+
+
+@windows_only
+def test_a_subprocess_outliving_its_loop_does_not_raise_in_the_waiter(monkeypatch):
+    """W17, end to end: the child is killed only after its loop closed."""
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    lp = cadeloop.new_event_loop()
+    try:
+
+        async def start():
+            return await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
+
+        proc = lp.run_until_complete(start())
+    finally:
+        lp.close()
+    proc._transport.close()  # kills the child; its waiter wakes on a closed loop
+    for t in threading.enumerate():
+        if t.name == "cadeloop-subprocess-wait":
+            t.join(10)
+    assert not errors, errors

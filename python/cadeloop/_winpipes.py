@@ -30,6 +30,7 @@ from __future__ import annotations
 import threading
 import warnings
 from asyncio import base_subprocess, futures, protocols, transports
+from asyncio.log import logger
 
 __all__ = ["ReadPipeTransport", "WritePipeTransport", "SubprocessTransport"]
 
@@ -46,6 +47,7 @@ class _PipeTransportBase(transports._FlowControlMixin, transports.BaseTransport)
         self._buffer = None
         self._read_fut = None
         self._write_fut = None
+        self._posted = None  # the bytes the in-flight WriteFile was given
         self._pending_write = 0
         self._conn_lost = 0
         self._closing = False
@@ -119,6 +121,7 @@ class _PipeTransportBase(transports._FlowControlMixin, transports.BaseTransport)
             self._read_fut = None
         self._pending_write = 0
         self._buffer = None
+        self._posted = None
         self._loop.call_soon(self._call_connection_lost, exc)
 
     def _call_connection_lost(self, exc):
@@ -282,7 +285,16 @@ class _BaseWritePipeTransport(_PipeTransportBase, transports.WriteTransport):
             if fut is not None:
                 self._write_fut = None
                 self._pending_write = 0
-                fut.result()
+                written = fut.result()
+                posted, self._posted = self._posted, None
+                if posted is not None and written < len(posted):
+                    # A short write: WriteFile takes a DWORD count and the
+                    # backend caps one write at 1 GiB (MAX_PIPE_WRITE in
+                    # iocp.rs), so a bigger write completes with only part
+                    # of it written. The rest goes out next, ahead of
+                    # anything buffered since; dropping it would truncate
+                    # the stream silently.
+                    data = posted[written:]
             if data is None:
                 data = self._buffer
                 self._buffer = None
@@ -292,9 +304,11 @@ class _BaseWritePipeTransport(_PipeTransportBase, transports.WriteTransport):
                 self._maybe_resume_protocol()
             else:
                 new_fut = self._loop.create_future()
-                self._core.pipe_write(self._fileno, bytes(data), new_fut)
+                posted = bytes(data)
+                self._core.pipe_write(self._fileno, posted, new_fut)
                 self._write_fut = new_fut
-                self._pending_write = len(data)
+                self._posted = posted
+                self._pending_write = len(posted)
                 new_fut.add_done_callback(self._loop_writing)
                 self._maybe_pause_protocol()
             if self._empty_waiter is not None and self._write_fut is None:
@@ -352,6 +366,24 @@ class WritePipeTransport(_BaseWritePipeTransport):
             self.close()
 
 
+def _deliver_exit(loop, pid, callback, returncode):
+    """Hand a child's exit status to its loop from the waiter thread.
+
+    The loop may have closed while the child ran (a subprocess that outlives
+    asyncio.run(), say). call_soon_threadsafe then raises RuntimeError, which
+    used to escape the daemon thread as an unhandled-exception traceback per
+    child. stdlib's ThreadedChildWatcher logs this same warning instead; the
+    except clause covers a close that lands between the check and the call."""
+    if not loop.is_closed():
+        try:
+            loop.call_soon_threadsafe(callback, returncode)
+            return
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+    logger.warning("Loop %r that handles pid %r is closed", loop, pid)
+
+
 def _watch_process_exit(loop, proc, callback):
     """Windows has no SIGCHLD; block on the process HANDLE in a dedicated
     thread (mirrors asyncio.ThreadedChildWatcher's os.waitpid thread on
@@ -361,7 +393,7 @@ def _watch_process_exit(loop, proc, callback):
     def waiter():
         _winapi.WaitForSingleObject(int(proc._handle), _winapi.INFINITE)
         rc = proc.poll()
-        loop.call_soon_threadsafe(callback, rc)
+        _deliver_exit(loop, proc.pid, callback, rc)
 
     threading.Thread(target=waiter, daemon=True, name="cadeloop-subprocess-wait").start()
 
