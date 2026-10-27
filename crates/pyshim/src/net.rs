@@ -566,7 +566,10 @@ pub(crate) enum NetEvent {
         connection_lost: Py<PyAny>,
         err: LostReason,
     },
+    /// `resume_writing`, then -- if that left the queue empty -- the
+    /// close or write_eof that was waiting for the drain.
     ResumeWriting {
+        tid: u64,
         resume_writing: Py<PyAny>,
     },
     Accepted {
@@ -645,6 +648,16 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
 
 fn teardown_err(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64, e: io::Error) {
     teardown_with(py, net, backend, tid, Some(e.raw_os_error().unwrap_or(5) as u32));
+}
+
+/// The drain-time close/eof that `on_send_done` held back for
+/// resume_writing: done now unless resume_writing queued more output (a
+/// flush is then on its way, and its completion finishes the job). In-cell.
+fn finish_after_resume(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
+    let Some(entry) = net.transports.get(&tid) else { return };
+    if entry.wq.is_empty() && entry.send_op.is_none() {
+        maybe_finish_shutdown(py, net, backend, tid);
+    }
 }
 
 /// eof/close finalization once the write queue is drained. In-cell.
@@ -2190,11 +2203,13 @@ fn on_send_done(
             }
         }
     }
+    let mut resuming = false;
     if entry.proto_paused && entry.queued_bytes <= entry.low_water {
         entry.proto_paused = false;
         if let ProtoKind::Py(p) = &entry.proto {
             let resume_writing = p.resume_writing.clone_ref(py);
-            net.events.push(NetEvent::ResumeWriting { resume_writing });
+            net.events.push(NetEvent::ResumeWriting { tid, resume_writing });
+            resuming = true;
         }
     }
     // Not `unwrap()`. It was safe only while nothing between the lookup
@@ -2206,9 +2221,13 @@ fn on_send_done(
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if !entry.wq.is_empty() {
         flush_pending(py, net, backend, tid);
-    } else {
+    } else if !resuming {
         maybe_finish_shutdown(py, net, backend, tid);
     }
+    // else: asyncio calls resume_writing BEFORE deciding the queue has
+    // drained, and what it writes still goes out ahead of a pending close
+    // -- sslproto's close_notify under backpressure is written exactly
+    // there. Its dispatch finishes the close (`finish_after_resume`).
     // A WebSocket paused for WRITE pressure has no other way back: the
     // inbox path only re-evaluates when the app calls receive(), and a
     // connection paused because we owed the peer output may have no
@@ -2357,8 +2376,11 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 };
                 core.guard_protocol_call(py, connection_lost.call1(py, (exc_obj,)))?;
             }
-            NetEvent::ResumeWriting { resume_writing } => {
-                core.guard_protocol_call(py, resume_writing.call0(py))?;
+            NetEvent::ResumeWriting { tid, resume_writing } => {
+                let res = core.guard_protocol_call(py, resume_writing.call0(py));
+                core.with_net(|net, reactor| finish_after_resume(py, net, reactor.backend_mut(), tid))?;
+                core.drain_graveyards(py)?;
+                res?;
             }
             NetEvent::Accepted { lid, sock } => {
                 enum Action {
@@ -2978,7 +3000,12 @@ impl Transport {
                 dirty = true;
                 return; // write after connection_lost: silently dropped
             };
-            if entry.eof_wanted && !entry.closing && !entry.conn_lost {
+            if entry.conn_lost {
+                net.graveyard_bufs.push(buf);
+                dirty = true;
+                return;
+            }
+            if entry.eof_wanted {
                 // Half-close MISUSE, not a dead connection: the asyncio
                 // write-transport contract raises here. Silently
                 // succeeding let protocol code believe output was queued
@@ -2989,11 +3016,13 @@ impl Transport {
                 eof_misuse = true;
                 return;
             }
-            if entry.closing || entry.conn_lost {
-                net.graveyard_bufs.push(buf);
-                dirty = true;
-                return;
-            }
+            // A transport that is `closing` but still mapped is draining
+            // its queue before the close completes (an idle one is torn
+            // down at once by close()). asyncio still sends what is
+            // written in that window, and sslproto depends on it: its
+            // close_notify can be written from resume_writing after the
+            // app closed. Dropping it ended TLS sessions under
+            // backpressure with a bare FIN.
             entry.queued_bytes += buf.remaining();
             entry.wq.push_back(buf);
             let no_send = entry.send_op.is_none();

@@ -673,3 +673,187 @@ def test_sock_recv_cancelled_after_close_raises_cancelled_error(loop):
         b.close()
 
     loop.run_until_complete(main())
+
+
+# --------------------------------------------------------------------- #
+# 9. write() while close() waits for the buffer to drain                #
+# --------------------------------------------------------------------- #
+
+
+def test_write_after_close_is_sent_while_draining(loop):
+    """close() with output still queued keeps accepting write()s until
+    the queue drains, and sends them; cadeloop dropped them."""
+
+    async def main():
+        got = bytearray()
+        eof = loop.create_future()
+        conns = []
+
+        class Sink(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.pause_reading()  # let the client's queue build up
+                conns.append(transport)
+
+            def data_received(self, data):
+                got.extend(data)
+
+            def eof_received(self):
+                eof.set_result(None)
+
+        server = await loop.create_server(Sink, "127.0.0.1", 0)
+        transport, _ = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", server.sockets[0].getsockname()[1]
+        )
+        while not conns:
+            await asyncio.sleep(0.01)
+        sent = 0
+        while transport.get_write_buffer_size() == 0:  # until the kernel is full
+            transport.write(b"x" * (1 << 20))
+            sent += 1 << 20
+        transport.close()
+        transport.write(b"TAIL")
+        await asyncio.sleep(0.05)
+        conns[0].resume_reading()
+        await asyncio.wait_for(eof, 10)
+        assert len(got) == sent + 4
+        assert got.endswith(b"TAIL")
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_resume_writing_can_still_write_after_close(loop):
+    """asyncio calls resume_writing before it decides the queue drained,
+    so output written there goes out ahead of a pending close. sslproto's
+    close_notify under backpressure is written exactly there."""
+
+    async def main():
+        got = bytearray()
+        eof = loop.create_future()
+        conns = []
+
+        class Sink(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.pause_reading()
+                conns.append(transport)
+
+            def data_received(self, data):
+                got.extend(data)
+
+            def eof_received(self):
+                eof.set_result(None)
+
+        class Writer(asyncio.Protocol):
+            def connection_made(self, transport):
+                self.transport = transport
+                self.paused = False
+
+            def pause_writing(self):
+                self.paused = True
+
+            def resume_writing(self):
+                self.transport.write(b"TRAILER")
+
+        server = await loop.create_server(Sink, "127.0.0.1", 0)
+        transport, proto = await loop.create_connection(
+            Writer, "127.0.0.1", server.sockets[0].getsockname()[1]
+        )
+        while not conns:
+            await asyncio.sleep(0.01)
+        while not proto.paused:
+            transport.write(b"x" * (1 << 20))
+        transport.close()
+        await asyncio.sleep(0.05)
+        conns[0].resume_reading()
+        await asyncio.wait_for(eof, 10)
+        assert got.endswith(b"TRAILER")
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_tls_close_notify_survives_write_backpressure(loop):
+    """The server closes the TLS session while the client still has
+    output queued: the client must deliver all of it and then a
+    close_notify (CPython's test_remote_shutdown_receives_trailing_data).
+    cadeloop ended the session with a bare FIN instead."""
+    import threading
+
+    server_ctx, client_ctx = _tls_contexts()
+    total = 32 * 128 * 1024
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    result = {}
+
+    def serve():
+        sock, _ = listener.accept()
+        sock.settimeout(10)
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        tls = server_ctx.wrap_bio(incoming, outgoing, server_side=True)
+        try:
+            while True:
+                try:
+                    tls.do_handshake()
+                    sock.sendall(outgoing.read())
+                    break
+                except ssl.SSLWantReadError:
+                    sock.sendall(outgoing.read())
+                    incoming.write(sock.recv(16384))
+            while True:
+                try:
+                    tls.read(4)
+                    break
+                except ssl.SSLWantReadError:
+                    incoming.write(sock.recv(16384))
+            tls.write(b"pong")
+            sock.sendall(outgoing.read())
+            time.sleep(0.2)
+            try:
+                tls.unwrap()
+            except ssl.SSLWantReadError:
+                pass
+            sock.sendall(outgoing.read())
+            received = 0
+            while True:
+                try:
+                    received += len(tls.read(16384))
+                except ssl.SSLWantReadError:
+                    chunk = sock.recv(16384)
+                    if not chunk:
+                        result["server"] = ("EOF before close_notify", received)
+                        return
+                    incoming.write(chunk)
+                except ssl.SSLZeroReturnError:
+                    result["server"] = ("close_notify", received)
+                    return
+        except Exception as exc:  # reported through `result`
+            result["server"] = repr(exc)
+        finally:
+            sock.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    async def main():
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", listener.getsockname()[1], ssl=client_ctx, server_hostname="localhost"
+        )
+        writer.write(b"ping")
+        assert await reader.readexactly(4) == b"pong"
+        for _ in range(32):
+            writer.transport._test__append_write_backlog(b"x" * (128 * 1024))
+        assert await asyncio.wait_for(reader.read(), 10) == b""
+        writer.close()
+        deadline = time.monotonic() + 10
+        while "server" not in result and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        thread.join(5)
+        listener.close()
+    assert result.get("server") == ("close_notify", total)
