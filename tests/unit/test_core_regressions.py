@@ -260,7 +260,10 @@ def test_accept_backs_off_under_descriptor_exhaustion():
         class H(logging.Handler):
             def emit(self, rec):
                 errors.append(rec.getMessage())
-        logging.getLogger("cadeloop").addHandler(H())
+        # asyncio's logger (where the default exception handler reports),
+        # and cadeloop's (where older builds reported).
+        for name in ("asyncio", "cadeloop"):
+            logging.getLogger(name).addHandler(H())
 
         async def main():
             loop = asyncio.get_running_loop()
