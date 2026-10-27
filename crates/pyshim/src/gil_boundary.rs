@@ -36,26 +36,58 @@
 //! section. Confining that change here is the point of this module.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-/// Process-unique small integer per OS thread (std's `ThreadId::as_u64` is
-/// unstable; this is the stable equivalent). 0 is reserved for "no owner".
+/// A non-zero identifier for the calling OS thread, unique among live
+/// threads. 0 is reserved for "no owner".
+///
+/// Read straight from the OS rather than from a `thread_local!`: in a
+/// cdylib a thread-local is a `__tls_get_addr` call, and this runs on
+/// every entry into the state cell -- several times per scheduled
+/// callback. `pthread_self` is the thread pointer (one load from `%fs`)
+/// and `GetCurrentThreadId` one read of the TEB. Reuse of an id by a later
+/// thread is harmless here: ownership is cleared before the owning thread
+/// can exit (`OwnerGuard` drops when `run_forever` returns).
+#[inline(always)]
 pub fn current_tid() -> u64 {
-    use std::sync::atomic::AtomicU64;
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    thread_local! {
-        static TID: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn pthread_self() -> usize;
+        }
+        // SAFETY: pthread_self has no preconditions and never fails.
+        let t = unsafe { pthread_self() } as u64;
+        debug_assert_ne!(t, 0);
+        t
     }
-    TID.with(|t| *t)
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        // SAFETY: no preconditions; thread ids are never 0.
+        u64::from(unsafe { GetCurrentThreadId() })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        thread_local! {
+            static TID: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+        }
+        TID.with(|t| *t)
+    }
 }
 
 pub struct StateCell<S> {
     cell: UnsafeCell<S>,
     /// 0 when the loop is not running; the loop thread's tid while it is.
     owner: AtomicU64,
+    /// A `with` borrow is live. Read only by [`StateCell::peek_for_gc`].
+    borrowed: AtomicBool,
 }
 
 // SAFETY: see module docs — access is serialized by (GIL ∧ owner==0) or
@@ -66,7 +98,7 @@ unsafe impl<S: Send> Send for StateCell<S> {}
 
 impl<S> StateCell<S> {
     pub fn new(state: S) -> Self {
-        StateCell { cell: UnsafeCell::new(state), owner: AtomicU64::new(0) }
+        StateCell { cell: UnsafeCell::new(state), owner: AtomicU64::new(0), borrowed: AtomicBool::new(false) }
     }
 
     /// Claim ownership for the duration of `run_forever`. Returns a guard
@@ -97,8 +129,26 @@ impl<S> StateCell<S> {
                 "Non-thread-safe operation invoked on an event loop other than the current one",
             ));
         }
+        let outer = self.borrowed.swap(true, Ordering::Relaxed);
         // SAFETY: module-level protocol (GIL ∧ owner==0) ∨ owner==tid.
-        Ok(f(unsafe { &mut *self.cell.get() }))
+        let r = f(unsafe { &mut *self.cell.get() });
+        self.borrowed.store(outer, Ordering::Relaxed);
+        Ok(r)
+    }
+
+    /// Shared access for the cycle collector's `tp_traverse`, or None when
+    /// that cannot be sound: the loop is running (its thread may hold the
+    /// `&mut` from `with` across the GIL-released poll), or a `with`
+    /// borrow is live on this thread (an allocation inside it triggered
+    /// the collection). Returning None makes the traverse under-report,
+    /// which can only delay a collection, never cause a premature free.
+    pub fn peek_for_gc(&self) -> Option<&S> {
+        if self.owner.load(Ordering::Acquire) != 0 || self.borrowed.load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: not running and not borrowed; traverse runs with the
+        // GIL held, so no `with` can start until it returns.
+        Some(unsafe { &*self.cell.get() })
     }
 }
 

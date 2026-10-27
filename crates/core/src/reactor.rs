@@ -29,10 +29,14 @@ use std::time::Duration;
 use crate::backend::{self, BackendKind, Completion, IoBackend, Wakeup};
 use crate::ready::{CrossThreadQueue, ReadyQueue, DISPATCH_BATCH};
 use crate::time::{Clock, Ticks};
-use crate::timer::{TimerHeap, TimerToken};
+use crate::timer::{TimerHeap, TimerPayload};
 
 /// R-030: poll timeout clamp.
 const MAX_PARK: Duration = Duration::from_millis(100);
+
+/// Poll-skip window (adopted from rloop): with ready callbacks pending, a
+/// real kernel poll is only taken this often.
+const POLL_SKIP_NS: Ticks = 250_000;
 
 #[derive(Debug, Clone)]
 pub struct ReactorConfig {
@@ -78,8 +82,9 @@ pub struct Reactor<T> {
     xthread: Arc<CrossThreadQueue<T>>,
     backend: Box<dyn IoBackend + Send>,
     wakeup: Arc<dyn Wakeup>,
-    /// Timer cancellations observed since last tick (see
-    /// `TimerHandleShared`): drained into the heap's tombstone accounting.
+    /// Cancellations of still-scheduled timers reported since the last
+    /// tick (the binding layer's `TimerHandle.cancel()` bumps it): drained
+    /// into the heap's tombstone accounting.
     cancelled_timers: Arc<AtomicUsize>,
     completions: Vec<Completion>,
     /// Tokens delivered by I/O completions, mapped op->token by the
@@ -95,7 +100,7 @@ pub struct Reactor<T> {
     ready_snapshot: usize,
 }
 
-impl<T> Reactor<T> {
+impl<T: TimerPayload> Reactor<T> {
     pub fn new(cfg: ReactorConfig) -> io::Result<Self> {
         let backend = backend::create(cfg.backend, &cfg.backend_opts)?;
         let wakeup = backend.wakeup_handle();
@@ -155,15 +160,11 @@ impl<T> Reactor<T> {
         self.stats.callbacks_dispatched = self.stats.callbacks_dispatched.saturating_sub(1);
     }
 
-    pub fn schedule_timer(&mut self, deadline: Ticks, token: T) -> Arc<TimerToken> {
-        self.timers.schedule(deadline, token)
-    }
-
-    /// Schedule with a caller-provided cancellation token (the binding
-    /// layer constructs its `TimerHandle` object — which owns the token —
-    /// before entering the state critical section).
-    pub fn schedule_timer_with_token(&mut self, deadline: Ticks, token: T, cancel: Arc<TimerToken>) {
-        self.timers.schedule_with_token(deadline, token, cancel);
+    /// Schedule `token` to become ready at `deadline`. Cancellation is read
+    /// off the payload itself ([`TimerPayload::is_cancelled`]).
+    #[inline]
+    pub fn schedule_timer(&mut self, deadline: Ticks, token: T) {
+        self.timers.schedule(deadline, token);
     }
 
     /// Tokens discarded by tombstone removal/compaction since the last
@@ -173,9 +174,16 @@ impl<T> Reactor<T> {
         self.timers.take_graveyard()
     }
 
-    /// Shared counter bumped by `TimerHandle.cancel()`; consumed each tick
-    /// to drive tombstone-ratio compaction (R-053) without needing `&mut`
-    /// access to the heap from handle objects.
+    /// Cheap test for `take_graveyard` having anything to hand back.
+    #[inline]
+    pub fn has_graveyard(&self) -> bool {
+        self.timers.has_graveyard()
+    }
+
+    /// Shared counter bumped by `TimerHandle.cancel()` (for still-scheduled
+    /// timers only); consumed each tick to drive tombstone-ratio compaction
+    /// (R-053) without needing `&mut` access to the heap from handle
+    /// objects.
     pub fn timer_cancel_counter(&self) -> Arc<AtomicUsize> {
         self.cancelled_timers.clone()
     }
@@ -204,23 +212,44 @@ impl<T> Reactor<T> {
         self.absorb_cancellations();
         self.drain_xthread();
         self.fire_expired_timers();
+        self.snapshot_batch();
+    }
+
+    #[inline]
+    fn snapshot_batch(&mut self) {
         self.ready_snapshot = self.ready.len();
         self.batch_left = DISPATCH_BATCH.min(self.ready_snapshot);
     }
 
+    #[inline]
     fn absorb_cancellations(&mut self) {
+        // Load first: the swap is a locked read-modify-write, and on the
+        // overwhelmingly common tick nothing was cancelled at all. Paying
+        // it unconditionally (twice a tick) was a measurable share of a
+        // pure-scheduling tick.
+        if self.cancelled_timers.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let n = self.cancelled_timers.swap(0, Ordering::AcqRel);
-        for _ in 0..n {
-            self.timers.note_cancelled();
+        if n > 0 {
+            self.timers.note_cancelled(n);
         }
     }
 
+    #[inline]
     fn drain_xthread(&mut self) {
         self.stats.xthread_items += self.xthread.drain_into(&mut self.ready) as u64;
     }
 
+    #[inline]
     fn fire_expired_timers(&mut self) {
         let now = self.clock.cached();
+        // Cheap reject before the pop loop: the top entry is a lower bound
+        // for every deadline in the heap (cancelled or not).
+        match self.timers.peek_deadline() {
+            Some(d) if d <= now => {}
+            _ => return,
+        }
         while let Some(token) = self.timers.pop_expired(now) {
             self.ready.push(token);
             self.stats.timers_fired += 1;
@@ -266,7 +295,14 @@ impl<T> Reactor<T> {
             // vast majority of busy ticks. Parked polls (timeout > 0) are
             // never skipped, so idle latency is unaffected.
             let now = self.clock.cached();
-            if now.saturating_sub(self.last_poll_ns) < 250_000 {
+            if now.saturating_sub(self.last_poll_ns) < POLL_SKIP_NS {
+                // Inside the skip window only the kernel round trip is
+                // saved. Completions the backend already holds in user
+                // space (inline successes, staged cancellations) cost no
+                // syscall to deliver, and holding them back delayed a
+                // finished recv or send by up to the whole window on
+                // exactly the busy ticks where latency matters most.
+                self.backend.take_staged(&mut self.completions);
                 return Ok(());
             }
             self.stats.polls += 1;
@@ -287,7 +323,7 @@ impl<T> Reactor<T> {
             }
         }
         self.backend.poll(&mut self.completions, Some(timeout))?;
-        self.last_poll_ns = self.clock.cached();
+        self.last_poll_ns = self.clock.now_uncached();
         Ok(())
     }
 
@@ -304,14 +340,21 @@ impl<T> Reactor<T> {
     pub fn finish_poll_after(&mut self, parked: bool) -> &[Completion] {
         self.stats.completions += self.completions.len() as u64;
         if parked {
+            // Time passed and producers may have posted: refresh the tick
+            // clock, absorb, drain and fire so this tick dispatches them.
             self.clock.refresh();
+            self.absorb_cancellations();
+            self.drain_xthread();
+            self.fire_expired_timers();
+            self.snapshot_batch();
         }
-        self.absorb_cancellations();
-        self.drain_xthread();
-        self.fire_expired_timers();
-        let batch = DISPATCH_BATCH.min(self.ready.len());
-        self.ready_snapshot = self.ready.len();
-        self.batch_left = batch;
+        // A non-blocking poll changes none of the inputs: the clock is not
+        // refreshed (so no further timer can be due), nothing ran Python
+        // (so nothing was cancelled), and a cross-thread item that raced
+        // in since prepare_tick raised its own wakeup and is drained at the
+        // top of the next tick. Re-running all three -- an atomic, a queue
+        // length probe and a heap peek -- on every busy tick bought
+        // nothing, and prepare_tick's batch snapshot is still exact.
         &self.completions
     }
 
@@ -345,6 +388,12 @@ impl<T> Reactor<T> {
         self.ready.len()
     }
 
+    /// Every token the reactor holds in its ready queue and timer heap.
+    /// (Cross-thread items in flight are not reachable without draining.)
+    pub fn pending_iter(&self) -> impl Iterator<Item = &T> {
+        self.ready.iter().chain(self.timers.iter())
+    }
+
     pub fn timers_len(&self) -> usize {
         self.timers.len()
     }
@@ -365,10 +414,7 @@ impl<T> Reactor<T> {
         while let Some(t) = scratch.pop() {
             out.push(t);
         }
-        while let Some(t) = self.timers.pop_expired(u64::MAX) {
-            out.push(t);
-        }
-        out.extend(self.timers.take_graveyard());
+        out.extend(self.timers.drain_all());
         out
     }
 }
@@ -377,18 +423,26 @@ impl<T> Reactor<T> {
 mod tests {
     use super::*;
 
-    fn reactor() -> Reactor<u32> {
+    use crate::timer::testing::Tok;
+
+    type T = Tok<u32>;
+
+    fn tok(v: u32) -> T {
+        Tok::new(v)
+    }
+
+    fn reactor() -> Reactor<T> {
         Reactor::new(ReactorConfig { spin_us: 0, ..Default::default() }).unwrap()
     }
 
-    fn run_tick(r: &mut Reactor<u32>) -> Vec<u32> {
+    fn run_tick(r: &mut Reactor<T>) -> Vec<u32> {
         r.prepare_tick();
         let t = r.poll_timeout();
         r.poll(t).unwrap();
         r.finish_poll();
         let mut out = Vec::new();
         while let Some(tok) = r.pop_ready_batched() {
-            out.push(tok);
+            out.push(tok.value);
         }
         out
     }
@@ -397,7 +451,7 @@ mod tests {
     fn call_soon_order_preserved() {
         let mut r = reactor();
         for i in 0..5 {
-            r.push_ready(i);
+            r.push_ready(tok(i));
         }
         assert_eq!(run_tick(&mut r), vec![0, 1, 2, 3, 4]);
     }
@@ -406,8 +460,8 @@ mod tests {
     fn timers_fire_in_order_after_deadline() {
         let mut r = reactor();
         let now = r.now_fresh();
-        r.schedule_timer(now + 5_000_000, 2); // +5ms
-        r.schedule_timer(now + 1_000_000, 1); // +1ms
+        r.schedule_timer(now + 5_000_000, tok(2)); // +5ms
+        r.schedule_timer(now + 1_000_000, tok(1)); // +1ms
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(run_tick(&mut r), vec![1, 2]);
     }
@@ -416,9 +470,10 @@ mod tests {
     fn cancelled_timer_never_fires() {
         let mut r = reactor();
         let now = r.now_fresh();
-        let tok = r.schedule_timer(now + 1_000_000, 1);
-        r.schedule_timer(now + 2_000_000, 2);
-        tok.cancel();
+        let t1 = tok(1);
+        r.schedule_timer(now + 1_000_000, t1.clone());
+        r.schedule_timer(now + 2_000_000, tok(2));
+        assert!(t1.cancel());
         r.timer_cancel_counter().fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(run_tick(&mut r), vec![2]);
@@ -430,11 +485,11 @@ mod tests {
         r.prepare_tick();
         assert_eq!(r.poll_timeout(), MAX_PARK, "idle loop parks at clamp");
         let now = r.time_cached();
-        r.schedule_timer(now + 3_000_000, 1);
+        r.schedule_timer(now + 3_000_000, tok(1));
         let t = r.poll_timeout();
         assert!(t <= Duration::from_millis(3));
         assert!(t > Duration::ZERO);
-        r.push_ready(9);
+        r.push_ready(tok(9));
         assert_eq!(r.poll_timeout(), Duration::ZERO, "ready work forces zero timeout");
     }
 
@@ -444,7 +499,7 @@ mod tests {
         let (q, wake) = r.cross_thread_handles();
         let t = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(10));
-            if q.push(42) {
+            if q.push(tok(42)) {
                 wake.wake();
             }
         });
@@ -455,7 +510,7 @@ mod tests {
         r.finish_poll();
         let mut out = Vec::new();
         while let Some(tok) = r.pop_ready_batched() {
-            out.push(tok);
+            out.push(tok.value);
         }
         // One 100ms park may elapse before the wakeup posts; run a second
         // tick if needed (the wakeup is never lost).
@@ -471,18 +526,18 @@ mod tests {
     fn batch_snapshot_defers_reentrant_pushes() {
         let mut r = reactor();
         for i in 0..3 {
-            r.push_ready(i);
+            r.push_ready(tok(i));
         }
         r.prepare_tick();
         r.poll(Duration::ZERO).unwrap();
         r.finish_poll();
         let first = r.pop_ready_batched().unwrap();
-        assert_eq!(first, 0);
+        assert_eq!(first.value, 0);
         // Simulate a callback scheduling more work mid-dispatch.
-        r.push_ready(99);
+        r.push_ready(tok(99));
         let mut rest = Vec::new();
         while let Some(tok) = r.pop_ready_batched() {
-            rest.push(tok);
+            rest.push(tok.value);
         }
         assert_eq!(rest, vec![1, 2], "token 99 must wait for the next tick");
         assert_eq!(run_tick(&mut r), vec![99]);
@@ -492,7 +547,7 @@ mod tests {
     fn dispatch_batch_caps_at_128() {
         let mut r = reactor();
         for i in 0..300 {
-            r.push_ready(i);
+            r.push_ready(tok(i));
         }
         let first = run_tick(&mut r);
         assert_eq!(first.len(), DISPATCH_BATCH);
@@ -503,12 +558,12 @@ mod tests {
     #[test]
     fn clear_pending_empties_everything() {
         let mut r = reactor();
-        r.push_ready(1);
+        r.push_ready(tok(1));
         let now = r.now_fresh();
-        r.schedule_timer(now + 1_000_000_000, 2);
+        r.schedule_timer(now + 1_000_000_000, tok(2));
         let (q, _w) = r.cross_thread_handles();
-        let _ = q.push(3);
-        let mut drained = r.clear_pending();
+        let _ = q.push(tok(3));
+        let mut drained: Vec<u32> = r.clear_pending().into_iter().map(|t| t.value).collect();
         drained.sort();
         assert_eq!(drained, vec![1, 2, 3]);
         assert_eq!(r.ready_len(), 0);

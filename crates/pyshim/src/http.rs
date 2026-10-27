@@ -3019,10 +3019,10 @@ impl AppTask {
         let core_py = slf.borrow().core.clone_ref(py);
         let core_bound = core_py.bind(py);
         let core = core_bound.get();
-        let self_arg = PyTuple::new(py, [slf.clone().into_any()])?;
+        let self_arg = crate::handles::CallArgs::One(slf.clone().into_any().unbind());
         let handle =
-            core.make_handle(py, callback.bind(py), &self_arg, Some(ctx.bind(py)), "add_done_callback")?;
-        let token: Py<PyAny> = Py::new(py, handle)?.into_any();
+            core.make_handle(py, callback.bind(py), self_arg, Some(ctx.bind(py)), "add_done_callback")?;
+        let token = crate::handles::HandleRef(Py::new(py, handle)?);
         core.with_net(move |_, reactor| reactor.push_ready(token))?;
         Ok(())
     }
@@ -3126,8 +3126,9 @@ impl AppTask {
                     if y.is_none() {
                         // bare `yield`: resume on the ready queue next tick.
                         let resume = slf.getattr(intern!(py, "_resume_bare"))?;
-                        let h = core.make_handle(py, &resume, &PyTuple::empty(py), None, "AppTask")?;
-                        let token: Py<PyAny> = Py::new(py, h)?.into_any();
+                        let h =
+                            core.make_handle(py, &resume, crate::handles::CallArgs::Zero, None, "AppTask")?;
+                        let token = crate::handles::HandleRef(Py::new(py, h)?);
                         core.with_net(move |_, reactor| reactor.push_ready(token))?;
                         return Ok(StepOutcome::Suspended);
                     }

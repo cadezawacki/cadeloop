@@ -126,10 +126,15 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
         # R-050: native fast paths bound straight onto the instance —
         # attribute lookup finds the bound native method, no Python frame.
-        self.call_soon = core.call_soon
-        self.call_soon_threadsafe = core.call_soon_threadsafe
-        self.call_later = core.call_later
-        self.call_at = core.call_at
+        # The scheduling four are raw METH_FASTCALL builtins (no generic
+        # argument parsing, no per-call *args tuple); asyncio's C Task and
+        # Future look `call_soon` up here on every step and done-callback.
+        (
+            self.call_soon,
+            self.call_soon_threadsafe,
+            self.call_later,
+            self.call_at,
+        ) = core.fast_methods()
         self.time = core.time
         self.stop = core.stop
         self.is_running = core.is_running
@@ -333,6 +338,19 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     def _check_closed(self):
         if self._core.is_closed():
             raise RuntimeError("Event loop is closed")
+
+    def __del__(self, _warn=warnings.warn):
+        # base_events.BaseEventLoop.__del__: an unclosed loop is a resource
+        # leak worth hearing about, and closing it here releases its
+        # sockets and pending callbacks now instead of never. `_core` is
+        # read from the instance dict: __init__ may have failed before
+        # setting it.
+        core = self.__dict__.get("_core")
+        if core is None or core.is_closed():
+            return
+        _warn(f"unclosed event loop {self!r}", ResourceWarning, source=self)
+        if not core.is_running():
+            self.close()
 
     def set_debug(self, enabled):
         self._core.set_debug(bool(enabled))

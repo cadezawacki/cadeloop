@@ -23,9 +23,11 @@
 //! methods called from protocol callbacks re-enter the cell one call at a
 //! time.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap as HashMap;
 
 use cadeloop_core::backend::{is_cancelled_error, Completion, IoBackend, IoSlice, RawSocket};
 use cadeloop_core::buffers::{BufferPool, SizeClass, SlotId};
@@ -39,6 +41,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
 use crate::coreloop::CoreLoop;
+use crate::handles::Handle;
 use crate::http::HttpConn;
 
 /// R-035: cork flush threshold.
@@ -223,6 +226,30 @@ pub(crate) struct ListenerEntry {
     /// descriptor limit). Nothing is outstanding, so no completion can
     /// wake this listener again -- the next tick retries instead.
     starved: bool,
+    /// Earliest loop time (ns) at which a starved listener is retried.
+    retry_at: u64,
+}
+
+/// R-032: how soon a starved listener or datagram endpoint is retried
+/// after a refused POST. Nothing is outstanding to complete and wake us --
+/// that is what starved means -- so the retry needs a tick of its own. 50ms
+/// is short enough that recovery is prompt and long enough that a starved
+/// resource that cannot recover does not spin the CPU.
+pub(crate) const STARVED_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long a listener backs off after an accept that FAILED (asyncio's
+/// `constants.ACCEPT_RETRY_DELAY`). Re-posting at once turned descriptor
+/// exhaustion into a hot loop: every re-post failed inline again, so each
+/// tick logged another "Accept failed" and spent a core doing it, for as
+/// long as the process sat at its descriptor limit.
+pub(crate) const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// An accept failure that belongs to the connection being accepted (the
+/// client reset or went away first), not to the listener: retried at once,
+/// never reported. The epoll backend already retries these inside its own
+/// accept; this catches what IOCP reports from a failed AcceptEx.
+fn accept_error_is_transient(code: u32) -> bool {
+    cadeloop_core::backend::is_transient_accept_error(code)
 }
 
 /// R-058 datagram endpoint state (cached protocol callbacks, one
@@ -276,13 +303,16 @@ pub(crate) struct NetState {
     pub listeners: HashMap<u64, ListenerEntry>,
     next_id: u64,
     pub buffers: BufferPool,
-    pub readers: HashMap<RawSocket, Py<PyAny>>,
-    pub writers: HashMap<RawSocket, Py<PyAny>>,
+    pub readers: HashMap<RawSocket, Py<Handle>>,
+    pub writers: HashMap<RawSocket, Py<Handle>>,
     pub flush_list: Vec<u64>,
     /// Events awaiting phase-2 dispatch (outside the state cell).
     pub events: Vec<NetEvent>,
     /// Watch-callback handles to enqueue on the reactor ready queue.
-    pub ready_scratch: Vec<Py<PyAny>>,
+    pub ready_scratch: Vec<Py<Handle>>,
+    /// The reactor's cached time for the tick being translated (ns), so
+    /// completion handlers can schedule retries without a clock read.
+    pub now_ns: u64,
     /// Python refs & buffers to drop outside the cell (see gil_boundary).
     /// Buffers owned by cancelled-but-unreaped ops, keyed by op.
     pub reap_guards: HashMap<OpId, ReapGuard>,
@@ -299,6 +329,9 @@ pub(crate) struct NetState {
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
+    /// Watch handles the loop gave up (removed or displaced readers and
+    /// writers): released, then dropped, outside the cell.
+    pub graveyard_handles: Vec<Py<Handle>>,
     /// Sockets handed out by `get_extra_info("socket")`, awaiting an
     /// explicit `close()` outside the state cell (see drain_graveyards).
     pub graveyard_sockets: Vec<Py<PyAny>>,
@@ -351,6 +384,24 @@ impl NetState {
     pub(crate) fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Anything in the graveyards the tick drops in bulk? Lets it skip four
+    /// `mem::take`s (and the drop of four empty vectors) on the
+    /// overwhelmingly common tick that retired nothing.
+    #[inline]
+    pub(crate) fn has_graveyards(&self) -> bool {
+        !(self.graveyard_entries.is_empty()
+            && self.graveyard_bufs.is_empty()
+            && self.graveyard_py.is_empty()
+            && self.graveyard_protos.is_empty())
+    }
+
+    /// Graveyard entries that need more than a drop (sockets to close,
+    /// handles to release): only `drain_graveyards` handles these.
+    #[inline]
+    pub(crate) fn has_special_graveyards(&self) -> bool {
+        !(self.graveyard_sockets.is_empty() && self.graveyard_handles.is_empty())
     }
 
     /// Unix wall seconds derived from the reactor's cached monotonic clock.
@@ -1503,6 +1554,7 @@ pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: Listene
             target: target.max(1),
             closing: false,
             starved: false,
+            retry_at: 0,
         },
     );
     lid
@@ -1512,7 +1564,9 @@ pub(crate) fn listener_create(net: &mut NetState, sock: RawSocket, kind: Listene
 /// could be posted: a listener with nothing outstanding accepts nothing,
 /// ever, and returning "serving" for it hides the outage completely.
 pub(crate) fn listener_start(net: &mut NetState, backend: Backend<'_>, lid: u64) -> io::Result<()> {
-    post_accepts(net, backend, lid);
+    // Not reported: a listener that cannot post its first accept fails
+    // the call that started it, which is the report.
+    post_accepts_inner(net, backend, lid, false);
     match net.listeners.get(&lid) {
         Some(l) if l.accept_ops.is_empty() => {
             Err(io::Error::other("listener could not post its first accept"))
@@ -1524,20 +1578,34 @@ pub(crate) fn listener_start(net: &mut NetState, backend: Backend<'_>, lid: u64)
 /// Re-arm listeners whose accept pool ran dry on a transient failure.
 /// Driven from the tick, because a starved listener has no outstanding
 /// operation left to deliver the completion that would otherwise retry.
-pub(crate) fn retry_starved_listeners(net: &mut NetState, backend: Backend<'_>) {
+pub(crate) fn retry_starved_listeners(net: &mut NetState, backend: Backend<'_>, now_ns: u64) {
     if !net.any_starved_listener {
         return;
     }
-    let starved: Vec<u64> =
-        net.listeners.iter().filter(|(_, l)| l.starved && !l.closing).map(|(&lid, _)| lid).collect();
+    let mut waiting = false;
+    let starved: Vec<u64> = net
+        .listeners
+        .iter()
+        .filter(|(_, l)| l.starved && !l.closing)
+        .filter(|(_, l)| {
+            let due = l.retry_at <= now_ns;
+            waiting |= !due;
+            due
+        })
+        .map(|(&lid, _)| lid)
+        .collect();
     let starved_dgrams: Vec<u64> = net
         .datagrams
         .iter()
         .filter(|(_, e)| e.recv_starved && !e.closing && !e.conn_lost)
         .map(|(&did, _)| did)
         .collect();
-    net.any_starved_listener = false;
+    // Listeners still inside their backoff keep the flag up.
+    net.any_starved_listener = waiting;
     for lid in starved {
+        if let Some(l) = net.listeners.get_mut(&lid) {
+            l.starved = false;
+        }
         post_accepts(net, backend, lid);
     }
     for did in starved_dgrams {
@@ -1550,6 +1618,24 @@ pub(crate) fn retry_starved_listeners(net: &mut NetState, backend: Backend<'_>) 
             Err(_) => net.any_starved_listener = true, // try again next tick
         }
     }
+}
+
+/// How long the tick may park before a starved listener or datagram
+/// endpoint is due for its retry (`STARVED_RETRY_INTERVAL` at most).
+pub(crate) fn starved_retry_in(net: &NetState, now_ns: u64) -> Duration {
+    let soonest = net
+        .listeners
+        .values()
+        .filter(|l| l.starved && !l.closing)
+        .map(|l| l.retry_at.saturating_sub(now_ns))
+        .min()
+        .unwrap_or(0);
+    // Datagram endpoints carry no deadline of their own: they retry on the
+    // plain interval, as do listeners with nothing scheduled.
+    let any_dgram = net.datagrams.values().any(|e| e.recv_starved && !e.closing && !e.conn_lost);
+    let listener_wait = Duration::from_nanos(soonest).min(ACCEPT_RETRY_DELAY);
+    let wait = if any_dgram { listener_wait.min(STARVED_RETRY_INTERVAL) } else { listener_wait };
+    wait.max(Duration::from_millis(1))
 }
 
 pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u64) {
@@ -1574,6 +1660,10 @@ pub(crate) fn listener_teardown(net: &mut NetState, backend: Backend<'_>, lid: u
 }
 
 fn post_accepts(net: &mut NetState, backend: Backend<'_>, lid: u64) {
+    post_accepts_inner(net, backend, lid, true);
+}
+
+fn post_accepts_inner(net: &mut NetState, backend: Backend<'_>, lid: u64, report: bool) {
     loop {
         let Some(listener) = net.listeners.get_mut(&lid) else { return };
         if listener.closing || listener.accept_ops.len() >= listener.target {
@@ -1588,17 +1678,31 @@ fn post_accepts(net: &mut NetState, backend: Backend<'_>, lid: u64) {
                 l.starved = false;
                 net.ops.insert(op, OpTarget::Accept(lid));
             }
-            Err(_) => {
-                // Transient (a descriptor limit, say). With at least one
-                // accept still outstanding its completion retries this.
-                // With none, nothing ever would -- the listener would go
-                // permanently deaf while still reporting itself as
-                // serving -- so flag it for the tick to re-arm.
+            Err(e) => {
+                // With at least one accept still outstanding its completion
+                // retries this. With none, nothing ever would -- the
+                // listener would go permanently deaf while still reporting
+                // itself as serving -- so flag it for the tick to re-arm.
+                //
+                // WouldBlock is the pool being full (a backend that parks
+                // one accept per listener), not a failure. Anything else is
+                // the accept itself failing -- descriptor or memory
+                // exhaustion, most often -- which is reported once and
+                // retried after ACCEPT_RETRY_DELAY rather than on the next
+                // tick, where it would fail the same way again.
+                let failed = e.kind() != io::ErrorKind::WouldBlock;
+                let now = net.now_ns;
                 let l = net.listeners.get_mut(&lid).unwrap();
                 if l.accept_ops.is_empty() {
+                    let delay = if failed { ACCEPT_RETRY_DELAY } else { STARVED_RETRY_INTERVAL };
                     l.starved = true;
+                    l.retry_at = now.saturating_add(delay.as_nanos() as u64);
                     net.any_starved_listener = true;
                     net.stats_accept_starved += 1;
+                    if failed && report {
+                        let err = e.raw_os_error().map_or(5, |c| c as u32);
+                        net.events.push(NetEvent::AcceptError { err });
+                    }
                 }
                 return;
             }
@@ -1634,7 +1738,9 @@ pub(crate) fn translate(
                 // Before anything else, and before the `continue` below:
                 // the kernel is done with this op, so any buffers held
                 // back for it can finally be freed.
-                if let Some(guard) = net.reap_guards.remove(&op) {
+                if let Some(guard) =
+                    if net.reap_guards.is_empty() { None } else { net.reap_guards.remove(&op) }
+                {
                     match guard {
                         ReapGuard::Slot(slot) => {
                             net.buffers.release(slot);
@@ -2035,14 +2141,29 @@ fn on_accept_done(net: &mut NetState, backend: Backend<'_>, lid: u64, op: OpId, 
     listener.accept_ops.retain(|&o| o != op);
     let closing = listener.closing;
     if os_error != 0 {
-        if !closing {
-            if !is_cancelled_error(os_error) {
-                net.events.push(NetEvent::AcceptError { err: os_error });
-            }
+        if closing {
+            return;
+        }
+        if is_cancelled_error(os_error) || accept_error_is_transient(os_error) {
             // Re-arm even for an ABORTED completion: this op has left the
             // pool either way, and if it was the last one the listener
             // would otherwise stop accepting for good.
             post_accepts(net, backend, lid);
+            return;
+        }
+        // A real failure (descriptor or memory exhaustion, most often):
+        // report it once, and if this was the pool's last op, back off
+        // before re-posting -- see ACCEPT_RETRY_DELAY. Other ops still
+        // outstanding (IOCP posts a pool) carry on undisturbed.
+        net.events.push(NetEvent::AcceptError { err: os_error });
+        let now = net.now_ns;
+        if let Some(l) = net.listeners.get_mut(&lid) {
+            if l.accept_ops.is_empty() {
+                l.starved = true;
+                l.retry_at = now.saturating_add(ACCEPT_RETRY_DELAY.as_nanos() as u64);
+                net.any_starved_listener = true;
+                net.stats_accept_starved += 1;
+            }
         }
         return;
     }

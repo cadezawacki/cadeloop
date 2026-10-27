@@ -29,31 +29,58 @@ use cadeloop_core::netsys;
 use cadeloop_core::reactor::{Reactor, ReactorConfig};
 use cadeloop_core::ready::CrossThreadQueue;
 use cadeloop_core::time::{secs_f64_to_ticks, ticks_to_secs_f64, Ticks};
-use cadeloop_core::timer::TimerToken;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PySystemExit, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::gil_boundary::StateCell;
-use crate::handles::{run_handle, DispatchOutcome, Handle, TimerHandle};
+use crate::handles::{run_handle, CallArgs, DispatchOutcome, Handle, HandleRef, TimerHandle};
 use crate::net::{self, NetEvent, NetState, Transport};
 use crate::taskfast;
 
 pub(crate) struct LoopState {
-    pub reactor: Reactor<Py<PyAny>>,
+    pub reactor: Reactor<HandleRef>,
     pub net: NetState,
     /// Scratch for per-tick completion copies (reused, no per-tick alloc).
     completions_scratch: Vec<cadeloop_core::backend::Completion>,
 }
 
+impl Drop for LoopState {
+    /// A loop deallocated without `close()` still owns pending handles.
+    /// Drain them through the normal path -- which marks every timer
+    /// unscheduled, so a `TimerHandle` the application kept never touches
+    /// the cancel counter this drop frees -- and release their references,
+    /// so none of them is left holding a cycle (handles.rs module docs).
+    fn drop(&mut self) {
+        let mut pending: Vec<HandleRef> = self.reactor.clear_pending();
+        pending.extend(std::mem::take(&mut self.net.ready_scratch).into_iter().map(HandleRef));
+        pending.extend(self.net.readers.drain().map(|(_, h)| HandleRef(h)));
+        pending.extend(self.net.writers.drain().map(|(_, h)| HandleRef(h)));
+        if pending.is_empty() {
+            return;
+        }
+        // Reached from the owning CoreLoop's tp_dealloc, which runs
+        // attached; `attach` then takes its already-attached fast path.
+        Python::attach(|py| {
+            for h in &pending {
+                h.get().release(py);
+            }
+            drop(pending);
+        });
+    }
+}
+
 #[pyclass(frozen, module = "cadeloop._core")]
 pub struct CoreLoop {
     state: StateCell<LoopState>,
-    xqueue: Arc<CrossThreadQueue<Py<PyAny>>>,
+    xqueue: Arc<CrossThreadQueue<HandleRef>>,
     waker: Arc<dyn Wakeup>,
+    /// Shared with the reactor: cancellations of still-scheduled timers,
+    /// absorbed into the heap's tombstone accounting each tick.
     timer_cancels: Arc<AtomicUsize>,
     closed: AtomicBool,
     stopping: AtomicBool,
@@ -61,7 +88,10 @@ pub struct CoreLoop {
     /// `loop.time()` cache, updated once per tick (R-061), readable from
     /// any thread without touching loop state.
     cached_time_ns: AtomicU64,
-    /// Tick counter for the throttled signal check.
+    /// Tick counter for the throttled signal check. Loop-thread only:
+    /// advanced with a plain load + store, never a locked `fetch_add` (an
+    /// atomic RMW on every tick was the single hottest instruction of a
+    /// pure-scheduling tick).
     tick_no: AtomicU64,
     /// Facade hook: `(handle, exception) -> None` for callback errors.
     error_hook: OnceLock<Py<PyAny>>,
@@ -146,7 +176,7 @@ impl CoreLoop {
     /// Exclusive access to (net, reactor) — see gil_boundary contract.
     pub(crate) fn with_net<R>(
         &self,
-        f: impl FnOnce(&mut NetState, &mut Reactor<Py<PyAny>>) -> R,
+        f: impl FnOnce(&mut NetState, &mut Reactor<HandleRef>) -> R,
     ) -> PyResult<R> {
         self.state.with(|st| f(&mut st.net, &mut st.reactor))
     }
@@ -157,7 +187,7 @@ impl CoreLoop {
 
     /// Drop graveyarded Python refs / buffers outside the state cell.
     pub(crate) fn drain_graveyards(&self, py: Python<'_>) -> PyResult<()> {
-        let (entries, bufs, pys, protos, timers, socks) = self.state.with(|st| {
+        let (entries, bufs, pys, protos, timers, socks, handles) = self.state.with(|st| {
             (
                 std::mem::take(&mut st.net.graveyard_entries),
                 std::mem::take(&mut st.net.graveyard_bufs),
@@ -165,8 +195,14 @@ impl CoreLoop {
                 std::mem::take(&mut st.net.graveyard_protos),
                 st.reactor.take_graveyard(),
                 std::mem::take(&mut st.net.graveyard_sockets),
+                std::mem::take(&mut st.net.graveyard_handles),
             )
         })?;
+        // Watch handles the loop no longer owns give up their references
+        // first (handles.rs module docs).
+        for h in &handles {
+            h.get().release(py);
+        }
         // Sockets handed out by `get_extra_info("socket")` are CLOSED, not
         // merely dropped. Each holds its own duplicate of the connection,
         // and a duplicate is another owner: if the application kept the
@@ -176,7 +212,7 @@ impl CoreLoop {
         for sock in &socks {
             let _ = sock.call_method0(py, intern!(py, "close"));
         }
-        drop((entries, bufs, pys, protos, timers, socks));
+        drop((entries, bufs, pys, protos, timers, socks, handles));
         Ok(())
     }
 
@@ -204,11 +240,11 @@ impl CoreLoop {
     /// user's own handler chose to surface. Anything else the hook call
     /// raises stays non-fatal (the facade already fell back to the
     /// default handler internally before letting it escape).
-    fn hook_error_verdict(&self, py: Python<'_>, e: PyErr, ctx: Option<&Py<PyAny>>) -> PyResult<()> {
+    fn hook_error_verdict(&self, py: Python<'_>, e: PyErr, ctx: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         if e.is_instance_of::<PyKeyboardInterrupt>(py) || e.is_instance_of::<PySystemExit>(py) {
             return Err(e);
         }
-        e.write_unraisable(py, ctx.map(|c| c.bind(py)));
+        e.write_unraisable(py, ctx);
         Ok(())
     }
 
@@ -226,14 +262,14 @@ impl CoreLoop {
         }
     }
 
-    fn report_failure(&self, py: Python<'_>, handle: &Py<PyAny>, err: PyErr) -> PyResult<()> {
+    fn report_failure(&self, py: Python<'_>, handle: &Bound<'_, PyAny>, err: PyErr) -> PyResult<()> {
         match self.error_hook.get() {
             Some(hook) => match hook.call1(py, (handle, err.value(py))) {
                 Ok(_) => Ok(()),
                 Err(hook_err) => self.hook_error_verdict(py, hook_err, Some(handle)),
             },
             None => {
-                err.write_unraisable(py, Some(handle.bind(py)));
+                err.write_unraisable(py, Some(handle));
                 Ok(())
             }
         }
@@ -244,7 +280,7 @@ impl CoreLoop {
         &self,
         py: Python<'_>,
         callback: &Bound<'_, PyAny>,
-        args: &Bound<'_, PyTuple>,
+        args: CallArgs,
         context: Option<&Bound<'_, PyAny>>,
         method: &str,
     ) -> PyResult<Handle> {
@@ -272,7 +308,7 @@ impl CoreLoop {
             Some(c) if !c.is_none() => c.clone().unbind(),
             _ => copy_context(py)?,
         };
-        Ok(Handle::new(callback.clone().unbind(), args.clone().unbind(), context))
+        Handle::new(py, callback.clone().unbind(), args, context, self.debug.load(Ordering::Relaxed))
     }
 
     /// Flush transports whose writes were corked (R-035). Returns pending
@@ -294,199 +330,220 @@ impl CoreLoop {
     /// translate + batch-take all under a single claim. rloop's tick
     /// anatomy showed the per-tick claim/release rounds are what a
     /// queue-depth-1 chain actually benchmarks.
-    fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>) -> PyResult<()> {
+    ///
+    /// `batch` is the dispatch buffer, owned by `run_forever`'s frame and
+    /// empty between ticks. It used to live in a `thread_local!`, which in
+    /// a cdylib is a `__tls_get_addr` call on every tick.
+    fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>, batch: &mut Vec<HandleRef>) -> PyResult<()> {
         let stopping = self.stopping.load(Ordering::Acquire);
-        DISPATCH_BUF.with_borrow_mut(|batch| -> PyResult<()> {
-            debug_assert!(batch.is_empty());
-            type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Graveyards);
-            let (poll_result, parked, events, graveyard): TickOut = self.state.with(|st| {
-                // Phase 1: flush corked writes from last tick's callbacks.
-                if !st.net.flush_list.is_empty() {
-                    let list = std::mem::take(&mut st.net.flush_list);
-                    for tid in list {
-                        net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
-                    }
+        debug_assert!(batch.is_empty());
+        type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Option<Graveyards>, bool);
+        let (poll_result, parked, events, graveyard, special): TickOut = self.state.with(|st| {
+            // Phase 1: flush corked writes from last tick's callbacks.
+            if !st.net.flush_list.is_empty() {
+                let list = std::mem::take(&mut st.net.flush_list);
+                for tid in list {
+                    net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
                 }
-                st.reactor.prepare_tick();
+            }
+            st.reactor.prepare_tick();
+            self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
+            let timeout = if stopping || !st.net.events.is_empty() {
+                Duration::ZERO
+            } else if st.net.any_starved_listener {
+                // R-032: a starved listener or datagram endpoint has
+                // NO operation outstanding -- that is what starved
+                // means -- so nothing will ever complete to wake this
+                // park. Without a bound the loop sleeps until some
+                // unrelated event arrives, and on an idle server that
+                // is never: the resource stays deaf even after
+                // whatever exhausted the system has recovered.
+                st.reactor.poll_timeout().min(net::starved_retry_in(&st.net, st.reactor.time_cached()))
+            } else {
+                st.reactor.poll_timeout()
+            };
+            let reactor = &mut st.reactor;
+            let (poll_result, parked) = if timeout.is_zero() {
+                // Non-blocking reap: keeping the GIL is legal (nothing
+                // can block) and skips a save/restore of thread state.
+                (reactor.poll(timeout), false)
+            } else {
+                // R-021: the only GIL release point; sound because
+                // `claim` guarantees no other thread enters this state.
+                (py.detach(move || reactor.poll(timeout)), true)
+            };
+            if poll_result.is_err() {
+                return (poll_result, parked, Vec::new(), None, false);
+            }
+            // Phase 2: translate completions (no Python execution).
+            st.reactor.finish_poll_after(parked);
+            if parked {
                 self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
-                let timeout = if stopping || !st.net.events.is_empty() {
-                    Duration::ZERO
-                } else if st.net.any_starved_listener {
-                    // R-032: a starved listener or datagram endpoint has
-                    // NO operation outstanding -- that is what starved
-                    // means -- so nothing will ever complete to wake this
-                    // park. Without a bound the loop sleeps until some
-                    // unrelated event arrives, and on an idle server that
-                    // is never: the resource stays deaf even after
-                    // whatever exhausted the system has recovered.
-                    st.reactor.poll_timeout().min(STARVED_RETRY_INTERVAL)
-                } else {
-                    st.reactor.poll_timeout()
-                };
-                let reactor = &mut st.reactor;
-                let (poll_result, parked) = if timeout.is_zero() {
-                    // Non-blocking reap: keeping the GIL is legal (nothing
-                    // can block) and skips a save/restore of thread state.
-                    (reactor.poll(timeout), false)
-                } else {
-                    // R-021: the only GIL release point; sound because
-                    // `claim` guarantees no other thread enters this state.
-                    (py.detach(move || reactor.poll(timeout)), true)
-                };
-                if poll_result.is_err() {
-                    return (
-                        poll_result,
-                        parked,
-                        Vec::new(),
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                    );
-                }
-                // Phase 2: translate completions (no Python execution).
-                st.reactor.finish_poll_after(parked);
-                if parked {
-                    self.cached_time_ns.store(st.reactor.time_cached(), Ordering::Release);
-                }
-                let mut comps = std::mem::take(&mut st.completions_scratch);
-                st.reactor.drain_completions(&mut comps);
-                if !comps.is_empty() {
-                    net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
-                    comps.clear();
-                }
-                // A listener whose accept pool ran dry on a transient
-                // failure has no completion left to retry it (R-032) --
-                // which is exactly why this cannot live inside the
-                // completions branch. On an otherwise idle loop no
-                // completion ever arrives, so gating the retry on one left
-                // the listener deaf for good. Cheap when nothing is
-                // starved: one bool load and return.
-                net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut());
-                st.completions_scratch = comps;
-                // Readiness watch callbacks join the ordinary ready queue.
-                if !st.net.ready_scratch.is_empty() {
-                    let ready: Vec<Py<PyAny>> = std::mem::take(&mut st.net.ready_scratch);
-                    for h in ready {
-                        st.reactor.push_ready(h);
-                    }
-                }
-                let events = std::mem::take(&mut st.net.events);
-                if events.is_empty() {
-                    // Pure-scheduling tick: take the dispatch batch in the
-                    // SAME cell entry (batch_left was snapshotted by
-                    // prepare_tick, so semantics match a later take).
-                    while let Some(token) = st.reactor.pop_ready_batched() {
-                        batch.push(token);
-                    }
-                }
-                (Ok(()), parked, events, take_graveyards(st))
-            })?;
-            drop(graveyard);
-            poll_result?;
-
-            // Ctrl-C responsiveness: a parked poll returns promptly on
-            // EINTR, so check right after it; busy ticks check every 64th
-            // tick instead of paying the call per tick. The batch may
-            // already be filled — hand tokens back (front, reverse order)
-            // so an interrupt loses nothing and preserves FIFO.
-            let tick_no = self.tick_no.fetch_add(1, Ordering::Relaxed);
-            if parked || tick_no & 63 == 0 {
-                let interrupted = unsafe { ffi::PyErr_CheckSignals() != 0 };
-                if interrupted {
-                    let err = PyErr::fetch(py);
-                    if !batch.is_empty() {
-                        self.state.with(|st| {
-                            for token in batch.drain(..).rev() {
-                                st.reactor.unpop_ready(token);
-                            }
-                        })?;
-                    }
-                    return Err(err);
+            }
+            st.net.now_ns = st.reactor.time_cached();
+            let mut comps = std::mem::take(&mut st.completions_scratch);
+            st.reactor.drain_completions(&mut comps);
+            if !comps.is_empty() {
+                net::translate(py, &mut st.net, st.reactor.backend_mut(), &comps);
+                comps.clear();
+            }
+            // A listener whose accept pool ran dry on a transient
+            // failure has no completion left to retry it (R-032) --
+            // which is exactly why this cannot live inside the
+            // completions branch. On an otherwise idle loop no
+            // completion ever arrives, so gating the retry on one left
+            // the listener deaf for good. Cheap when nothing is
+            // starved: one bool load and return.
+            let now = st.reactor.time_cached();
+            net::retry_starved_listeners(&mut st.net, st.reactor.backend_mut(), now);
+            st.completions_scratch = comps;
+            // Readiness watch callbacks join the ordinary ready queue.
+            if !st.net.ready_scratch.is_empty() {
+                for h in std::mem::take(&mut st.net.ready_scratch) {
+                    st.reactor.push_ready(HandleRef(h));
                 }
             }
-
-            // Phases 3-5 only exist when network events fired: dispatch
-            // protocol callbacks, flush the writes they corked (same tick,
-            // R-035), then dispatch teardowns produced by that flush.
-            if !events.is_empty() {
-                net::dispatch_events(py, slf, events)?;
-                let events = self.flush_corked(py)?;
-                self.drain_graveyards(py)?;
-                if !events.is_empty() {
-                    net::dispatch_events(py, slf, events)?;
-                }
-                // The batch was not taken in-cell on this path.
-                self.state.with(|st| {
-                    while let Some(token) = st.reactor.pop_ready_batched() {
-                        batch.push(token);
-                    }
-                })?;
-            }
-
-            // Phase 6: ready-callback batch (R-054); the buffer lives in
-            // loop-thread TLS and is always emptied before being parked —
-            // a fatal error (KeyboardInterrupt/SystemExit from a callback)
-            // returns the undispatched tail to the queue front so nothing
-            // is lost and FIFO order holds across the unwind.
-            let debug = self.debug.load(Ordering::Relaxed);
-            let mut fatal: Option<(usize, PyErr)> = None;
-            for (idx, token) in batch.iter().enumerate() {
-                let started = debug.then(std::time::Instant::now);
-                match run_handle(py, token.bind(py)) {
-                    Ok(DispatchOutcome::Done) => {}
-                    Ok(DispatchOutcome::Failed(err)) => {
-                        // A fatal raise from the hook unwinds exactly like
-                        // one from the callback itself: the undispatched
-                        // tail goes back to the queue front below.
-                        if let Err(e) = self.report_failure(py, token, err) {
-                            fatal = Some((idx, e));
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        fatal = Some((idx, e));
-                        break;
-                    }
-                }
-                if let Some(started) = started {
-                    let elapsed = started.elapsed();
-                    if elapsed.as_nanos() as u64 > self.slow_callback_ns.load(Ordering::Relaxed) {
-                        if let Some(hook) = self.slow_callback_hook.get() {
-                            if let Err(e) = hook.call1(py, (&token, elapsed.as_secs_f64())) {
-                                e.write_unraisable(py, Some(token.bind(py)));
-                            }
-                        }
-                    }
+            let events = std::mem::take(&mut st.net.events);
+            if events.is_empty() {
+                // Pure-scheduling tick: take the dispatch batch in the
+                // SAME cell entry (batch_left was snapshotted by
+                // prepare_tick, so semantics match a later take).
+                while let Some(token) = st.reactor.pop_ready_batched() {
+                    batch.push(token);
                 }
             }
-            if let Some((idx, err)) = fatal {
-                // idx ran (and raised); everything after it goes back.
-                if idx + 1 < batch.len() {
+            let graveyard = if st.net.has_graveyards() || st.reactor.has_graveyard() {
+                Some(take_graveyards(st))
+            } else {
+                None
+            };
+            (Ok(()), parked, events, graveyard, st.net.has_special_graveyards())
+        })?;
+        drop(graveyard);
+        poll_result?;
+        if special && events.is_empty() {
+            // The event path drains these itself after dispatch.
+            self.drain_graveyards(py)?;
+        }
+
+        // Ctrl-C responsiveness: a parked poll returns promptly on
+        // EINTR, so check right after it; busy ticks check every 64th
+        // tick instead of paying the call per tick. The batch may
+        // already be filled — hand tokens back (front, reverse order)
+        // so an interrupt loses nothing and preserves FIFO.
+        let tick_no = self.tick_no.load(Ordering::Relaxed);
+        self.tick_no.store(tick_no.wrapping_add(1), Ordering::Relaxed);
+        if parked || tick_no & 63 == 0 {
+            let interrupted = unsafe { ffi::PyErr_CheckSignals() != 0 };
+            if interrupted {
+                let err = PyErr::fetch(py);
+                if !batch.is_empty() {
                     self.state.with(|st| {
-                        for token in batch.drain(idx + 1..).rev() {
+                        for token in batch.drain(..).rev() {
                             st.reactor.unpop_ready(token);
                         }
                     })?;
                 }
-                batch.clear();
                 return Err(err);
             }
-            batch.clear();
-            Ok(())
-        })
+        }
+
+        // Phases 3-5 only exist when network events fired: dispatch
+        // protocol callbacks, flush the writes they corked (same tick,
+        // R-035), then dispatch teardowns produced by that flush.
+        if !events.is_empty() {
+            net::dispatch_events(py, slf, events)?;
+            let events = self.flush_corked(py)?;
+            self.drain_graveyards(py)?;
+            if !events.is_empty() {
+                net::dispatch_events(py, slf, events)?;
+            }
+            // The batch was not taken in-cell on this path.
+            self.state.with(|st| {
+                while let Some(token) = st.reactor.pop_ready_batched() {
+                    batch.push(token);
+                }
+            })?;
+        }
+
+        // Phase 6: ready-callback batch (R-054). A fatal error
+        // (KeyboardInterrupt/SystemExit from a callback) returns the
+        // undispatched tail to the queue front so nothing is lost and FIFO
+        // order holds across the unwind.
+        let debug = self.debug.load(Ordering::Relaxed);
+        let mut fatal: Option<(usize, PyErr)> = None;
+        for (idx, token) in batch.iter().enumerate() {
+            let started = debug.then(std::time::Instant::now);
+            match run_handle(py, token.get()) {
+                Ok(DispatchOutcome::Done) => {}
+                Ok(DispatchOutcome::Failed(err)) => {
+                    // A fatal raise from the hook unwinds exactly like
+                    // one from the callback itself: the undispatched
+                    // tail goes back to the queue front below.
+                    if let Err(e) = self.report_failure(py, token.0.bind(py).as_any(), err) {
+                        fatal = Some((idx, e));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    fatal = Some((idx, e));
+                    break;
+                }
+            }
+            if let Some(started) = started {
+                let elapsed = started.elapsed();
+                if elapsed.as_nanos() as u64 > self.slow_callback_ns.load(Ordering::Relaxed) {
+                    if let Some(hook) = self.slow_callback_hook.get() {
+                        if let Err(e) = hook.call1(py, (&token.0, elapsed.as_secs_f64())) {
+                            e.write_unraisable(py, Some(token.0.bind(py).as_any()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((idx, err)) = fatal {
+            // idx ran (and raised); everything after it goes back.
+            if idx + 1 < batch.len() {
+                self.state.with(|st| {
+                    for token in batch.drain(idx + 1..).rev() {
+                        st.reactor.unpop_ready(token);
+                    }
+                })?;
+            }
+            release_batch(py, batch);
+            return Err(err);
+        }
+        release_batch(py, batch);
+        Ok(())
     }
 }
 
-thread_local! {
-    /// Reusable dispatch buffer (loop thread only; empty between ticks).
-    static DISPATCH_BUF: std::cell::RefCell<Vec<Py<PyAny>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// Release and drop every handle in a dispatched batch.
+///
+/// One-shot handles give up their callback, arguments and context here
+/// (handles.rs module docs); readiness watches keep theirs. The drops are
+/// straight `Py_DECREF`s: we are on the loop thread inside `run_forever`,
+/// attached by construction, so `Py::drop`'s per-object thread-local
+/// "am I attached?" probe (a `__tls_get_addr` call in a cdylib) buys
+/// nothing here.
+#[inline]
+fn release_batch(py: Python<'_>, batch: &mut Vec<HandleRef>) {
+    for token in batch.drain(..) {
+        token.get().release_after_dispatch(py);
+        // SAFETY: attached (see above); into_ptr transfers our reference.
+        unsafe { ffi::Py_DECREF(token.into_ptr()) };
+    }
 }
 
+/// What the tick moves out of the cell to drop. `graveyard_sockets` and
+/// `graveyard_handles` are not here: both need work beyond a drop (an
+/// explicit close, a reference release), which `drain_graveyards` does.
 type Graveyards = (
     Vec<crate::net::TransportEntry>,
     Vec<crate::net::WriteBuf>,
     Vec<Py<PyAny>>,
     Vec<crate::net::ProtoKind>,
-    Vec<Py<PyAny>>,
+    Vec<HandleRef>,
 );
 
 fn take_graveyards(st: &mut LoopState) -> Graveyards {
@@ -509,13 +566,6 @@ fn take_graveyards(st: &mut LoopState) -> Graveyards {
 /// asyncio.iscoroutinefunction does — the common mistake (passing an
 /// `async def` function or bound method directly) is what this catches.
 const CO_COROUTINE: i32 = 0x80;
-
-/// R-032: upper bound on the park while a listener or datagram endpoint
-/// is starved. Nothing is outstanding to complete and wake us -- that is
-/// what starved means -- so the retry needs a tick of its own. 50ms is
-/// short enough that recovery is prompt and long enough that a starved
-/// resource that cannot recover does not spin the CPU.
-const STARVED_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 fn is_coroutine_function(py: Python<'_>, callback: &Bound<'_, PyAny>) -> bool {
     let Ok(code) = callback.getattr(intern!(py, "__code__")) else { return false };
@@ -562,7 +612,7 @@ impl CoreLoop {
             backend_opts: cadeloop_core::backend::BackendOptions { rio_cq_size, rio_rq_recv, rio_rq_send },
             ..Default::default()
         };
-        let reactor: Reactor<Py<PyAny>> = Reactor::new(cfg)?;
+        let reactor: Reactor<HandleRef> = Reactor::new(cfg)?;
         let (xqueue, waker) = reactor.cross_thread_handles();
         let timer_cancels = reactor.timer_cancel_counter();
         Ok(CoreLoop {
@@ -597,8 +647,9 @@ impl CoreLoop {
         let this = slf.get();
         this.check_closed()?;
         let guard = this.state.claim()?;
+        let mut batch: Vec<HandleRef> = Vec::with_capacity(cadeloop_core::ready::DISPATCH_BATCH);
         let result = loop {
-            match this.tick(slf, py) {
+            match this.tick(slf, py, &mut batch) {
                 Err(e) => break Err(e),
                 Ok(()) => {
                     if this.stopping.load(Ordering::Acquire) {
@@ -635,7 +686,7 @@ impl CoreLoop {
         // R-122 "close with pending ops": tear down every live connection
         // and listener (cancels in-flight kernel ops), then drop all
         // pending work outside the cell.
-        let (pending, events) = self.state.with(|st| {
+        let (handles, py_refs, net_events) = self.state.with(|st| {
             let tids: Vec<u64> = st.net.transports.keys().copied().collect();
             for tid in tids {
                 net::teardown(&mut st.net, st.reactor.backend_mut(), tid, None);
@@ -656,8 +707,9 @@ impl CoreLoop {
             // above, so they would keep their futures, buffers and (for
             // connect) an open socket alive for the closed core's
             // lifetime.
-            let mut dropped: Vec<Py<PyAny>> =
+            let dropped_py: Vec<Py<PyAny>> =
                 net::cancel_standalone_ops(&mut st.net, st.reactor.backend_mut());
+            let mut dropped: Vec<HandleRef> = Vec::new();
             // R-073 reap guards: the sweeps above could not free the
             // buffers of the ops they cancelled, because the kernel may
             // still own them until each op's completion is dequeued -- and
@@ -667,22 +719,26 @@ impl CoreLoop {
             // living as long as anything still references the dead loop.
             net::reap_at_close(py, &mut st.net, st.reactor.backend_mut());
             dropped.extend(st.reactor.clear_pending());
-            dropped.extend(std::mem::take(&mut st.net.ready_scratch));
+            dropped.extend(std::mem::take(&mut st.net.ready_scratch).into_iter().map(HandleRef));
             for (_, h) in st.net.readers.drain() {
-                dropped.push(h);
+                dropped.push(HandleRef(h));
             }
             for (_, h) in st.net.writers.drain() {
-                dropped.push(h);
+                dropped.push(HandleRef(h));
             }
             // ADR-5: NetEvent variants OWN Python references. Clearing the
             // vector here would decref them while `with` holds the exclusive
             // &mut, and a finalizer reached by one of those decrefs can
             // re-enter the loop and alias the state. Move them out and drop
             // after leaving the cell, exactly as the tick path does.
-            (dropped, std::mem::take(&mut st.net.events))
+            (dropped, dropped_py, std::mem::take(&mut st.net.events))
         })?;
-        drop(pending);
-        drop(events);
+        for h in &handles {
+            h.get().release(py);
+        }
+        drop(handles);
+        drop(py_refs);
+        drop(net_events);
         self.drain_graveyards(py)?;
         Ok(())
     }
@@ -704,11 +760,9 @@ impl CoreLoop {
         context: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle = self.make_handle(py, &callback, &args, context.as_ref(), "call_soon")?;
-        let handle = Py::new(py, handle)?;
-        let token: Py<PyAny> = handle.clone_ref(py).into_any();
-        self.state.with(move |st| st.reactor.push_ready(token))?;
-        Ok(handle)
+        let handle =
+            self.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_soon")?;
+        self.enqueue_soon(py, handle)
     }
 
     /// Thread-safe variant (R-022): lock-free queue push + single wakeup.
@@ -721,12 +775,14 @@ impl CoreLoop {
         context: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle = self.make_handle(py, &callback, &args, context.as_ref(), "call_soon_threadsafe")?;
-        let handle = Py::new(py, handle)?;
-        if self.xqueue.push(handle.clone_ref(py).into_any()) {
-            self.waker.wake();
-        }
-        Ok(handle)
+        let handle = self.make_handle(
+            py,
+            &callback,
+            CallArgs::from_tuple(&args),
+            context.as_ref(),
+            "call_soon_threadsafe",
+        )?;
+        self.enqueue_threadsafe(py, handle)
     }
 
     #[pyo3(signature = (delay, callback, *args, context=None))]
@@ -738,9 +794,12 @@ impl CoreLoop {
         args: Bound<'_, PyTuple>,
         context: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<TimerHandle>> {
-        let now = self.now_ns()?;
-        let deadline = if delay <= 0.0 { now } else { now.saturating_add(secs_f64_to_ticks(delay)) };
-        self.schedule_timer(py, deadline, callback, args, context)
+        let this = self;
+        this.check_closed()?;
+        let (deadline, when) = this.later_deadline(delay)?;
+        let base =
+            this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_later")?;
+        this.schedule_timer(py, deadline, when, base)
     }
 
     #[pyo3(signature = (when, callback, *args, context=None))]
@@ -752,7 +811,38 @@ impl CoreLoop {
         args: Bound<'_, PyTuple>,
         context: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<TimerHandle>> {
-        self.schedule_timer(py, secs_f64_to_ticks(when), callback, args, context)
+        let this = self;
+        this.check_closed()?;
+        let base =
+            this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_at")?;
+        this.schedule_timer(py, secs_f64_to_ticks(when), when, base)
+    }
+
+    /// The scheduling fast paths as builtin functions bound to this core:
+    /// `(call_soon, call_soon_threadsafe, call_later, call_at)`.
+    ///
+    /// Same names, signatures and semantics as the methods above, but
+    /// entered through a raw METH_FASTCALL function that reads its
+    /// arguments straight off the vectorcall array: no generic argument
+    /// extraction, and no `*args` tuple built per call only to be unpacked
+    /// again at dispatch. The facade binds these onto the loop instance,
+    /// which is where asyncio's C Task and Future look `call_soon` up on
+    /// every step and every done-callback.
+    fn fast_methods<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        let py = slf.py();
+        let mut out = Vec::with_capacity(FAST_DEFS.0.len());
+        for def in FAST_DEFS.0.iter() {
+            // SAFETY: `def` lives in a static (stable address, never
+            // freed); PyCFunction_NewEx takes a new reference to `slf`.
+            let f = unsafe {
+                ffi::PyCFunction_NewEx(std::ptr::from_ref(def).cast_mut(), slf.as_ptr(), std::ptr::null_mut())
+            };
+            if f.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            out.push(unsafe { Bound::from_owned_ptr(py, f) });
+        }
+        PyTuple::new(py, out)
     }
 
     // ---- TCP (M1) --------------------------------------------------------
@@ -1315,9 +1405,10 @@ impl CoreLoop {
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle = self.make_handle(py, &callback, &args, None, "add_reader")?;
+        let handle =
+            self.make_handle(py, &callback, CallArgs::from_tuple(&args), None, "add_reader")?.persistent();
         let handle = Py::new(py, handle)?;
-        let token: Py<PyAny> = handle.clone_ref(py).into_any();
+        let token: Py<Handle> = handle.clone_ref(py);
         let sock = fd as RawSocket;
         self.with_net(|net, reactor| -> std::io::Result<()> {
             let displaced = net.readers.insert(sock, token);
@@ -1333,12 +1424,12 @@ impl CoreLoop {
                     None => net.readers.remove(&sock),
                 };
                 if let Some(h) = ours {
-                    net.graveyard_py.push(h);
+                    net.graveyard_handles.push(h);
                 }
                 return Err(e);
             }
             if let Some(old) = displaced {
-                net.graveyard_py.push(old);
+                net.graveyard_handles.push(old);
             }
             Ok(())
         })??;
@@ -1359,14 +1450,14 @@ impl CoreLoop {
                     // event finds no handler.
                     if let Some(h) = removed {
                         if let Some(newer) = net.readers.insert(sock, h) {
-                            net.graveyard_py.push(newer);
+                            net.graveyard_handles.push(newer);
                         }
                     }
                     return Err(e);
                 }
             }
             if let Some(h) = removed {
-                net.graveyard_py.push(h);
+                net.graveyard_handles.push(h);
             }
             Ok(had)
         })??;
@@ -1383,9 +1474,10 @@ impl CoreLoop {
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle = self.make_handle(py, &callback, &args, None, "add_writer")?;
+        let handle =
+            self.make_handle(py, &callback, CallArgs::from_tuple(&args), None, "add_writer")?.persistent();
         let handle = Py::new(py, handle)?;
-        let token: Py<PyAny> = handle.clone_ref(py).into_any();
+        let token: Py<Handle> = handle.clone_ref(py);
         let sock = fd as RawSocket;
         self.with_net(|net, reactor| -> std::io::Result<()> {
             let displaced = net.writers.insert(sock, token);
@@ -1397,12 +1489,12 @@ impl CoreLoop {
                     None => net.writers.remove(&sock),
                 };
                 if let Some(h) = ours {
-                    net.graveyard_py.push(h);
+                    net.graveyard_handles.push(h);
                 }
                 return Err(e);
             }
             if let Some(old) = displaced {
-                net.graveyard_py.push(old);
+                net.graveyard_handles.push(old);
             }
             Ok(())
         })??;
@@ -1421,14 +1513,14 @@ impl CoreLoop {
                     // Same restore as remove_reader: see the note there.
                     if let Some(h) = removed {
                         if let Some(newer) = net.writers.insert(sock, h) {
-                            net.graveyard_py.push(newer);
+                            net.graveyard_handles.push(newer);
                         }
                     }
                     return Err(e);
                 }
             }
             if let Some(h) = removed {
-                net.graveyard_py.push(h);
+                net.graveyard_handles.push(h);
             }
             Ok(had)
         })??;
@@ -1502,13 +1594,49 @@ impl CoreLoop {
     /// visited. Under-reporting in `tp_traverse` costs at most a missed
     /// collection, never a premature free -- and by the time a loop is
     /// garbage, `close()` has already emptied the cell.
+    ///
+    /// Pending handles' references are reported too, as the loop's own:
+    /// handles are not GC-tracked (handles.rs module docs), so a loop that
+    /// is dropped without `close()` while a timer's callback references the
+    /// loop -- `self.loop = loop; self.h = loop.call_later(...)` -- forms a
+    /// cycle the collector could otherwise never see. Only while the state
+    /// is quiescent (`peek_for_gc`); `__clear__` then breaks the cycle.
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         for slot in [&self.owner, &self.error_hook, &self.net_error_hook, &self.slow_callback_hook] {
             if let Some(obj) = slot.get() {
                 visit.call(obj)?;
             }
         }
+        if let Some(st) = self.state.peek_for_gc() {
+            for h in st.reactor.pending_iter() {
+                h.get().visit_refs(&visit)?;
+            }
+            for h in st.net.readers.values().chain(st.net.writers.values()) {
+                h.get().visit_refs(&visit)?;
+            }
+        }
         Ok(())
+    }
+
+    /// The cycle collector found this loop garbage: give up every pending
+    /// handle's references, which is what breaks a cycle running through
+    /// them (see `__traverse__`).
+    fn __clear__(&self, py: Python<'_>) {
+        if self.state.is_claimed() {
+            return;
+        }
+        let Ok(handles) = self.state.with(|st| {
+            let mut out: Vec<HandleRef> = st.reactor.clear_pending();
+            out.extend(st.net.readers.drain().map(|(_, h)| HandleRef(h)));
+            out.extend(st.net.writers.drain().map(|(_, h)| HandleRef(h)));
+            out
+        }) else {
+            return;
+        };
+        for h in &handles {
+            h.get().release(py);
+        }
+        drop(handles);
     }
 
     // ---- hooks / config ----------------------------------------------------
@@ -1623,25 +1751,52 @@ impl CoreLoop {
 }
 
 impl CoreLoop {
+    /// `deadline_ns` drives the heap; `when` is what `TimerHandle.when()`
+    /// reports -- the caller's own float, as asyncio returns it, rather
+    /// than the deadline rounded through integer nanoseconds and back.
     fn schedule_timer(
         &self,
         py: Python<'_>,
         deadline_ns: Ticks,
-        callback: Bound<'_, PyAny>,
-        args: Bound<'_, PyTuple>,
-        context: Option<Bound<'_, PyAny>>,
+        when: f64,
+        base: Handle,
     ) -> PyResult<Py<TimerHandle>> {
-        self.check_closed()?;
-        let base = self.make_handle(py, &callback, &args, context.as_ref(), "call_later")?;
-        let token = TimerToken::new();
-        let timer = TimerHandle {
-            token: token.clone(),
-            when_ns: deadline_ns,
-            cancel_counter: self.timer_cancels.clone(),
-        };
+        let timer = TimerHandle { when, cancel_counter: Arc::as_ptr(&self.timer_cancels) };
         let handle = Py::new(py, PyClassInitializer::from(base).add_subclass(timer))?;
-        let payload: Py<PyAny> = handle.clone_ref(py).into_any();
-        self.state.with(move |st| st.reactor.schedule_timer_with_token(deadline_ns, payload, token))?;
+        // SAFETY: TimerHandle extends Handle (its layout starts with it).
+        let payload = HandleRef(
+            unsafe { Bound::from_owned_ptr(py, handle.clone_ref(py).into_ptr()).cast_into_unchecked() }
+                .unbind(),
+        );
+        payload.get().mark_scheduled();
+        self.state.with(move |st| st.reactor.schedule_timer(deadline_ns, payload))?;
+        Ok(handle)
+    }
+
+    /// `(deadline_ns, when_secs)` for `call_later(delay)`.
+    #[inline]
+    fn later_deadline(&self, delay: f64) -> PyResult<(Ticks, f64)> {
+        let now = self.now_ns()?;
+        let deadline =
+            if delay <= 0.0 || delay.is_nan() { now } else { now.saturating_add(secs_f64_to_ticks(delay)) };
+        Ok((deadline, ticks_to_secs_f64(now) + delay))
+    }
+
+    /// Push a freshly built handle on the ready queue; returns it.
+    #[inline]
+    fn enqueue_soon(&self, py: Python<'_>, handle: Handle) -> PyResult<Py<Handle>> {
+        let handle = Py::new(py, handle)?;
+        let token = HandleRef(handle.clone_ref(py));
+        self.state.with(move |st| st.reactor.push_ready(token))?;
+        Ok(handle)
+    }
+
+    #[inline]
+    fn enqueue_threadsafe(&self, py: Python<'_>, handle: Handle) -> PyResult<Py<Handle>> {
+        let handle = Py::new(py, handle)?;
+        if self.xqueue.push(HandleRef(handle.clone_ref(py))) {
+            self.waker.wake();
+        }
         Ok(handle)
     }
 
@@ -1785,3 +1940,226 @@ fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> PyResult<RawSoc
     }
     Ok(sock)
 }
+
+// --------------------------------------------------------------------- //
+// raw FASTCALL scheduling entry points (see `CoreLoop::fast_methods`)    //
+// --------------------------------------------------------------------- //
+
+/// `"context"`, interned once: asyncio's C Task/Future pass it in a static
+/// kwnames tuple whose item is the interned string, so the common case is
+/// a pointer compare.
+static CONTEXT_KW: PyOnceLock<Py<PyString>> = PyOnceLock::new();
+
+/// The single keyword every scheduling call takes: `context=`.
+///
+/// # Safety
+/// `args`/`kwnames` must be a valid vectorcall argument array: `nargs`
+/// positionals followed by one value per name in `kwnames`.
+#[inline]
+unsafe fn sched_context_kw(
+    py: Python<'_>,
+    args: *const *mut ffi::PyObject,
+    nargs: usize,
+    kwnames: *mut ffi::PyObject,
+    fname: &str,
+) -> PyResult<*mut ffi::PyObject> {
+    if kwnames.is_null() {
+        return Ok(std::ptr::null_mut());
+    }
+    let ctx_name = CONTEXT_KW.get_or_init(py, || PyString::intern(py, "context").unbind()).as_ptr();
+    let mut context = std::ptr::null_mut();
+    unsafe {
+        let nkw = ffi::PyTuple_GET_SIZE(kwnames);
+        for i in 0..nkw {
+            let key = ffi::PyTuple_GET_ITEM(kwnames, i);
+            let matches = key == ctx_name || ffi::PyUnicode_Compare(key, ctx_name) == 0;
+            if !matches {
+                let key = Bound::from_borrowed_ptr(py, key);
+                return Err(PyTypeError::new_err(format!(
+                    "{fname}() got an unexpected keyword argument {}",
+                    key.repr()?
+                )));
+            }
+            context = *args.add(nargs + i as usize);
+        }
+    }
+    Ok(context)
+}
+
+/// Build a Handle from raw vectorcall arguments `args[0..n]` (callback
+/// first). `context` is borrowed and may be null or None (copy current).
+///
+/// # Safety
+/// `args` must hold `n >= 1` valid borrowed pointers; `context` must be
+/// null or a valid borrowed pointer.
+#[inline]
+unsafe fn raw_handle(
+    py: Python<'_>,
+    core: &CoreLoop,
+    args: *const *mut ffi::PyObject,
+    n: usize,
+    context: *mut ffi::PyObject,
+    method: &str,
+) -> PyResult<Handle> {
+    unsafe {
+        let callback = Borrowed::from_ptr(py, *args);
+        let rest = CallArgs::from_slice(py, args.add(1), n - 1)?;
+        let ctx = if context.is_null() { None } else { Some(Borrowed::from_ptr(py, context).to_owned()) };
+        core.make_handle(py, &callback, rest, ctx.as_ref(), method)
+    }
+}
+
+/// `missing 1 required positional argument` in CPython's wording.
+fn missing_arg(fname: &str, what: &str) -> PyErr {
+    PyTypeError::new_err(format!("{fname}() missing 1 required positional argument: '{what}'"))
+}
+
+/// A float argument (`delay` / `when`) the way `float(x)` reads it.
+///
+/// # Safety
+/// `obj` must be a valid borrowed pointer.
+#[inline]
+unsafe fn arg_f64(py: Python<'_>, obj: *mut ffi::PyObject) -> PyResult<f64> {
+    unsafe {
+        if ffi::PyFloat_CheckExact(obj) != 0 {
+            return Ok(ffi::PyFloat_AS_DOUBLE(obj));
+        }
+        let v = ffi::PyFloat_AsDouble(obj);
+        if v == -1.0 && !ffi::PyErr_Occurred().is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        Ok(v)
+    }
+}
+
+unsafe fn fast_call_soon(
+    py: Python<'_>,
+    slf: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+) -> PyResult<*mut ffi::PyObject> {
+    let nargs = nargs as usize;
+    unsafe {
+        let core = Borrowed::from_ptr(py, slf).cast_unchecked::<CoreLoop>();
+        let this = core.get();
+        if nargs == 0 {
+            return Err(missing_arg("call_soon", "callback"));
+        }
+        let context = sched_context_kw(py, args, nargs, kwnames, "call_soon")?;
+        this.check_closed()?;
+        let handle = raw_handle(py, this, args, nargs, context, "call_soon")?;
+        Ok(this.enqueue_soon(py, handle)?.into_ptr())
+    }
+}
+
+unsafe fn fast_call_soon_threadsafe(
+    py: Python<'_>,
+    slf: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+) -> PyResult<*mut ffi::PyObject> {
+    let nargs = nargs as usize;
+    unsafe {
+        let core = Borrowed::from_ptr(py, slf).cast_unchecked::<CoreLoop>();
+        let this = core.get();
+        if nargs == 0 {
+            return Err(missing_arg("call_soon_threadsafe", "callback"));
+        }
+        let context = sched_context_kw(py, args, nargs, kwnames, "call_soon_threadsafe")?;
+        this.check_closed()?;
+        let handle = raw_handle(py, this, args, nargs, context, "call_soon_threadsafe")?;
+        Ok(this.enqueue_threadsafe(py, handle)?.into_ptr())
+    }
+}
+
+unsafe fn fast_call_later(
+    py: Python<'_>,
+    slf: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+) -> PyResult<*mut ffi::PyObject> {
+    let nargs = nargs as usize;
+    unsafe {
+        let core = Borrowed::from_ptr(py, slf).cast_unchecked::<CoreLoop>();
+        let this = core.get();
+        if nargs == 0 {
+            return Err(missing_arg("call_later", "delay"));
+        }
+        if nargs == 1 {
+            return Err(missing_arg("call_later", "callback"));
+        }
+        let context = sched_context_kw(py, args, nargs, kwnames, "call_later")?;
+        let delay = arg_f64(py, *args)?;
+        this.check_closed()?;
+        let (deadline, when) = this.later_deadline(delay)?;
+        let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_later")?;
+        Ok(this.schedule_timer(py, deadline, when, base)?.into_ptr())
+    }
+}
+
+unsafe fn fast_call_at(
+    py: Python<'_>,
+    slf: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+) -> PyResult<*mut ffi::PyObject> {
+    let nargs = nargs as usize;
+    unsafe {
+        let core = Borrowed::from_ptr(py, slf).cast_unchecked::<CoreLoop>();
+        let this = core.get();
+        if nargs == 0 {
+            return Err(missing_arg("call_at", "when"));
+        }
+        if nargs == 1 {
+            return Err(missing_arg("call_at", "callback"));
+        }
+        let context = sched_context_kw(py, args, nargs, kwnames, "call_at")?;
+        let when = arg_f64(py, *args)?;
+        this.check_closed()?;
+        let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_at")?;
+        Ok(this.schedule_timer(py, secs_f64_to_ticks(when), when, base)?.into_ptr())
+    }
+}
+
+/// `PyMethodDef`s for the FASTCALL entry points. In a static: CPython keeps
+/// the pointer for the life of every function object made from it.
+struct FastDefs([ffi::PyMethodDef; 4]);
+
+// SAFETY: immutable after construction; the raw pointers are to 'static
+// C strings and functions.
+unsafe impl Sync for FastDefs {}
+
+macro_rules! fast_def {
+    ($name:literal, $f:path, $doc:literal) => {
+        ffi::PyMethodDef {
+            ml_name: $name.as_ptr(),
+            ml_meth: ffi::PyMethodDefPointer {
+                // PyO3's own FASTCALL trampoline: it maintains PyO3's
+                // attach count, converts panics, and restores errors --
+                // exactly what the #[pymethods] wrappers get, minus the
+                // generic argument extraction.
+                PyCFunctionFastWithKeywords: pyo3::impl_::trampoline::get_trampoline_function!(
+                    fastcall_cfunction_with_keywords,
+                    $f
+                ),
+            },
+            ml_flags: ffi::METH_FASTCALL | ffi::METH_KEYWORDS,
+            ml_doc: $doc.as_ptr(),
+        }
+    };
+}
+
+static FAST_DEFS: FastDefs = FastDefs([
+    fast_def!(c"call_soon", fast_call_soon, c"call_soon(callback, *args, context=None)"),
+    fast_def!(
+        c"call_soon_threadsafe",
+        fast_call_soon_threadsafe,
+        c"call_soon_threadsafe(callback, *args, context=None)"
+    ),
+    fast_def!(c"call_later", fast_call_later, c"call_later(delay, callback, *args, context=None)"),
+    fast_def!(c"call_at", fast_call_at, c"call_at(when, callback, *args, context=None)"),
+]);

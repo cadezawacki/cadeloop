@@ -63,6 +63,11 @@ impl<T> ReadyQueue<T> {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Queued items, front to back (GC traversal support).
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.queue.iter()
+    }
 }
 
 /// Lock-free MPSC handoff for cross-thread `call_soon_threadsafe` (R-022).
@@ -97,9 +102,24 @@ impl<T> CrossThreadQueue<T> {
     /// Drain into `ready` on the loop thread. Bounded by the queue length
     /// observed at entry so producers cannot starve the tick.
     pub fn drain_into(&self, ready: &mut ReadyQueue<T>) -> usize {
+        // Nothing pushed since the last drain: the flag is the cheap test
+        // (one relaxed load), and it is exact -- every push sets it AFTER
+        // enqueueing, and only a drain clears it.
+        if !self.wake_pending.load(Ordering::Relaxed) {
+            return 0;
+        }
         // Clear the flag before draining: a producer that pushes after this
         // point sets it again and posts a fresh wakeup, so nothing is lost.
-        self.wake_pending.store(false, Ordering::Release);
+        //
+        // A swap, not a store. A producer whose `swap(true)` found the flag
+        // already set posts no wakeup and relies on THIS drain to see its
+        // item. A plain store does not synchronize-with that producer's
+        // RMW, so on a weakly ordered CPU the item could still be invisible
+        // to the pops below -- and with the flag now clear and no wakeup
+        // posted, it would sit there until something unrelated woke the
+        // loop. An RMW reads from the producer's swap (release sequence),
+        // which makes its push happen-before our pops.
+        self.wake_pending.swap(false, Ordering::AcqRel);
         let mut n = 0;
         let bound = self.queue.len();
         while n < bound {

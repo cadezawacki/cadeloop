@@ -389,10 +389,17 @@ def test_net_error_hook_raising_fatal_stops_the_loop(loop):
 
     loop.set_exception_handler(handler)
     lid, port = listen(loop, app)
-    with pytest.raises(KeyboardInterrupt):
-        loop.run_until_complete(
-            _request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", read_all=True)
-        )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            loop.run_until_complete(
+                _request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", read_all=True)
+            )
+    finally:
+        # The interrupted request's futures are collected later, and a
+        # never-retrieved exception is reported through the handler from
+        # their __del__ -- where a raising handler can only produce an
+        # unraisable-exception warning in whatever test runs next.
+        loop.set_exception_handler(None)
     loop._core.listener_close(lid)
 
 

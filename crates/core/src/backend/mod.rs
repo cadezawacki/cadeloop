@@ -64,6 +64,45 @@ pub fn is_cancelled_error(code: u32) -> bool {
     }
 }
 
+/// Is this failed accept's error about the CONNECTION being accepted (the
+/// client reset or vanished first) rather than about the listener?
+///
+/// Such failures are retried at once and never reported -- accept(2)
+/// says to treat them like EAGAIN, and asyncio swallows
+/// ConnectionAbortedError the same way. Anything else (descriptor or
+/// memory exhaustion, most often) is a listener-level failure.
+pub fn is_transient_accept_error(code: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_NETNAME_DELETED, ERROR_CONNECTION_ABORTED, WSAECONNABORTED,
+        // WSAECONNRESET: what a failed AcceptEx reports for a peer that
+        // went away before the accept completed.
+        matches!(code, 64 | 1236 | 10053 | 10054)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            code as i32,
+            libc::ECONNABORTED
+                | libc::EPROTO
+                | libc::ECONNRESET
+                | libc::ENETDOWN
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+                | libc::EINTR
+        )
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 /// Gather list entry for scatter/gather sends (R-035: up to 16 per send).
 #[derive(Debug, Clone, Copy)]
 pub struct IoSlice {
@@ -172,6 +211,16 @@ pub trait IoBackend {
     /// Non-blocking poll used by the spin phase of spin-then-park (R-060).
     fn try_poll(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         self.poll(out, Some(Duration::ZERO))
+    }
+
+    /// Move completions the backend already holds in user space -- inline
+    /// successes and staged cancellations -- into `out`, WITHOUT a kernel
+    /// call. The reactor uses it on busy ticks inside its poll-skip
+    /// window: skipping the syscall is the point of the window, but
+    /// holding back completions that need no syscall only added latency.
+    /// Returns the number appended.
+    fn take_staged(&mut self, _out: &mut Vec<Completion>) -> usize {
+        0
     }
 
     /// Can this backend possibly produce a completion right now -- any op

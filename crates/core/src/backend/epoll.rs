@@ -27,7 +27,6 @@
 //! acceptance platform): EPOLLET + always-armed interest would cut
 //! `epoll_ctl` churn; `recvmmsg`/`sendmmsg` batching; io_uring backend.
 
-use std::collections::HashMap;
 use std::io;
 use std::mem::zeroed;
 use std::os::fd::RawFd;
@@ -39,8 +38,25 @@ use super::{Completion, IoBackend, IoSlice, RawSocket, Wakeup, MAX_GATHER};
 use crate::netsys;
 use crate::opslab::{OpId, OpKind, OpSlab};
 
+/// The calling thread's `errno`, read directly. `io::Error::last_os_error`
+/// builds a whole error value to get at the same integer, and the old
+/// helper was called twice per failed syscall (once to test for EAGAIN,
+/// once to report).
+#[inline(always)]
 fn errno() -> i32 {
-    io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+    // SAFETY: __errno_location always returns this thread's errno slot.
+    unsafe { *libc::__errno_location() }
+}
+
+/// `accept4` failures that belong to the CONNECTION being accepted, not to
+/// the listener: the peer reset or the route vanished between the SYN and
+/// our accept. accept(2) says to treat these like EAGAIN and retry, and
+/// asyncio swallows ConnectionAbortedError the same way. Reporting them as
+/// listener errors turned a client that hung up early into an "Accept
+/// failed" log line, and handed the pool a failed op to replace.
+#[inline]
+fn accept_error_is_transient(e: i32) -> bool {
+    super::is_transient_accept_error(e as u32)
 }
 
 fn cvt(rc: i32) -> io::Result<i32> {
@@ -98,6 +114,8 @@ fn empty_op() -> EpollOp {
 
 #[derive(Default)]
 struct FdEntry {
+    /// The slot is in use (the `HashMap` this table replaced had an entry).
+    present: bool,
     /// Parked recv-side op (recv or accept).
     read_op: Option<OpId>,
     /// Parked send-side op (send or connect).
@@ -151,11 +169,80 @@ impl Wakeup for EpollWakeup {
     }
 }
 
+/// Per-fd state, indexed directly by descriptor number.
+///
+/// Descriptors are small dense integers the kernel hands out lowest-first,
+/// so a flat table is both smaller and much faster than the SipHash
+/// `HashMap` it replaces: every op post, every readiness event and every
+/// tick's `has_io_interest` did at least one hash of an `i32`, and the
+/// per-tick one was a measurable share of a pure-scheduling tick.
+#[derive(Default)]
+struct FdTable {
+    slots: Vec<FdEntry>,
+    /// Number of `present` slots.
+    live: usize,
+}
+
+impl FdTable {
+    #[inline]
+    fn get(&self, fd: RawFd) -> Option<&FdEntry> {
+        self.slots.get(fd as usize).filter(|e| e.present)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, fd: RawFd) -> Option<&mut FdEntry> {
+        self.slots.get_mut(fd as usize).filter(|e| e.present)
+    }
+
+    #[inline]
+    fn contains(&self, fd: RawFd) -> bool {
+        self.get(fd).is_some()
+    }
+
+    /// The entry for `fd`, created (as `Default`) if absent.
+    #[inline]
+    fn entry(&mut self, fd: RawFd) -> &mut FdEntry {
+        let i = fd as usize;
+        if i >= self.slots.len() {
+            // Geometric growth, never below a page's worth of entries.
+            let want = (i + 1).max(self.slots.len() * 2).max(64);
+            self.slots.resize_with(want, FdEntry::default);
+        }
+        let e = &mut self.slots[i];
+        if !e.present {
+            *e = FdEntry { present: true, ..FdEntry::default() };
+            self.live += 1;
+        }
+        e
+    }
+
+    /// Remove and return the entry for `fd`, if present.
+    #[inline]
+    fn remove(&mut self, fd: RawFd) -> Option<FdEntry> {
+        let e = self.slots.get_mut(fd as usize)?;
+        if !e.present {
+            return None;
+        }
+        self.live -= 1;
+        Some(std::mem::take(e))
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.live
+    }
+}
+
 pub struct EpollBackend {
     epfd: RawFd,
     wake: Arc<WakeShared>,
     slab: OpSlab<EpollOp>,
-    fds: HashMap<RawFd, FdEntry>,
+    fds: FdTable,
     /// Ops completed inline or cancelled, delivered on the next poll.
     inline_completions: Vec<Completion>,
     events: Vec<libc::epoll_event>,
@@ -179,7 +266,7 @@ impl EpollBackend {
             epfd,
             wake: Arc::new(WakeShared { eventfd, armed: AtomicBool::new(false) }),
             slab: OpSlab::new(empty_op),
-            fds: HashMap::new(),
+            fds: FdTable::default(),
             inline_completions: Vec::with_capacity(32),
             events: vec![unsafe { zeroed() }; 1024],
             wake_only: None,
@@ -197,7 +284,7 @@ impl EpollBackend {
     /// mirror (ADR-20): steady-state connections keep one persistent
     /// level-triggered registration instead of a DEL/ADD pair per message.
     fn sync_interest(&mut self, fd: RawFd, lazy: bool) -> io::Result<()> {
-        let Some(entry) = self.fds.get_mut(&fd) else { return Ok(()) };
+        let Some(entry) = self.fds.get_mut(fd) else { return Ok(()) };
         let interest = entry.interest();
         if interest == entry.kernel {
             return Ok(());
@@ -211,7 +298,7 @@ impl EpollBackend {
                 cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) })?;
                 entry.registered = false;
                 entry.kernel = 0;
-                self.fds.remove(&fd);
+                self.fds.remove(fd);
             } else {
                 cvt(unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) })?;
                 entry.kernel = interest;
@@ -221,7 +308,7 @@ impl EpollBackend {
             entry.registered = true;
             entry.kernel = interest;
         } else {
-            self.fds.remove(&fd);
+            self.fds.remove(fd);
         }
         Ok(())
     }
@@ -232,7 +319,7 @@ impl EpollBackend {
     /// unreachable while still counted live. Callers that maintain a pool
     /// (accepts) must therefore treat WouldBlock as "the pool is full".
     fn park(&mut self, id: OpId, fd: RawFd, write_side: bool) -> io::Result<OpId> {
-        let entry = self.fds.entry(fd).or_default();
+        let entry = self.fds.entry(fd);
         let slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
         if slot.is_some() {
             // Release the slab entry we were about to strand, and report a
@@ -252,16 +339,17 @@ impl EpollBackend {
         let slot = self.slab.get_mut(id)?;
         let fd = slot.data.fd;
         match &mut slot.data.pending {
-            Pending::Recv { buf, len } => {
+            Pending::Recv { buf, len } => loop {
                 let rc = unsafe { libc::recv(fd, (*buf).cast(), *len as usize, 0) };
                 if rc >= 0 {
-                    Some((rc as u32, 0))
-                } else if errno() == libc::EAGAIN {
-                    None
-                } else {
-                    Some((0, errno() as u32))
+                    break Some((rc as u32, 0));
                 }
-            }
+                match errno() {
+                    libc::EINTR => continue,
+                    libc::EAGAIN => break None,
+                    e => break Some((0, e as u32)),
+                }
+            },
             Pending::Send { bufs, n, done } => {
                 let mut iov: [libc::iovec; MAX_GATHER] = unsafe { zeroed() };
                 let mut skip = *done as usize;
@@ -282,22 +370,34 @@ impl EpollBackend {
                 if cnt == 0 {
                     return Some((*done, 0));
                 }
-                let rc = unsafe { libc::writev(fd, iov.as_ptr(), cnt as i32) };
-                if rc >= 0 {
-                    *done += rc as u32;
-                    let total: u32 = bufs.iter().take(*n as usize).map(|b| b.len).sum();
-                    if *done >= total {
-                        Some((*done, 0))
-                    } else {
-                        None // partial: stay parked for EPOLLOUT
+                // sendmsg(MSG_NOSIGNAL), not writev: a write to a socket the
+                // peer has reset raises SIGPIPE, and only Python's own
+                // startup ignores that signal. An embedder that initialised
+                // without signal handling -- or an application that put
+                // SIGPIPE back to SIG_DFL to behave under `| head` -- was
+                // killed outright by a client disconnecting mid-response.
+                let mut msg: libc::msghdr = unsafe { zeroed() };
+                msg.msg_iov = iov.as_mut_ptr();
+                msg.msg_iovlen = cnt as _;
+                loop {
+                    let rc = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+                    if rc >= 0 {
+                        *done += rc as u32;
+                        let total: u32 = bufs.iter().take(*n as usize).map(|b| b.len).sum();
+                        break if *done >= total {
+                            Some((*done, 0))
+                        } else {
+                            None // partial: stay parked for EPOLLOUT
+                        };
                     }
-                } else if errno() == libc::EAGAIN {
-                    None
-                } else {
-                    Some((*done, errno() as u32))
+                    match errno() {
+                        libc::EINTR => continue,
+                        libc::EAGAIN => break None,
+                        e => break Some((*done, e as u32)),
+                    }
                 }
             }
-            Pending::Accept => {
+            Pending::Accept => loop {
                 let rc = unsafe {
                     libc::accept4(
                         fd,
@@ -308,13 +408,16 @@ impl EpollBackend {
                 };
                 if rc >= 0 {
                     slot.data.accepted = rc;
-                    Some((0, 0))
-                } else if errno() == libc::EAGAIN {
-                    None
-                } else {
-                    Some((0, errno() as u32))
+                    break Some((0, 0));
                 }
-            }
+                match errno() {
+                    libc::EAGAIN => break None,
+                    // The failed connection is gone; the next one in the
+                    // backlog (if any) is still there to take.
+                    e if accept_error_is_transient(e) => continue,
+                    e => break Some((0, e as u32)),
+                }
+            },
             Pending::Connect => {
                 let mut err: i32 = 0;
                 let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -337,33 +440,42 @@ impl EpollBackend {
                     Some((0, err as u32))
                 }
             }
-            Pending::RecvFrom { buf, len, from, from_len } => {
+            Pending::RecvFrom { buf, len, from, from_len } => loop {
                 let mut sl: libc::socklen_t = from.len() as libc::socklen_t;
                 let rc = unsafe {
                     libc::recvfrom(fd, (*buf).cast(), *len as usize, 0, from.as_mut_ptr().cast(), &mut sl)
                 };
                 if rc >= 0 {
                     *from_len = sl as u32;
-                    Some((rc as u32, 0))
-                } else if errno() == libc::EAGAIN {
-                    None
-                } else {
-                    Some((0, errno() as u32))
+                    break Some((rc as u32, 0));
                 }
-            }
+                match errno() {
+                    libc::EINTR => continue,
+                    libc::EAGAIN => break None,
+                    e => break Some((0, e as u32)),
+                }
+            },
             Pending::SendTo { data, to, to_len } => {
                 let (to_ptr, sl): (*const libc::sockaddr, libc::socklen_t) = if *to_len == 0 {
                     (std::ptr::null(), 0) // connected-mode send()
                 } else {
                     (to.as_ptr().cast(), *to_len as libc::socklen_t)
                 };
-                let rc = unsafe { libc::sendto(fd, data.as_ptr().cast(), data.len(), 0, to_ptr, sl) };
-                if rc >= 0 {
-                    Some((rc as u32, 0))
-                } else if errno() == libc::EAGAIN {
-                    None
-                } else {
-                    Some((0, errno() as u32))
+                loop {
+                    // MSG_NOSIGNAL for the same reason as the stream path:
+                    // a connected AF_UNIX datagram peer that went away is
+                    // EPIPE, and must not be a SIGPIPE.
+                    let rc = unsafe {
+                        libc::sendto(fd, data.as_ptr().cast(), data.len(), libc::MSG_NOSIGNAL, to_ptr, sl)
+                    };
+                    if rc >= 0 {
+                        break Some((rc as u32, 0));
+                    }
+                    match errno() {
+                        libc::EINTR => continue,
+                        libc::EAGAIN => break None,
+                        e => break Some((0, e as u32)),
+                    }
                 }
             }
         }
@@ -373,7 +485,7 @@ impl EpollBackend {
     /// event had a consumer (a parked op on that side), so `poll` can
     /// lazily disarm stale kernel interest only when nothing wanted it.
     fn drive_side(&mut self, fd: RawFd, write_side: bool, out: &mut Vec<Completion>) -> bool {
-        let Some(entry) = self.fds.get_mut(&fd) else { return false };
+        let Some(entry) = self.fds.get_mut(fd) else { return false };
         let op_slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
         let Some(id) = *op_slot else { return false };
         // Buffer size of a recv op, read before `attempt` releases the slot
@@ -383,7 +495,7 @@ impl EpollBackend {
             _ => None,
         });
         if let Some((bytes, os_error)) = self.attempt(id) {
-            if let Some(entry) = self.fds.get_mut(&fd) {
+            if let Some(entry) = self.fds.get_mut(fd) {
                 let op_slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
                 *op_slot = None;
                 // A short read means the socket buffer is drained: the next
@@ -430,14 +542,18 @@ impl IoBackend for EpollBackend {
         // Reset both views: drop the entry AND best-effort-DEL the kernel
         // registration (ENOENT for case (a), success for case (b)) so the
         // next park's ADD starts from a clean slate.
-        if let Some(entry) = self.fds.remove(&fd) {
+        if let Some(entry) = self.fds.remove(fd) {
             if entry.registered {
                 let mut ev: libc::epoll_event = unsafe { zeroed() };
                 unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) };
             }
         }
         let flags = cvt(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
-        cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
+        if flags & libc::O_NONBLOCK == 0 {
+            // Accepted sockets are created SOCK_NONBLOCK and connects use a
+            // non-blocking socket already: skip the second syscall then.
+            cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
+        }
         Ok(())
     }
 
@@ -457,17 +573,35 @@ impl IoBackend for EpollBackend {
 
     fn post_accept(&mut self, listener: RawSocket) -> io::Result<OpId> {
         let fd = listener as RawFd;
+        // An accept is already parked on this listener: readiness is
+        // per-fd, so a second one could only be refused by `park` -- after
+        // paying an accept4 that, with an accept parked, the kernel has
+        // just told us would block. Every accepted connection used to
+        // spend exactly that wasted syscall refilling the pool.
+        if self.fds.get(fd).is_some_and(|e| e.read_op.is_some()) {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let id = self.slab.post(OpKind::Accept);
         {
             let s = self.slab.get_mut(id).unwrap();
             s.data = EpollOp { fd, pending: Pending::Accept, accepted: -1 };
         }
         match self.attempt(id) {
-            Some((bytes, err)) => {
+            Some((bytes, 0)) => {
                 self.syscalls_saved_inline += 1;
                 // complete_now handles accept-slot retention/teardown.
-                self.complete_now_keeping_accept(id, bytes, err);
+                self.complete_now_keeping_accept(id, bytes, 0);
                 Ok(id)
+            }
+            Some((_, err)) => {
+                // A synchronous failure is the POST failing (as it is on
+                // IOCP), not an op that completed: report it as such. As a
+                // completion, every op a pool refill posted failed the same
+                // way in the same breath -- one listener at its descriptor
+                // limit produced a whole pool's worth of errors per retry.
+                self.slab.complete(id);
+                self.slab.release(id);
+                Err(io::Error::from_raw_os_error(err as i32))
             }
             None => self.park(id, fd, false),
         }
@@ -484,14 +618,14 @@ impl IoBackend for EpollBackend {
         // recv would EAGAIN — park directly. Level-triggered epoll covers
         // the race where data arrived in between: the next poll reports it
         // immediately (ADR-20).
-        if self.fds.get(&fd).is_some_and(|e| e.drained) {
+        if self.fds.get(fd).is_some_and(|e| e.drained) {
             return self.park(id, fd, false);
         }
         match self.attempt(id) {
             Some((bytes, err)) => {
                 self.syscalls_saved_inline += 1;
                 if err == 0 {
-                    let entry = self.fds.entry(fd).or_default();
+                    let entry = self.fds.entry(fd);
                     entry.drained = bytes < len;
                 }
                 self.slab.complete(id);
@@ -646,7 +780,7 @@ impl IoBackend for EpollBackend {
                 slot.data.accepted,
             )
         };
-        if let Some(entry) = self.fds.get_mut(&fd) {
+        if let Some(entry) = self.fds.get_mut(fd) {
             let op_slot = if write_side { &mut entry.write_op } else { &mut entry.read_op };
             if *op_slot == Some(op) {
                 *op_slot = None;
@@ -664,8 +798,13 @@ impl IoBackend for EpollBackend {
 
     fn set_watch(&mut self, socket: RawSocket, readable: bool, writable: bool) -> io::Result<()> {
         let fd = socket as RawFd;
+        if !readable && !writable && !self.fds.contains(fd) {
+            // Nothing watched and nothing to unwatch: do not materialise an
+            // entry just to delete it again.
+            return Ok(());
+        }
         {
-            let entry = self.fds.entry(fd).or_default();
+            let entry = self.fds.entry(fd);
             entry.watch_r = readable;
             entry.watch_w = writable;
         }
@@ -680,7 +819,7 @@ impl IoBackend for EpollBackend {
 
     fn detach_socket(&mut self, socket: RawSocket) {
         let fd = socket as RawFd;
-        if let Some(entry) = self.fds.remove(&fd) {
+        if let Some(entry) = self.fds.remove(fd) {
             if entry.registered {
                 let mut ev: libc::epoll_event = unsafe { zeroed() };
                 unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) };
@@ -709,9 +848,19 @@ impl IoBackend for EpollBackend {
             return true;
         }
         match self.wake_only {
-            Some(w) => self.fds.len() > 1 || !self.fds.contains_key(&(w as RawFd)),
+            Some(w) => self.fds.len() > usize::from(self.fds.contains(w as RawFd)),
             None => !self.fds.is_empty(),
         }
+    }
+
+    fn take_staged(&mut self, out: &mut Vec<Completion>) -> usize {
+        // Inline successes and the ECANCELED completions `cancel` /
+        // `detach_socket` stage: all already known, none needs epoll_wait.
+        let n = self.inline_completions.len();
+        if n > 0 {
+            out.append(&mut self.inline_completions);
+        }
+        n
     }
 
     fn set_wake_only(&mut self, fd: Option<RawSocket>) {
@@ -781,7 +930,7 @@ impl IoBackend for EpollBackend {
                 write_used = self.drive_side(fd, true, out);
             }
             // Watches: emit readiness for whatever remains watched.
-            if let Some(entry) = self.fds.get(&fd) {
+            if let Some(entry) = self.fds.get(fd) {
                 let wr = entry.watch_r && read_ready;
                 let ww = entry.watch_w && write_ready;
                 if wr || ww {

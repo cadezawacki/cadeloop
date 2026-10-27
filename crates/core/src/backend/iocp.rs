@@ -1148,6 +1148,16 @@ impl IoBackend for IocpBackend {
         self.wake_only = fd;
     }
 
+    fn take_staged(&mut self, out: &mut Vec<Completion>) -> usize {
+        // R-031 inline completions were never queued to the port: handing
+        // them over needs no GetQueuedCompletionStatusEx.
+        let n = self.inline_completions.len();
+        if n > 0 {
+            out.append(&mut self.inline_completions);
+        }
+        n
+    }
+
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {
         let before = out.len();
         self.rearm_watch_probes();
