@@ -24,10 +24,14 @@ def test_defaults_match_spec():
     # body before dispatch, so an unlimited default was an unauthenticated
     # memory-exhaustion vector. None stays available as an explicit opt-in.
     assert c.max_body == 16 * 1024 * 1024
-    assert c.reuse_scope is False  # R-083
+    # R-083 reuse_scope was never wired to the engine (and reusing a scope
+    # breaks the ASGI per-request contract); it is gone rather than a no-op.
+    assert not hasattr(c, "reuse_scope")
     assert c.write_high_water == 64 * 1024  # R-122
     assert c.write_low_water == 16 * 1024
-    assert c.pin is True and c.grace == 10.0  # R-091/R-092
+    # R-091 pinning is opt-in: it measured no gain on the hot path and
+    # punishes shared CPUs (see Config.pin).
+    assert c.pin is False and c.grace == 10.0  # R-091/R-092
     assert c.access_log is False  # R-140
 
 

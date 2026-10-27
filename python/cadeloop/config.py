@@ -1,6 +1,8 @@
 """``cadeloop.Config`` (R-102): every spec tunable, validated eagerly.
 
-Unknown kwargs raise ``TypeError`` (dataclass-generated ``__init__``).
+Unknown kwargs raise ``TypeError`` (dataclass-generated ``__init__``), as
+does a value of the wrong type; an out-of-range value raises
+``ValueError``.
 ``Config.from_env(prefix="CADELOOP_")`` reads typed overrides from the
 environment.
 """
@@ -9,7 +11,10 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import numbers
+import operator
 import os
+import sys
 import typing
 
 __all__ = ["Config", "LATENCY_PRESETS"]
@@ -22,6 +27,41 @@ LATENCY_PRESETS = {"throughput": 0, "balanced": 20, "spin": 200}
 # raise before binding (Codex review, PR #1).
 _BACKENDS = ("auto", "iocp", "rio", "epoll")
 _GC_MODES = ("default", "freeze", "disable")  # R-075
+
+_BOOL_FIELDS = ("loopback_fast_path", "tfo", "dns_cache", "eager_tasks", "pin", "access_log")
+_USIZE_MAX = sys.maxsize * 2 + 1
+_U32_MAX = 2**32 - 1
+# field: (minimum, maximum). The maxima are the native integer types these
+# end up in: past them the failure used to surface as an OverflowError
+# from deep inside startup -- after the application's lifespan startup
+# had already run -- instead of here.
+_INT_FIELDS = {
+    "accept_pool": (1, _USIZE_MAX),
+    "rio_cq_size": (1, _U32_MAX),
+    "rio_rq_recv": (1, _U32_MAX),
+    "rio_rq_send": (1, _U32_MAX),
+    "max_header_bytes": (1, _USIZE_MAX),
+    "max_headers": (1, _USIZE_MAX),
+    "max_url": (1, _USIZE_MAX),
+    "warmup": (0, None),
+    "workers": (0, None),
+    "spin_us": (0, 2**64 - 1),
+    "write_high_water": (0, _USIZE_MAX),
+    "write_low_water": (0, _USIZE_MAX),
+}
+_OPTIONAL_INT_FIELDS = {"max_body": (0, _USIZE_MAX), "stats_endpoint": (1, 65535)}
+_FLOAT_FIELDS = ("request_line_timeout", "keepalive_idle", "grace", "dns_cache_ttl")
+
+
+def _checked_int(name, value):
+    # operator.index takes any real integer (numpy's included) and refuses
+    # floats; bool is an int subclass, but `workers=True` is a mistake.
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an int, not bool")
+    try:
+        return operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
 
 
 @dataclasses.dataclass
@@ -55,7 +95,10 @@ class Config:
     # --- tasks / GC -------------------------------------------------------
     eager_tasks: bool = True  # R-056 / §16 (switchable interop escape hatch)
     gc_mode: str = "freeze"  # R-075 server default
-    warmup: int = 1000  # R-075 requests before gc.freeze()
+    # R-075: with gc_mode="freeze", requests served before a second
+    # gc.freeze() takes in what the first requests built lazily (route and
+    # template caches, compiled statements); 0 freezes at startup only.
+    warmup: int = 1000
     # --- HTTP engine (R-080) ----------------------------------------------
     max_header_bytes: int = 64 * 1024
     max_headers: int = 100
@@ -67,13 +110,18 @@ class Config:
     # one request into unbounded memory. Raise it, or set None explicitly,
     # for large-upload workloads; over the limit the client gets a 413.
     max_body: int | None = 16 * 1024 * 1024
-    reuse_scope: bool = False  # R-083 (correctness default)
     # --- transports ---------------------------------------------------------
     write_high_water: int = 64 * 1024  # R-122 backpressure defaults
     write_low_water: int = 16 * 1024
     # --- multi-process (§8) --------------------------------------------------
-    workers: int = 0  # 0 -> physical cores (R-090)
-    pin: bool = True  # R-091
+    workers: int = 0  # 0 -> one per CPU the process may run on (R-090)
+    # R-091: pin each worker's loop thread to one CPU. Off by default:
+    # measured on loopback it bought nothing (73.5k vs 76.3k requests per
+    # worker CPU-second, pinned vs not), and pinning is a deployment
+    # decision -- RSS-aligned NIC queues on dedicated hardware -- that
+    # shared or virtualised CPUs mostly punish (a pinned worker cannot move
+    # off a busy core). uvicorn and gunicorn do not pin either.
+    pin: bool = False
     grace: float = 10.0  # R-092 graceful drain seconds
     # --- misc ----------------------------------------------------------------
     access_log: bool = False  # R-140
@@ -83,6 +131,17 @@ class Config:
     stats_endpoint: int | None = None
 
     def __post_init__(self):
+        for field in _BOOL_FIELDS:
+            if not isinstance(getattr(self, field), bool):
+                # A string here was stored as given and read as truthy:
+                # access_log="false" turned the access log ON.
+                raise TypeError(
+                    f"{field} must be a bool, got {type(getattr(self, field)).__name__}"
+                )
+        if self.immediate_flush is not None and not isinstance(self.immediate_flush, bool):
+            raise TypeError(
+                f"immediate_flush must be a bool or None, got {type(self.immediate_flush).__name__}"
+            )
         if self.backend not in _BACKENDS:
             raise ValueError(
                 f"backend must be one of {_BACKENDS}, got {self.backend!r}"
@@ -111,22 +170,26 @@ class Config:
             self.spin_us = LATENCY_PRESETS[self.latency_mode]
         if self.immediate_flush is None:
             self.immediate_flush = self.latency_mode == "spin"
-        for field, minimum in (
-            ("accept_pool", 1),
-            ("rio_cq_size", 1),
-            ("rio_rq_recv", 1),
-            ("rio_rq_send", 1),
-            ("max_header_bytes", 1),
-            ("max_headers", 1),
-            ("max_url", 1),
-            ("warmup", 0),
-            ("workers", 0),
-            ("spin_us", 0),
-        ):
-            if getattr(self, field) < minimum:
+        for field, (minimum, maximum) in _INT_FIELDS.items():
+            value = _checked_int(field, getattr(self, field))
+            if value < minimum:
                 raise ValueError(f"{field} must be >= {minimum}")
-        for field in ("request_line_timeout", "keepalive_idle", "grace", "dns_cache_ttl"):
+            if maximum is not None and value > maximum:
+                raise ValueError(f"{field} must be <= {maximum}")
+            setattr(self, field, value)
+        for field, (minimum, maximum) in _OPTIONAL_INT_FIELDS.items():
             value = getattr(self, field)
+            if value is None:
+                continue
+            value = _checked_int(field, value)
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{field} must be None or in {minimum}..{maximum}")
+            setattr(self, field, value)
+        for field in _FLOAT_FIELDS:
+            value = getattr(self, field)
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                raise TypeError(f"{field} must be a number, got {type(value).__name__}")
+            value = float(value)
             # NaN fails every comparison, so a bare `< 0` check waves it
             # through -- and a NaN request timeout converts to zero
             # downstream, silently disabling the slow-request guard it was
@@ -138,18 +201,10 @@ class Config:
                 raise ValueError(f"{field} must be a finite number, got {value!r}")
             if value < 0:
                 raise ValueError(f"{field} must be >= 0")
-        if self.max_body is not None and self.max_body < 0:
-            raise ValueError("max_body must be None or >= 0")
-        if self.stats_endpoint is not None and not 1 <= self.stats_endpoint <= 65535:
-            raise ValueError("stats_endpoint must be None or a port in 1..65535")
-        # Non-negative BEFORE ordering: `write_low_water=-1,
-        # write_high_water=0` is ordered, so the comparison alone let it
-        # through, and the negative value then reached CoreLoop's usize
-        # argument and blew up at startup with an OverflowError instead of
-        # being rejected as the configuration error it is.
-        for field in ("write_low_water", "write_high_water"):
-            if getattr(self, field) < 0:
-                raise ValueError(f"{field} must be >= 0")
+            setattr(self, field, value)
+        # (Non-negative watermarks are checked above, BEFORE this ordering:
+        # `write_low_water=-1, write_high_water=0` is ordered, and the
+        # negative value used to reach CoreLoop's usize argument.)
         if self.write_low_water > self.write_high_water:
             raise ValueError("write_low_water must be <= write_high_water")
 
@@ -170,7 +225,7 @@ def _parse(raw: str, hint, name: str):
     optional = typing.get_origin(hint) in (typing.Union, __import__("types").UnionType)
     if optional:
         args = [a for a in typing.get_args(hint) if a is not type(None)]
-        if raw.lower() in ("none", ""):
+        if raw.strip().lower() in ("none", ""):
             return None
         hint = args[0]
     if hint is bool:
@@ -180,8 +235,11 @@ def _parse(raw: str, hint, name: str):
         if low in ("0", "false", "no", "off"):
             return False
         raise ValueError(f"invalid boolean for {name}: {raw!r}")
-    if hint is int:
-        return int(raw)
-    if hint is float:
-        return float(raw)
+    try:
+        if hint is int:
+            return int(raw)
+        if hint is float:
+            return float(raw)
+    except ValueError:
+        raise ValueError(f"invalid {hint.__name__} for {name}: {raw!r}") from None
     return raw

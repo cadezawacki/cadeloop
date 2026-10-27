@@ -127,15 +127,21 @@ def main() -> int:
     if cmd != b"HELLO":
         return 1
     header = json.loads(body)
+    if header.get("sys_path") is not None:
+        # The supervisor's import path, as multiprocessing's spawn passes it:
+        # started as `python -m`, this process otherwise sees only its
+        # working directory and PYTHONPATH, and an app the supervisor found
+        # next to its launcher script could not be imported here at all.
+        sys.path[:] = header["sys_path"]
     if header.get("pin") is not None:
         _pin_to_cpu(header["pin"])
 
     from .config import Config
-    from .server import _serve_single, load_app
+    from .server import _EXIT_RESTART, _serve_single, load_app
 
     app = load_app(header["spec"])
     config = Config(**header["config"])
-    _serve_single(
+    reason = _serve_single(
         app,
         "-",  # no listener: connections arrive over the channel
         0,
@@ -143,7 +149,10 @@ def main() -> int:
         worker_id=header.get("worker_id"),
         control_channel=chan,
     )
-    return 0
+    # 0 asks the supervisor to stop the pool (the application stopped its
+    # own loop -- or the supervisor itself is stopping); a stop that came
+    # from a signal sent to this worker alone asks only to be replaced.
+    return _EXIT_RESTART if reason == "signal" else 0
 
 
 if __name__ == "__main__":

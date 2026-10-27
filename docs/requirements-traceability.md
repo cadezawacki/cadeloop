@@ -43,17 +43,17 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-072 | Zero-copy memoryview via BufferedProtocol | 🔶 BufferedProtocol supported (single copy into app buffer); recv-into-app-buffer zero-copy 📅 | net.rs |
 | R-073 | Slot lifetime refcounts + poison | ✅ (proptested; kernel ops hold slot refs released at completion reap) | buffers.rs, net.rs |
 | R-074 | Write retention semantics (bytes zero-copy, bytearray copy) | ✅ (bytes-backed memoryview currently copied — documented deviation) | net.rs |
-| R-075 | gc.freeze warmup policy | 🔶 freeze/disable applied post-lifespan-startup in serve(); per-request warmup counter 📅 | server.py |
+| R-075 | gc.freeze warmup policy | ✅ freeze/disable applied post-lifespan-startup in serve() (multi-worker: frozen once in the supervisor before forking); a second freeze after `warmup` requests | server.py |
 | R-080 | llhttp strict, limits (64K headers/100 count/8K URL) | ✅ in-callback enforcement → 414/431/413; request-line/idle timeouts 📅 | core/http.rs, vendor/llhttp |
 | R-081 | ASGI 3.0 scope + lifespan | ✅ native scope (percent-decode, latin-1 fallback, client/server tuples, lifespan state copy); lifespan `auto` in facade | http.rs (pyshim), server.py |
 | R-082 | Header-name/method interning | ✅ interned common methods + scope keys | http.rs (pyshim) |
-| R-083 | Per-connection cached receive/send; scope reuse opt-in | 🔶 receive/send cached per conn ✅; `reuse_scope` 📅 | http.rs (pyshim) |
+| R-083 | Per-connection cached receive/send; scope reuse opt-in | 🔶 receive/send cached per conn ✅; 📝 `reuse_scope` dropped: never wired, and a reused scope breaks ASGI's fresh-scope-per-request contract | http.rs (pyshim) |
 | R-084 | Native response assembly, Date cache, framing at first body chunk | ✅ zero Python objects on the wire path; per-second civil-from-days Date; HEAD suppression; HTTP/1.0 close-delimited | http.rs (pyshim) |
 | R-085 | Keep-alive + pipelined drain, strict ordering | ✅ iterative pump; request finishes at coro return (background-task safe) | http.rs (pyshim) |
 | R-086 | Error paths: in-cell 4xx, 500-or-abort, disconnect futures | ✅ | core/http.rs, http.rs (pyshim) |
 | R-087 | WebSockets | 📅 M4 | — |
 | R-088 | Fallback to pure-Python h11 path | ➖ not planned (native engine + uvicorn interop cover it) | — |
-| R-090..093 | Worker model, affinity, supervision | 🔶 Linux ✅: SO_REUSEPORT pool, supervisor restart + fast-crash cutoff, grace drain, sched_setaffinity pinning; Windows (WSADuplicateSocketW) 📅 M3 | server.py, tests/unit/test_multiworker.py |
+| R-090..093 | Worker model, affinity, supervision | 🔶 Linux ✅: SO_REUSEPORT pool, supervisor restart + fast-crash cutoff, grace drain, opt-in sched_setaffinity pinning (`pin=True`); Windows (WSADuplicateSocketW) 📅 M3 | server.py, tests/unit/test_multiworker.py |
 | R-100 | new_event_loop/EventLoopPolicy/install/run | ✅ | policy.py |
 | R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy, multi-worker pool | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
