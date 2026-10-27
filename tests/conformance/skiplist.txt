@@ -27,3 +27,4 @@ test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_exception  # c
 test_events.CadeloopEventLoopTests.test_create_connection  # isinstance(transport, asyncio.Transport): a native type cannot subclass asyncio.Transport (instance-layout conflict); uvloop's transports are not instances either
 test_events.CadeloopEventLoopTests.test_create_unix_connection  # isinstance(transport, asyncio.Transport): see test_create_connection
 test_sock_lowlevel.CadeloopSockTests.test_create_connection_sock  # isinstance(transport, asyncio.Transport): see test_events test_create_connection
+test_events.CadeloopEventLoopTests.test_datagram_send_to_non_listening_address  # timing-dependent on I/O-vs-ready order: protocol callbacks run before callbacks already ready at the poll (asyncio runs them after; uvloop, like cadeloop, before), so datagram_received can beat the task step that installs its future
