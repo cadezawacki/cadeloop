@@ -672,6 +672,11 @@ pub(crate) enum NetEvent {
 pub(crate) struct ConnLost {
     connection_lost: Py<PyAny>,
     err: LostReason,
+    /// asyncio calls connection_lost straight from the I/O callback that
+    /// finished draining a closing transport (`_write_ready`), and
+    /// through `call_soon` everywhere else (`_force_close`, an idle
+    /// `close()`): true for the former.
+    immediate: bool,
     /// The facade transport and its protocol: `get_protocol()` keeps
     /// answering while connection_lost runs, as asyncio's does.
     transport: Option<Py<Transport>>,
@@ -696,7 +701,7 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
         return;
     }
     if entry.wq.is_empty() {
-        maybe_finish_shutdown(py, net, backend, tid);
+        maybe_finish_shutdown(py, net, backend, tid, true);
         return;
     }
     let mut slices: [IoSlice; 16] = [IoSlice { ptr: std::ptr::null(), len: 0 }; 16];
@@ -728,7 +733,7 @@ fn teardown_err(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u
 fn finish_after_resume(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get(&tid) else { return };
     if entry.wq.is_empty() && entry.send_op.is_none() {
-        maybe_finish_shutdown(py, net, backend, tid);
+        maybe_finish_shutdown(py, net, backend, tid, true);
     }
 }
 
@@ -781,7 +786,10 @@ fn settle_inline(py: Python<'_>, net: &mut NetState, backend: Backend<'_>) {
 }
 
 /// eof/close finalization once the write queue is drained. In-cell.
-fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
+/// `drained`: the queue just emptied on the I/O path (a send completion,
+/// the tick's flush), where asyncio's `_write_ready` calls
+/// connection_lost directly; a `close()` call itself defers it.
+fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64, drained: bool) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.send_op.is_some() || !entry.wq.is_empty() || entry.conn_lost {
         return;
@@ -791,7 +799,7 @@ fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_
         let _ = netsys::shutdown_send(entry.socket);
     }
     if entry.closing {
-        teardown_with(py, net, backend, tid, None);
+        teardown_lost(py, net, backend, tid, LostReason::Clean, drained);
     }
 }
 
@@ -883,6 +891,19 @@ pub(crate) fn teardown_reason(
     tid: u64,
     err: LostReason,
 ) {
+    teardown_lost(py, net, backend, tid, err, false);
+}
+
+/// `teardown_reason`, saying whether connection_lost runs at once (see
+/// `ConnLost::immediate`).
+fn teardown_lost(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    tid: u64,
+    err: LostReason,
+    immediate: bool,
+) {
     let Some(mut entry) = net.transports.remove(&tid) else {
         if let LostReason::Exc(exc) = err {
             net.graveyard_py.push(exc);
@@ -911,6 +932,7 @@ pub(crate) fn teardown_reason(
             let lost = ConnLost {
                 connection_lost: p.connection_lost.clone_ref(py),
                 err,
+                immediate,
                 transport: entry.pyobj.take(),
                 protocol: p.protocol.clone_ref(py),
                 close_after: entry.owner.take().or_else(|| entry.extra_sock.take()),
@@ -1732,7 +1754,7 @@ pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend
         // Mapping stays; the completion is discarded by the closing check.
         let _ = backend.cancel(op);
     }
-    maybe_finish_shutdown(py, net, backend, tid);
+    maybe_finish_shutdown(py, net, backend, tid, true);
 }
 
 /// R-043: after slab growth, hand the new regions to the backend for
@@ -2440,7 +2462,7 @@ fn on_send_done(
     if !entry.wq.is_empty() {
         flush_pending(py, net, backend, tid);
     } else if !resuming {
-        maybe_finish_shutdown(py, net, backend, tid);
+        maybe_finish_shutdown(py, net, backend, tid, true);
     }
     // else: asyncio calls resume_writing BEFORE deciding the queue has
     // drained, and what it writes still goes out ahead of a pending close
@@ -2578,34 +2600,12 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 }
             },
             NetEvent::ConnLost(lost) => {
-                let ConnLost { connection_lost, err, transport, protocol, close_after, server } = *lost;
-                let exc_obj = match err {
-                    LostReason::Clean => py.None(),
-                    LostReason::Os(code) => os_err(py, code),
-                    LostReason::Exc(exc) => exc,
-                };
-                // asyncio's _call_connection_lost: get_protocol() still
-                // answers while connection_lost runs; afterwards the
-                // socket is closed and the server forgets the connection.
-                if let Some(t) = &transport {
-                    t.get().set_losing(Some(protocol));
+                if lost.immediate {
+                    let res = call_connection_lost(py, *lost);
+                    core.guard_protocol_call(py, res)?;
+                } else {
+                    schedule_connection_lost(py, core, lost)?;
                 }
-                let res = connection_lost.call1(py, (exc_obj,));
-                if let Some(t) = &transport {
-                    // Dropped here, attached and outside the cell. Holding
-                    // it longer would make protocol -> transport -> protocol
-                    // a cycle the collector cannot see.
-                    drop(t.get().set_losing(None));
-                }
-                if let Some(sock) = close_after {
-                    let _ = sock.call_method0(py, intern!(py, "close"));
-                }
-                let detached = match server {
-                    Some(srv) => srv.call_method0(py, intern!(py, "_detach")).map(drop),
-                    None => Ok(()),
-                };
-                core.guard_protocol_call(py, res)?;
-                core.guard_protocol_call(py, detached)?;
             }
             NetEvent::DgramData { datagram_received, payload, addr } => {
                 let addr_obj = any_addr_tuple(py, addr).unwrap_or_else(|| py.None());
@@ -2834,6 +2834,110 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
         }
     }
     Ok(())
+}
+
+/// asyncio's `_call_connection_lost`: get_protocol() still answers while
+/// connection_lost runs; afterwards the socket is closed and the server
+/// forgets the connection. Returns connection_lost's own outcome (or
+/// the server's), after the cleanup has run either way.
+fn call_connection_lost(py: Python<'_>, lost: ConnLost) -> PyResult<()> {
+    let ConnLost { connection_lost, err, immediate: _, transport, protocol, close_after, server } = lost;
+    let exc_obj = match err {
+        LostReason::Clean => py.None(),
+        LostReason::Os(code) => os_err(py, code),
+        LostReason::Exc(exc) => exc,
+    };
+    if let Some(t) = &transport {
+        t.get().set_losing(Some(protocol));
+    }
+    let res = connection_lost.call1(py, (exc_obj,));
+    if let Some(t) = &transport {
+        // Dropped here, attached and outside the cell. Holding it longer
+        // would make protocol -> transport -> protocol a cycle the
+        // collector cannot see.
+        drop(t.get().set_losing(None));
+    }
+    if let Some(sock) = close_after {
+        let _ = sock.call_method0(py, intern!(py, "close"));
+    }
+    let detached = match server {
+        Some(srv) => srv.call_method0(py, intern!(py, "_detach")).map(drop),
+        None => Ok(()),
+    };
+    res?;
+    detached
+}
+
+/// A deferred connection_lost, as asyncio defers it: `call_soon` on the
+/// facade loop, so it runs after what was already scheduled and before
+/// what the caller schedules next. Handed to the loop as the callable
+/// below; a failure in connection_lost is then reported the way any
+/// failing callback is.
+fn schedule_connection_lost(py: Python<'_>, core: &CoreLoop, lost: Box<ConnLost>) -> PyResult<()> {
+    let call = Py::new(py, LostCall { lost: Mutex::new(Some(lost)) })?;
+    let scheduled =
+        core.require_owner().and_then(|owner| owner.call_method1(py, intern!(py, "call_soon"), (&call,)));
+    if let Err(e) = scheduled {
+        // The loop is closed (asyncio raises the same from _force_close).
+        // Nothing will ever run it, so the socket at least is closed now.
+        let pending = call.get().lost.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(lost) = pending {
+            if let Some(sock) = lost.close_after {
+                let _ = sock.call_method0(py, intern!(py, "close"));
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Deferred connection_lost events a Python-level transport call
+/// produced (close(), abort(), a failed write...), scheduled at once:
+/// asyncio's `_force_close` calls `call_soon` right there, in order with
+/// whatever the caller schedules next. Left in the event queue they
+/// would wait for the next tick's dispatch -- a tick late.
+pub(crate) fn schedule_pending_lost(py: Python<'_>, core: &CoreLoop) -> PyResult<()> {
+    let lost = core.with_net(|net, _| {
+        if !net.events.iter().any(|e| matches!(e, NetEvent::ConnLost(l) if !l.immediate)) {
+            return Vec::new();
+        }
+        let mut lost = Vec::new();
+        let mut keep = Vec::with_capacity(net.events.len());
+        for event in net.events.drain(..) {
+            match event {
+                NetEvent::ConnLost(l) if !l.immediate => lost.push(l),
+                other => keep.push(other),
+            }
+        }
+        net.events = keep;
+        lost
+    })?;
+    for l in lost {
+        schedule_connection_lost(py, core, l)?;
+    }
+    Ok(())
+}
+
+/// The callable behind a deferred connection_lost (see
+/// `schedule_connection_lost`).
+#[pyclass(frozen, module = "cadeloop._core")]
+pub struct LostCall {
+    lost: Mutex<Option<Box<ConnLost>>>,
+}
+
+#[pymethods]
+impl LostCall {
+    fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        let lost = self.lost.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match lost {
+            Some(lost) => call_connection_lost(py, *lost),
+            None => Ok(()),
+        }
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "Transport._call_connection_lost"
+    }
 }
 
 /// Win32 ERROR_BROKEN_PIPE: ReadFile on a pipe whose write end closed can
@@ -3075,6 +3179,7 @@ pub(crate) fn wire_stream(
     core.guard_protocol_call(py, made.map(|b| b.unbind()))?;
     core.with_net(|net, reactor| post_recv(py, net, reactor.backend_mut(), tid))?;
     core.drain_graveyards(py)?;
+    schedule_pending_lost(py, core)?;
     Ok(transport)
 }
 
@@ -3454,6 +3559,7 @@ impl Transport {
         if dirty {
             // Rare paths only (dropped write, >=64KiB flush that tore down).
             core.drain_graveyards(py)?;
+            schedule_pending_lost(py, core)?;
         }
         if eof_misuse {
             return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
@@ -3506,9 +3612,10 @@ impl Transport {
             if let Some(entry) = net.transports.get_mut(&tid) {
                 entry.eof_wanted = true;
             }
-            maybe_finish_shutdown(py, net, reactor.backend_mut(), tid);
+            maybe_finish_shutdown(py, net, reactor.backend_mut(), tid, false);
         })?;
-        core.drain_graveyards(py)
+        core.drain_graveyards(py)?;
+        schedule_pending_lost(py, core)
     }
 
     fn can_write_eof(&self) -> bool {
@@ -3556,6 +3663,7 @@ impl Transport {
             maybe_pause(py, net, reactor.backend_mut(), self.tid)
         })?;
         core.drain_graveyards(py)?;
+        schedule_pending_lost(py, core)?;
         if let Some(pause_writing) = pause {
             report_flow_control_error(py, core, self.tid, pause_writing.call0(py), PAUSE_WRITING_FAILED)?;
         }
@@ -3602,7 +3710,9 @@ impl Transport {
                     }
                 }
             }
-        })
+        })?;
+        core.drain_graveyards(py)?;
+        schedule_pending_lost(py, core)
     }
 
     fn is_reading(&self, py: Python<'_>) -> PyResult<bool> {
@@ -3631,9 +3741,10 @@ impl Transport {
                 // routed and discarded by the closing/conn_lost checks.
                 let _ = backend.cancel(op);
             }
-            maybe_finish_shutdown(py, net, backend, tid);
+            maybe_finish_shutdown(py, net, backend, tid, false);
         })?;
-        core.drain_graveyards(py)
+        core.drain_graveyards(py)?;
+        schedule_pending_lost(py, core)
     }
 
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
@@ -3658,7 +3769,8 @@ impl Transport {
             _ => LostReason::Clean,
         };
         core.with_net(|net, reactor| teardown_reason(py, net, reactor.backend_mut(), tid, reason))?;
-        core.drain_graveyards(py)
+        core.drain_graveyards(py)?;
+        schedule_pending_lost(py, core)
     }
 
     /// `loop.start_tls()` checks this before upgrading a transport.

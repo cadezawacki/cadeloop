@@ -1786,3 +1786,64 @@ def test_queue_matches_asyncio_queue_construction(cade_loop):
     assert fast.full() and ref.full()
     assert fast.maxsize == ref.maxsize == 2.5
     assert str(cadeloop.Queue()).startswith("<Queue maxsize=0")
+
+
+# --------------------------------------------------------------------- #
+# C10. connection_lost is scheduled, as asyncio's call_soon schedules it #
+# --------------------------------------------------------------------- #
+
+
+def test_connection_lost_runs_in_call_soon_order(loop):
+    """abort() and an idle close() schedule connection_lost with
+    call_soon in asyncio: it runs after what was scheduled before the
+    call and before what is scheduled after it. cadeloop ran it in the
+    next tick's network phase, ahead of both."""
+
+    async def main():
+        order = []
+
+        class P(asyncio.Protocol):
+            def __init__(self, name):
+                self.name = name
+
+            def connection_lost(self, exc):
+                order.append(f"lost {self.name}")
+
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        aborted, _ = await loop.create_connection(lambda: P("abort"), "127.0.0.1", port)
+        closed, _ = await loop.create_connection(lambda: P("close"), "127.0.0.1", port)
+        loop.call_soon(order.append, "before")
+        aborted.abort()
+        loop.call_soon(order.append, "between")
+        closed.close()
+        loop.call_soon(order.append, "after")
+        await asyncio.sleep(0.05)
+        assert order == ["before", "lost abort", "between", "lost close", "after"]
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_connection_lost_exception_is_reported_like_a_callback(loop):
+    """A deferred connection_lost that raises is reported, and the
+    socket is still closed."""
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+
+    async def main():
+        class P(asyncio.Protocol):
+            def connection_lost(self, exc):
+                raise ZeroDivisionError
+
+        server, transport, _ = await _pair(loop, P)
+        sock = transport.get_extra_info("socket")
+        transport.abort()
+        await asyncio.sleep(0.05)
+        assert [type(c.get("exception")) for c in reported] == [ZeroDivisionError]
+        assert sock.fileno() == -1
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
