@@ -551,3 +551,125 @@ def test_create_server_skips_a_family_without_sockets(cade_loop):
         loop.run_until_complete(main())
     finally:
         loop._core = real_core
+
+
+# --------------------------------------------------------------------- #
+# 4. sock_* watches: a cancelled call must not remove a newer call's    #
+# --------------------------------------------------------------------- #
+
+
+def test_sock_recv_cancel_then_retry_gets_the_data(loop):
+    """Cancel a pending sock_recv and issue another on the same socket in
+    the same step (CPython's test_sock_client_racing): the second call
+    receives the data. It hung: the cancelled call's cleanup removed the
+    reader the second call had just installed."""
+
+    async def main():
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        with a, b:
+            first = asyncio.ensure_future(loop.sock_recv(a, 100))
+            await asyncio.sleep(0)
+            first.cancel()
+            loop.call_later(0.05, b.send, b"data")
+            # In this task, not a wait_for() task: the race needs the new
+            # call to register before the cancelled one cleans up.
+            async with asyncio.timeout(5):
+                assert await loop.sock_recv(a, 100) == b"data"
+            assert first.cancelled()
+
+    loop.run_until_complete(main())
+
+
+def test_sock_recv_into_and_recvfrom_cancel_then_retry(loop):
+    async def main():
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        with a, b:
+            buf = bytearray(16)
+            first = asyncio.ensure_future(loop.sock_recv_into(a, buf))
+            await asyncio.sleep(0)
+            first.cancel()
+            loop.call_later(0.05, b.send, b"into")
+            async with asyncio.timeout(5):
+                assert await loop.sock_recv_into(a, buf) == 4
+            assert bytes(buf[:4]) == b"into"
+
+        u1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        with u1, u2:
+            u1.bind(("127.0.0.1", 0))
+            u1.setblocking(False)
+            first = asyncio.ensure_future(loop.sock_recvfrom(u1, 100))
+            await asyncio.sleep(0)
+            first.cancel()
+            loop.call_later(0.05, u2.sendto, b"dgram", u1.getsockname())
+            async with asyncio.timeout(5):
+                data, _addr = await loop.sock_recvfrom(u1, 100)
+            assert data == b"dgram"
+
+    loop.run_until_complete(main())
+
+
+def test_sock_sendall_cancel_then_retry_delivers(loop):
+    """The sock_sendall form of the race (a blocked send cancelled, then a
+    new one on the same socket)."""
+
+    async def main():
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        sock.setblocking(False)
+        with listener, sock:
+            await loop.sock_connect(sock, listener.getsockname())
+            server, _ = listener.accept()
+            server.setblocking(False)
+            with server:
+                size = 8192
+                while size >= 4:
+                    try:
+                        while True:
+                            sock.send(b" " * size)
+                    except BlockingIOError:
+                        pass
+                    size //= 2
+                first = asyncio.ensure_future(loop.sock_sendall(sock, b"hello"))
+                await asyncio.sleep(0)
+                first.cancel()
+
+                async def recv_all():
+                    got = b""
+                    while True:
+                        chunk = await loop.sock_recv(server, 8192)
+                        if not chunk:
+                            return got
+                        got += chunk.strip()
+
+                reader = asyncio.ensure_future(recv_all())
+                async with asyncio.timeout(5):
+                    await loop.sock_sendall(sock, b"world")
+                sock.shutdown(socket.SHUT_WR)
+                assert (await asyncio.wait_for(reader, 5)).endswith(b"world")
+
+    loop.run_until_complete(main())
+
+
+def test_sock_recv_cancelled_after_close_raises_cancelled_error(loop):
+    """Cancelling a sock_recv whose socket was already closed raises
+    CancelledError; the cleanup's removal of the dead watch used to raise
+    OSError(EBADF) in its place."""
+
+    async def main():
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        task = asyncio.ensure_future(loop.sock_recv(a, 100))
+        await asyncio.sleep(0)
+        a.close()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        b.close()
+
+    loop.run_until_complete(main())

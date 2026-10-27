@@ -984,7 +984,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     if not fut.done():
                         fut.set_result(None)
 
-                self._core.add_writer(fd, on_writable)
+                handle = self._core.add_writer(fd, on_writable)
                 try:
                     # Bounded waits, not a bare await: closing the fd
                     # removes it from the poller, so a transport that
@@ -1001,7 +1001,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                         except TimeoutError:
                             pass
                 finally:
-                    self._core.remove_writer(fd)
+                    # The transport may have closed (and its fd with it):
+                    # see TcpSurface._watch_done.
+                    self._watch_done(handle, self._core.remove_writer, fd)
             return total
         finally:
             # stdlib convention: leave the file positioned after the bytes

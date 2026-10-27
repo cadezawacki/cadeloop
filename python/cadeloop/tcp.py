@@ -828,6 +828,25 @@ class TcpSurface:
 
     # -- sock_* (readiness-based; cold path by design) ---------------------
 
+    @staticmethod
+    def _watch_done(handle, remove, fd):
+        """Drop a sock_* call's readiness watch -- but only its own.
+
+        A newer call on the same socket (cancel-and-retry, or two tasks
+        racing) displaces this call's watch, which cancels it. Removing
+        "the" reader regardless removed the newer call's instead, and that
+        call then waited forever: base_events' _sock_read_done checks
+        `handle.cancelled()` for exactly this. And a socket closed in the
+        meantime has no watch left to remove: the EBADF that removal can
+        hit must not replace the exception (usually CancelledError)
+        unwinding through the caller.
+        """
+        if not handle.cancelled():
+            try:
+                remove(fd)
+            except OSError:
+                pass
+
     async def sock_recv(self, sock, n):
         try:
             return sock.recv(n)
@@ -850,11 +869,11 @@ class TcpSurface:
             else:
                 fut.set_result(data)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recv_into(self, sock, buf):
         try:
@@ -878,11 +897,11 @@ class TcpSurface:
             else:
                 fut.set_result(nbytes)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_sendall(self, sock, data):
         try:
@@ -912,11 +931,11 @@ class TcpSurface:
             if pos[0] >= len(view):
                 fut.set_result(None)
 
-        self._core.add_writer(fd, on_writable)
+        handle = self._core.add_writer(fd, on_writable)
         try:
             await fut
         finally:
-            self._core.remove_writer(fd)
+            self._watch_done(handle, self._core.remove_writer, fd)
 
     async def sock_connect(self, sock, address):
         # Resolution only applies to AF_INET/AF_INET6 (matches stdlib):
@@ -968,11 +987,11 @@ class TcpSurface:
             else:
                 fut.set_exception(OSError(e, f"Connect call failed {address}"))
 
-        self._core.add_writer(fd, on_writable)
+        handle = self._core.add_writer(fd, on_writable)
         try:
             await fut
         finally:
-            self._core.remove_writer(fd)
+            self._watch_done(handle, self._core.remove_writer, fd)
 
     async def sock_accept(self, sock):
         try:
@@ -1005,11 +1024,11 @@ class TcpSurface:
                 conn.setblocking(False)
                 fut.set_result((conn, addr))
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recvfrom(self, sock, bufsize):
         try:
@@ -1033,11 +1052,11 @@ class TcpSurface:
             else:
                 fut.set_result(result)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recvfrom_into(self, sock, buf, nbytes=0):
         if not nbytes:
@@ -1063,11 +1082,11 @@ class TcpSurface:
             else:
                 fut.set_result(result)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_sendto(self, sock, data, address):
         try:
@@ -1094,11 +1113,11 @@ class TcpSurface:
                 # depend on transient socket readiness.
                 fut.set_result(sent)
 
-        self._core.add_writer(fd, on_writable)
+        handle = self._core.add_writer(fd, on_writable)
         try:
             return await fut
         finally:
-            self._core.remove_writer(fd)
+            self._watch_done(handle, self._core.remove_writer, fd)
 
     @staticmethod
     def _check_sendfile_params(file, offset, count):
@@ -1183,11 +1202,11 @@ class TcpSurface:
                     if not fut.done():
                         fut.set_result(None)
 
-                self._core.add_writer(fd, on_writable)
+                handle = self._core.add_writer(fd, on_writable)
                 try:
                     await fut
                 finally:
-                    self._core.remove_writer(fd)
+                    self._watch_done(handle, self._core.remove_writer, fd)
             return total
         finally:
             file.seek(offset + total)  # stdlib convention
