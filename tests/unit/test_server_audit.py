@@ -902,6 +902,10 @@ def test_s18_s19_pinning_stays_inside_the_affinity_mask_and_off_helper_threads(t
         assert report["executor"] == allowed, report
 
 
+def test_s19_pinning_is_opt_in():
+    assert cadeloop.Config().pin is False
+
+
 # --------------------------------------------------------------------- #
 # S17, S21, S23, S26, S29: the single-worker lifecycle (in process)      #
 # --------------------------------------------------------------------- #
@@ -1114,6 +1118,11 @@ def test_s23_warmup_freezes_what_the_first_requests_built():
     assert gc.get_freeze_count() == 0, "serve() must still unfreeze on the way out"
 
 
+def test_s23_reuse_scope_is_gone():
+    with pytest.raises(TypeError):
+        cadeloop.Config(reuse_scope=True)
+
+
 def test_s29_every_resolved_address_gets_a_listener(monkeypatch):
     """S29: binding stopped at the first candidate, so a name resolving to
     several addresses (localhost on a dual-stack host) got one listener.
@@ -1229,8 +1238,96 @@ def test_s20_access_log_records_reach_the_handler_with_ipv6_brackets():
     assert lines == ['[::1]:5555 "GET /x" 200 1.50ms', '127.0.0.1:6666 "POST /y" 201 2.50ms'], lines
 
 
+# --------------------------------------------------------------------- #
+# S8, S24, S25: CLI and Config                                           #
+# --------------------------------------------------------------------- #
+
 
 @posix_only
+def test_s8_the_console_script_imports_the_app_from_the_current_directory(tmp_path):
+    """S8: the installed `cadeloop` script runs with its own directory on
+    sys.path, not the current one, so `cadeloop myapp:app` -- the README's
+    first example -- could not import myapp."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "cadeloop"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import re, sys\n"
+        "from cadeloop.__main__ import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        "    sys.exit(main())\n"
+    )
+    script.chmod(0o755)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "myapp.py").write_text(APP)
+    port = _free_port()
+    proc = subprocess.Popen(
+        [str(script), "myapp:app", "--port", str(port)],
+        env=_env(),
+        cwd=str(project),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        _wait_up(port, deadline=15)
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        _, err = proc.communicate(timeout=10)
+    assert "ModuleNotFoundError" not in err
+
+
+@pytest.mark.parametrize(
+    "kwargs, exc",
+    [
+        ({"access_log": "false"}, TypeError),
+        ({"pin": "false"}, TypeError),
+        ({"immediate_flush": "false"}, TypeError),
+        ({"workers": "4"}, TypeError),
+        ({"workers": True}, TypeError),
+        ({"grace": "10"}, TypeError),
+        ({"accept_pool": 1.5}, TypeError),
+        ({"stats_endpoint": True}, TypeError),
+        ({"max_body": 2**64}, ValueError),
+        ({"rio_cq_size": 2**32}, ValueError),
+    ],
+)
+def test_s24_config_rejects_wrong_types_and_native_overflows(kwargs, exc):
+    """S24: a string "false" was stored and read as true (access_log="false"
+    turned the access log on), and values past the native integer types
+    failed only inside startup, after lifespan startup had run."""
+    with pytest.raises(exc):
+        cadeloop.Config(**kwargs)
+
+
+def test_s24_config_normalises_numbers():
+    c = cadeloop.Config(grace=3, workers=2)
+    assert c.grace == 3.0 and isinstance(c.grace, float) and c.workers == 2
+
+
+def test_s25_cli_flags_match_the_readme(monkeypatch):
+    """S25: --no-access-log did not exist although every boolean was
+    documented with a --no- form; --gc-mode accepted any string and
+    --port any integer, both failing later with a traceback."""
+    import contextlib
+    import io
+
+    import cadeloop.__main__ as cli
+
+    seen = {}
+    monkeypatch.setattr(cli, "serve", lambda app, host, port, **kw: seen.update(kw, port=port))
+    monkeypatch.setattr(cli, "load_app", lambda spec: None)
+    assert cli.main(["m:a", "--no-access-log"]) == 0 and seen["access_log"] is False
+    assert cli.main(["m:a", "--access-log"]) == 0 and seen["access_log"] is True
+    for bad in (["--gc-mode", "bogus"], ["--port", "70000"]):
+        with pytest.raises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["m:a", *bad])
+
+
 # --------------------------------------------------------------------- #
 # S30: smaller leaks and rough edges                                     #
 # --------------------------------------------------------------------- #
