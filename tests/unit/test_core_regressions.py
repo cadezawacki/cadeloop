@@ -778,3 +778,27 @@ def test_close_releases_the_epoll_instance():
         del lp
         gc.collect()
     assert nfds() <= before
+
+
+def test_timer_handles_order_and_hash_like_asyncio(loop):
+    a = loop.call_at(100.0, print)
+    b = loop.call_at(200.0, print)
+    c = loop.call_at(100.0, print)
+    assert a < b and b > a and a <= c and a >= c and not (a < c)
+    assert a == c and a != b and hash(a) == hash(c) == hash(100.0)
+    assert sorted([b, a]) == [a, b]
+    c.cancel()
+    assert a != c  # cancellation is part of equality
+    for h in (a, b):
+        h.cancel()
+
+
+def test_call_later_coroutine_error_names_call_at(loop):
+    loop.set_debug(True)
+
+    async def coro_fn():
+        pass
+
+    # asyncio's call_later is call_at(time() + delay): its message says so.
+    with pytest.raises(TypeError, match=r"coroutines cannot be used with call_at\(\)"):
+        loop.call_later(1, coro_fn)

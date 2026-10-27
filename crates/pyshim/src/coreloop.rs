@@ -849,7 +849,9 @@ impl CoreLoop {
         this.check_thread()?;
         let (deadline, when) = this.later_deadline(delay);
         let base =
-            this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_later")?;
+            // "call_at": asyncio's call_later is call_at(time() + delay),
+            // so its debug-mode callback errors name call_at().
+            this.make_handle(py, &callback, CallArgs::from_tuple(&args), context.as_ref(), "call_at")?;
         this.schedule_timer(py, deadline, when, base)
     }
 
@@ -2191,7 +2193,8 @@ unsafe fn fast_call_later(
         this.check_closed()?;
         this.check_thread()?;
         let (deadline, when) = this.later_deadline(delay);
-        let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_later")?;
+        // "call_at" in its error messages, as asyncio's (see call_later).
+        let base = raw_handle(py, this, args.add(1), nargs - 1, context, "call_at")?;
         Ok(this.schedule_timer(py, deadline, when, base)?.into_ptr())
     }
 }
