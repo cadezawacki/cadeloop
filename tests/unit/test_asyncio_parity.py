@@ -14,6 +14,7 @@ import signal
 import socket
 import ssl
 import struct
+import sys
 import time
 
 import cadeloop
@@ -44,6 +45,30 @@ def cade_loop():
     asyncio.set_event_loop(None)
     if not lp.is_closed():
         lp.close()
+
+
+def _bind_failure_text(addr):
+    """The OS's own wording for "that address is taken", as the socket
+    module reports it -- the text asyncio's bind error message embeds."""
+    probe = socket.socket()
+    try:
+        probe.bind(addr)
+    except OSError as e:
+        return e.strerror
+    finally:
+        probe.close()
+    raise AssertionError(f"{addr} was expected to be in use")
+
+
+def _socket_error_text(code):
+    """How the socket module words error `code`. Windows socket errors come
+    from FormatMessage, with trailing whitespace and the final period
+    stripped -- the C runtime's strerror() calls them "Unknown error"."""
+    if sys.platform == "win32":
+        import ctypes
+
+        return ctypes.FormatError(code).rstrip(" \t\r\n.")
+    return os.strerror(code)
 
 
 def _tls_contexts():
@@ -126,9 +151,11 @@ def test_tls_corrupted_record_raises_ssl_error(loop):
         writer.write(b"A\n")
         await writer.drain()
         await reader.readexactly(1)
-        # Application-data record header + garbage, under the TLS layer.
-        fd = writer.get_extra_info("socket").fileno()
-        os.write(fd, b"\x17\x03\x03\x00\x20" + b"\x00" * 32)
+        # Application-data record header + garbage, under the TLS layer --
+        # through a duplicate of the socket: os.write() cannot take a socket
+        # on Windows, where a socket handle is not a C runtime descriptor.
+        with writer.get_extra_info("socket").dup() as raw:
+            raw.send(b"\x17\x03\x03\x00\x20" + b"\x00" * 32)
         await asyncio.sleep(0.5)
         writer.close()
 
@@ -359,7 +386,7 @@ def test_bind_in_use_has_errno_and_names_the_address(loop):
         assert info.value.errno == errno.EADDRINUSE
         assert info.value.strerror == (
             f"error while attempting to bind on address ('127.0.0.1', {port}): "
-            "address already in use"
+            + _bind_failure_text(("127.0.0.1", port)).lower()
         )
 
     try:
@@ -383,7 +410,8 @@ def test_local_addr_bind_failure_names_the_local_address(loop):
             )
         assert info.value.errno == errno.EADDRINUSE
         assert info.value.strerror == (
-            f"error while attempting to bind on address {taken!r}: address already in use"
+            f"error while attempting to bind on address {taken!r}: "
+            + _bind_failure_text(taken).lower()
         )
         server.close()
         await server.wait_closed()
@@ -421,7 +449,7 @@ def test_peer_reset_reaches_connection_lost_with_errno(loop):
         exc = await asyncio.wait_for(lost, 5)
         assert isinstance(exc, ConnectionResetError)
         assert exc.errno == errno.ECONNRESET
-        assert exc.strerror == os.strerror(errno.ECONNRESET)
+        assert exc.strerror == _socket_error_text(errno.ECONNRESET)
         transport.close()
         server.close()
         await server.wait_closed()
@@ -458,7 +486,10 @@ def test_wildcard_server_serves(loop):
     async def main():
         server = await loop.create_server(asyncio.Protocol, None, 0)
         assert server.sockets
-        port = server.sockets[0].getsockname()[1]
+        # Port 0 gives each family's socket its own ephemeral port, and the
+        # sockets come in no particular order (asyncio iterates a set of
+        # address infos): dial the IPv4 one's port, not sockets[0]'s.
+        port = next(s.getsockname()[1] for s in server.sockets if s.family == socket.AF_INET)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.close()
         server.close()
@@ -661,6 +692,9 @@ def test_sock_recv_cancelled_after_close_raises_cancelled_error(loop):
     """Cancelling a sock_recv whose socket was already closed raises
     CancelledError; the cleanup's removal of the dead watch used to raise
     OSError(EBADF) in its place."""
+
+    if sys.platform == "win32" and not isinstance(loop, cadeloop.Loop):
+        pytest.skip("stdlib's Windows selector loop raises WinError 10038 from select() on the closed socket")
 
     async def main():
         a, b = socket.socketpair()
@@ -1598,6 +1632,11 @@ def test_sendfile_dispatches_on_the_transport_mode(loop, tmp_path):
     loop.run_until_complete(main())
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "sendfile"),
+    reason="the guard belongs to the native path: without os.sendfile (Windows) both loops use "
+    "asyncio's fallback, which does not refuse writes",
+)
 def test_write_during_sendfile_raises(loop, tmp_path):
     """CPython's test_sendfile_prevents_bare_write: bytes written while a
     native sendfile runs would land in the middle of the file."""

@@ -1416,6 +1416,15 @@ class _DatagramTransport(asyncio.DatagramTransport, asyncio.Transport):
             self._extra["sockname"] = sock.getsockname()
         except OSError:
             self._extra["sockname"] = None
+        if self._extra["sockname"] is None and sys.platform == "win32":
+            # An endpoint made with neither local_addr nor remote_addr has an
+            # unbound socket. Windows binds one implicitly on its first
+            # sendto, but IOCP cannot post the receive this endpoint keeps
+            # outstanding on a socket with no address (WSARecvFrom fails
+            # with WSAEINVAL), so do now what that first send would do.
+            wildcard = "::" if sock.family == socket.AF_INET6 else "0.0.0.0"
+            sock.bind((wildcard, 0))
+            self._extra["sockname"] = sock.getsockname()
         try:
             self._extra["peername"] = sock.getpeername()
         except OSError:
