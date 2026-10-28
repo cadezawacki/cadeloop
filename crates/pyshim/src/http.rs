@@ -120,10 +120,17 @@ pub(crate) struct HttpConn {
     /// forever. On disconnect every waiter resolves; a WS wake delivers
     /// one inbox message per waiter (the surplus re-park).
     pub(crate) recv_waiters: VecDeque<Py<PyAny>>,
-    /// R-084: an ASGI producer parked because the write queue crossed its
-    /// high-water mark; resolved when it drains below the low-water mark
-    /// (or when the connection dies).
-    pub(crate) drain_waiter: Option<Py<PyAny>>,
+    /// R-084: ASGI producers parked because the write queue crossed its
+    /// high-water mark, in call order; every one is resolved when the
+    /// queue drains below the low-water mark (or when the connection
+    /// dies). A queue, not a slot, for the reason `recv_waiters` is one:
+    /// concurrent websocket.send calls on one socket are ordinary (a
+    /// broadcast task and a heartbeat task, say), and parking each send
+    /// by displacing the previous one wrote every frame but resumed only
+    /// the last sender -- the displaced ones stayed pending until the
+    /// app's own timeout, or until the collector destroyed their tasks,
+    /// which nothing else kept alive.
+    pub(crate) drain_waiters: VecDeque<Py<PyAny>>,
     /// Monotonic per-request counter, bumped each time a request is
     /// dispatched on this connection. The `receive`/`send` callables handed
     /// to the app capture the value current at dispatch; a call whose epoch
@@ -311,7 +318,7 @@ impl HttpConn {
             deferred_error: None,
             disconnected: false,
             recv_waiters: VecDeque::new(),
-            drain_waiter: None,
+            drain_waiters: VecDeque::new(),
             req_epoch: 0,
             driver: None,
             eager,
@@ -334,6 +341,10 @@ impl HttpConn {
 
     pub(crate) fn take_recv_waiters(&mut self) -> VecDeque<Py<PyAny>> {
         std::mem::take(&mut self.recv_waiters)
+    }
+
+    pub(crate) fn take_drain_waiters(&mut self) -> VecDeque<Py<PyAny>> {
+        std::mem::take(&mut self.drain_waiters)
     }
 
     /// The pipeline queue is at its depth or byte budget.
@@ -1035,14 +1046,49 @@ impl HttpSend {
             return Ok(completed(py).clone_ref(py).into_any());
         };
         let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
-        let stored = fut.clone().unbind();
-        // A previous waiter would only exist if the app called send()
-        // concurrently from two tasks, which ASGI forbids; drop it via the
-        // graveyard rather than in-cell (ADR-5).
-        let displaced = core.with_net(|net, _| net::set_drain_waiter(net, self.tid, stored))?;
-        if let Some(old) = displaced {
-            core.with_net(|net, _| net.graveyard_py.push(old))?;
-            core.drain_graveyards(py)?;
+        // Park behind the senders already waiting, never in place of one.
+        // First prune the waiters cancelled sends left behind: an app that
+        // bounds each send with wait_for() against a client that has
+        // stopped reading cancels one future per timeout, and keeping
+        // them grew the queue for as long as the connection stayed stuck.
+        // done() is a Python call, so the queue is taken out of the cell,
+        // filtered here and put back in one uninterrupted stretch of
+        // loop-thread code, as HttpReceive does with its waiters.
+        let parked = core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.take_drain_waiters()))?;
+        let live: VecDeque<Py<PyAny>> = parked
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| {
+                let done: bool =
+                    w.bind(py).call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+                !done
+            })
+            .collect();
+        let store = fut.clone().unbind();
+        // Both go back out of the closure when the connection is gone, so
+        // no reference drops in-cell (ADR-5).
+        let unstored = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
+            Some(conn) => {
+                conn.drain_waiters = live;
+                conn.drain_waiters.push_back(store);
+                None
+            }
+            None => Some((live, store)),
+        })?;
+        if let Some((live, store)) = unstored {
+            // Gone between the pressure check and here: nothing will ever
+            // drain. Release every producer now; each one's next send()
+            // raises instead of hanging.
+            for w in live.into_iter().chain(std::iter::once(store)) {
+                let w = w.bind(py);
+                let done: bool =
+                    w.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+                if !done {
+                    // As the HttpDrained dispatch does: one failing waiter
+                    // must not leave the rest of them parked.
+                    let _ = w.call_method1(intern!(py, "set_result"), (py.None(),));
+                }
+            }
         }
         Ok(fut.unbind())
     }

@@ -5,6 +5,7 @@ against the RFC, not against itself."""
 
 import asyncio
 import base64
+import gc
 import hashlib
 import os
 import struct
@@ -758,3 +759,146 @@ def test_upgrade_is_parsed_as_a_token_list(loop, extra, expect_101):
     loop._core.listener_close(lid)
     got_101 = b"101" in head.split(b"\r\n", 1)[0]
     assert got_101 is expect_101, head[:80]
+
+
+# ---- concurrent sends under write backpressure ------------------------- #
+
+FILL = "f" * 65536  # one frame of the default high-water mark
+
+
+def _parked_senders_app(n, outcome, parked, done, keep_refs=True, collect=False):
+    """An app that drives one connection over its high-water mark, then
+    has `n` more sends in flight on it at once.
+
+    A filler task streams frames at a client that has stopped reading
+    until its send() parks (no progress for 0.3s); `n` sender tasks then
+    each send one small frame, which parks too since the queue is still
+    over the mark. Every task that gets back from `await send(...)` is
+    recorded in `outcome`; `done` is set when all n + 1 have."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        state = {"stop": False, "filled": 0}
+
+        def returned(who):
+            outcome.append(who)
+            if len(outcome) == n + 1:
+                done.set()
+
+        async def filler():
+            while not state["stop"]:
+                await send({"type": "websocket.send", "text": FILL})
+                state["filled"] += 1
+            returned("filler")
+
+        async def sender(i):
+            await send({"type": "websocket.send", "text": f"m{i}"})
+            returned(i)
+
+        tasks = [asyncio.ensure_future(filler())]
+        seen = -1
+        while state["filled"] != seen:
+            seen = state["filled"]
+            await asyncio.sleep(0.3)
+        state["stop"] = True
+        tasks += [asyncio.ensure_future(sender(i)) for i in range(n)]
+        if not keep_refs:
+            # Fire-and-forget: the loop holds no strong reference to a
+            # task, so only the connection keeps a parked sender alive.
+            del tasks
+        await asyncio.sleep(0.05)  # let every sender reach its await
+        if collect:
+            gc.collect()
+            gc.collect()
+        parked.set()
+        try:
+            await asyncio.wait_for(done.wait(), 5)
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await send({"type": "websocket.close"})
+        except (OSError, RuntimeError):
+            pass  # the teardown test has already dropped the connection
+
+    return app
+
+
+async def _read_until_close(reader):
+    while True:
+        _fin, op, payload = await asyncio.wait_for(read_server_frame(reader), 10)
+        if op == 0x8:
+            return
+
+
+def test_concurrent_ws_sends_all_resume_after_backpressure(loop):
+    """Several websocket.send calls in flight on one socket past its
+    high-water mark must each get back from their await once the queue
+    drains. The drain waiter was a single slot: each parked send
+    displaced the previous one's future and dropped it unresolved, so
+    every frame was written but only the last sender resumed -- the rest
+    hung until the app's own timeout."""
+    n = 4
+    outcome = []
+    parked, done = asyncio.Event(), asyncio.Event()
+    lid, port = listen(loop, _parked_senders_app(n, outcome, parked, done))
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        await asyncio.wait_for(parked.wait(), 30)  # the client reads nothing until here
+        await _read_until_close(reader)
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert sorted(outcome, key=str) == sorted(["filler", *range(n)], key=str), outcome
+
+
+def test_parked_ws_senders_survive_garbage_collection(loop):
+    """A sender parked on backpressure is reachable only through the
+    connection holding its drain future: asyncio keeps no strong reference
+    to a task. A displaced, dropped future left the task and its future in
+    a cycle of their own, and the collector destroyed the still-pending
+    task ("Task was destroyed but it is pending!")."""
+    n = 4
+    outcome, reports = [], []
+    parked, done = asyncio.Event(), asyncio.Event()
+    loop.set_exception_handler(lambda _loop, ctx: reports.append(ctx.get("message")))
+    app = _parked_senders_app(n, outcome, parked, done, keep_refs=False, collect=True)
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        await asyncio.wait_for(parked.wait(), 30)
+        await _read_until_close(reader)
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert not [r for r in reports if "destroyed but it is pending" in str(r)], reports
+    assert sorted(outcome, key=str) == sorted(["filler", *range(n)], key=str), outcome
+
+
+def test_parked_ws_senders_are_all_released_when_the_connection_dies(loop):
+    """A connection torn down with several sends parked on it will never
+    drain: every one of them must be released, not just the last."""
+    n = 4
+    outcome = []
+    parked, done = asyncio.Event(), asyncio.Event()
+    lid, port = listen(loop, _parked_senders_app(n, outcome, parked, done))
+
+    async def main():
+        _reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        await asyncio.wait_for(parked.wait(), 30)
+        writer.transport.abort()
+        await asyncio.wait_for(done.wait(), 5)
+
+    try:
+        loop.run_until_complete(main())
+    except asyncio.TimeoutError:
+        pass
+    loop._core.listener_close(lid)
+    assert sorted(outcome, key=str) == sorted(["filler", *range(n)], key=str), outcome

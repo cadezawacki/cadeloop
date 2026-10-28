@@ -21,7 +21,8 @@ methodology: [benchmarks.md](benchmarks.md).*
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | CI | The PGO wheel build baked a git-bash POSIX path into the instrumented binary, so Windows wrote the profiles elsewhere and the merge found nothing | `` |
+> | ASGI | Concurrent `send()` calls parked on write backpressure displaced one another's drain future: every frame was written but only the last sender resumed, and the rest stayed pending until the app's timeout or were destroyed by the GC as pending tasks; waiters now queue and all resolve on drain or teardown | `` |
+> | CI | The PGO wheel build baked a git-bash POSIX path into the instrumented binary, so Windows wrote the profiles elsewhere and the merge found nothing | `79bab8f` |
 > | TLS | A peer that connected and never sent a ClientHello was never torn down: each sweep staged another unencryptable 408 while the socket and receive slot stayed held | `7069869` |
 > | Loop | `sendfile` held a raw fd across suspensions: a transport closed mid-transfer could aim `os.sendfile` at whatever connection reused the number, or park forever on a dead watcher | `7069869` |
 > | Server | A lifespan app raising `KeyboardInterrupt`/`SystemExit` before `startup.complete` was classified as "no lifespan support" and served through | `7069869` |
