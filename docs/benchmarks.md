@@ -20,14 +20,14 @@ python bench/harness/charts.py --sched /tmp/sched.json \
 
 | | |
 |---|---|
-| OS | Linux 6.18.5 |
-| CPU | 4 vCPU Intel Xeon @ 2.80 GHz |
-| Python | CPython 3.11.15 |
+| OS | Linux 6.18.44 |
+| CPU | 4 vCPU Intel Xeon @ 2.10 GHz |
+| Python | CPython 3.11.17 |
 | libc | glibc 2.39 |
 | cadeloop backend | `epoll-dev` (the Linux dev backend, not the Windows/IOCP production target) |
 
-Contenders: uvloop 0.22.1, rloop 0.3.1, rsloop 0.1.36, uvicorn 0.52.3 (h11
-and httptools), granian 2.8.1, hypercorn 0.18.
+Contenders: uvloop 0.23.0, rloop 0.5.0, rsloop 0.1.66, uvicorn 0.54.0 (h11 0.16
+and httptools 0.9), granian 2.8.5, hypercorn 0.18.0.
 
 Everything runs over loopback with the load generator sharing the same four
 cores as the server. Absolute throughput is therefore conservative; the
@@ -55,7 +55,9 @@ records non-2xx responses and socket errors per run, so a contender that is
 fast because it is answering wrongly shows up rather than averaging in.
 
 **Scheduling**: 3 warmup + 5 measured runs, one fresh process per
-(loop, benchmark) pair, medians reported. No sockets and no external load
+(loop, benchmark) pair. The README figures merge three full passes, so each
+is the median of 15 runs: on a shared 4-vCPU VM a single pass's spread
+(slowest to fastest run) reached 30–60% on several benchmarks. No sockets and no external load
 generator, so these are free of trap 1 below.
 
 `queue_pingpong` and `queue_pingpong_native` are the same workload on
@@ -126,6 +128,9 @@ from a later run and differ slightly):
 only way to run uvicorn on cadeloop in an application.
 
 ## rloop 0.3.1 aborts under sustained load
+
+Fixed upstream: rloop 0.5.0 completes the full protocol and has an HTTP row
+again. Kept for the record.
 
 rloop served ~7.1 K req/s for two consecutive 3s runs and then killed the
 process on a Rust panic:
