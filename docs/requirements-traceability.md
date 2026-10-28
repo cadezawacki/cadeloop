@@ -31,7 +31,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-052 | SIGINT/SIGBREAK handlers | 🔶 POSIX ✅ (EINTR-prompt); Windows SetConsoleCtrlHandler 📅 M4 | loop.py |
 | R-053 | 4-ary timer heap, tombstones, >50% compaction | ✅ (proptested) | timer.rs |
 | R-054 | snapshot-batch dispatch (asyncio `_run_once` semantics; the 128 cap is gone: it broke `stop()`), vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, reactor.rs, handles.rs, net.rs |
-| R-055 | DNS thread pool min(8,cpus) + 5s LRU cache | ✅ | loop.py |
+| R-055 | DNS on the default executor (asyncio's; `set_default_executor` governs it), IP literals resolved without a lookup, opt-in TTL cache (`dns_cache`, on in `serve()`) | ✅ | loop.py, tcp.py |
 | R-056 | Eager task fast path, zero-Task completions | ✅ `PyIter_Send` stepping; non-suspending requests allocate no Task/Future; AppTask registers via `_enter_task` (anyio-compatible); `eager_tasks=False` stdlib path | http.rs (pyshim), config.py |
 | R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP `IOCTL_AFD_POLL` readiness (ADR-30), compile-verified pending Windows CI | epoll.rs, iocp.rs, iocp_util.rs, coreloop.rs |
 | R-058 | UDP endpoints | 📅 M4 | loop.py (gated) |

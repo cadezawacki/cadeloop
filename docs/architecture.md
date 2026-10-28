@@ -94,7 +94,9 @@ all resolve to it off-Windows.
 `Loop.__init__` binds the native methods (`call_soon`, `call_later`,
 `call_at`, `time`, `stop`, ...) directly onto the instance, so hot calls hit
 the PyO3 method with no Python wrapper frame. The facade supplies the
-long-tail surface: futures/tasks, executors, DNS pool + 5s cache (R-055),
+long-tail surface: futures/tasks, executors, DNS (IP literals resolved
+without a lookup, the rest on the default executor, plus an opt-in TTL
+cache; R-055),
 exception-handler machinery, asyncgen shutdown, and milestone-gated
 `NotImplementedError`s for I/O that hasn't landed.
 

@@ -814,7 +814,8 @@ traffic burns close to a core doing nothing.
 response that became wire-ready first still waits behind however many *other*
 connections' app dispatch the same tick batched ahead of it. Flushing
 immediately puts it on the wire straight away — at the cost of one syscall per
-response instead of one per batch.
+response instead of one per batch. Either way nothing corked is lost:
+`close()` and `abort()` hand any corked output to the kernel first.
 
 The two are independent, so a mixed setting is legitimate:
 
