@@ -447,7 +447,7 @@ def main():
                 rows,
                 "thousand coroutine calls/second",
                 m,
-                note="35,421 coroutine calls per run, median of 5",
+                note=f"35,421 coroutine calls per run, median of {sr.get('measured', 5)}",
             ),
         )
     if args.echo:

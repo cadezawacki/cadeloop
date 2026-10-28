@@ -25,8 +25,8 @@ work unmodified.
 For an even faster performance boost, skip the Python HTTP stack entirely.
 `cadeloop.serve()` parses HTTP, builds the ASGI scope, and serializes responses
 **in Rust**. Your `async def app(scope, receive, send)` is the only Python left
-on the request path — which is why it serves **2.4× a tuned uvicorn**
-(httptools + uvloop), **1.6× granian**, and **15.3× uvicorn + h11 on stdlib
+on the request path — which is why it serves **3.8× a tuned uvicorn**
+(httptools + uvloop), **2.4× granian**, and **15.2× uvicorn + h11 on stdlib
 asyncio**.
 
 ---
@@ -128,7 +128,7 @@ if __name__ == "__main__":
 
 ## Benchmarks
 
-Linux 6.18.5, 4 vCPU Intel Xeon @ 2.80 GHz, CPython 3.11.15. Loopback,
+Linux 6.18.44, 4 vCPU Intel Xeon @ 2.10 GHz, CPython 3.11.17. Loopback,
 single box, load generator sharing the cores — relative comparison, not
 capacity numbers. Linux runs the `epoll` dev backend; the Windows/IOCP
 numbers are in [docs/README.md](docs/README.md).
@@ -139,36 +139,34 @@ Methodology, raw commands, and known measurement pitfalls:
 ### HTTP / ASGI
 
 `wrk -t2 -c64`, 3s warmup + 3×10s measured, median. Single worker, plaintext
-`Hello, World!` ASGI app.
+`Hello, World!` ASGI app. No contender returned a non-2xx response or a socket
+error.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-http-ranked-dark.svg">
-  <img alt="HTTP throughput: cadeloop serve() 101.9K req/s, granian 63.1K, uvicorn+httptools/uvloop 42.3K, uvicorn+h11 6.4-9.9K, hypercorn 4.0K" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-http-ranked.svg">
+  <img alt="HTTP throughput: cadeloop serve() 105.4K req/s, granian 44.7K, uvicorn+httptools/uvloop 27.4K, uvicorn+h11 6.9-10.7K, hypercorn 4.2K" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-http-ranked.svg">
 </picture>
 
 <table>
 <thead><tr><th>server</th><th>parsing</th><th>loop</th><th align="right">req/s</th><th align="right">p50</th><th align="right">p99</th></tr></thead>
 <tbody>
-<tr><td><b>cadeloop</b> <code>serve()</code></td><td>Rust</td><td>cadeloop</td><td align="right" style="background-color: #00f0d11a"><b>101.9 K</b></td><td align="right" style="background-color: #00f0d11a"><b>0.53 ms</b></td><td align="right" style="background-color: #00f0d11a"><b>1.47 ms</b></td></tr>
-<tr><td>granian</td><td>Rust (hyper)</td><td>its own</td><td align="right">63.1 K</td><td align="right">0.96 ms</td><td align="right">1.98 ms</td></tr>
-<tr><td>uvicorn + httptools</td><td>C</td><td>uvloop</td><td align="right">42.3 K</td><td align="right">1.33 ms</td><td align="right">2.96 ms</td></tr>
-<tr><td>uvicorn + httptools</td><td>C</td><td>asyncio</td><td align="right">25.7 K</td><td align="right">2.40 ms</td><td align="right">4.04 ms</td></tr>
-<tr><td>uvicorn + h11</td><td>Python</td><td>cadeloop</td><td align="right">9.9 K</td><td align="right">6.58 ms</td><td align="right">9.83 ms</td></tr>
-<tr><td>uvicorn + h11</td><td>Python</td><td>uvloop</td><td align="right">9.7 K</td><td align="right">6.11 ms</td><td align="right">12.74 ms</td></tr>
-<tr><td>uvicorn + h11</td><td>Python</td><td>asyncio</td><td align="right">6.7 K</td><td align="right">9.36 ms</td><td align="right">12.05 ms</td></tr>
-<tr><td>uvicorn + h11</td><td>Python</td><td>rsloop</td><td align="right">6.4 K</td><td align="right">9.81 ms</td><td align="right">14.01 ms</td></tr>
-<tr><td>uvicorn + h11</td><td>Python</td><td>rloop</td><td align="right" colspan="3"><i>crashed under load</i></td></tr>
-<tr><td>hypercorn</td><td>Python</td><td>asyncio</td><td align="right">4.0 K</td><td align="right">15.79 ms</td><td align="right">23.86 ms</td></tr>
+<tr><td><b>cadeloop</b> <code>serve()</code></td><td>Rust</td><td>cadeloop</td><td align="right" style="background-color: #00f0d11a"><b>105.4 K</b></td><td align="right" style="background-color: #00f0d11a"><b>0.53 ms</b></td><td align="right" style="background-color: #00f0d11a"><b>2.21 ms</b></td></tr>
+<tr><td>granian</td><td>Rust (hyper)</td><td>its own</td><td align="right">44.7 K</td><td align="right">1.36 ms</td><td align="right">3.66 ms</td></tr>
+<tr><td>uvicorn + httptools</td><td>C</td><td>uvloop</td><td align="right">27.4 K</td><td align="right">2.17 ms</td><td align="right">4.84 ms</td></tr>
+<tr><td>uvicorn + httptools</td><td>C</td><td>asyncio</td><td align="right">21.3 K</td><td align="right">2.75 ms</td><td align="right">6.03 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>cadeloop</td><td align="right">10.7 K</td><td align="right">5.59 ms</td><td align="right">10.71 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>rsloop</td><td align="right">7.5 K</td><td align="right">8.01 ms</td><td align="right">13.56 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>uvloop</td><td align="right">7.1 K</td><td align="right">8.38 ms</td><td align="right">15.30 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>rloop</td><td align="right">6.9 K</td><td align="right">8.66 ms</td><td align="right">17.68 ms</td></tr>
+<tr><td>uvicorn + h11</td><td>Python</td><td>asyncio</td><td align="right">6.9 K</td><td align="right">8.67 ms</td><td align="right">14.18 ms</td></tr>
+<tr><td>hypercorn</td><td>Python</td><td>asyncio</td><td align="right">4.2 K</td><td align="right">14.07 ms</td><td align="right">24.13 ms</td></tr>
 </tbody>
 </table>
 
-Holding uvicorn+h11 fixed, cadeloop is 1.48× stdlib asyncio. Holding the loop
-fixed at cadeloop, `serve()` is 10.3× uvicorn+h11. The comparable stacks —
-those that also moved parsing out of Python — are granian (1.6×) and
-uvicorn+httptools+uvloop (2.4×).
-
-rloop 0.3.1 aborted mid-run on a Rust panic and has no result; details in
-[docs/benchmarks.md](docs/benchmarks.md#rloop-031-aborts-under-sustained-load).
+Holding uvicorn+h11 fixed, cadeloop is 1.54× stdlib asyncio and 1.42–1.54×
+the other loops. Holding the loop fixed at cadeloop, `serve()` is 9.9×
+uvicorn+h11. The comparable stacks — those that also moved parsing out of
+Python — are granian (2.4×) and uvicorn+httptools+uvloop (3.8×).
 
 ### Scheduling — recursive async `fib(21)`
 
@@ -181,29 +179,30 @@ and the node count are verified, so a loop cannot win by skipping work.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-sched-task-fib-dark.svg">
-  <img alt="Recursive async fib(21): cadeloop 87.8K calls/s, rloop 79.7K, rsloop 79.6K, uvloop 75.2K, asyncio 57.1K" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-sched-task-fib.svg">
+  <img alt="Recursive async fib(21): uvloop 79.4K calls/s, rsloop 77.4K, rloop 74.9K, cadeloop 71.8K, asyncio 50.4K" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-sched-task-fib.svg">
 </picture>
 
 <table>
 <thead><tr><th>loop</th><th align="right">K coroutine calls/s</th><th align="right">vs asyncio</th></tr></thead>
 <tbody>
-<tr><td><b>cadeloop</b></td><td align="right" style="background-color: #00f0d11a"><b>87.8</b></td><td align="right" style="background-color: #00f0d11a"><b>1.54×</b></td></tr>
-<tr><td>rloop</td><td align="right">79.7</td><td align="right">1.40×</td></tr>
-<tr><td>rsloop</td><td align="right">79.6</td><td align="right">1.40×</td></tr>
-<tr><td>uvloop</td><td align="right">75.2</td><td align="right">1.32×</td></tr>
-<tr><td>asyncio</td><td align="right">57.1</td><td align="right">1.00×</td></tr>
+<tr><td>uvloop</td><td align="right">79.4</td><td align="right">1.57×</td></tr>
+<tr><td>rsloop</td><td align="right">77.4</td><td align="right">1.53×</td></tr>
+<tr><td>rloop</td><td align="right">74.9</td><td align="right">1.49×</td></tr>
+<tr><td><b>cadeloop</b></td><td align="right" style="background-color: #00f0d11a"><b>71.8</b></td><td align="right" style="background-color: #00f0d11a"><b>1.42×</b></td></tr>
+<tr><td>asyncio</td><td align="right">50.4</td><td align="right">1.00×</td></tr>
 </tbody>
 </table>
 
-cadeloop leads by 10% over the next loop, and every Rust loop lands in a
-1.3–1.5× band over stdlib — well short of what the single-operation
-microbenchmarks below suggest, because this workload also spends real time in
-CPython's coroutine machinery, which no loop replaces.
+Every native loop lands in a 1.4–1.6× band over stdlib, and the four sit within
+11% of each other — about the size of this machine's run-to-run noise on this
+workload. Most of the time here goes to CPython's coroutine machinery, which no
+loop replaces, so the single-operation gaps below mostly wash out.
 
 ### Scheduling microbenchmarks
 
-Single-operation isolation, 3 warmup + 5 measured runs, fresh process per run,
-medians. Millions of ops/second.
+Single-operation isolation, 3 warmup + 5 measured runs per pass, fresh process
+per run; three passes, so each figure is the median of 15 runs. Millions of
+ops/second.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-sched-dark.svg">
@@ -213,28 +212,30 @@ medians. Millions of ops/second.
 <table>
 <thead><tr><th>benchmark</th><th align="right">cadeloop</th><th align="right">asyncio</th><th align="right">uvloop</th><th align="right">rloop</th><th align="right">rsloop</th></tr></thead>
 <tbody>
-<tr><td><code>call_soon_chain</code></td><td align="right">3.084</td><td align="right">0.517</td><td align="right">1.409</td><td align="right">3.575</td><td align="right" style="background-color: #00f0d11a"><b>3.880</b></td></tr>
-<tr><td><code>call_soon_burst</code></td><td align="right" style="background-color: #00f0d11a"><b>2.753</b></td><td align="right">0.734</td><td align="right">1.081</td><td align="right">2.535</td><td align="right">1.494</td></tr>
-<tr><td><code>timer_fire</code></td><td align="right" style="background-color: #00f0d11a"><b>1.603</b></td><td align="right">0.251</td><td align="right">1.013</td><td align="right">1.281</td><td align="right">0.912</td></tr>
-<tr><td><code>timer_schedule_cancel</code></td><td align="right" style="background-color: #00f0d11a"><b>1.869</b></td><td align="right">0.435</td><td align="right">0.429</td><td align="right">1.465</td><td align="right">1.052</td></tr>
-<tr><td><code>sleep0_chain</code></td><td align="right">1.149</td><td align="right">0.406</td><td align="right">0.806</td><td align="right" style="background-color: #00f0d11a"><b>1.472</b></td><td align="right">1.344</td></tr>
-<tr><td><code>task_spawn</code></td><td align="right" style="background-color: #00f0d11a"><b>0.264</b></td><td align="right">0.177</td><td align="right">0.235</td><td align="right">0.244</td><td align="right">0.237</td></tr>
-<tr><td><code>threadsafe_throughput</code></td><td align="right">2.852</td><td align="right">0.165</td><td align="right">1.669</td><td align="right" style="background-color: #00f0d11a"><b>3.024</b></td><td align="right">2.631</td></tr>
-<tr><td><code>future_chain</code></td><td align="right">0.847</td><td align="right">0.220</td><td align="right">0.503</td><td align="right" style="background-color: #00f0d11a"><b>0.905</b></td><td align="right">0.797</td></tr>
-<tr><td><code>gather_fanin</code></td><td align="right" style="background-color: #00f0d11a"><b>0.255</b></td><td align="right">0.159</td><td align="right">0.227</td><td align="right">0.227</td><td align="right">0.226</td></tr>
-<tr><td><code>queue_pingpong</code></td><td align="right" style="background-color: #00f0d11a"><b>1.104</b></td><td align="right">1.018</td><td align="right">1.049</td><td align="right">1.088</td><td align="right">1.011</td></tr>
-<tr><td><code>queue_pingpong_native</code></td><td align="right" style="background-color: #00f0d11a"><b>2.537</b></td><td align="right">1.988</td><td align="right">2.253</td><td align="right">2.383</td><td align="right">2.112</td></tr>
+<tr><td><code>call_soon_chain</code></td><td align="right" style="background-color: #00f0d11a"><b>5.821</b></td><td align="right">0.551</td><td align="right">1.773</td><td align="right">4.366</td><td align="right">2.534</td></tr>
+<tr><td><code>call_soon_burst</code></td><td align="right">2.371</td><td align="right">0.751</td><td align="right">1.218</td><td align="right" style="background-color: #00f0d11a"><b>2.829</b></td><td align="right">1.240</td></tr>
+<tr><td><code>timer_schedule_cancel</code></td><td align="right">1.798</td><td align="right">0.524</td><td align="right">0.447</td><td align="right" style="background-color: #00f0d11a"><b>2.018</b></td><td align="right">1.148</td></tr>
+<tr><td><code>timer_fire</code></td><td align="right">1.434</td><td align="right">0.293</td><td align="right">1.223</td><td align="right" style="background-color: #00f0d11a"><b>1.498</b></td><td align="right">1.200</td></tr>
+<tr><td><code>sleep0_chain</code></td><td align="right">1.778</td><td align="right">0.411</td><td align="right">1.059</td><td align="right" style="background-color: #00f0d11a"><b>1.843</b></td><td align="right">1.297</td></tr>
+<tr><td><code>task_spawn</code></td><td align="right">0.274</td><td align="right">0.200</td><td align="right">0.276</td><td align="right" style="background-color: #00f0d11a"><b>0.279</b></td><td align="right">0.278</td></tr>
+<tr><td><code>threadsafe_throughput</code></td><td align="right">2.646</td><td align="right">0.060</td><td align="right">1.726</td><td align="right">3.810</td><td align="right" style="background-color: #00f0d11a"><b>3.997</b></td></tr>
+<tr><td><code>future_chain</code></td><td align="right" style="background-color: #00f0d11a"><b>1.231</b></td><td align="right">0.233</td><td align="right">0.654</td><td align="right">1.127</td><td align="right">0.777</td></tr>
+<tr><td><code>gather_fanin</code></td><td align="right">0.256</td><td align="right">0.176</td><td align="right">0.246</td><td align="right" style="background-color: #00f0d11a"><b>0.279</b></td><td align="right">0.268</td></tr>
+<tr><td><code>queue_pingpong</code></td><td align="right" style="background-color: #00f0d11a"><b>1.348</b></td><td align="right">1.211</td><td align="right">1.294</td><td align="right">1.170</td><td align="right">1.253</td></tr>
+<tr><td><code>queue_pingpong_native</code></td><td align="right" style="background-color: #00f0d11a"><b>3.443</b></td><td align="right">2.672</td><td align="right">3.029</td><td align="right">2.902</td><td align="right">2.891</td></tr>
 </tbody>
 </table>
 
-cadeloop leads on seven of eleven and beats stdlib asyncio on all eleven.
-Where it does not lead — `call_soon_chain`, `sleep0_chain`,
-`threadsafe_throughput`, `future_chain` — rloop or rsloop is ahead by 6–28%.
+cadeloop beats stdlib asyncio on all eleven and uvloop on ten of eleven, and
+leads outright on four: `call_soon_chain` (10.6× asyncio), `future_chain`, and
+both queue workloads. rloop 0.5 leads most of the rest, by 2–19%;
+`threadsafe_throughput` is the one wide gap, where rsloop and rloop are 1.4–1.5×
+ahead.
 
 `queue_pingpong_native` is the same workload on `cadeloop.Queue` instead of
 `asyncio.Queue`. The queue is loop-agnostic, so it runs under every contender,
 and the pair isolates what the stdlib queue's pure-Python `put`/`get` costs:
-2.3× on cadeloop, and roughly 2× on every other loop. That gap is the queue,
+2.6× on cadeloop, and 2.2–2.5× on every other loop. That gap is the queue,
 not the loop.
 
 ---
