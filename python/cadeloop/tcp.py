@@ -70,6 +70,20 @@ def _check_ssl_socket(sock):
         raise TypeError("Socket cannot be of type SSLSocket")
 
 
+def _port_unreachable(sock, exc):
+    """Whether `exc`, raised by a receive on `sock`, is Windows reporting
+    the ICMP "port unreachable" that an earlier datagram from the socket
+    drew. A plain receive gets that report as WSAECONNRESET. asyncio's
+    proactor gets it as ERROR_PORT_UNREACHABLE on the receive it posted
+    and returns an empty datagram from no address in its place; the
+    socket keeps working."""
+    return (
+        sys.platform == "win32"
+        and isinstance(exc, ConnectionResetError)
+        and sock.type == socket.SOCK_DGRAM
+    )
+
+
 # socket()-creation failures that CPython's create_server treats as
 # "skip this address family" during multi-family resolution. The core
 # reports those by returning None (tcp_listen's skip_unavailable); this
@@ -1156,6 +1170,10 @@ class TcpSurface:
             return sock.recvfrom(bufsize)
         except (BlockingIOError, InterruptedError):
             pass
+        except ConnectionResetError as exc:
+            if not _port_unreachable(sock, exc):
+                raise
+            return b"", None
         fut = self.create_future()
         fd = sock.fileno()
 
@@ -1169,7 +1187,10 @@ class TcpSurface:
             except (SystemExit, KeyboardInterrupt):
                 raise
             except BaseException as exc:
-                fut.set_exception(exc)
+                if _port_unreachable(sock, exc):
+                    fut.set_result((b"", None))
+                else:
+                    fut.set_exception(exc)
             else:
                 fut.set_result(result)
 
@@ -1187,6 +1208,10 @@ class TcpSurface:
             return sock.recvfrom_into(buf, nbytes)
         except (BlockingIOError, InterruptedError):
             pass
+        except ConnectionResetError as exc:
+            if not _port_unreachable(sock, exc):
+                raise
+            return 0, None
         fut = self.create_future()
         fd = sock.fileno()
 
@@ -1200,7 +1225,10 @@ class TcpSurface:
             except (SystemExit, KeyboardInterrupt):
                 raise
             except BaseException as exc:
-                fut.set_exception(exc)
+                if _port_unreachable(sock, exc):
+                    fut.set_result((0, None))
+                else:
+                    fut.set_exception(exc)
             else:
                 fut.set_result(result)
 
@@ -1416,6 +1444,15 @@ class _DatagramTransport(asyncio.DatagramTransport, asyncio.Transport):
             self._extra["sockname"] = sock.getsockname()
         except OSError:
             self._extra["sockname"] = None
+        if self._extra["sockname"] is None and sys.platform == "win32":
+            # An endpoint made with neither local_addr nor remote_addr has an
+            # unbound socket. Windows binds one implicitly on its first
+            # sendto, but IOCP cannot post the receive this endpoint keeps
+            # outstanding on a socket with no address (WSARecvFrom fails
+            # with WSAEINVAL), so do now what that first send would do.
+            wildcard = "::" if sock.family == socket.AF_INET6 else "0.0.0.0"
+            sock.bind((wildcard, 0))
+            self._extra["sockname"] = sock.getsockname()
         try:
             self._extra["peername"] = sock.getpeername()
         except OSError:

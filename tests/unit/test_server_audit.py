@@ -1366,6 +1366,10 @@ def test_s30_the_spawn_supervisor_does_not_import_the_app(monkeypatch, tmp_path)
         srv.serve("__main__:app", workers=2)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX wait statuses: the fork-model supervisor that reports them is POSIX-only",
+)
 def test_s30_worker_exit_statuses_are_decoded_in_logs():
     from cadeloop.server import _describe_status
 
