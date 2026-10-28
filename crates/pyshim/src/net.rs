@@ -1012,9 +1012,10 @@ fn teardown_lost(
                 let code = wsc.close_code.unwrap_or(1006);
                 net.note_ws_close(tid, code);
             }
-            if let Some(fut) = conn.drain_waiter.take() {
-                // The queue will never drain now; releasing the producer
-                // lets its next send() raise properly instead of hanging.
+            // The queue will never drain now; releasing every parked
+            // producer lets each one's next send() raise properly instead
+            // of hanging.
+            for fut in conn.take_drain_waiters() {
                 net.events.push(NetEvent::HttpDrained { fut });
             }
             for fut in conn.take_recv_waiters() {
@@ -2549,14 +2550,6 @@ pub(crate) fn write_pressure(net: &NetState, tid: u64) -> Option<(usize, usize, 
     })
 }
 
-/// Park an ASGI producer on this connection until the queue drains.
-pub(crate) fn set_drain_waiter(net: &mut NetState, tid: u64, fut: Py<PyAny>) -> Option<Py<PyAny>> {
-    match net.transports.get_mut(&tid).map(|e| &mut e.proto) {
-        Some(ProtoKind::Http(conn)) => conn.drain_waiter.replace(fut),
-        _ => Some(fut), // no connection: hand it straight back
-    }
-}
-
 /// R-085: re-post the recv a spent pipeline budget suppressed, once the
 /// queue has drained far enough. In-cell.
 pub(crate) fn http_resume_reading(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
@@ -2608,13 +2601,15 @@ fn on_send_done(
             consumed = 0;
         }
     }
-    // R-084: release an ASGI producer parked on the high-water mark --
-    // counting staged plaintext, exactly as write_pressure does, so a
-    // waiter is not woken while the TLS staging buffer is still full.
+    // R-084: release the ASGI producers parked on the high-water mark --
+    // all of them, in the order they parked, as asyncio's FlowControlMixin
+    // resumes every drain() waiter -- counting staged plaintext, exactly as
+    // write_pressure does, so none is woken while the TLS staging buffer
+    // is still full.
     if let ProtoKind::Http(conn) = &mut entry.proto {
         let staged = conn.tls.as_ref().map(|t| t.staged.len()).unwrap_or(0);
         if entry.queued_bytes + staged <= entry.low_water {
-            if let Some(fut) = conn.drain_waiter.take() {
+            for fut in conn.take_drain_waiters() {
                 net.events.push(NetEvent::HttpDrained { fut });
             }
         }
