@@ -1,13 +1,30 @@
-# R-120 conformance skip-list. One `TestClass.test_name` per line; every
-# entry MUST carry a justification. This list must shrink monotonically
-# across milestones (checked in review; a milestone exit criterion).
-#
-# ---- M5 floor ----------------------------------------------------------
-# Every feature-area skip from M0 has been removed: TCP transports (M1),
-# reader/writer callbacks (M1), UDP (M4), signal handlers (R-052),
-# subprocess (M5-POSIX) are all implemented and covered by the in-repo
-# suites. Windows CI's suite-shipping interpreter adjudicates the CPython
-# tests themselves; any test that fails there gets re-added WITH a fresh
-# justification (the documented process), never silently.
-#
-# (currently empty)
+# R-120 conformance skip-list. One `module.TestClass.test_name` per line
+# (`TestClass.test_name` matches in any module), each with a `# reason` on
+# the same line -- the runner rejects an entry without one. Skips are for
+# tests of the stdlib loop's own internals, which cadeloop does not have;
+# a test that fails for a cadeloop bug stays a failure. This list must
+# shrink monotonically across milestones (checked in review; a milestone
+# exit criterion).
+
+# ---- stdlib internals cadeloop does not have ----------------------------
+test_events.CadeloopEventLoopTests.test_create_server_multiple_hosts_ipv4  # mocks asyncio.base_events.socket and the loop's private _start_serving/_stop_serving
+test_events.CadeloopEventLoopTests.test_create_server_multiple_hosts_ipv6  # mocks asyncio.base_events.socket and the loop's private _start_serving/_stop_serving
+test_events.CadeloopEventLoopTests.test_prompt_cancellation  # wraps the selector loop's private _run_once
+test_events.CadeloopEventLoopTests.test_timeout_rounding  # counts calls to the private _run_once and reads _selector
+test_unix_events.CadeloopUnixSocketTests.test_create_unix_server_bind_error  # mocks asyncio.unix_events.socket, which cadeloop does not use
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_not_available  # patches asyncio.unix_events.os and calls the private _sock_sendfile_native
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_not_a_file  # calls the selector loop's private _sock_sendfile_native
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_iobuffer  # calls the selector loop's private _sock_sendfile_native
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_not_regular_file  # calls the selector loop's private _sock_sendfile_native
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_cancel1  # calls the private _sock_sendfile_native_impl and reads _selector
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_cancel2  # calls the private _sock_sendfile_native_impl and reads _selector
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_blocking_error  # calls the private _sock_sendfile_native_impl and reads _selector
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_os_error_first_call  # calls the private _sock_sendfile_native_impl and reads _selector
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_os_error_next_call  # calls the private _sock_sendfile_native_impl and reads _selector
+test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_exception  # calls the private _sock_sendfile_native_impl and reads _selector
+
+# ---- deliberate deviations (as in uvloop) -------------------------------
+test_events.CadeloopEventLoopTests.test_create_connection  # isinstance(transport, asyncio.Transport): a native type cannot subclass asyncio.Transport (instance-layout conflict); uvloop's transports are not instances either
+test_events.CadeloopEventLoopTests.test_create_unix_connection  # isinstance(transport, asyncio.Transport): see test_create_connection
+test_sock_lowlevel.CadeloopSockTests.test_create_connection_sock  # isinstance(transport, asyncio.Transport): see test_events test_create_connection
+test_events.CadeloopEventLoopTests.test_datagram_send_to_non_listening_address  # timing-dependent on I/O-vs-ready order: protocol callbacks run before callbacks already ready at the poll (asyncio runs them after; uvloop, like cadeloop, before), so datagram_received can beat the task step that installs its future

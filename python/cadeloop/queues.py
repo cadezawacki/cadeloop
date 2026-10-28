@@ -93,7 +93,15 @@ class Queue:
         self._q.task_done()
 
     def __repr__(self):
-        return f"<cadeloop.Queue maxsize={self._maxsize!r} qsize={self._q.qsize()}>"
+        return f"<{type(self).__name__} at {id(self):#x} {self._format()}>"
+
+    def __str__(self):
+        return f"<{type(self).__name__} {self._format()}>"
+
+    def _format(self):
+        # asyncio's leading fields; the queued items and waiters live in
+        # the native core.
+        return f"maxsize={self._maxsize!r} qsize={self._q.qsize()}"
 
     def _bind(self, loop, attr="_loop"):
         # asyncio.mixins._LoopBoundMixin._get_loop. Without it a waiter

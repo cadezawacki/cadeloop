@@ -282,6 +282,26 @@ impl CoreLoop {
         }
     }
 
+    /// `report_net_error` for a transport's own failure, with the
+    /// `transport` and `protocol` context keys asyncio's `_fatal_error`
+    /// and flow-control reports carry.
+    pub(crate) fn report_transport_error(
+        &self,
+        py: Python<'_>,
+        message: &str,
+        exc: Py<PyAny>,
+        transport: Option<Py<PyAny>>,
+        protocol: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        match self.net_error_hook.get() {
+            Some(hook) => match hook.call1(py, (message, &exc, transport, protocol)) {
+                Ok(_) => Ok(()),
+                Err(e) => self.hook_error_verdict(py, e, None),
+            },
+            None => self.report_net_error(py, message, exc),
+        }
+    }
+
     fn report_failure(&self, py: Python<'_>, handle: &Bound<'_, PyAny>, err: PyErr) -> PyResult<()> {
         match self.error_hook.get() {
             Some(hook) => match hook.call1(py, (handle, err.value(py))) {
@@ -926,8 +946,13 @@ impl CoreLoop {
 
     /// Bind + listen (+ start the accept pool unless `start=false`).
     /// Returns (listener id, (ip, port) bound name, raw fd).
+    ///
+    /// `skip_unavailable`: return None instead of raising when no socket
+    /// of the address's family can be created at all -- create_server's
+    /// rule for a multi-family resolution, where a host without IPv6
+    /// still serves on IPv4.
     #[pyo3(signature = (ip, port, factory, backlog=1024, reuse_addr=true, reuse_port=false,
-                        accept_pool=64, start=true, flowinfo=0, scope_id=0))]
+                        accept_pool=64, start=true, flowinfo=0, scope_id=0, skip_unavailable=false))]
     #[allow(clippy::too_many_arguments)]
     fn tcp_listen(
         &self,
@@ -942,11 +967,17 @@ impl CoreLoop {
         start: bool,
         flowinfo: u32,
         scope_id: u32,
-    ) -> PyResult<(u64, Py<PyAny>, u64)> {
+        skip_unavailable: bool,
+    ) -> PyResult<Option<(u64, Py<PyAny>, u64)>> {
         self.check_closed()?;
         let spec = ListenSpec { backlog, reuse_addr, reuse_port, tfo: self.tfo, flowinfo, scope_id };
-        let sock = bind_listen_socket(ip, port, &spec)?;
-        self.listen_socket(py, sock, net::ListenerKind::Factory(factory.unbind()), accept_pool, start)
+        let sock = match bind_listen_socket(ip, port, &spec) {
+            Ok(sock) => sock,
+            Err(ListenError::Socket(_)) if skip_unavailable => return Ok(None),
+            Err(e) => return Err(e.into_pyerr(py, ip, port, &spec)),
+        };
+        self.listen_socket(py, sock, net::ListenerKind::Factory(factory.unbind()), accept_pool, start, None)
+            .map(Some)
     }
 
     /// Bind + listen for the native HTTP/ASGI engine (M2, R-080). Every
@@ -991,7 +1022,7 @@ impl CoreLoop {
         };
         let secs_to_ns = |s: f64| if s > 0.0 { (s * 1e9) as u64 } else { 0 };
         let spec = ListenSpec { backlog, reuse_addr, reuse_port, tfo: self.tfo, flowinfo, scope_id };
-        let sock = bind_listen_socket(ip, port, &spec)?;
+        let sock = bind_listen_socket(ip, port, &spec).map_err(|e| e.into_pyerr(py, ip, port, &spec))?;
         let kind = net::ListenerKind::Http {
             app: app.unbind(),
             pyloop: pyloop.unbind(),
@@ -1004,7 +1035,7 @@ impl CoreLoop {
             },
             tls: tls.filter(|t| !t.is_none()).map(|t| t.unbind()),
         };
-        self.listen_socket(py, sock, kind, accept_pool, true)
+        self.listen_socket(py, sock, kind, accept_pool, true, None)
     }
 
     /// Adopt an EXISTING listening socket for the native HTTP engine —
@@ -1053,7 +1084,7 @@ impl CoreLoop {
             },
             tls: tls.filter(|t| !t.is_none()).map(|t| t.unbind()),
         };
-        self.listen_socket(py, fd as RawSocket, kind, accept_pool, true)
+        self.listen_socket(py, fd as RawSocket, kind, accept_pool, true, None)
     }
 
     /// Adopt an already-ACCEPTED, connected socket as an HTTP connection
@@ -1114,15 +1145,21 @@ impl CoreLoop {
     /// R-058: adopt a bound (optionally connected) UDP socket as a
     /// datagram endpoint. Callbacks are the protocol's datagram_received /
     /// error_received / connection_lost bound methods. Returns the did.
+    /// `owner`: the socket object whose descriptor `fd` is; it stays the
+    /// owner and is closed after connection_lost (see udp_wire).
+    #[pyo3(signature = (fd, datagram_received, error_received, connection_lost, owner=None))]
     fn udp_open(
         &self,
+        py: Python<'_>,
         fd: u64,
         datagram_received: Bound<'_, PyAny>,
         error_received: Bound<'_, PyAny>,
         connection_lost: Bound<'_, PyAny>,
+        owner: Option<Bound<'_, PyAny>>,
     ) -> PyResult<u64> {
         self.check_closed()?;
-        let did = self.with_net(|net, reactor| {
+        let owner = owner.filter(|o| !o.is_none()).map(Bound::unbind);
+        let wired = self.with_net(|net, reactor| {
             net::udp_wire(
                 net,
                 reactor.backend_mut(),
@@ -1130,9 +1167,11 @@ impl CoreLoop {
                 datagram_received.clone().unbind(),
                 error_received.clone().unbind(),
                 connection_lost.clone().unbind(),
+                owner,
             )
-        })??;
-        Ok(did)
+        })?;
+        self.drain_graveyards(py)?;
+        wired.map_err(net::io_error)
     }
 
     /// R-058: swap a datagram endpoint's cached protocol callbacks so
@@ -1173,7 +1212,8 @@ impl CoreLoop {
     ) -> PyResult<()> {
         self.check_closed()?;
         let addr = addr.filter(|a| !a.is_none()).map(parse_addr_tuple).transpose()?;
-        self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))??;
+        self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))?
+            .map_err(net::io_error)?;
         self.drain_graveyards(py)
     }
 
@@ -1183,7 +1223,8 @@ impl CoreLoop {
         self.with_net(|net, reactor| {
             net::udp_close(py, net, reactor.backend_mut(), did, abort);
         })?;
-        self.drain_graveyards(py)
+        self.drain_graveyards(py)?;
+        net::schedule_pending_lost(py, self)
     }
 
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the
@@ -1215,11 +1256,15 @@ impl CoreLoop {
     }
 
     /// Adopt an existing listening socket fd (create_server(sock=...)).
-    /// Owns the caller-detached descriptor from entry: every error path
-    /// closes it exactly once, and the Python side no longer discards on
-    /// failure -- doing both was a double close, and in a threaded
-    /// process the second close lands on whatever reused the number.
-    #[pyo3(signature = (fd, factory, accept_pool=64, start=true))]
+    ///
+    /// With `owner` (the caller's socket object, whose descriptor `fd` is)
+    /// the object stays the owner, as asyncio leaves it: it keeps working
+    /// while the server runs, the listener's close closes it, and a
+    /// failure here leaves it open. Without, the listener owns the
+    /// (detached) descriptor from entry and every error path closes it
+    /// exactly once -- the Python side must not, or a threaded process's
+    /// second close lands on whatever reused the number.
+    #[pyo3(signature = (fd, factory, accept_pool=64, start=true, owner=None))]
     fn listen_fd(
         &self,
         py: Python<'_>,
@@ -1227,9 +1272,13 @@ impl CoreLoop {
         factory: Bound<'_, PyAny>,
         accept_pool: usize,
         start: bool,
+        owner: Option<Bound<'_, PyAny>>,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
+        let owner = owner.filter(|o| !o.is_none()).map(Bound::unbind);
         if let Err(e) = self.check_closed() {
-            netsys::close(fd as RawSocket);
+            if owner.is_none() {
+                netsys::close(fd as RawSocket);
+            }
             return Err(e);
         }
         self.listen_socket(
@@ -1238,7 +1287,27 @@ impl CoreLoop {
             net::ListenerKind::Factory(factory.unbind()),
             accept_pool,
             start,
+            owner,
         )
+    }
+
+    /// The live transport whose descriptor `fd` is, if any (asyncio's
+    /// `_ensure_fd_no_transport`, for add_reader and friends).
+    fn transport_for_fd(&self, py: Python<'_>, fd: u64) -> PyResult<Option<Py<PyAny>>> {
+        let found = self.with_net(|net, _| net.transport_for_fd(py, fd as RawSocket))?;
+        Ok(match found {
+            Some((false, transport)) => Some(transport),
+            Some((true, connection_lost)) => connection_lost.getattr(py, "__self__").ok(),
+            None => None,
+        })
+    }
+
+    /// Give a listener its asyncio Server facade, so every connection it
+    /// accepts is counted (`_attach`/`_detach`) for `Server.wait_closed()`.
+    fn listener_set_server(&self, lid: u64, server: Bound<'_, PyAny>) -> PyResult<()> {
+        let old = self.with_net(|net, _| net::listener_set_server(net, lid, server.unbind()))?;
+        drop(old); // outside the cell
+        Ok(())
     }
 
     /// R-052: the facade marks the signal-wakeup pipe's read end here so
@@ -1250,11 +1319,11 @@ impl CoreLoop {
 
     /// Start (or restart) accepting on a listener created with start=false.
     fn listener_start(&self, lid: u64) -> PyResult<()> {
-        self.with_net(|net, reactor| {
+        let started = self.with_net(|net, reactor| {
             net.now_ns = reactor.now_fresh(); // a failed first post backs off from now
             net::listener_start(net, reactor.backend_mut(), lid)
-        })??;
-        Ok(())
+        })?;
+        started.map_err(net::io_error)
     }
 
     fn listener_close(&self, py: Python<'_>, lid: u64) -> PyResult<()> {
@@ -1319,14 +1388,14 @@ impl CoreLoop {
         self.check_closed()?;
         let sockaddr = parse_addr_tuple(addr)?;
         let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
-        let sock = netsys::create_tcp(family)?;
+        let sock = netsys::create_tcp(family).map_err(net::io_error)?;
         if self.loopback_fast_path {
             // Best-effort by design (R-038/R-131): it needs both ends to
             // opt in and is unsupported on some builds.
             let _ = netsys::set_loopback_fast_path(sock);
         }
         if let Some(local) = local_addr.filter(|a| !a.is_none()) {
-            let laddr = match parse_addr_tuple(local) {
+            let laddr = match parse_addr_tuple(local.clone()) {
                 Ok(a) => a,
                 Err(e) => {
                     netsys::close(sock);
@@ -1336,7 +1405,14 @@ impl CoreLoop {
             let lsa = netsys::build_sockaddr(laddr);
             if let Err(e) = netsys::bind(sock, &lsa) {
                 netsys::close(sock);
-                return Err(e.into());
+                // Worded as create_connection words it, naming the local
+                // address: the caller may have offered several.
+                let Some(code) = e.raw_os_error() else { return Err(e.into()) };
+                let strerror = net::os_strerror(code).to_lowercase();
+                return Err(net::os_error_msg(
+                    code,
+                    format!("error while attempting to bind on address {}: {strerror}", local.repr()?),
+                ));
             }
         }
         let fut: Py<PyAny> = fut.unbind();
@@ -1361,7 +1437,7 @@ impl CoreLoop {
         match res {
             Err(e) => {
                 netsys::close(sock);
-                Err(e.into())
+                Err(net::io_error(e))
             }
             Ok(op) => Ok(op),
         }
@@ -1406,14 +1482,21 @@ impl CoreLoop {
     }
 
     /// Wire a connected socket (from tcp_connect's future) into a transport.
+    ///
+    /// `owner`: the caller's socket object, when `sock` is its descriptor
+    /// (`create_connection(sock=...)` and friends) -- see
+    /// `TransportEntry::owner`.
+    #[pyo3(signature = (sock, protocol, owner=None))]
     fn attach_stream(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         sock: u64,
         protocol: Bound<'_, PyAny>,
+        owner: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<Transport>> {
         slf.get().check_closed()?;
-        net::wire_stream(py, slf, sock as RawSocket, protocol)
+        let owner = owner.filter(|o| !o.is_none()).map(Bound::unbind);
+        net::wire_stream(py, slf, sock as RawSocket, protocol, owner, None)
     }
 
     // ---- named pipes (R-051 Windows subprocess/pipe support) -------------
@@ -1426,7 +1509,8 @@ impl CoreLoop {
     /// Associate a pipe HANDLE with the backend's completion port.
     fn pipe_register(&self, handle: u64) -> PyResult<()> {
         self.check_closed()?;
-        self.with_net(|_, reactor| reactor.backend_mut().register_pipe(handle as RawSocket))??;
+        self.with_net(|_, reactor| reactor.backend_mut().register_pipe(handle as RawSocket))?
+            .map_err(net::io_error)?;
         Ok(())
     }
 
@@ -1461,7 +1545,7 @@ impl CoreLoop {
                 fut_for_broken_pipe.call_method1(py, "set_result", (PyBytes::new(py, b""),))?;
                 return Ok(());
             }
-            return Err(PyErr::from(e));
+            return Err(net::io_error(e));
         }
         Ok(())
     }
@@ -1478,7 +1562,7 @@ impl CoreLoop {
             net.ops.insert(op, net::OpTarget::PipeWrite { fut, _buf: buf });
             Ok(())
         })?;
-        res.map_err(PyErr::from)
+        res.map_err(net::io_error)
     }
 
     // ---- readiness watches (R-057) ---------------------------------------
@@ -1924,6 +2008,9 @@ impl CoreLoop {
         Ok(handle)
     }
 
+    /// `owner`: the caller's socket object when the descriptor is that
+    /// object's (`create_server(sock=...)`); it keeps owning it, and on
+    /// failure it is handed back open, as asyncio leaves it.
     fn listen_socket(
         &self,
         py: Python<'_>,
@@ -1931,20 +2018,24 @@ impl CoreLoop {
         kind: net::ListenerKind,
         accept_pool: usize,
         start: bool,
+        owner: Option<Py<PyAny>>,
     ) -> PyResult<(u64, Py<PyAny>, u64)> {
         let sockname = netsys::sockname(sock).ok();
-        let lid = self.with_net(|net, reactor| -> std::io::Result<u64> {
+        let owned = owner.is_none();
+        let created = self.with_net(|net, reactor| -> std::io::Result<u64> {
             if let Err(e) = reactor.backend_mut().register_socket(sock) {
                 // Nothing owns this descriptor yet: `listener_create` has
                 // not run, so no listener entry will ever close it. For
                 // tcp_listen/http_listen that leaves the port we just
-                // bound held for the life of the process; for
-                // create_server(sock=...) the caller already detached its
-                // socket object, so the fd has no owner at all.
-                netsys::close(sock);
+                // bound held for the life of the process.
+                if owned {
+                    netsys::close(sock);
+                } else if let Some(owner) = owner {
+                    net.graveyard_py.push(owner);
+                }
                 return Err(e);
             }
-            let lid = net::listener_create(net, sock, kind, accept_pool);
+            let lid = net::listener_create(net, sock, kind, accept_pool, owner);
             if start {
                 net.now_ns = reactor.now_fresh(); // a failed first post backs off from now
                 if let Err(e) = net::listener_start(net, reactor.backend_mut(), lid) {
@@ -1952,12 +2043,14 @@ impl CoreLoop {
                     // registered, but no lid reaches the caller -- so the
                     // port would stay bound (and a retry hit EADDRINUSE)
                     // until the whole loop closed. Undo both.
-                    net::listener_teardown(net, reactor.backend_mut(), lid);
+                    net::listener_remove(net, reactor.backend_mut(), lid, false);
                     return Err(e);
                 }
             }
             Ok(lid)
-        })??;
+        })?;
+        self.drain_graveyards(py)?;
+        let lid = created.map_err(net::io_error)?;
         // Converted only now: an error above leaves the descriptor closed
         // by the branch that hit it, and nothing after the native work
         // can return early while the socket has no owner.
@@ -2016,12 +2109,58 @@ struct ListenSpec {
     scope_id: u32,
 }
 
+/// How `bind_listen_socket` failed. Kept apart because asyncio words and
+/// handles each differently: create_server skips an address family whose
+/// socket cannot be made at all, and names the address in a bind error.
+enum ListenError {
+    /// Not an IP literal.
+    Invalid(PyErr),
+    /// socket() itself failed -- typically EAFNOSUPPORT for IPv6 on a host
+    /// without it.
+    Socket(std::io::Error),
+    Bind(std::io::Error),
+    /// A socket option or listen().
+    Setup(std::io::Error),
+}
+
+impl ListenError {
+    /// The error asyncio raises for this failure. A bind error names the
+    /// address as create_server does --
+    /// `error while attempting to bind on address ('::1', 80, 0, 0): ...`
+    /// -- since "address already in use" alone does not say which of the
+    /// resolved addresses was taken.
+    fn into_pyerr(self, py: Python<'_>, ip: &str, port: u16, spec: &ListenSpec) -> PyErr {
+        match self {
+            ListenError::Invalid(e) => e,
+            ListenError::Socket(e) | ListenError::Setup(e) => net::io_error(e),
+            ListenError::Bind(e) => {
+                let Some(code) = e.raw_os_error() else { return e.into() };
+                let sa = if ip.contains(':') {
+                    (ip, port, spec.flowinfo, spec.scope_id).into_pyobject(py).map(|t| t.into_any())
+                } else {
+                    (ip, port).into_pyobject(py).map(|t| t.into_any())
+                };
+                let repr = match sa.and_then(|t| t.repr()) {
+                    Ok(r) => r.to_string(),
+                    Err(err) => return err,
+                };
+                let strerror = net::os_strerror(code).to_lowercase();
+                net::os_error_msg(
+                    code,
+                    format!("error while attempting to bind on address {repr}: {strerror}"),
+                )
+            }
+        }
+    }
+}
+
 /// Create, bind, and listen a TCP socket (shared by tcp_listen /
 /// http_listen).
-fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> PyResult<RawSocket> {
+fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> Result<RawSocket, ListenError> {
     let ListenSpec { backlog, reuse_addr, reuse_port, tfo, flowinfo, scope_id } = *spec;
-    let addr: std::net::IpAddr =
-        ip.parse().map_err(|_| PyValueError::new_err(format!("invalid IP address: {ip:?}")))?;
+    let addr: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| ListenError::Invalid(PyValueError::new_err(format!("invalid IP address: {ip:?}"))))?;
     // A scoped IPv6 bind address (fe80::1%eth0) resolves to a sockaddr
     // whose scope_id names the interface. Dropping it bound with scope
     // zero, so a server aimed at a link-local interface bound the wrong
@@ -2033,8 +2172,8 @@ fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> PyResult<RawSoc
         std::net::IpAddr::V4(_) => std::net::SocketAddr::new(addr, port),
     };
     let family = if sockaddr.is_ipv4() { netsys::AF_INET } else { netsys::AF_INET6 };
-    let sock = netsys::create_tcp(family)?;
-    let setup = (|| -> std::io::Result<()> {
+    let sock = netsys::create_tcp(family).map_err(ListenError::Socket)?;
+    let setup = (|| -> Result<(), ListenError> {
         if family == netsys::AF_INET6 {
             // A wildcard IPv6 socket accepts IPv4 too on Linux (v6only
             // defaults off), so `create_server(host=None, port=P)` --
@@ -2042,26 +2181,26 @@ fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> PyResult<RawSoc
             // per family -- had whichever bound second fail EADDRINUSE,
             // and the Python layer then rolled back an otherwise valid
             // server. Separate per-family listeners require this.
-            netsys::set_v6only(sock, true)?;
+            netsys::set_v6only(sock, true).map_err(ListenError::Setup)?;
         }
         if reuse_addr {
-            netsys::set_reuse_addr(sock, true)?;
+            netsys::set_reuse_addr(sock, true).map_err(ListenError::Setup)?;
         }
         if reuse_port {
-            netsys::set_reuse_port(sock, true)?;
+            netsys::set_reuse_port(sock, true).map_err(ListenError::Setup)?;
         }
         if tfo {
             // R-038. Not best-effort: the option was asked for
             // explicitly, and silently serving without it is how it came
             // to be a no-op in the first place.
-            netsys::set_fastopen(sock, backlog)?;
+            netsys::set_fastopen(sock, backlog).map_err(ListenError::Setup)?;
         }
-        netsys::bind(sock, &netsys::build_sockaddr(sockaddr))?;
-        netsys::listen(sock, backlog)
+        netsys::bind(sock, &netsys::build_sockaddr(sockaddr)).map_err(ListenError::Bind)?;
+        netsys::listen(sock, backlog).map_err(ListenError::Setup)
     })();
     if let Err(e) = setup {
         netsys::close(sock);
-        return Err(e.into());
+        return Err(e);
     }
     Ok(sock)
 }
