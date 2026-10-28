@@ -177,7 +177,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._exception_handler = None
         self._default_executor = None
         self._executor_shutdown_called = False
-        self._dns_executor = None
         self._dns_cache: dict = {}
         # R-055: off by default (matches the AbstractEventLoop contract —
         # real asyncio.getaddrinfo never caches). cadeloop.Config/serve()
@@ -377,9 +376,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None
-        if self._dns_executor is not None:
-            self._dns_executor.shutdown(wait=False)
-            self._dns_executor = None
         self._core.close()
 
     def _check_closed(self):

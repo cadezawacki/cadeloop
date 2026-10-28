@@ -2879,21 +2879,23 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             }
             NetEvent::HttpDisconnect { fut, ws } => {
                 let fut = fut.bind(py);
-                let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                let done: bool =
+                    fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
                 if !done {
                     let msg = if ws {
                         crate::http::ws_message_dict(py, crate::http::WsMsg::Disconnect(1006))?
                     } else {
                         crate::http::disconnect_message(py)?
                     };
-                    let _ = fut.call_method1("set_result", (msg,));
+                    let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
                 }
             }
             NetEvent::HttpDrained { fut } => {
                 let fut = fut.bind(py);
-                let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                let done: bool =
+                    fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
                 if !done {
-                    let _ = fut.call_method1("set_result", (py.None(),));
+                    let _ = fut.call_method1(intern!(py, "set_result"), (py.None(),));
                 }
             }
             NetEvent::WsWake { tid, fut } => {
@@ -2922,11 +2924,12 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                     })?;
                 }
                 let fut = fut.bind(py);
-                let done: bool = fut.call_method0("done").and_then(|v| v.extract()).unwrap_or(true);
+                let done: bool =
+                    fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
                 match (done, msg) {
                     (false, Some(m)) => {
                         let d = crate::http::ws_message_dict(py, m)?;
-                        let _ = fut.call_method1("set_result", (d,));
+                        let _ = fut.call_method1(intern!(py, "set_result"), (d,));
                     }
                     (false, None) => {
                         // Spurious wake: park the waiter again.
@@ -2966,7 +2969,8 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             }
             NetEvent::ConnectDone { fut, sock, err } => {
                 let fut = fut.bind(py);
-                let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
+                let cancelled: bool =
+                    fut.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(true);
                 if err != 0 || cancelled {
                     // tcp_connect registered this socket, so detach before
                     // closing (ADR-25). A bare close left the backend
@@ -2977,36 +2981,38 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                     core.with_net(|_net, reactor| reactor.backend_mut().detach_socket(sock))?;
                     netsys::close(sock);
                     if err != 0 && !cancelled {
-                        let _ = fut.call_method1("set_exception", (os_err(py, err),));
+                        let _ = fut.call_method1(intern!(py, "set_exception"), (os_err(py, err),));
                     }
                 } else {
-                    let _ = fut.call_method1("set_result", (sock as u64,));
+                    let _ = fut.call_method1(intern!(py, "set_result"), (sock as u64,));
                 }
             }
             NetEvent::PipeReadDone { fut, buf, bytes, err } => {
                 let fut = fut.bind(py);
-                let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
+                let cancelled: bool =
+                    fut.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(true);
                 if cancelled {
                     // nothing to deliver; the transport already moved on
                 } else if err != 0 && err != ERROR_BROKEN_PIPE {
-                    let _ = fut.call_method1("set_exception", (os_err(py, err),));
+                    let _ = fut.call_method1(intern!(py, "set_exception"), (os_err(py, err),));
                 } else {
                     // ERROR_BROKEN_PIPE (the writer closed) is EOF, same
                     // convention as a genuine 0-byte successful read —
                     // matches stdlib's IocpProactor.recv() precisely.
                     let data = PyBytes::new(py, &buf[..bytes as usize]);
-                    let _ = fut.call_method1("set_result", (data,));
+                    let _ = fut.call_method1(intern!(py, "set_result"), (data,));
                 }
             }
             NetEvent::PipeWriteDone { fut, bytes, err } => {
                 let fut = fut.bind(py);
-                let cancelled: bool = fut.call_method0("cancelled").and_then(|v| v.extract()).unwrap_or(true);
+                let cancelled: bool =
+                    fut.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(true);
                 if cancelled {
                     // nothing to deliver
                 } else if err != 0 {
-                    let _ = fut.call_method1("set_exception", (os_err(py, err),));
+                    let _ = fut.call_method1(intern!(py, "set_exception"), (os_err(py, err),));
                 } else {
-                    let _ = fut.call_method1("set_result", (bytes,));
+                    let _ = fut.call_method1(intern!(py, "set_result"), (bytes,));
                 }
             }
         }
@@ -3220,13 +3226,25 @@ fn cache_proto(py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<ProtoRef
     let is_buffered = protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")?;
     Ok(ProtoRefs {
         protocol: protocol.clone().unbind(),
-        data_received: if is_buffered { None } else { Some(protocol.getattr("data_received")?.unbind()) },
-        get_buffer: if is_buffered { Some(protocol.getattr("get_buffer")?.unbind()) } else { None },
-        buffer_updated: if is_buffered { Some(protocol.getattr("buffer_updated")?.unbind()) } else { None },
-        eof_received: protocol.getattr("eof_received")?.unbind(),
-        connection_lost: protocol.getattr("connection_lost")?.unbind(),
-        pause_writing: protocol.getattr("pause_writing")?.unbind(),
-        resume_writing: protocol.getattr("resume_writing")?.unbind(),
+        data_received: if is_buffered {
+            None
+        } else {
+            Some(protocol.getattr(intern!(py, "data_received"))?.unbind())
+        },
+        get_buffer: if is_buffered {
+            Some(protocol.getattr(intern!(py, "get_buffer"))?.unbind())
+        } else {
+            None
+        },
+        buffer_updated: if is_buffered {
+            Some(protocol.getattr(intern!(py, "buffer_updated"))?.unbind())
+        } else {
+            None
+        },
+        eof_received: protocol.getattr(intern!(py, "eof_received"))?.unbind(),
+        connection_lost: protocol.getattr(intern!(py, "connection_lost"))?.unbind(),
+        pause_writing: protocol.getattr(intern!(py, "pause_writing"))?.unbind(),
+        resume_writing: protocol.getattr(intern!(py, "resume_writing"))?.unbind(),
     })
 }
 
@@ -3323,7 +3341,7 @@ pub(crate) fn wire_stream(
     let name = any_addr_tuple(py, netsys::sockname_any(sock).ok());
     // A protocol without connection_made reaches here with the descriptor
     // still unowned; `?` alone would have dropped it on the floor.
-    let connection_made = match protocol.getattr("connection_made") {
+    let connection_made = match protocol.getattr(intern!(py, "connection_made")) {
         Ok(cb) => cb,
         Err(e) => {
             discard(core);

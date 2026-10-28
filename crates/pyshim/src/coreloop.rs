@@ -1621,35 +1621,38 @@ impl CoreLoop {
                 net.graveyard_handles.push(old);
             }
             Ok(())
-        })??;
+        })?
+        .map_err(net::io_error)?;
         self.drain_graveyards(py)?;
         Ok(handle)
     }
 
     fn remove_reader(&self, py: Python<'_>, fd: u64) -> PyResult<bool> {
         let sock = fd as RawSocket;
-        let removed = self.with_net(|net, reactor| -> std::io::Result<bool> {
-            let removed = net.readers.remove(&sock);
-            let had = removed.is_some();
-            let w = net.writers.contains_key(&sock);
-            if had || w {
-                if let Err(e) = reactor.backend_mut().set_watch(sock, false, w) {
-                    // Put it back: the backend is still watching, so the
-                    // callback must stay reachable or its next readiness
-                    // event finds no handler.
-                    if let Some(h) = removed {
-                        if let Some(newer) = net.readers.insert(sock, h) {
-                            net.graveyard_handles.push(newer);
+        let removed = self
+            .with_net(|net, reactor| -> std::io::Result<bool> {
+                let removed = net.readers.remove(&sock);
+                let had = removed.is_some();
+                let w = net.writers.contains_key(&sock);
+                if had || w {
+                    if let Err(e) = reactor.backend_mut().set_watch(sock, false, w) {
+                        // Put it back: the backend is still watching, so the
+                        // callback must stay reachable or its next readiness
+                        // event finds no handler.
+                        if let Some(h) = removed {
+                            if let Some(newer) = net.readers.insert(sock, h) {
+                                net.graveyard_handles.push(newer);
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
-            }
-            if let Some(h) = removed {
-                net.graveyard_handles.push(h);
-            }
-            Ok(had)
-        })??;
+                if let Some(h) = removed {
+                    net.graveyard_handles.push(h);
+                }
+                Ok(had)
+            })?
+            .map_err(net::io_error)?;
         self.drain_graveyards(py)?;
         Ok(removed)
     }
@@ -1686,33 +1689,36 @@ impl CoreLoop {
                 net.graveyard_handles.push(old);
             }
             Ok(())
-        })??;
+        })?
+        .map_err(net::io_error)?;
         self.drain_graveyards(py)?;
         Ok(handle)
     }
 
     fn remove_writer(&self, py: Python<'_>, fd: u64) -> PyResult<bool> {
         let sock = fd as RawSocket;
-        let removed = self.with_net(|net, reactor| -> std::io::Result<bool> {
-            let removed = net.writers.remove(&sock);
-            let had = removed.is_some();
-            let r = net.readers.contains_key(&sock);
-            if had || r {
-                if let Err(e) = reactor.backend_mut().set_watch(sock, r, false) {
-                    // Same restore as remove_reader: see the note there.
-                    if let Some(h) = removed {
-                        if let Some(newer) = net.writers.insert(sock, h) {
-                            net.graveyard_handles.push(newer);
+        let removed = self
+            .with_net(|net, reactor| -> std::io::Result<bool> {
+                let removed = net.writers.remove(&sock);
+                let had = removed.is_some();
+                let r = net.readers.contains_key(&sock);
+                if had || r {
+                    if let Err(e) = reactor.backend_mut().set_watch(sock, r, false) {
+                        // Same restore as remove_reader: see the note there.
+                        if let Some(h) = removed {
+                            if let Some(newer) = net.writers.insert(sock, h) {
+                                net.graveyard_handles.push(newer);
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
-            }
-            if let Some(h) = removed {
-                net.graveyard_handles.push(h);
-            }
-            Ok(had)
-        })??;
+                if let Some(h) = removed {
+                    net.graveyard_handles.push(h);
+                }
+                Ok(had)
+            })?
+            .map_err(net::io_error)?;
         self.drain_graveyards(py)?;
         Ok(removed)
     }
