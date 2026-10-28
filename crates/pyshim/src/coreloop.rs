@@ -546,6 +546,17 @@ impl CoreLoop {
                     }
                 }
             }
+            // Drop what the callback held NOW, not when the batch ends. A
+            // batch is the whole ready snapshot -- thousands of callbacks
+            // when a gather fans out -- and holding every dispatched
+            // callback's task, future and context until its end kept them
+            // alive through the young collections they would have died
+            // before: CPython 3.11 counts a late free against the next
+            // gen-0 trigger and promotes the survivors, so the recursive
+            // task_fib ran 16% more young and 33% more full collections
+            // (-24% throughput) until this moved here. (After the hooks
+            // above: the slow-callback report formats the callback.)
+            token.get().release_after_dispatch(py);
         }
         if let Some((idx, err)) = fatal {
             // idx ran (and raised); everything after it goes back.
@@ -592,10 +603,12 @@ impl CoreLoop {
     }
 }
 
-/// Release and drop every handle in a dispatched batch.
+/// Drop every handle in a dispatched batch.
 ///
-/// One-shot handles give up their callback, arguments and context here
-/// (handles.rs module docs); readiness watches keep theirs. The drops are
+/// Each one-shot handle already gave up its callback, arguments and
+/// context right after it ran (handles.rs module docs; readiness watches
+/// keep theirs); the release repeated here is a no-op for those and
+/// covers the one a fatal error cut off before its own. The drops are
 /// straight `Py_DECREF`s: we are on the loop thread inside `run_forever`,
 /// attached by construction, so `Py::drop`'s per-object thread-local
 /// "am I attached?" probe (a `__tls_get_addr` call in a cdylib) buys
