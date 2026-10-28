@@ -802,3 +802,34 @@ def test_call_later_coroutine_error_names_call_at(loop):
     # asyncio's call_later is call_at(time() + delay): its message says so.
     with pytest.raises(TypeError, match=r"coroutines cannot be used with call_at\(\)"):
         loop.call_later(1, coro_fn)
+
+
+def test_ready_callbacks_run_before_this_iterations_io_callbacks(loop):
+    """asyncio's _run_once appends an iteration's I/O callbacks behind the
+    callbacks already ready, so a task step queued before the poll runs
+    before the protocol callback the poll produced. The tick dispatched
+    transport events first: CPython's test_datagram_send_to_non_listening_
+    address failed 12 runs in 20 (datagram_received beat the step that
+    installs the future it resolves)."""
+    out = []
+
+    class P(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            out.append("io")
+
+    async def endpoints():
+        a = await loop.create_datagram_endpoint(asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0))
+        b = await loop.create_datagram_endpoint(P, local_addr=("127.0.0.1", 0))
+        return a[0], b[0]
+
+    ta, tb = loop.run_until_complete(endpoints())
+    try:
+        for _ in range(20):
+            out.clear()
+            ta.sendto(b"x", tb.get_extra_info("sockname"))
+            loop.call_soon(out.append, "ready")
+            loop.run_until_complete(asyncio.sleep(0.01))
+            assert out == ["ready", "io"]
+    finally:
+        ta.close()
+        tb.close()

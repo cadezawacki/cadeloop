@@ -460,13 +460,14 @@ impl CoreLoop {
                 st.reactor.absorb_into_batch();
             }
             let events = std::mem::take(&mut st.net.events);
-            if events.is_empty() {
-                // Pure-scheduling tick: take the dispatch batch in the
-                // SAME cell entry (batch_left was snapshotted by
-                // prepare_tick, so semantics match a later take).
-                while let Some(token) = st.reactor.pop_ready_batched() {
-                    batch.push(token);
-                }
+            // The dispatch batch, in the SAME cell entry: every callback
+            // ready when the tick began, plus this tick's timers and
+            // readiness watches (batch_left was snapshotted for exactly
+            // those). It runs BEFORE the transport events below, as
+            // asyncio's _run_once appends an iteration's I/O callbacks
+            // behind the callbacks already in `_ready`.
+            while let Some(token) = st.reactor.pop_ready_batched() {
+                batch.push(token);
             }
             let graveyard = if st.net.has_graveyards() || st.reactor.has_graveyard() {
                 Some(take_graveyards(st))
@@ -500,32 +501,21 @@ impl CoreLoop {
                         }
                     })?;
                 }
+                // The transport events too: dropped here, they took their
+                // payloads and teardowns with them -- and a caller that
+                // runs the loop again after a KeyboardInterrupt (asyncio.run
+                // cancelling the remaining tasks does) never saw that data
+                // or those connection_lost calls.
+                self.requeue_events(events)?;
                 return Err(err);
             }
         }
 
-        // Phases 3-5 only exist when network events fired: dispatch
-        // protocol callbacks, flush the writes they corked (same tick,
-        // R-035), then dispatch teardowns produced by that flush.
-        if !events.is_empty() {
-            net::dispatch_events(py, slf, events)?;
-            let events = self.flush_corked(py)?;
-            self.drain_graveyards(py)?;
-            if !events.is_empty() {
-                net::dispatch_events(py, slf, events)?;
-            }
-            // The batch was not taken in-cell on this path.
-            self.state.with(|st| {
-                while let Some(token) = st.reactor.pop_ready_batched() {
-                    batch.push(token);
-                }
-            })?;
-        }
-
-        // Phase 6: ready-callback batch (R-054). A fatal error
+        // Phase 3: ready-callback batch (R-054). A fatal error
         // (KeyboardInterrupt/SystemExit from a callback) returns the
-        // undispatched tail to the queue front so nothing is lost and FIFO
-        // order holds across the unwind.
+        // undispatched tail to the queue front -- and this tick's transport
+        // events, which have not run yet, to theirs -- so nothing is lost
+        // and FIFO order holds across the unwind.
         let debug = self.debug.load(Ordering::Relaxed);
         let mut fatal: Option<(usize, PyErr)> = None;
         for (idx, token) in batch.iter().enumerate() {
@@ -567,10 +557,38 @@ impl CoreLoop {
                 })?;
             }
             release_batch(py, batch);
+            self.requeue_events(events)?;
             return Err(err);
         }
         release_batch(py, batch);
+
+        // Phases 4-6 only exist when transport events fired: dispatch the
+        // protocol callbacks, flush the writes this tick corked (same tick,
+        // R-035), then dispatch the teardowns that flush produced. Anything
+        // they schedule runs next tick, as in asyncio.
+        if !events.is_empty() {
+            net::dispatch_events(py, slf, events)?;
+            let events = self.flush_corked(py)?;
+            self.drain_graveyards(py)?;
+            if !events.is_empty() {
+                net::dispatch_events(py, slf, events)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Put transport events this tick took but did not dispatch back at
+    /// the FRONT of the queue (ahead of any a callback produced since), so
+    /// the next tick delivers them in their original order.
+    fn requeue_events(&self, events: Vec<NetEvent>) -> PyResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.with_net(|net, _| {
+            let mut later = std::mem::take(&mut net.events);
+            net.events = events;
+            net.events.append(&mut later);
+        })
     }
 }
 
