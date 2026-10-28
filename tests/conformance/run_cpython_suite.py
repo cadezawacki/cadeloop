@@ -94,6 +94,9 @@ REBOUND = {
         ("CadeloopUnixSocketTests", "setUp", ["SelectorEventLoopUnixSocketTests"]),
         ("CadeloopUnixSockSendfileTests", "setUp", ["SelectorEventLoopUnixSockSendfileTests"]),
     ],
+    # Windows only: the POSIX classes build their loops through the policy,
+    # which _pin_policy already points at cadeloop.
+    "test_subprocess": [("CadeloopSubprocessTests", "setUp", ["SubprocessProactorTests"])],
 }
 
 
@@ -185,20 +188,25 @@ def _rebind(module):
 
 
 def _rebound_setup(base):
-    """For classes whose setUp builds `asyncio.SelectorEventLoop()`
-    itself: run that setUp with the selector loop class swapped for
+    """For classes whose setUp builds its loop itself
+    (`asyncio.SelectorEventLoop()`, or `asyncio.ProactorEventLoop()` on
+    Windows): run that setUp with those loop classes swapped for
     cadeloop's, so whatever else it prepares stays as written."""
     import asyncio
 
     import cadeloop
 
+    names = [n for n in ("SelectorEventLoop", "ProactorEventLoop") if hasattr(asyncio, n)]
+
     def setUp(self):
-        real = asyncio.SelectorEventLoop
-        asyncio.SelectorEventLoop = lambda *a, **k: cadeloop.new_event_loop()
+        real = {n: getattr(asyncio, n) for n in names}
+        for n in names:
+            setattr(asyncio, n, lambda *a, **k: cadeloop.new_event_loop())
         try:
             base.setUp(self)
         finally:
-            asyncio.SelectorEventLoop = real
+            for n, cls in real.items():
+                setattr(asyncio, n, cls)
 
     return setUp
 
