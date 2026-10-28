@@ -30,30 +30,30 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-051 | Subprocess gated (default off) | ✅ gate + message | config.py, loop.py |
 | R-052 | SIGINT/SIGBREAK handlers | 🔶 POSIX ✅ (EINTR-prompt); Windows SetConsoleCtrlHandler 📅 M4 | loop.py |
 | R-053 | 4-ary timer heap, tombstones, >50% compaction | ✅ (proptested) | timer.rs |
-| R-054 | 128-batch dispatch, vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, handles.rs, net.rs |
-| R-055 | DNS thread pool min(8,cpus) + 5s LRU cache | ✅ | loop.py |
+| R-054 | snapshot-batch dispatch (asyncio `_run_once` semantics; the 128 cap is gone: it broke `stop()`), vectorcall, bound-method cache | ✅ per-connection protocol methods cached at setup | ready.rs, reactor.rs, handles.rs, net.rs |
+| R-055 | DNS on the default executor (asyncio's; `set_default_executor` governs it), IP literals resolved without a lookup, opt-in TTL cache (`dns_cache`, on in `serve()`) | ✅ | loop.py, tcp.py |
 | R-056 | Eager task fast path, zero-Task completions | ✅ `PyIter_Send` stepping; non-suspending requests allocate no Task/Future; AppTask registers via `_enter_task` (anyio-compatible); `eager_tasks=False` stdlib path | http.rs (pyshim), config.py |
-| R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP zero-byte probes compile-verified (harden M4) | epoll.rs, iocp.rs, coreloop.rs |
+| R-057 | add_reader/add_writer emulation | ✅ Linux (native LT interest); IOCP `IOCTL_AFD_POLL` readiness (ADR-30), compile-verified pending Windows CI | epoll.rs, iocp.rs, iocp_util.rs, coreloop.rs |
 | R-058 | UDP endpoints | 📅 M4 | loop.py (gated) |
 | R-059 | Native TLS (memory BIOs), SSLContext compat | 🔶 sslproto MemoryBIO fallback ✅ (spec-sanctioned, tested); native engine 📅 M4 | tcp.py |
 | R-060 | Spin-then-park + latency_mode presets | ✅ | reactor.rs, config.py |
-| R-061 | QPC clock, cached per tick | ✅ (via std Instant=QPC; documented) | time.rs |
+| R-061 | monotonic clock = `time.monotonic()`'s (CLOCK_MONOTONIC on Linux; QPC aligned at creation on Windows); per-tick reading for expiry, fresh for `loop.time()`/`call_later` | ✅ | time.rs |
 | R-070 | mimalloc global allocator | ✅ | pyshim/src/lib.rs |
 | R-071 | Slabs {4K,16K,64K}, VirtualAlloc, large pages, thread-affine | ✅ | buffers.rs |
 | R-072 | Zero-copy memoryview via BufferedProtocol | 🔶 BufferedProtocol supported (single copy into app buffer); recv-into-app-buffer zero-copy 📅 | net.rs |
 | R-073 | Slot lifetime refcounts + poison | ✅ (proptested; kernel ops hold slot refs released at completion reap) | buffers.rs, net.rs |
 | R-074 | Write retention semantics (bytes zero-copy, bytearray copy) | ✅ (bytes-backed memoryview currently copied — documented deviation) | net.rs |
-| R-075 | gc.freeze warmup policy | 🔶 freeze/disable applied post-lifespan-startup in serve(); per-request warmup counter 📅 | server.py |
+| R-075 | gc.freeze warmup policy | ✅ freeze/disable applied post-lifespan-startup in serve() (multi-worker: frozen once in the supervisor before forking); a second freeze after `warmup` requests | server.py |
 | R-080 | llhttp strict, limits (64K headers/100 count/8K URL) | ✅ in-callback enforcement → 414/431/413; request-line/idle timeouts 📅 | core/http.rs, vendor/llhttp |
 | R-081 | ASGI 3.0 scope + lifespan | ✅ native scope (percent-decode, latin-1 fallback, client/server tuples, lifespan state copy); lifespan `auto` in facade | http.rs (pyshim), server.py |
 | R-082 | Header-name/method interning | ✅ interned common methods + scope keys | http.rs (pyshim) |
-| R-083 | Per-connection cached receive/send; scope reuse opt-in | 🔶 receive/send cached per conn ✅; `reuse_scope` 📅 | http.rs (pyshim) |
+| R-083 | Per-connection cached receive/send; scope reuse opt-in | 🔶 receive/send cached per conn ✅; 📝 `reuse_scope` dropped: never wired, and a reused scope breaks ASGI's fresh-scope-per-request contract | http.rs (pyshim) |
 | R-084 | Native response assembly, Date cache, framing at first body chunk | ✅ zero Python objects on the wire path; per-second civil-from-days Date; HEAD suppression; HTTP/1.0 close-delimited | http.rs (pyshim) |
 | R-085 | Keep-alive + pipelined drain, strict ordering | ✅ iterative pump; request finishes at coro return (background-task safe) | http.rs (pyshim) |
 | R-086 | Error paths: in-cell 4xx, 500-or-abort, disconnect futures | ✅ | core/http.rs, http.rs (pyshim) |
 | R-087 | WebSockets | 📅 M4 | — |
 | R-088 | Fallback to pure-Python h11 path | ➖ not planned (native engine + uvicorn interop cover it) | — |
-| R-090..093 | Worker model, affinity, supervision | 🔶 Linux ✅: SO_REUSEPORT pool, supervisor restart + fast-crash cutoff, grace drain, sched_setaffinity pinning; Windows (WSADuplicateSocketW) 📅 M3 | server.py, tests/unit/test_multiworker.py |
+| R-090..093 | Worker model, affinity, supervision | 🔶 Linux ✅: SO_REUSEPORT pool, supervisor restart + fast-crash cutoff, grace drain, opt-in sched_setaffinity pinning (`pin=True`); Windows (WSADuplicateSocketW) 📅 M3 | server.py, tests/unit/test_multiworker.py |
 | R-100 | new_event_loop/EventLoopPolicy/install/run | ✅ | policy.py |
 | R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy, multi-worker pool | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
@@ -87,5 +87,5 @@ Deviations from spec text (owner-approved or forced):
    in ci.yml.
 4. **R-074**: bytes-backed memoryviews are copied (not zero-copy retained)
    pending a cheap detection path; plain `bytes` follow the spec rule.
-5. **R-057 on Windows**: probe-based emulation is compile-verified only
-   until Windows CI runs it (Linux uses native epoll interest).
+5. **R-057 on Windows**: AFD-poll readiness (ADR-30) is compile-verified
+   only until Windows CI runs it (Linux uses native epoll interest).

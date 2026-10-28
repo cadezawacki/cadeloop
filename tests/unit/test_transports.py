@@ -1648,8 +1648,12 @@ def test_sendto_rejects_a_malformed_address_tuple(loop):
                 transport.sendto(b"x", ("127.0.0.1", 9, 0, 0))
             with pytest.raises(ValueError, match="2 elements"):
                 transport.sendto(b"x", ("127.0.0.1", 9, 0))
-            with pytest.raises(ValueError, match="invalid IP address"):
-                transport.sendto(b"x", ("not-an-ip", 9))
+            # A host name is resolved, as by the socket module's sendto();
+            # a failed lookup goes to error_received, as in asyncio.
+            errors = []
+            transport.get_protocol().error_received = errors.append
+            transport.sendto(b"x", ("name.invalid", 9))
+            assert len(errors) == 1 and isinstance(errors[0], OSError), errors
         finally:
             transport.close()
             await asyncio.sleep(0.05)
@@ -1706,7 +1710,7 @@ def test_data_received_exception_closes_the_transport(loop):
             assert seen, "the protocol never received anything"
             assert lost, "connection_lost never ran; the transport stayed open"
             assert transport.is_closing()
-            assert any("protocol callback" in m for m in reported), reported
+            assert any("protocol.data_received() call failed" in m for m in reported), reported
         finally:
             server.close()
             await server.wait_closed()

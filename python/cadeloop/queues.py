@@ -15,28 +15,64 @@ stdlib gets from overridable _put/_get would put Python back on the hot
 path, which is the entire cost being removed.
 """
 
-from asyncio import events
+import math
+import numbers
+import operator
+import types
+from asyncio import events, mixins
 
 from . import _core
 
 __all__ = ["Queue"]
 
 _MISSING = object()
+_I64_MAX = 2**63 - 1
+
+
+def _native_maxsize(maxsize):
+    """The capacity the native queue enforces for a stdlib-style maxsize.
+
+    asyncio.Queue keeps maxsize as given and only ever evaluates
+    ``maxsize <= 0`` and ``qsize() >= maxsize``; the native side needs an
+    i64 that answers both the same way. Anything at or above 2**63 cannot
+    be reached by a real queue, and a non-integral bound is reached at its
+    ceiling.
+    """
+    try:
+        n = operator.index(maxsize)
+    except TypeError:
+        if not isinstance(maxsize, numbers.Real):
+            raise TypeError(f"maxsize must be a number, not {type(maxsize).__name__}") from None
+        x = float(maxsize)
+        if not math.isfinite(x) or x <= 0:
+            return 0  # NaN, +-inf and <= 0 are never "full" in the stdlib either
+        return min(math.ceil(x), _I64_MAX)
+    return max(min(n, _I64_MAX), -_I64_MAX)
 
 
 class Queue:
     """Drop-in for asyncio.Queue (FIFO), native hot paths."""
 
-    __slots__ = ("_q",)
+    # __weakref__: asyncio.Queue is weak-referenceable, and pub/sub fan-out
+    # keeps its subscribers' queues in a WeakSet.
+    __slots__ = ("_q", "_maxsize", "_loop", "_join_loop", "__weakref__")
+
+    __class_getitem__ = classmethod(types.GenericAlias)
 
     def __init__(self, maxsize=0):
-        self._q = _core.FastQueue(maxsize)
+        self._q = _core.FastQueue(_native_maxsize(maxsize))
+        self._maxsize = maxsize
+        # Bound on first park, like asyncio.mixins._LoopBoundMixin. join()
+        # waits on the stdlib queue's internal Event, which binds on its
+        # own -- hence a second slot rather than one shared binding.
+        self._loop = None
+        self._join_loop = None
 
     # -- inspection (delegated, one native call each) -------------------
 
     @property
     def maxsize(self):
-        return self._q.maxsize
+        return self._maxsize
 
     def qsize(self):
         return self._q.qsize()
@@ -57,14 +93,37 @@ class Queue:
         self._q.task_done()
 
     def __repr__(self):
-        return f"<cadeloop.Queue maxsize={self._q.maxsize} qsize={self._q.qsize()}>"
+        return f"<{type(self).__name__} at {id(self):#x} {self._format()}>"
+
+    def __str__(self):
+        return f"<{type(self).__name__} {self._format()}>"
+
+    def _format(self):
+        # asyncio's leading fields; the queued items and waiters live in
+        # the native core.
+        return f"maxsize={self._maxsize!r} qsize={self._q.qsize()}"
+
+    def _bind(self, loop, attr="_loop"):
+        # asyncio.mixins._LoopBoundMixin._get_loop. Without it a waiter
+        # left parked by an earlier loop the queue outlived silently
+        # swallowed the next wake, and the live waiter behind it hung with
+        # an item in the queue; the stdlib refuses the second loop instead.
+        if getattr(self, attr) is None:
+            with mixins._global_lock:
+                if getattr(self, attr) is None:
+                    setattr(self, attr, loop)
+        if loop is not getattr(self, attr):
+            raise RuntimeError(f"{self!r} is bound to a different event loop")
 
     # -- awaitable surface ----------------------------------------------
 
     async def put(self, item):
         q = self._q
         while not q.try_put(item):
-            fut = events.get_running_loop().create_future()
+            loop = events.get_running_loop()
+            if loop is not self._loop:
+                self._bind(loop)
+            fut = loop.create_future()
             q.park_putter(fut)
             try:
                 await fut
@@ -76,7 +135,10 @@ class Queue:
         q = self._q
         v = q.get_or(_MISSING)
         while v is _MISSING:
-            fut = events.get_running_loop().create_future()
+            loop = events.get_running_loop()
+            if loop is not self._loop:
+                self._bind(loop)
+            fut = loop.create_future()
             q.park_getter(fut)
             try:
                 await fut
@@ -87,12 +149,18 @@ class Queue:
         return v
 
     async def join(self):
-        fut = self._q.join()
-        try:
-            await fut
-        finally:
-            # Event.wait()-style removal: a cancelled or timed-out join
-            # must not stay parked until the count reaches zero -- on a
-            # queue that never drains, repeated timed-out joins would
-            # retain one future each, without bound.
-            self._q.unjoin(fut)
+        q = self._q
+        if q.unfinished():
+            loop = events.get_running_loop()
+            if loop is not self._join_loop:
+                self._bind(loop, "_join_loop")
+            fut = loop.create_future()
+            q.park_joiner(fut)
+            try:
+                await fut
+            finally:
+                # Event.wait()-style removal: a cancelled or timed-out join
+                # must not stay parked until the count reaches zero -- on a
+                # queue that never drains, repeated timed-out joins would
+                # retain one future each, without bound.
+                q.unjoin(fut)

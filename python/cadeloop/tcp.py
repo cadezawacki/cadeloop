@@ -8,14 +8,20 @@ replaces it in M4). Mixed into ``cadeloop.Loop``.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import errno
 import functools
+import itertools
 import os
 import socket
 import stat
 import sys
-from asyncio import sslproto, staggered
-from asyncio.base_events import _interleave_addrinfos
+from asyncio import sslproto, staggered, tasks, trsock
+from asyncio.base_events import _interleave_addrinfos, _ipaddr_info
+
+# Everything logged here is a message asyncio itself logs, so it goes to
+# asyncio's logger, where applications already route it.
+from asyncio.log import logger
 
 try:
     import ssl as ssl_module
@@ -24,13 +30,34 @@ except ImportError:  # pragma: no cover
 
 __all__ = ["TcpSurface", "Server"]
 
-logger = __import__("logging").getLogger("cadeloop")
-
 
 def _fileno(fd):
+    """selectors' _fileobj_to_fd: an int, or an object with fileno();
+    anything else is a ValueError, not an AttributeError/OverflowError
+    from deeper down."""
     if isinstance(fd, int):
-        return fd
-    return fd.fileno()
+        fileno = fd
+    else:
+        try:
+            fileno = int(fd.fileno())
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError(f"Invalid file object: {fd!r}") from None
+    if fileno < 0:
+        raise ValueError(f"Invalid file descriptor: {fileno}")
+    return fileno
+
+
+def _seekable(file):
+    """Whether the sendfile paths may set `file`'s position. They restore
+    it (and the fallbacks start from `offset` even when it is 0), but a
+    pipe or a socket file has no position: seeking one raised
+    UnsupportedOperation after its data had already gone out."""
+    try:
+        return file.seekable()
+    except AttributeError:
+        return hasattr(file, "seek")
+    except (OSError, ValueError):
+        return False
 
 
 def _check_ssl_socket(sock):
@@ -44,18 +71,23 @@ def _check_ssl_socket(sock):
 
 
 # socket()-creation failures that CPython's create_server treats as
-# "skip this address family" during multi-family resolution.
-# WSAEAFNOSUPPORT rides along because the native listener surfaces raw
-# Winsock codes on Windows.
+# "skip this address family" during multi-family resolution. The core
+# reports those by returning None (tcp_listen's skip_unavailable); this
+# covers one that raises instead. WSAEAFNOSUPPORT rides along because the
+# native listener surfaces raw Winsock codes on Windows.
 _AF_UNAVAILABLE = frozenset(
     {errno.EAFNOSUPPORT, getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT)}
 )
+
+# How the core words a bind failure (asyncio's wording).
+_BIND_ERROR_PREFIX = "error while attempting to bind on address"
+
 
 
 class Server(asyncio.AbstractServer):
     """asyncio.AbstractServer implementation over native listeners."""
 
-    def __init__(self, loop, entries, factory, accept_pool, serving):
+    def __init__(self, loop, entries, factory, accept_pool, serving, sock=None):
         # entries: list of (lid, sockname, rawfd)
         self._loop = loop
         self._entries = entries
@@ -63,10 +95,35 @@ class Server(asyncio.AbstractServer):
         self._accept_pool = accept_pool
         self._serving = serving
         self._closed = False
-        self._close_waiters = []
-        self._sockets = None
+        # create_server(sock=...): the caller's socket, which the listener
+        # uses (and closes) itself rather than a detached descriptor.
+        self._sock = sock
+        # Duplicates behind `sockets` for listeners the core created.
+        self._dups = None
+        # Connections accepted and not yet lost (asyncio's _active_count):
+        # wait_closed() waits for them, not merely for close().
+        self._active_count = 0
+        self._waiters = []
         # The future serve_forever() parks on, so close() can wake it.
         self._serving_forever = None
+        for lid, _name, _fd in entries:
+            loop._core.listener_set_server(lid, self)
+
+    # -- connection accounting (called by the core) -----------------------
+
+    def _attach(self):
+        self._active_count += 1
+
+    def _detach(self):
+        self._active_count -= 1
+        if self._active_count == 0 and self._closed:
+            self._wakeup()
+
+    def _wakeup(self):
+        waiters, self._waiters = self._waiters, None
+        for waiter in waiters or ():
+            if not waiter.done():
+                waiter.set_result(waiter)
 
     # -- introspection ----------------------------------------------------
 
@@ -78,7 +135,11 @@ class Server(asyncio.AbstractServer):
             # closed -- raising EBADF, or worse, handing back a duplicate
             # of whatever unrelated socket has since reused the number.
             return ()
-        if self._sockets is None:
+        # TransportSockets, as asyncio returns: they refuse close() and
+        # setblocking(True), either of which would break the listener.
+        if self._sock is not None:
+            return (trsock.TransportSocket(self._sock),)
+        if self._dups is None:
             socks = []
             for _lid, _name, fd in self._entries:
                 # Duplicate so the reporting socket's lifetime is
@@ -94,8 +155,16 @@ class Server(asyncio.AbstractServer):
                         tmp.detach()  # never close the native listener
                 else:
                     socks.append(socket.socket(fileno=os.dup(fd)))
-            self._sockets = socks
-        return tuple(self._sockets)
+            self._dups = socks
+        return tuple(trsock.TransportSocket(s) for s in self._dups)
+
+    @property
+    def _sockets(self):
+        # asyncio's attribute (code and tests read it): the listening
+        # socket objects, None once the server is closed.
+        if self._closed:
+            return None
+        return [s._sock for s in self.sockets]
 
     def get_loop(self):
         return self._loop
@@ -107,17 +176,17 @@ class Server(asyncio.AbstractServer):
 
     async def start_serving(self):
         if self._closed:
-            raise RuntimeError("server is closed")
+            raise RuntimeError(f"server {self!r} is closed")
         if not self._serving:
             self._serving = True
             for lid, _name, _fd in self._entries:
                 self._loop._core.listener_start(lid)
 
     async def serve_forever(self):
-        if self._closed:
-            raise RuntimeError("server is closed")
         if self._serving_forever is not None:
-            raise RuntimeError("server is already being awaited on serve_forever()")
+            raise RuntimeError(f"server {self!r} is already being awaited on serve_forever()")
+        if self._closed:
+            raise RuntimeError(f"server {self!r} is closed")
         await self.start_serving()
         # Held, not anonymous. An anonymous future is unreachable from
         # close(), so a server closed by another task left this coroutine
@@ -126,9 +195,14 @@ class Server(asyncio.AbstractServer):
         self._serving_forever = self._loop.create_future()
         try:
             await self._serving_forever
+        except asyncio.CancelledError:
+            try:
+                self.close()
+                await self.wait_closed()
+            finally:
+                raise
         finally:
             self._serving_forever = None
-            self.close()
 
     def close(self):
         if self._closed:
@@ -140,26 +214,27 @@ class Server(asyncio.AbstractServer):
                 self._loop._core.listener_close(lid)
             except RuntimeError:
                 pass  # loop already closed
-        if self._sockets:
-            for s in self._sockets:
+        if self._dups:
+            for s in self._dups:
                 s.close()
-        self._sockets = ()
+        self._dups = None
         self._entries = []  # the raw descriptors are gone; do not reuse them
         # Cancelled rather than resolved, matching the stdlib: serve_forever
         # raises CancelledError when its server is closed underneath it.
         fut, self._serving_forever = self._serving_forever, None
         if fut is not None and not fut.done():
             fut.cancel()
-        for waiter in self._close_waiters:
-            if not waiter.done():
-                waiter.set_result(None)
-        self._close_waiters.clear()
+        if self._active_count == 0:
+            self._wakeup()
 
     async def wait_closed(self):
-        if self._closed:
+        # Python 3.11's semantics, exactly: a call made before close()
+        # waits for close() AND for every connection the server accepted
+        # to be lost; a call made after close() returns at once.
+        if self._closed or self._waiters is None:
             return
         waiter = self._loop.create_future()
-        self._close_waiters.append(waiter)
+        self._waiters.append(waiter)
         await waiter
 
     async def __aenter__(self):
@@ -170,8 +245,7 @@ class Server(asyncio.AbstractServer):
         await self.wait_closed()
 
     def __repr__(self):
-        names = [name for _lid, name, _fd in self._entries]
-        return f"<cadeloop.Server sockets={names} serving={self.is_serving()}>"
+        return f"<{self.__class__.__name__} sockets={self.sockets!r}>"
 
 
 class TcpSurface:
@@ -221,12 +295,24 @@ class TcpSurface:
             # destination.
             if sock.type != socket.SOCK_STREAM:
                 raise ValueError(f"a stream socket was expected, got {sock!r}")
-            fd = sock.detach()
+            # Not detached: the caller's socket keeps owning the
+            # descriptor, so it stays usable (getsockname(), options) while
+            # the transport lives, and the transport's close closes it --
+            # asyncio's contract.
+            sock.setblocking(False)
             return await self._wrap_outgoing(
-                fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
+                sock.fileno(),
+                protocol_factory,
+                ssl,
+                server_hostname,
+                ssl_handshake_timeout,
+                ssl_shutdown_timeout,
+                owner=sock,
             )
 
-        if host is None or port is None:
+        # Either one is enough to resolve, as in base_events: a missing
+        # host is getaddrinfo's loopback, a missing port is port 0.
+        if host is None and port is None:
             raise ValueError("host and port was not specified and no sock specified")
 
         if happy_eyeballs_delay is not None and interleave is None:
@@ -234,58 +320,33 @@ class TcpSurface:
             # is on (matches base_events.create_connection).
             interleave = 1
 
-        infos = await self.getaddrinfo(
-            host, port, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
+        infos = await self._ensure_resolved(
+            (host, port), family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
         )
         if not infos:
-            raise OSError(f"getaddrinfo({host!r}) returned empty list")
+            raise OSError("getaddrinfo() returned empty list")
         laddr_infos = None
         if local_addr is not None:
-            laddr_infos = await self.getaddrinfo(
-                local_addr[0], local_addr[1], family=family, type=socket.SOCK_STREAM,
-                proto=proto, flags=flags,
+            laddr_infos = await self._ensure_resolved(
+                local_addr, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
             )
             if not laddr_infos:
-                raise OSError("getaddrinfo() returned empty list for local_addr")
+                raise OSError("getaddrinfo() returned empty list")
         if interleave:
             infos = _interleave_addrinfos(infos, interleave)
 
-        errors = []
+        # One list per attempt, flattened at the end -- the shape of
+        # base_events._connect_sock, so the error raised when every
+        # attempt fails is the one asyncio would raise.
+        exceptions = []
 
         async def attempt(address, af):
-            # The whole sockaddr, not host/port: an IPv6 one carries the
-            # flow info and interface scope in elements 2 and 3, and a
-            # link-local peer (fe80::...%eth0) is unreachable without the
-            # scope however cleanly it resolved.
-            local_sockaddr = None
-            if laddr_infos is not None:
-                for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
-                    if lfamily == af:
-                        local_sockaddr = laddr
-                        break
-                else:
-                    exc = OSError(f"no matching local address with family={af!r} found")
-                    errors.append(exc)
-                    raise exc
-            fut = self.create_future()
+            my_exceptions = []
+            exceptions.append(my_exceptions)
             try:
-                op = self._core.tcp_connect(address, fut, local_sockaddr)
+                return await self._connect_one(address, af, laddr_infos, my_exceptions)
             except OSError as exc:
-                errors.append(exc)
-                raise
-            try:
-                return await fut
-            except asyncio.CancelledError:
-                # Cancel the native op too. Every losing Happy Eyeballs
-                # attempt lands here, so without this each connection
-                # leaves N-1 sockets in a half-open connect until the OS
-                # times them out -- which can be minutes. The completion
-                # still arrives and closes the socket; this only brings
-                # that forward.
-                self._core.cancel_connect(op)
-                raise
-            except OSError as exc:
-                errors.append(exc)
+                my_exceptions.append(exc)
                 raise
 
         if happy_eyeballs_delay is None:
@@ -310,14 +371,77 @@ class TcpSurface:
                 loop=self,
             )
         if fd is None:
-            if len(errors) == 1:
-                raise errors[0]
-            raise OSError(
-                f"Multiple exceptions: {', '.join(str(e) for e in errors)}"
-            ) from (errors[0] if errors else None)
+            exceptions = [exc for sub in exceptions for exc in sub]
+            try:
+                if len(exceptions) == 1:
+                    raise exceptions[0]
+                # If they all have the same str(), raise one.
+                model = str(exceptions[0])
+                if all(str(exc) == model for exc in exceptions):
+                    raise exceptions[0]
+                raise OSError(
+                    "Multiple exceptions: {}".format(", ".join(str(exc) for exc in exceptions))
+                )
+            finally:
+                exceptions = None
         return await self._wrap_outgoing(
             fd, protocol_factory, ssl, server_hostname, ssl_handshake_timeout, ssl_shutdown_timeout
         )
+
+    async def _ensure_resolved(self, address, *, family=0, type=socket.SOCK_STREAM, proto=0, flags=0):
+        """base_events._ensure_resolved: an address whose host is already
+        an IP literal needs no lookup. Sending it through getaddrinfo cost
+        an executor round trip per call -- about 38us each, three of them
+        for a create_server/create_connection/create_datagram_endpoint
+        triple -- and its result is the same."""
+        host, port = address[:2]
+        info = _ipaddr_info(host, port, family, type, proto, *address[2:])
+        if info is not None:
+            return [info]
+        return await self.getaddrinfo(host, port, family=family, type=type, proto=proto, flags=flags)
+
+    async def _connect_one(self, address, af, laddr_infos, my_exceptions):
+        """One native connect to `address` (a full sockaddr: an IPv6 one
+        carries the interface scope a link-local peer needs), bound to the
+        first of `laddr_infos` of the same family that will bind."""
+        fut = self.create_future()
+        if laddr_infos is None:
+            op = self._core.tcp_connect(address, fut, None)
+        else:
+            op = None
+            for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
+                if lfamily != af:
+                    continue
+                try:
+                    op = self._core.tcp_connect(address, fut, laddr)
+                    break
+                except OSError as exc:
+                    # The core words a bind failure as asyncio does; any
+                    # other failure (no socket of this family) ends the
+                    # attempt, as socket() failing does in base_events.
+                    if not (exc.strerror or "").startswith(_BIND_ERROR_PREFIX):
+                        raise
+                    my_exceptions.append(exc)
+            if op is None:
+                if my_exceptions:
+                    raise my_exceptions.pop()
+                raise OSError(f"no matching local address with family={af!r} found")
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            # Cancel the native op too. Every losing Happy Eyeballs
+            # attempt lands here, so without this each connection
+            # leaves N-1 sockets in a half-open connect until the OS
+            # times them out -- which can be minutes. The completion
+            # still arrives and closes the socket; this only brings
+            # that forward.
+            self._core.cancel_connect(op)
+            raise
+        except OSError as exc:
+            if exc.errno is None:
+                raise
+            # base_events' wording, so the address that refused is named.
+            raise OSError(exc.errno, f"Connect call failed {address}") from None
 
     async def _wrap_outgoing(
         self,
@@ -329,19 +453,25 @@ class TcpSurface:
         ssl_shutdown_timeout,
         *,
         server_side=False,
+        owner=None,
     ):
-        # Until attach_stream() takes it, this descriptor has no owner:
-        # it came back from a native connect, or from a `sock=` the caller
-        # already detached. A protocol_factory that raises (or an
-        # SSLContext that will not build) therefore leaked one connected
-        # socket per failure -- invisible until the process ran out.
+        # Without an `owner` socket object, nothing owns this descriptor
+        # until attach_stream() takes it: it came back from a native
+        # connect. A protocol_factory that raises (or an SSLContext that
+        # will not build) therefore leaked one connected socket per failure
+        # -- invisible until the process ran out. A caller's own socket
+        # (`owner`) is left to the caller on failure, as asyncio leaves it.
+        def discard():
+            if owner is None:
+                self._core.discard_socket(fd)
+
         if not ssl:
             try:
                 protocol = protocol_factory()
             except BaseException:
-                self._core.discard_socket(fd)
+                discard()
                 raise
-            transport = self._core.attach_stream(fd, protocol)
+            transport = self._core.attach_stream(fd, protocol, owner)
             return transport, protocol
         # Everything up to attach_stream() belongs in the rollback, not
         # just the factory calls: `_make_ssl_context` hands back anything
@@ -362,10 +492,16 @@ class TcpSurface:
                 ssl_handshake_timeout=ssl_handshake_timeout,
                 ssl_shutdown_timeout=ssl_shutdown_timeout,
             )
+            # Taken now, as selector_events._make_ssl_transport does:
+            # SSLProtocol.connection_lost clears the attribute, so reading
+            # it after the handshake returned None for any connection that
+            # had already died -- a handshake that failed without failing
+            # the waiter came back as a successful `(None, protocol)`.
+            app_transport = protocol._app_transport
         except BaseException:
-            self._core.discard_socket(fd)
+            discard()
             raise
-        transport = self._core.attach_stream(fd, protocol)
+        transport = self._core.attach_stream(fd, protocol, owner)
         try:
             await waiter  # handshake
         except BaseException:
@@ -377,7 +513,7 @@ class TcpSurface:
             # believes the connection attempt was abandoned.
             transport.close()
             raise
-        return protocol._app_transport, app_protocol
+        return app_transport, app_protocol
 
     async def connect_accepted_socket(
         self,
@@ -400,9 +536,16 @@ class TcpSurface:
         if ssl_shutdown_timeout is not None and not ssl:
             raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
         _check_ssl_socket(sock)
-        fd = sock.detach()
+        sock.setblocking(False)
         return await self._wrap_outgoing(
-            fd, protocol_factory, ssl, None, ssl_handshake_timeout, ssl_shutdown_timeout, server_side=True
+            sock.fileno(),
+            protocol_factory,
+            ssl,
+            None,
+            ssl_handshake_timeout,
+            ssl_shutdown_timeout,
+            server_side=True,
+            owner=sock,
         )
 
     async def start_tls(
@@ -417,6 +560,18 @@ class TcpSurface:
         ssl_shutdown_timeout=None,
     ):
         """Upgrade an established transport to TLS (sslproto path)."""
+        if ssl_module is None:
+            raise RuntimeError("Python ssl module is not available")
+        # base_events.start_tls's checks. Without the first, a missing
+        # context reached SSLProtocol, which builds a default *client*
+        # context for it -- a server-side upgrade then waited out the
+        # handshake timeout instead of failing at the call.
+        if not isinstance(sslcontext, ssl_module.SSLContext):
+            raise TypeError(
+                f"sslcontext is expected to be an instance of ssl.SSLContext, got {sslcontext!r}"
+            )
+        if not getattr(transport, "_start_tls_compatible", False):
+            raise TypeError(f"transport {transport!r} is not supported by start_tls()")
         waiter = self.create_future()
         ssl_protocol = self._make_ssl_protocol(
             protocol,
@@ -445,9 +600,10 @@ class TcpSurface:
         if ssl_module is None:
             raise RuntimeError("stdlib ssl module is not available")
         if isinstance(ssl, bool):
-            if server_side:
-                raise ValueError("ssl=True is not supported server-side; pass an SSLContext")
-            return ssl_module.create_default_context()
+            # None: SSLProtocol builds the default context itself, exactly
+            # as asyncio does -- including dropping the hostname check for
+            # `server_hostname=''`, and refusing ssl=True server-side.
+            return None
         return ssl
 
     def _make_ssl_protocol(self, app_protocol, sslcontext, waiter, **kwargs):
@@ -489,13 +645,20 @@ class TcpSurface:
             raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
         if sock is not None:
             _check_ssl_socket(sock)
+        if host is not None or port is not None:
+            if sock is not None:
+                raise ValueError("host/port and sock can not be specified at the same time")
+        elif sock is None:
+            # Not a random port: asyncio refuses a call that names nothing
+            # to serve on, and binding something anyway hid the mistake.
+            raise ValueError("Neither host/port nor sock were specified")
+        elif sock.type != socket.SOCK_STREAM:
             # Checked before ownership transfers. A SOCK_DGRAM socket got
             # detached and registered as a listener, and then accept() on
             # it failed forever -- the listener rearms after each failure,
             # so the caller was handed an apparently serving Server that
             # only logged accept errors, instead of a ValueError here.
-            if sock.type != socket.SOCK_STREAM:
-                raise ValueError(f"a stream socket was expected, got {sock!r}")
+            raise ValueError(f"a stream socket was expected, got {sock!r}")
         if reuse_port and not hasattr(socket, "SO_REUSEPORT"):
             raise ValueError("reuse_port not supported by socket module")
 
@@ -517,8 +680,6 @@ class TcpSurface:
         entries = []
 
         if sock is not None:
-            if host is not None or port is not None:
-                raise ValueError("host/port and sock can not be specified at the same time")
             sock.setblocking(False)
             # stdlib create_server() accepts a bound-but-not-listening
             # socket and calls listen() itself. Without this the native
@@ -547,31 +708,42 @@ class TcpSurface:
                     raise ValueError(
                         f"A listening socket was expected, got a connected socket {sock!r}"
                     ) from exc
-            fd = sock.detach()
-            # No cleanup here on failure: the native listen_fd owns the
-            # descriptor from this point and closes it on every one of
-            # its error paths. Closing it here as well was a double
-            # close -- in a threaded process another thread can reuse
-            # the number between the two, and the second close lands on
-            # an unrelated descriptor.
-            lid, name, rawfd = self._core.listen_fd(fd, factory, accept_pool, start_serving)
+            # Not detached: the listener uses the caller's socket, which
+            # stays usable while the server runs (asyncio's contract) and
+            # is closed by Server.close(). On failure it is left open for
+            # the caller.
+            lid, name, rawfd = self._core.listen_fd(
+                sock.fileno(), factory, accept_pool, start_serving, sock
+            )
             entries.append((lid, name, rawfd))
-            return Server(self, entries, factory, accept_pool, start_serving)
+            return Server(self, entries, factory, accept_pool, start_serving, sock=sock)
 
-        if port is None:
-            port = 0
         if reuse_address is None:
             reuse_address = os.name == "posix" and sys.platform != "cygwin"
+        if host == "":
+            hosts = [None]
+        elif isinstance(host, str) or not isinstance(host, collections.abc.Iterable):
+            hosts = [host]
+        else:
+            hosts = host
 
-        hosts = [host] if (host is None or isinstance(host, str)) else list(host)
-        resolved = []
-        for h in hosts:
-            if h == "" or h is None:
-                h = None  # wildcard
-            infos = await self.getaddrinfo(
-                h, port, family=family, type=socket.SOCK_STREAM, flags=flags
+        async def resolve(h):
+            infos = await self._ensure_resolved(
+                (h, port), family=family, type=socket.SOCK_STREAM, flags=flags
             )
-            for af, _st, _pr, _cname, address in infos:
+            if not infos:
+                raise OSError(f"getaddrinfo({h!r}) returned empty list")
+            return infos
+
+        # Every host at once, then de-duplicated (several hosts can
+        # resolve to one address) -- base_events' rule. Ordered rather than
+        # a set, so which address binds first does not vary run to run.
+        resolved = await tasks.gather(*[resolve(h) for h in hosts])
+        infos = list(dict.fromkeys(itertools.chain.from_iterable(resolved)))
+
+        completed = False
+        try:
+            for af, socktype, proto, _cname, sa in infos:
                 if af not in (socket.AF_INET, socket.AF_INET6):
                     continue
                 # Keep the flow info and interface scope an IPv6 sockaddr
@@ -579,21 +751,11 @@ class TcpSurface:
                 # with a scope_id naming the interface, and dropping it
                 # bound with scope zero -- the wrong interface, or nothing
                 # at all, despite a clean resolution.
-                key = (address[0], address[1]) + tuple(address[2:4])
-                if key not in resolved:
-                    resolved.append(key)
-        if not resolved:
-            raise OSError(f"getaddrinfo({host!r}) returned empty list")
-
-        unavailable = None
-        try:
-            for entry in resolved:
-                ip, bind_port = entry[0], entry[1]
-                flowinfo, scope_id = (entry[2], entry[3]) if len(entry) == 4 else (0, 0)
+                flowinfo, scope_id = (sa[2], sa[3]) if len(sa) >= 4 else (0, 0)
                 try:
-                    lid, name, rawfd = self._core.tcp_listen(
-                        ip,
-                        bind_port,
+                    entry = self._core.tcp_listen(
+                        sa[0],
+                        sa[1],
                         factory,
                         backlog,
                         reuse_address,
@@ -602,26 +764,38 @@ class TcpSurface:
                         start_serving,
                         flowinfo,
                         scope_id,
+                        True,  # skip_unavailable
                     )
                 except OSError as exc:
-                    if exc.errno in _AF_UNAVAILABLE:
-                        # CPython skips families this host cannot create
-                        # a socket for -- a dual-stack resolution on a
-                        # v4-only host must still serve on v4, not fail
-                        # outright. Any OTHER error (EADDRINUSE, EACCES)
-                        # still aborts the whole call.
-                        unavailable = exc
+                    # EADDRNOTAVAIL: asyncio assumes the family is not
+                    # enabled on this host (bpo-30945) and moves on.
+                    if exc.errno == errno.EADDRNOTAVAIL or exc.errno in _AF_UNAVAILABLE:
+                        if self.get_debug():
+                            logger.warning(exc.strerror)
                         continue
                     raise
-                entries.append((lid, name, rawfd))
-        except BaseException:
-            for lid, _name, _fd in entries:
-                self._core.listener_close(lid)
-            raise
-        if not entries:
-            # Every resolved family was unavailable: that is an error,
-            # not an empty server.
-            raise unavailable
+                if entry is None:
+                    # No socket of this family can be made here (a host
+                    # without IPv6): skipped, as asyncio skips it, so a
+                    # wildcard server still serves on IPv4.
+                    if self.get_debug():
+                        logger.warning(
+                            "create_server() failed to create socket.socket(%r, %r, %r)",
+                            af,
+                            socktype,
+                            proto,
+                        )
+                    continue
+                entries.append(entry)
+            if not entries:
+                raise OSError(
+                    "could not bind on any address out of %r" % ([info[4] for info in infos],)
+                )
+            completed = True
+        finally:
+            if not completed:
+                for lid, _name, _fd in entries:
+                    self._core.listener_close(lid)
         return Server(self, entries, factory, accept_pool, start_serving)
 
     # -- AF_UNIX (delegates to create_connection/create_server's sock= ----
@@ -748,20 +922,56 @@ class TcpSurface:
     # -- readiness callbacks (R-057) ---------------------------------------
 
     def add_reader(self, fd, callback, *args):
-        self._core.add_reader(_fileno(fd), callback, *args)
+        self._core.add_reader(self._ensure_fd_no_transport(fd), callback, *args)
 
     def remove_reader(self, fd):
-        return self._core.remove_reader(_fileno(fd))
+        return self._core.remove_reader(self._ensure_fd_no_transport(fd))
 
     def add_writer(self, fd, callback, *args):
-        self._core.add_writer(_fileno(fd), callback, *args)
+        self._core.add_writer(self._ensure_fd_no_transport(fd), callback, *args)
 
     def remove_writer(self, fd):
-        return self._core.remove_writer(_fileno(fd))
+        return self._core.remove_writer(self._ensure_fd_no_transport(fd))
+
+    def _ensure_fd_no_transport(self, fd):
+        """base_events' guard: a descriptor a live transport drives is not
+        the application's to watch -- a watch on it fights the transport's
+        own registration. Returns the descriptor number."""
+        fileno = _fileno(fd)
+        transport = self._core.transport_for_fd(fileno)
+        if transport is not None and not transport.is_closing():
+            raise RuntimeError(f"File descriptor {fd!r} is used by transport {transport!r}")
+        return fileno
+
+    def _check_sock(self, sock):
+        # base_events' preamble for every sock_* method.
+        _check_ssl_socket(sock)
+        if self.get_debug() and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
 
     # -- sock_* (readiness-based; cold path by design) ---------------------
 
+    @staticmethod
+    def _watch_done(handle, remove, fd):
+        """Drop a sock_* call's readiness watch -- but only its own.
+
+        A newer call on the same socket (cancel-and-retry, or two tasks
+        racing) displaces this call's watch, which cancels it. Removing
+        "the" reader regardless removed the newer call's instead, and that
+        call then waited forever: base_events' _sock_read_done checks
+        `handle.cancelled()` for exactly this. And a socket closed in the
+        meantime has no watch left to remove: the EBADF that removal can
+        hit must not replace the exception (usually CancelledError)
+        unwinding through the caller.
+        """
+        if not handle.cancelled():
+            try:
+                remove(fd)
+            except OSError:
+                pass
+
     async def sock_recv(self, sock, n):
+        self._check_sock(sock)
         try:
             return sock.recv(n)
         except (BlockingIOError, InterruptedError):
@@ -783,13 +993,14 @@ class TcpSurface:
             else:
                 fut.set_result(data)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recv_into(self, sock, buf):
+        self._check_sock(sock)
         try:
             return sock.recv_into(buf)
         except (BlockingIOError, InterruptedError):
@@ -811,13 +1022,14 @@ class TcpSurface:
             else:
                 fut.set_result(nbytes)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_sendall(self, sock, data):
+        self._check_sock(sock)
         try:
             n = sock.send(data)
         except (BlockingIOError, InterruptedError):
@@ -845,31 +1057,24 @@ class TcpSurface:
             if pos[0] >= len(view):
                 fut.set_result(None)
 
-        self._core.add_writer(fd, on_writable)
+        handle = self._core.add_writer(fd, on_writable)
         try:
             await fut
         finally:
-            self._core.remove_writer(fd)
+            self._watch_done(handle, self._core.remove_writer, fd)
 
     async def sock_connect(self, sock, address):
+        self._check_sock(sock)
         # Resolution only applies to AF_INET/AF_INET6 (matches stdlib):
         # AF_UNIX addresses are filesystem paths, not (host, port) pairs,
         # and any other family's address is used exactly as given.
         if sock.family in (socket.AF_INET, socket.AF_INET6):
-            # Numeric fast path first.
-            try:
-                socket.inet_pton(sock.family, address[0])
-            except (OSError, ValueError, IndexError):
-                infos = await self.getaddrinfo(
-                    address[0], address[1], family=sock.family, type=sock.type, proto=sock.proto
-                )
-                if not infos:
-                    # `from None`: the inet_pton failure we are inside is
-                    # expected control flow ("not a numeric address"), so
-                    # chaining it onto a resolution failure buries the real
-                    # cause under an irrelevant one.
-                    raise OSError(f"getaddrinfo({address!r}) returned empty list") from None
-                address = infos[0][4]
+            infos = await self._ensure_resolved(
+                address, family=sock.family, type=sock.type, proto=sock.proto
+            )
+            if not infos:
+                raise OSError(f"getaddrinfo({address!r}) returned empty list")
+            address = infos[0][4]
         err = sock.connect_ex(address)
         if err == 0:
             return
@@ -901,13 +1106,14 @@ class TcpSurface:
             else:
                 fut.set_exception(OSError(e, f"Connect call failed {address}"))
 
-        self._core.add_writer(fd, on_writable)
+        handle = self._core.add_writer(fd, on_writable)
         try:
             await fut
         finally:
-            self._core.remove_writer(fd)
+            self._watch_done(handle, self._core.remove_writer, fd)
 
     async def sock_accept(self, sock):
+        self._check_sock(sock)
         try:
             conn, addr = sock.accept()
         except (BlockingIOError, InterruptedError):
@@ -938,13 +1144,14 @@ class TcpSurface:
                 conn.setblocking(False)
                 fut.set_result((conn, addr))
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recvfrom(self, sock, bufsize):
+        self._check_sock(sock)
         try:
             return sock.recvfrom(bufsize)
         except (BlockingIOError, InterruptedError):
@@ -966,13 +1173,14 @@ class TcpSurface:
             else:
                 fut.set_result(result)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_recvfrom_into(self, sock, buf, nbytes=0):
+        self._check_sock(sock)
         if not nbytes:
             nbytes = len(buf)
         try:
@@ -996,13 +1204,14 @@ class TcpSurface:
             else:
                 fut.set_result(result)
 
-        self._core.add_reader(fd, on_readable)
+        handle = self._core.add_reader(fd, on_readable)
         try:
             return await fut
         finally:
-            self._core.remove_reader(fd)
+            self._watch_done(handle, self._core.remove_reader, fd)
 
     async def sock_sendto(self, sock, data, address):
+        self._check_sock(sock)
         try:
             return sock.sendto(data, address)
         except (BlockingIOError, InterruptedError):
@@ -1027,11 +1236,11 @@ class TcpSurface:
                 # depend on transient socket readiness.
                 fut.set_result(sent)
 
-        self._core.add_writer(fd, on_writable)
+        handle = self._core.add_writer(fd, on_writable)
         try:
             return await fut
         finally:
-            self._core.remove_writer(fd)
+            self._watch_done(handle, self._core.remove_writer, fd)
 
     @staticmethod
     def _check_sendfile_params(file, offset, count):
@@ -1063,6 +1272,9 @@ class TcpSurface:
         `_check_sendfile_params`; this previously always took the chunked
         path regardless of fallback= and skipped every one of these
         checks."""
+        if self.get_debug() and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+        _check_ssl_socket(sock)
         self._check_sendfile_params(file, offset, count)
         if sock.type != socket.SOCK_STREAM:
             raise ValueError("only SOCK_STREAM type sockets are supported")
@@ -1073,13 +1285,17 @@ class TcpSurface:
                 file.fileno()
             except (OSError, AttributeError, ValueError):
                 can_native = False
-        if not can_native:
-            if not fallback:
-                raise asyncio.SendfileNotAvailableError(
-                    "syscall sendfile is not available for this socket/file combination"
-                )
-            return await self._sock_sendfile_fallback(sock, file, offset, count)
-        return await self._sock_sendfile_native(sock, file, offset, count)
+        if can_native:
+            try:
+                return await self._sock_sendfile_native(sock, file, offset, count)
+            except asyncio.SendfileNotAvailableError:
+                if not fallback:
+                    raise
+        elif not fallback:
+            raise asyncio.SendfileNotAvailableError(
+                "syscall sendfile is not available for this socket/file combination"
+            )
+        return await self._sock_sendfile_fallback(sock, file, offset, count)
 
     async def _sock_sendfile_native(self, sock, file, offset, count):
         fd = sock.fileno()
@@ -1100,6 +1316,13 @@ class TcpSurface:
                     sent = None
                 except InterruptedError:
                     continue
+                except OSError as exc:
+                    if total:
+                        raise
+                    # Nothing sent yet: most often a file os.sendfile
+                    # cannot read from (a pipe, a character device).
+                    # asyncio falls back to plain sends then.
+                    raise asyncio.SendfileNotAvailableError("os.sendfile call failed") from exc
                 if sent == 0:
                     break  # end of file
                 if sent is not None:
@@ -1116,17 +1339,20 @@ class TcpSurface:
                     if not fut.done():
                         fut.set_result(None)
 
-                self._core.add_writer(fd, on_writable)
+                handle = self._core.add_writer(fd, on_writable)
                 try:
                     await fut
                 finally:
-                    self._core.remove_writer(fd)
+                    self._watch_done(handle, self._core.remove_writer, fd)
             return total
         finally:
-            file.seek(offset + total)  # stdlib convention
+            # stdlib convention: positioned after what was sent, and left
+            # alone when nothing was (or there is no position to set).
+            if total and _seekable(file):
+                file.seek(offset + total)
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
-        # Unconditional, matching Loop._sendfile_fallback: the old guard
+        # Even at offset 0, matching Loop._sendfile_fallback: the old guard
         # skipped the seek for the default offset=0, so this path sent from
         # the file's current position while the native path sent from byte
         # zero.
@@ -1137,8 +1363,12 @@ class TcpSurface:
         # transfer interrupted part-way must still report how far it got.
         blocksize = min(count, 16384) if count else 16384
         total = 0
+        # A pipe has no position to start from or restore (and asyncio
+        # seeks neither for it at offset 0).
+        seekable = _seekable(file)
         try:
-            await self.run_in_executor(None, file.seek, offset)
+            if offset or seekable:
+                await self.run_in_executor(None, file.seek, offset)
             while True:
                 if count:
                     blocksize = min(count - total, blocksize)
@@ -1153,15 +1383,19 @@ class TcpSurface:
         finally:
             # Synchronous for the same reason as Loop._sendfile_fallback:
             # an await here is skipped when unwinding a cancellation.
-            file.seek(offset + total)
+            if seekable:
+                file.seek(offset + total)
 
 
-class _DatagramTransport(asyncio.DatagramTransport):
+class _DatagramTransport(asyncio.DatagramTransport, asyncio.Transport):
     """R-058 datagram transport over the native endpoint (core `udp_*`).
 
-    The socket is detached into the engine at `_open`; sends are copied
-    into the core (fire-and-forget, serialized per endpoint), receives
-    arrive via protocol.datagram_received from the event dispatch.
+    The engine drives the socket's descriptor from `_open`, while the
+    socket object keeps owning it (asyncio's contract: the caller's
+    socket stays usable, and the transport closes it after
+    connection_lost); sends are copied into the core (fire-and-forget,
+    serialized per endpoint), receives arrive via
+    protocol.datagram_received from the event dispatch.
     """
 
     def __init__(self, loop, sock, protocol, remote_addr):
@@ -1174,35 +1408,37 @@ class _DatagramTransport(asyncio.DatagramTransport):
         self._extra = {}
 
     def _open(self):
-        self._extra["sockname"] = self._sock_obj.getsockname()
+        sock = self._sock_obj
+        # asyncio's extra info for a datagram transport -- 'socket' is what
+        # multicast setups reach for to set their options.
+        self._extra["socket"] = trsock.TransportSocket(sock)
         try:
-            self._extra["peername"] = self._sock_obj.getpeername()
+            self._extra["sockname"] = sock.getsockname()
+        except OSError:
+            self._extra["sockname"] = None
+        try:
+            self._extra["peername"] = sock.getpeername()
         except OSError:
             self._extra["peername"] = None
-        fd = self._sock_obj.detach()
-        try:
-            self._did = self._loop._core.udp_open(
-                fd,
-                self._protocol.datagram_received,
-                self._protocol.error_received,
-                self._connection_lost,
-            )
-        except BaseException:
-            # detach() has already run, so neither the caller nor
-            # create_datagram_endpoint's cleanup holds a socket object
-            # that owns this descriptor any more.
-            self._loop._core.discard_socket(fd)
-            raise
+        # On failure the socket object still owns its descriptor, so the
+        # caller's (or create_datagram_endpoint's) cleanup closes it.
+        self._did = self._loop._core.udp_open(
+            sock.fileno(),
+            self._protocol.datagram_received,
+            self._protocol.error_received,
+            self._connection_lost,
+            sock,
+        )
         # Synchronous: guarantees connection_made precedes any
         # datagram_received (those dispatch only from future loop ticks).
         try:
             self._protocol.connection_made(self)
         except BaseException:
-            # udp_open already detached the socket and installed the native
-            # endpoint, so the caller's cleanup (which only closes the now-
-            # detached Python socket) would leave the descriptor, its
-            # outstanding receive and the protocol callbacks alive until the
-            # whole loop closed. Tear the endpoint down before propagating.
+            # udp_open already installed the native endpoint, so the
+            # caller's cleanup (which only closes the Python socket) would
+            # leave its outstanding receive and the protocol callbacks
+            # alive until the whole loop closed. Tear the endpoint down
+            # before propagating.
             did, self._did = self._did, None
             if did is not None:
                 try:
@@ -1218,6 +1454,10 @@ class _DatagramTransport(asyncio.DatagramTransport):
     # ---- asyncio.DatagramTransport surface ----------------------------
 
     def sendto(self, data, addr=None):
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__!r}")
+        if not data:
+            return  # Python 3.11 sends no empty datagram
         if self._closing:
             return
         if self._remote_addr is not None:
@@ -1229,8 +1469,21 @@ class _DatagramTransport(asyncio.DatagramTransport):
                 # explicit sendto address -- a plain send() on an
                 # unconnected socket is EDESTADDRREQ.
                 addr = self._remote_addr
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__}")
+        family = self._sock_obj.family
+        if (
+            isinstance(addr, tuple)
+            and len(addr) >= 2
+            and family in (socket.AF_INET, socket.AF_INET6)
+            and _ipaddr_info(addr[0], addr[1], family, socket.SOCK_DGRAM, 0) is None
+        ):
+            # A host name, which the socket module's sendto() resolves
+            # (synchronously) for asyncio; the native send takes a sockaddr.
+            try:
+                addr = socket.getaddrinfo(addr[0], addr[1], family, socket.SOCK_DGRAM)[0][4]
+            except OSError as exc:
+                # Where asyncio's sendto() delivers that lookup's failure.
+                self._protocol.error_received(exc)
+                return
         self._loop._core.udp_sendto(self._did, bytes(data), addr)
 
     def close(self):

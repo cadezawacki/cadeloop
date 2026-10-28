@@ -14,23 +14,32 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
+import errno
+import io
 import os
-import reprlib
+import signal as signal_module
 import socket
 import stat
 import subprocess
 import sys
 import threading
+import time
+import traceback
 import warnings
 import weakref
-from asyncio import events, futures, tasks
+from asyncio import base_events, constants, events, format_helpers, futures, tasks
+
+# asyncio's own logger, as uvloop uses it too: "Task exception was never
+# retrieved", exception-handler output and slow-callback warnings are
+# routed, filtered and silenced through logging.getLogger("asyncio") by
+# applications and test harnesses alike.
+from asyncio.log import logger
 
 from . import _core
-from .tcp import TcpSurface, _DatagramTransport
+from .tcp import TcpSurface, _DatagramTransport, _fileno, _seekable
 
 __all__ = ["Loop"]
-
-logger = __import__("logging").getLogger("cadeloop")
 
 _MILESTONES = {
     "tcp": "TCP transports arrive with the IOCP backend in milestone M1",
@@ -114,6 +123,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._core = core
         self._accept_pool = accept_pool  # R-032
         self._signal_handlers = {}
+        self._signal_wakeup_pair = None  # R-052, made on first main-thread run
         self._console_ctrl_handler_ref = None  # R-052: keeps the ctypes callback alive
         core.set_error_hook(self._on_callback_error)
         core.set_net_error_hook(self._on_net_error)
@@ -126,16 +136,40 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
         # R-050: native fast paths bound straight onto the instance —
         # attribute lookup finds the bound native method, no Python frame.
-        self.call_soon = core.call_soon
-        self.call_soon_threadsafe = core.call_soon_threadsafe
-        self.call_later = core.call_later
-        self.call_at = core.call_at
-        self.time = core.time
-        self.stop = core.stop
-        self.is_running = core.is_running
-        self.is_closed = core.is_closed
-        self.get_debug = core.get_debug
-        self.stats = core.stats  # R-103
+        # The scheduling four are raw METH_FASTCALL builtins (no generic
+        # argument parsing, no per-call *args tuple); asyncio's C Task and
+        # Future look `call_soon` up here on every step and done-callback.
+        # Not where a subclass overrides one: the instance attribute would
+        # shadow the override, which then silently never ran (see the
+        # class-level forms below).
+        fast = core.fast_methods()
+        (
+            self._fast_call_soon,
+            self._fast_call_soon_threadsafe,
+            self._fast_call_later,
+            self._fast_call_at,
+        ) = fast
+        natives = {
+            "call_soon": fast[0],
+            "call_soon_threadsafe": fast[1],
+            "call_later": fast[2],
+            "call_at": fast[3],
+            "time": core.time,
+            "stop": core.stop,
+            "is_running": core.is_running,
+            "is_closed": core.is_closed,
+            "get_debug": core.get_debug,
+            "stats": core.stats,  # R-103
+        }
+        cls = type(self)
+        overridden = {n for n in natives if getattr(cls, n) is not getattr(Loop, n)}
+        if overridden & {"time", "call_at"}:
+            # asyncio's call_later is call_at(time() + delay): an override
+            # of either must be honoured by it too.
+            overridden.add("call_later")
+        for name, native in natives.items():
+            if name not in overridden:
+                setattr(self, name, native)
 
         self._task_factory = None
         core.set_owner(self)
@@ -143,7 +177,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._exception_handler = None
         self._default_executor = None
         self._executor_shutdown_called = False
-        self._dns_executor = None
         self._dns_cache: dict = {}
         # R-055: off by default (matches the AbstractEventLoop contract —
         # real asyncio.getaddrinfo never caches). cadeloop.Config/serve()
@@ -221,17 +254,32 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         immediately, so CTRL+C interrupts an idle loop at once. This is
         the proactor CTRL+C fix on Windows, and on POSIX it also closes
         the race of a signal landing between the tick's signal check and
-        the park. Main thread only (set_wakeup_fd's own rule)."""
+        the park. Main thread only (set_wakeup_fd's own rule).
+
+        The socket pair and its watch are made once per loop and kept until
+        close(): only the set_wakeup_fd swap is per run. Building and
+        tearing them down on every run_forever() -- a socketpair, two
+        fcntls, an epoll_ctl pair and two closes -- made
+        run_until_complete() over twice as slow as asyncio's."""
         if threading.current_thread() is not threading.main_thread():
             return None
-        import signal as signal_module
+        pair = self._signal_wakeup_pair
+        if pair is None:
+            pair = self._signal_wakeup_pair = self._make_signal_wakeup_pair()
+            if pair is None:
+                return None
+        try:
+            old_fd = signal_module.set_wakeup_fd(pair[1].fileno(), warn_on_full_buffer=False)
+        except (ValueError, OSError):
+            return None
+        return (old_fd,)
 
+    def _make_signal_wakeup_pair(self):
         try:
             rsock, csock = socket.socketpair()
             rsock.setblocking(False)
             csock.setblocking(False)
-            old_fd = signal_module.set_wakeup_fd(csock.fileno(), warn_on_full_buffer=False)
-        except (ValueError, OSError, AttributeError):
+        except OSError:
             return None
 
         def drain():
@@ -244,7 +292,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         try:
             self._core.add_reader(rsock.fileno(), drain)
         except OSError:
-            signal_module.set_wakeup_fd(old_fd)
             rsock.close()
             csock.close()
             return None
@@ -252,22 +299,25 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # without this, its permanent registration would keep the poll
         # elision (pure-scheduling fast path) from ever engaging.
         self._core.set_signal_wakeup_fd(rsock.fileno())
-        return (rsock, csock, old_fd)
+        return (rsock, csock)
 
     def _remove_signal_wakeup(self, wakeup):
         if wakeup is None:
             return
-        import signal as signal_module
+        try:
+            signal_module.set_wakeup_fd(wakeup[0])
+        except (ValueError, OSError):
+            pass
 
-        rsock, csock, old_fd = wakeup
+    def _close_signal_wakeup_pair(self):
+        pair, self._signal_wakeup_pair = self._signal_wakeup_pair, None
+        if pair is None:
+            return
+        rsock, csock = pair
         self._core.set_signal_wakeup_fd(None)
         try:
             self._core.remove_reader(rsock.fileno())
         except OSError:
-            pass
-        try:
-            signal_module.set_wakeup_fd(old_fd)
-        except (ValueError, OSError):
             pass
         rsock.close()
         csock.close()
@@ -322,17 +372,28 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             except (OSError, ValueError, RuntimeError):
                 self._signal_handlers.pop(sig, None)
         self._remove_console_ctrl_handler()
+        self._close_signal_wakeup_pair()
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None
-        if self._dns_executor is not None:
-            self._dns_executor.shutdown(wait=False)
-            self._dns_executor = None
         self._core.close()
 
     def _check_closed(self):
         if self._core.is_closed():
             raise RuntimeError("Event loop is closed")
+
+    def __del__(self, _warn=warnings.warn):
+        # base_events.BaseEventLoop.__del__: an unclosed loop is a resource
+        # leak worth hearing about, and closing it here releases its
+        # sockets and pending callbacks now instead of never. `_core` is
+        # read from the instance dict: __init__ may have failed before
+        # setting it.
+        core = self.__dict__.get("_core")
+        if core is None or core.is_closed():
+            return
+        _warn(f"unclosed event loop {self!r}", ResourceWarning, source=self)
+        if not core.is_running():
+            self.close()
 
     def set_debug(self, enabled):
         self._core.set_debug(bool(enabled))
@@ -381,6 +442,48 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 else:
                     set_name(name)
         return task
+
+    # Class-level forms of the fast paths __init__ binds per instance: what
+    # a subclass's super().call_soon(...) reaches, and what an instance of
+    # a subclass that overrides one of them runs for the others.
+
+    def call_soon(self, callback, *args, context=None):
+        return self._fast_call_soon(callback, *args, context=context)
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        return self._fast_call_soon_threadsafe(callback, *args, context=context)
+
+    def call_later(self, delay, callback, *args, context=None):
+        cls = type(self)
+        if cls.time is Loop.time and cls.call_at is Loop.call_at:
+            return self._fast_call_later(delay, callback, *args, context=context)
+        # asyncio's own definition, so an overridden time() or call_at()
+        # is honoured.
+        timer = self.call_at(self.time() + delay, callback, *args, context=context)
+        if timer._source_traceback:
+            del timer._source_traceback[-1]
+        return timer
+
+    def call_at(self, when, callback, *args, context=None):
+        return self._fast_call_at(when, callback, *args, context=context)
+
+    def time(self):
+        return self._core.time()
+
+    def stop(self):
+        self._core.stop()
+
+    def is_running(self):
+        return self._core.is_running()
+
+    def is_closed(self):
+        return self._core.is_closed()
+
+    def get_debug(self):
+        return self._core.get_debug()
+
+    def stats(self):
+        return self._core.stats()
 
     def _rebind_task_fastpath(self):
         """(Re)install the native create_task/create_future fast paths.
@@ -436,14 +539,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             raise TypeError("executor must be ThreadPoolExecutor instance")
         self._default_executor = executor
 
-    def _dns_pool(self):
-        # R-055: fixed internal pool, size = min(8, cpus).
-        if self._dns_executor is None:
-            self._dns_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, os.cpu_count() or 1),
-                thread_name_prefix="cadeloop-dns",
-            )
-        return self._dns_executor
+    # Lookups run in the default executor, as asyncio's do, so that
+    # set_default_executor() governs them too (a private pool ignored it:
+    # an application sizing or instrumenting its executor saw no DNS
+    # work there). Callers skip them altogether for numeric hosts
+    # (TcpSurface._ensure_resolved).
 
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
         key = (host, port, family, type, proto, flags)
@@ -451,23 +551,40 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             hit = self._dns_cache.get(key)
             if hit is not None and hit[0] > self.time():
                 return hit[1]
-        result = await futures.wrap_future(
-            self._dns_pool().submit(
-                socket.getaddrinfo, host, port, family, type, proto, flags
-            ),
-            loop=self,
-        )
+        getaddr_func = self._getaddrinfo_debug if self.get_debug() else socket.getaddrinfo
+        result = await self.run_in_executor(None, getaddr_func, host, port, family, type, proto, flags)
         if self._dns_cache_enabled:
             if len(self._dns_cache) > 1024:
                 self._dns_cache.clear()
             self._dns_cache[key] = (self.time() + self._dns_cache_ttl, result)
         return result
 
+    def _getaddrinfo_debug(self, host, port, family, type, proto, flags):
+        # base_events' debug-mode lookup log. Runs in the executor, so it
+        # times itself with time.monotonic() rather than the loop's clock.
+        msg = [f"{host}:{port!r}"]
+        if family:
+            msg.append(f"family={family!r}")
+        if type:
+            msg.append(f"type={type!r}")
+        if proto:
+            msg.append(f"proto={proto!r}")
+        if flags:
+            msg.append(f"flags={flags!r}")
+        msg = ", ".join(msg)
+        logger.debug("Get address info %s", msg)
+        t0 = time.monotonic()
+        addrinfo = socket.getaddrinfo(host, port, family, type, proto, flags)
+        dt = time.monotonic() - t0
+        msg = f"Getting address info {msg} took {dt * 1e3:.3f}ms: {addrinfo!r}"
+        if dt >= self.slow_callback_duration:
+            logger.info(msg)
+        else:
+            logger.debug(msg)
+        return addrinfo
+
     async def getnameinfo(self, sockaddr, flags=0):
-        return await futures.wrap_future(
-            self._dns_pool().submit(socket.getnameinfo, sockaddr, flags),
-            loop=self,
-        )
+        return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
 
     async def shutdown_default_executor(self):
         self._executor_shutdown_called = True
@@ -557,6 +674,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return self._exception_handler
 
     def default_exception_handler(self, context):
+        # asyncio's BaseEventLoop.default_exception_handler, line for line
+        # (less the `_current_handle` fallback: the native dispatcher does
+        # not track one; handles pass their traceback explicitly instead).
         message = context.get("message")
         if not message:
             message = "Unhandled exception in event loop"
@@ -569,7 +689,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         for key in sorted(context):
             if key in {"message", "exception"}:
                 continue
-            log_lines.append(f"{key}: {context[key]!r}")
+            value = context[key]
+            if key == "source_traceback":
+                tb = "".join(traceback.format_list(value))
+                value = "Object created at (most recent call last):\n"
+                value += tb.rstrip()
+            elif key == "handle_traceback":
+                tb = "".join(traceback.format_list(value))
+                value = "Handle created at (most recent call last):\n"
+                value += tb.rstrip()
+            else:
+                value = repr(value)
+            log_lines.append(f"{key}: {value}")
         logger.error("\n".join(log_lines), exc_info=exc_info)
 
     def call_exception_handler(self, context):
@@ -609,16 +740,26 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # Hooks invoked from the native dispatcher.
 
     def _on_callback_error(self, handle, exc):
-        self.call_exception_handler(
-            {
-                "message": f"Exception in callback {handle!r}",
-                "exception": exc,
-                "handle": handle,
-            }
-        )
+        # asyncio's Handle._run report, same message and keys.
+        cb = format_helpers._format_callback_source(handle._callback, handle._args)
+        context = {
+            "message": f"Exception in callback {cb}",
+            "exception": exc,
+            "handle": handle,
+        }
+        if handle._source_traceback:
+            context["source_traceback"] = handle._source_traceback
+        self.call_exception_handler(context)
 
-    def _on_net_error(self, message, exc):
-        self.call_exception_handler({"message": message, "exception": exc})
+    def _on_net_error(self, message, exc, transport=None, protocol=None):
+        context = {"message": message, "exception": exc}
+        # A transport's own failures carry these, as asyncio's
+        # _fatal_error and flow-control reports do.
+        if transport is not None:
+            context["transport"] = transport
+        if protocol is not None:
+            context["protocol"] = protocol
+        self.call_exception_handler(context)
 
     @property
     def slow_callback_duration(self):
@@ -632,9 +773,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         self._slow_callback_duration = seconds
 
     def _on_slow_callback(self, handle, seconds):
-        # R-142: slow-callback warnings in debug mode (>100ms).
+        # R-142: slow-callback warnings in debug mode, worded and formatted
+        # as asyncio's (a Task step names the task, not its __step).
         logger.warning(
-            "Executing %s took %.3f seconds", reprlib.repr(handle), seconds
+            "Executing %s took %.3f seconds", base_events._format_handle(handle), seconds
         )
 
     # ------------------------------------------------------------------ #
@@ -663,15 +805,32 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
         local_res = remote_res = None
         if sock is not None:
-            if any((local_addr, remote_addr, family, proto, flags, reuse_port, allow_broadcast)):
-                raise ValueError("sock is mutually exclusive with address/options")
-            if sock.type != socket_module.SOCK_DGRAM:
-                # Otherwise a stream socket is detached into the datagram
+            if sock.type == socket_module.SOCK_STREAM:
+                # Otherwise a stream socket is driven by the datagram
                 # machinery, which then applies recvfrom/sendto semantics
                 # and datagram callbacks to a byte stream.
                 raise ValueError(f"A datagram socket was expected, got {sock!r}")
+            opts = dict(
+                local_addr=local_addr,
+                remote_addr=remote_addr,
+                family=family,
+                proto=proto,
+                flags=flags,
+                reuse_port=reuse_port,
+                allow_broadcast=allow_broadcast,
+            )
+            problems = ", ".join(f"{k}={v}" for k, v in opts.items() if v)
+            if problems:
+                raise ValueError(
+                    "socket modifier keyword arguments can not be used "
+                    f"when sock is specified. ({problems})"
+                )
             udp_sock = sock
         else:
+            if not (local_addr or remote_addr) and family == 0:
+                # asyncio refuses to guess: there is no address to take a
+                # family from.
+                raise ValueError("unexpected address family")
             fam = family or socket_module.AF_INET
             # Resolve BOTH addresses here and keep the sockaddrs, rather
             # than resolving one to pick a family and throwing the result
@@ -711,9 +870,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 for key, addr in (("local", local_addr), ("remote", remote_addr)):
                     if not addr:
                         continue
-                    infos = await self.getaddrinfo(
-                        addr[0],
-                        addr[1],
+                    if not (isinstance(addr, tuple) and len(addr) == 2):
+                        raise TypeError("2-tuple is expected")
+                    infos = await self._ensure_resolved(
+                        addr,
                         family=family,
                         type=socket_module.SOCK_DGRAM,
                         proto=proto,
@@ -788,36 +948,57 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         os.sendfile straight on the borrowed socket fd (zero-copy).
         TransmitFile on Windows is the remaining native refinement; there
         (and for SSL transports, which have no raw fd) the chunked
-        transport-write fallback applies."""
+        transport-write fallback applies.
+
+        Dispatch follows base_events: the transport's
+        `_sendfile_compatible` mode says whether to try the native path,
+        fall back, or refuse (a datagram or pipe transport)."""
+        if transport.is_closing():
+            raise RuntimeError("Transport is closing")
         # Validated BEFORE a path is chosen, and by the same helper
         # sock_sendfile uses: without it `count=0` quietly returned zero
         # instead of raising, a text-mode file went straight to
         # os.sendfile, and every other bad value failed later with an
-        # exception that depended on which path had been taken.
+        # exception that depended on which path had been taken. (After the
+        # closing check, which asyncio makes first.)
         self._check_sendfile_params(file, offset, count)
-        if transport.is_closing():
-            raise RuntimeError("Transport is closing")
-        fileno = getattr(transport, "fileno", None)
-        can_native = (
-            fileno is not None and hasattr(os, "sendfile") and hasattr(file, "fileno")
-        )
-        if can_native:
+        mode = getattr(transport, "_sendfile_compatible", constants._SendfileMode.UNSUPPORTED)
+        if mode is constants._SendfileMode.UNSUPPORTED:
+            raise RuntimeError(f"sendfile is not supported for transport {transport!r}")
+        if mode is constants._SendfileMode.TRY_NATIVE:
             try:
-                file.fileno()
-            except (OSError, AttributeError, ValueError):
-                can_native = False
-        if not can_native:
-            if not fallback:
-                raise asyncio.SendfileNotAvailableError(
-                    "sendfile is not available for this transport/file"
-                )
-            return await self._sendfile_fallback(transport, file, offset, count)
-        # No byte may interleave: wait out writes already queued in the
-        # engine before bypassing it (concurrent app writes during a
-        # sendfile are user error, as in stdlib asyncio).
-        while transport.get_write_buffer_size() > 0:
-            await tasks.sleep(0.001)
-        return await self._sendfile_native_fd(transport, file, offset, count)
+                return await self._sendfile_native(transport, file, offset, count)
+            except asyncio.SendfileNotAvailableError:
+                if not fallback:
+                    raise
+        if not fallback:
+            raise RuntimeError(
+                "fallback is disabled and native sendfile is not supported "
+                f"for transport {transport!r}"
+            )
+        return await self._sendfile_fallback(transport, file, offset, count)
+
+    async def _sendfile_native(self, transport, file, offset, count):
+        # base_events' contract: SendfileNotAvailableError when the syscall
+        # cannot serve this transport/file pair; the caller decides whether
+        # to fall back.
+        fileno = getattr(transport, "fileno", None)
+        if fileno is None or not hasattr(os, "sendfile"):
+            raise asyncio.SendfileNotAvailableError("os.sendfile() is not available")
+        try:
+            os.fstat(file.fileno())
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            raise asyncio.SendfileNotAvailableError("not a regular file") from None
+        # No byte may interleave: write() raises until the transfer ends
+        # (asyncio's "sendfile is in progress"), and writes already queued
+        # in the engine go out first.
+        transport._set_sendfile_active(True)
+        try:
+            while transport.get_write_buffer_size() > 0:
+                await tasks.sleep(0.001)
+            return await self._sendfile_native_fd(transport, file, offset, count)
+        finally:
+            transport._set_sendfile_active(False)
 
     async def _sendfile_native_fd(self, transport, file, offset, count):
         in_fd = file.fileno()
@@ -850,10 +1031,21 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     sent = None
                 except InterruptedError:
                     continue
+                except OSError as exc:
+                    if total:
+                        raise
+                    # Nothing sent yet: most often a file os.sendfile
+                    # cannot read from (a pipe, a character device), and
+                    # sendfile() falls back to writes, as asyncio's does.
+                    raise asyncio.SendfileNotAvailableError("os.sendfile call failed") from exc
                 if sent == 0:
                     break  # end of file
                 if sent is not None:
                     total += sent
+                    # Let the loop run between chunks, as asyncio's
+                    # writer-driven sendfile does: a fast peer would
+                    # otherwise hold the loop for the whole file.
+                    await tasks.sleep(0)
                     continue
                 # Socket buffer full: wait for writability.
                 fut = self.create_future()
@@ -863,7 +1055,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     if not fut.done():
                         fut.set_result(None)
 
-                self._core.add_writer(fd, on_writable)
+                handle = self._core.add_writer(fd, on_writable)
                 try:
                     # Bounded waits, not a bare await: closing the fd
                     # removes it from the poller, so a transport that
@@ -880,15 +1072,19 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                         except TimeoutError:
                             pass
                 finally:
-                    self._core.remove_writer(fd)
+                    # The transport may have closed (and its fd with it):
+                    # see TcpSurface._watch_done.
+                    self._watch_done(handle, self._core.remove_writer, fd)
             return total
         finally:
             # stdlib convention: leave the file positioned after the bytes
-            # actually sent.
-            file.seek(offset + total)
+            # actually sent -- and alone when none were (the fallback that
+            # follows positions it itself) or it has no position (a pipe).
+            if total and _seekable(file):
+                file.seek(offset + total)
 
     async def _sendfile_fallback(self, transport, file, offset, count):
-        # Seek unconditionally: with the default offset=0 the old guard
+        # Seek even for the default offset=0 (any seekable file): the old guard
         # skipped the seek entirely, so a fallback (BytesIO, SSL, Windows)
         # sent from the file's CURRENT position while the native path sent
         # from byte zero — the same call returning different bytes
@@ -900,8 +1096,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # connection the loop is serving for the duration of each read.
         # asyncio's own fallback does the same.
         total = 0
+        # A pipe has no position to start from or restore (and asyncio
+        # seeks neither for it at offset 0).
+        seekable = _seekable(file)
         try:
-            await self.run_in_executor(None, file.seek, offset)
+            if offset or seekable:
+                await self.run_in_executor(None, file.seek, offset)
             while True:
                 blocksize = 16384 if count is None else min(count - total, 16384)
                 if blocksize <= 0:
@@ -927,7 +1127,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             # Synchronous, unlike the reads above: awaiting here would
             # re-raise during a cancellation unwind and the position would
             # never be corrected. One lseek is not worth an executor hop.
-            file.seek(offset + total)
+            if seekable:
+                file.seek(offset + total)
 
     def add_signal_handler(self, sig, callback, *args):
         """R-052. The Python-level handler runs on the main thread once
@@ -955,6 +1156,70 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         manager controls, which that mechanism does not reach."""
         import signal as signal_module
 
+        if (
+            asyncio.iscoroutine(callback)
+            or asyncio.iscoroutinefunction(callback)
+        ):
+            raise TypeError("coroutines cannot be used with add_signal_handler()")
+        self._check_signal(sig)
+        self._check_closed()
+        if sys.platform == "win32":
+            self._install_console_ctrl_handler()
+        # The callback runs in the context current HERE, as asyncio's
+        # does (its Handle is built now): not in whatever context the main
+        # thread happens to be in when the signal arrives.
+        self._signal_handlers[sig] = (callback, args, contextvars.copy_context())
+
+        def _dispatch(signum, frame):
+            entry = self._signal_handlers.get(signum)
+            if entry is None or self.is_closed():
+                return
+            cb, cb_args, ctx = entry
+            self.call_soon_threadsafe(cb, *cb_args, context=ctx)
+
+        try:
+            signal_module.signal(sig, _dispatch)
+            if hasattr(signal_module, "siginterrupt"):
+                # SA_RESTART, as asyncio sets it: fewer EINTRs elsewhere.
+                signal_module.siginterrupt(sig, False)
+        except (OSError, ValueError) as exc:
+            # Nothing was installed, so nothing may stay registered: a
+            # stale entry made the next remove_signal_handler() raise
+            # instead of answering False.
+            del self._signal_handlers[sig]
+            if isinstance(exc, ValueError):
+                # Not the main thread: asyncio reports a RuntimeError.
+                raise RuntimeError(str(exc)) from None
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f"sig {sig:d} cannot be caught") from None
+            raise
+
+    def remove_signal_handler(self, sig):
+        import signal as signal_module
+
+        self._check_signal(sig)
+        try:
+            del self._signal_handlers[sig]
+        except KeyError:
+            return False
+        if sig == signal_module.SIGINT:
+            handler = signal_module.default_int_handler
+        else:
+            handler = signal_module.SIG_DFL
+        try:
+            signal_module.signal(sig, handler)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f"sig {sig:d} cannot be caught") from None
+            raise
+        return True
+
+    def _check_signal(self, sig):
+        """unix_events' validation, shared by add and remove: TypeError
+        for a non-int, ValueError for a number this platform cannot
+        deliver."""
+        import signal as signal_module
+
         if not isinstance(sig, int):
             raise TypeError(f"sig must be an int, not {sig!r}")
         if sys.platform == "win32":
@@ -963,37 +1228,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 allowed.add(signal_module.SIGBREAK)
             if sig not in allowed:
                 raise ValueError(f"signal {sig!r} not supported on this platform")
-            self._install_console_ctrl_handler()
         elif sig not in signal_module.valid_signals():
             raise ValueError(f"invalid signal number {sig}")
-        if (
-            asyncio.iscoroutine(callback)
-            or asyncio.iscoroutinefunction(callback)
-        ):
-            raise TypeError("coroutines cannot be used with add_signal_handler()")
-        self._check_closed()
-        self._signal_handlers[sig] = (callback, args)
-
-        def _dispatch(signum, frame):
-            entry = self._signal_handlers.get(signum)
-            if entry is None or self.is_closed():
-                return
-            cb, cb_args = entry
-            self.call_soon_threadsafe(cb, *cb_args)
-
-        signal_module.signal(sig, _dispatch)
-
-    def remove_signal_handler(self, sig):
-        import signal as signal_module
-
-        if sig not in self._signal_handlers:
-            return False
-        del self._signal_handlers[sig]
-        if sig == signal_module.SIGINT:
-            signal_module.signal(sig, signal_module.default_int_handler)
-        else:
-            signal_module.signal(sig, signal_module.SIG_DFL)
-        return True
 
     # Console control events SetConsoleCtrlHandler treats as a stop
     # request; CTRL_C_EVENT (0) is deliberately excluded — Python's own
@@ -1043,9 +1279,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             ):
                 entry = self._signal_handlers.get(candidate) if candidate is not None else None
                 if entry is not None:
-                    cb, cb_args = entry
+                    cb, cb_args, ctx = entry
                     try:
-                        self.call_soon_threadsafe(cb, *cb_args)
+                        self.call_soon_threadsafe(cb, *cb_args, context=ctx)
                     except RuntimeError:
                         pass  # loop already closing/closed
                     return 1
@@ -1073,14 +1309,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
     # (IOCP backend) — see connect_read_pipe/connect_write_pipe/
     # _make_subprocess_transport below.
 
+    # The private pair returns the watch's Handle, as asyncio's does (the
+    # public add_* return None): stdlib code like _sock_read_done keeps it
+    # to tell its own watch from a newer one that replaced it -- a
+    # replaced or removed watch's handle is cancelled.
     def _add_reader(self, fd, callback, *args):
-        return self.add_reader(fd, callback, *args)
+        return self._core.add_reader(_fileno(fd), callback, *args)
 
     def _remove_reader(self, fd):
         return self.remove_reader(fd)
 
     def _add_writer(self, fd, callback, *args):
-        return self.add_writer(fd, callback, *args)
+        return self._core.add_writer(_fileno(fd), callback, *args)
 
     def _remove_writer(self, fd):
         return self.remove_writer(fd)

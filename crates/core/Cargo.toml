@@ -15,7 +15,10 @@ crossbeam-queue.workspace = true
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# The IOCP backend's per-socket maps (integer keys; looked up per post).
+rustc-hash = "2"
 windows-sys = { version = "0.59", features = [
+    "Wdk_System_IO", # NtDeviceIoControlFile: IOCTL_AFD_POLL readiness (R-057)
     "Win32_Foundation",
     "Win32_System_IO",
     "Win32_System_Threading",

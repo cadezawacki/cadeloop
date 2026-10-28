@@ -124,18 +124,30 @@ pub(crate) struct HttpConn {
     /// high-water mark; resolved when it drains below the low-water mark
     /// (or when the connection dies).
     pub(crate) drain_waiter: Option<Py<PyAny>>,
-    /// Cached per-connection ASGI callables (R-083).
-    pub(crate) recv_obj: Option<Py<HttpReceive>>,
-    pub(crate) send_obj: Option<Py<HttpSend>>,
+    /// Monotonic per-request counter, bumped each time a request is
+    /// dispatched on this connection. The `receive`/`send` callables handed
+    /// to the app capture the value current at dispatch; a call whose epoch
+    /// no longer matches belongs to a request that has already finished
+    /// (the app retained the callable into a later task), and is refused
+    /// rather than allowed to steal the current request's body or splice
+    /// bytes into its response. R-083 previously cached ONE receive/send
+    /// per connection and reused it for every request, so a retained
+    /// callable silently operated on whatever request was current.
+    pub(crate) req_epoch: u64,
     /// Suspended continuation (eager path) — kept alive here.
     pub(crate) driver: Option<Py<AppTask>>,
     pub(crate) eager: bool,
     // --- R-080 idle/head timeouts (0 = disabled), driven by http_sweep --
     pub(crate) head_timeout_ns: u64,
     pub(crate) idle_timeout_ns: u64,
-    /// Bumped on every recv and request completion; the sweep re-anchors
-    /// an Idle connection whose activity moved between sweeps (a fast
-    /// request served wholly between two sweeps must not look idle).
+    /// Bumped when a request COMPLETES (finish_request); the sweep
+    /// re-anchors an Idle connection whose activity moved between sweeps,
+    /// so a fast request served wholly between two sweeps does not look
+    /// idle. Deliberately NOT bumped per recv: counting raw bytes as
+    /// activity let a slowloris reset the idle deadline forever (a `\r\n`
+    /// or one body byte every sweep), so neither the pre-request CRLF
+    /// trickle nor a dripped request body ever timed out. "Idle" means "no
+    /// request finished", not "no byte arrived".
     pub(crate) activity: u32,
     /// Sweep bookkeeping: last observed phase (0 idle / 1 head / 2 busy),
     /// activity snapshot, and the anchor timestamp for the current phase.
@@ -300,8 +312,7 @@ impl HttpConn {
             disconnected: false,
             recv_waiters: VecDeque::new(),
             drain_waiter: None,
-            recv_obj: None,
-            send_obj: None,
+            req_epoch: 0,
             driver: None,
             eager,
             head_timeout_ns,
@@ -360,10 +371,19 @@ pub(crate) struct FeedOutcome {
     /// A head carried `Expect: 100-continue` and the interim response is
     /// owed to the client (RFC 7231 5.1.1).
     pub owes_continue: bool,
+    /// Bytes buffered after an upgrade head (before the WS session is
+    /// dispatched) exceeded WS_MAX_MESSAGE: the caller tears the
+    /// connection down (see `conn_feed`).
+    pub oversize_ws_trailing: bool,
 }
 
 pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome, ParseError> {
-    conn.activity = conn.activity.wrapping_add(1);
+    // NB: receiving bytes is NOT "activity" for the idle sweep (see the
+    // `activity` field). Bumping it here reset the keep-alive idle deadline
+    // on every recv, so a drip of `\r\n`s before a request line, or a
+    // byte-at-a-time request body, held the connection open indefinitely --
+    // the slowloris the R-080 timeouts exist to stop. Only a completed
+    // request re-anchors idle.
     conn.saw_bytes = true;
     let fed = conn.parser.feed(data);
     // Drained BEFORE the error check: the parser keeps requests that
@@ -375,15 +395,34 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
         conn.pending_bytes += req.queued_size();
         conn.pending.push_back(req);
     }
+    let mut oversize_ws_trailing = false;
     if let Some(offset) = fed? {
         // Upgrade head complete (R-087): bytes past it are NOT HTTP —
         // they belong to the upgraded protocol (early client WS frames).
-        conn.ws_trailing.extend_from_slice(&data[offset..]);
+        //
+        // The upgrade's own request sits in `pending` until it is
+        // dispatched, and until then `conn.ws` is None, so these bytes
+        // land here rather than in `ws_ingest` -- outside every read
+        // budget the pipeline queue enforces. Left uncapped, a client that
+        // pipelined the upgrade behind a slow request could stream
+        // unbounded bytes into `ws_trailing` (measured: 400 MiB sent grew
+        // RSS ~795 MiB). Cap it exactly like `ws_ingest`'s pre-accept
+        // buffer: more than a whole message buffered before the handshake
+        // is even served is abusive, and the caller tears the connection
+        // down rather than grow the heap without bound.
+        let trailing = &data[offset..];
+        if conn.ws_trailing.len() + trailing.len() > WS_MAX_MESSAGE {
+            conn.ws_trailing = Vec::new();
+            oversize_ws_trailing = true;
+        } else {
+            conn.ws_trailing.extend_from_slice(trailing);
+        }
     }
     Ok(FeedOutcome {
         pump: !conn.pending.is_empty() && !conn.active,
         pause_reading: conn.pipeline_full(),
         owes_continue: conn.parser.take_owes_continue(),
+        oversize_ws_trailing,
     })
 }
 
@@ -440,6 +479,12 @@ pub(crate) fn error_response_for(conn: &HttpConn, err: ParseError) -> Vec<u8> {
 
 pub(crate) fn error_response(err: ParseError, minor: u8) -> Vec<u8> {
     let reason = err.reason;
+    // The status line always has major version 1 and a minor of 0 or 1.
+    // `minor` is read from llhttp's partially-parsed state, which on a
+    // malformed version line ("HTTP/1.9", "HTTP/0.9", "HTTP/2.0") is the
+    // bogus digit it saw -- emitting e.g. "HTTP/1.9 400" is itself an
+    // invalid status line. Anything >= 1 answers as HTTP/1.1.
+    let minor = if minor >= 1 { 1 } else { 0 };
     format!(
         "HTTP/1.{} {} {}\r\nserver: cadeloop\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         minor,
@@ -806,13 +851,18 @@ pub(crate) fn value_awaitable(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<P
 }
 
 // --------------------------------------------------------------------- //
-// receive / send (R-083: per-connection cached callables)               //
+// receive / send (fresh per request, bound to a request epoch)          //
 // --------------------------------------------------------------------- //
 
 #[pyclass(frozen, module = "cadeloop._core")]
 pub struct HttpReceive {
     core: Py<CoreLoop>,
     tid: u64,
+    /// The connection's `req_epoch` when this callable was handed to the
+    /// app. Once the connection moves on to a later request this no longer
+    /// matches, and the callable reports `http.disconnect` instead of
+    /// consuming the new request's body.
+    epoch: u64,
 }
 
 #[pymethods]
@@ -827,6 +877,11 @@ impl HttpReceive {
             Ws(WsMsg),
         }
         let r = core.with_net(|net, _| match net.http_conn_mut(self.tid) {
+            // A receive() from a request that has already finished (the app
+            // retained the callable into a later task): that request's body
+            // is gone, so report disconnect rather than hand it the body of
+            // whatever request is current now.
+            Some(conn) if conn.req_epoch != self.epoch => R::Disconnect,
             None => R::Disconnect,
             Some(conn) if conn.ws.is_some() => {
                 let disconnected = conn.disconnected;
@@ -940,12 +995,27 @@ impl HttpReceive {
 pub struct HttpSend {
     core: Py<CoreLoop>,
     tid: u64,
+    /// The connection's `req_epoch` when this callable was handed to the
+    /// app (see `HttpReceive::epoch`). A send() whose epoch no longer
+    /// matches belongs to a finished request; letting it through would
+    /// splice bytes into whatever response is being written now.
+    epoch: u64,
 }
 
 #[pymethods]
 impl HttpSend {
     fn __call__(&self, py: Python<'_>, message: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let core = self.core.bind(py).get();
+        // Refuse a send() from a request that has already finished: its
+        // response is complete, and the bytes would otherwise land in the
+        // CURRENT request's response stream (verified: a retained send from
+        // request 1 spliced `<LEAK>` into request 2's chunked body).
+        let stale = core.with_net(|net, _| {
+            net.http_conn_mut(self.tid).map(|c| c.req_epoch != self.epoch).unwrap_or(true)
+        })?;
+        if stale {
+            return Err(send_err(SendErr::Gone));
+        }
         process_send(py, core, self.tid, &message)?;
 
         // R-084 write backpressure. Returning an already-completed
@@ -1050,9 +1120,25 @@ fn absolute_form_parts(url: &[u8]) -> (Option<&[u8]>, &[u8]) {
         return (None, b"/");
     }
     let start = scheme_len + 3;
-    match url[start..].iter().position(|&b| matches!(b, b'/' | b'?' | b'#')) {
-        Some(i) => (Some(&url[start..start + i]), &url[start + i..]),
-        None => (Some(&url[start..]), b"/"),
+    let (authority, target) = match url[start..].iter().position(|&b| matches!(b, b'/' | b'?' | b'#')) {
+        Some(i) => (&url[start..start + i], &url[start + i..]),
+        None => (&url[start..], &b"/"[..]),
+    };
+    (Some(strip_userinfo(authority)), target)
+}
+
+/// Drop any `userinfo@` prefix from an absolute-form authority.
+///
+/// authority = [ userinfo "@" ] host [ ":" port ] (RFC 3986 3.2), and this
+/// authority overrides the Host header (RFC 7230 5.4). Userinfo is
+/// attacker-controlled and not part of the host an application should route
+/// or trust-check on; `http://trusted@evil/x` must not surface a Host of
+/// "trusted@evil" (worse, something that string-matches "trusted"). Userinfo
+/// contains no '@', so the host begins after the first one.
+fn strip_userinfo(authority: &[u8]) -> &[u8] {
+    match authority.iter().position(|&b| b == b'@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
     }
 }
 
@@ -1234,7 +1320,18 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 if name.eq_ignore_ascii_case(b"content-length") {
                     // Parsed, not merely noted: the body path enforces it,
                     // and a duplicate that disagrees is ambiguous framing.
-                    let parsed = std::str::from_utf8(&value).ok().and_then(|v| v.trim().parse::<u64>().ok());
+                    // RFC 9110: Content-Length = 1*DIGIT. Rust's u64 parser
+                    // also accepts a leading '+', which the wire grammar does
+                    // not -- and the raw value is copied onto the wire
+                    // verbatim below, so a client reading "+2" rejects the
+                    // framing. Require ASCII digits only (OWS trimmed).
+                    let digits = value.trim_ascii();
+                    let valid = !digits.is_empty() && digits.iter().all(|b| b.is_ascii_digit());
+                    let parsed = if valid {
+                        std::str::from_utf8(digits).ok().and_then(|v| v.parse::<u64>().ok())
+                    } else {
+                        None
+                    };
                     let Some(n) = parsed else {
                         return Err(PyRuntimeError::new_err(
                             "ASGI application sent a non-numeric content-length",
@@ -1763,6 +1860,13 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
             false
         } else {
             match conn_feed(conn, &plaintext) {
+                // R-087 parity with the plaintext path: a pre-dispatch WS
+                // flood past WS_MAX_MESSAGE drops the connection. This arm
+                // touches no `conn` field, so `net` is free to borrow.
+                Ok(outcome) if outcome.oversize_ws_trailing => {
+                    net::teardown_with(py, net, backend, tid, None);
+                    false
+                }
                 Ok(outcome) => {
                     // TLS reads are driven by the ciphertext recv, which
                     // this path does not repost; flagging the connection
@@ -2367,6 +2471,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
             conn.pending.pop_front().map(|mut req| {
                 conn.pending_bytes = conn.pending_bytes.saturating_sub(req.queued_size());
                 conn.active = true;
+                conn.req_epoch = conn.req_epoch.wrapping_add(1);
                 conn.keep_alive = req.keep_alive;
                 conn.resp = RespPhase::Idle;
                 conn.resp_head = Vec::new();
@@ -2423,10 +2528,11 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                     conn.ws.is_some(),
                     conn.tls.is_some(),
                     bad_upgrade,
+                    conn.req_epoch,
                 )
             })
         })?;
-        let Some((req, app, state, pyloop, eager, is_ws, is_tls, bad_upgrade)) = next else {
+        let Some((req, app, state, pyloop, eager, is_ws, is_tls, bad_upgrade, epoch)) = next else {
             return Ok(());
         };
         if bad_upgrade {
@@ -2451,39 +2557,13 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         let scope = build_scope(py, &req, peer.as_ref(), local.as_ref(), &state, is_ws, is_tls)?;
         drop(req);
 
-        // Per-connection cached receive/send callables (R-083).
-        let cached = core.with_net(|net, _| {
-            let conn = net.http_conn_mut(tid)?;
-            Some((
-                conn.recv_obj.as_ref().map(|o| o.clone_ref(py)),
-                conn.send_obj.as_ref().map(|o| o.clone_ref(py)),
-            ))
-        })?;
-        let Some((recv_obj, send_obj)) = cached else { return Ok(()) };
-        let recv_obj = match recv_obj {
-            Some(o) => o,
-            None => {
-                let o = Py::new(py, HttpReceive { core: slf.clone().unbind(), tid })?;
-                core.with_net(|net, _| {
-                    if let Some(c) = net.http_conn_mut(tid) {
-                        c.recv_obj = Some(o.clone_ref(py));
-                    }
-                })?;
-                o
-            }
-        };
-        let send_obj = match send_obj {
-            Some(o) => o,
-            None => {
-                let o = Py::new(py, HttpSend { core: slf.clone().unbind(), tid })?;
-                core.with_net(|net, _| {
-                    if let Some(c) = net.http_conn_mut(tid) {
-                        c.send_obj = Some(o.clone_ref(py));
-                    }
-                })?;
-                o
-            }
-        };
+        // Fresh receive/send per request (R-083 note in `req_epoch`): each
+        // captures `epoch`, so a callable the app retains past its request
+        // is refused by the next request rather than acting on it. The two
+        // small allocations are dwarfed by the scope dict and the
+        // coroutine the app call creates.
+        let recv_obj = Py::new(py, HttpReceive { core: slf.clone().unbind(), tid, epoch })?;
+        let send_obj = Py::new(py, HttpSend { core: slf.clone().unbind(), tid, epoch })?;
 
         let coro = match app.bind(py).call1((scope, recv_obj, send_obj)) {
             Ok(c) => c,
@@ -2570,8 +2650,14 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
     if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
         return Err(err);
     }
-    let disconnect =
-        err.is_instance_of::<PyConnectionResetError>(py) || err.is_instance_of::<PyBrokenPipeError>(py);
+    // CancelledError is not an application error: it is how a request is
+    // abandoned (the disconnect reclaim cancels a parked coroutine whose
+    // client is gone -- H4 -- and anyio/Starlette cancel scopes raise it
+    // too). asyncio itself never logs a cancellation; neither do we.
+    let cancelled = err.is_instance(py, cancelled_error_type(py)?.bind(py));
+    let disconnect = cancelled
+        || err.is_instance_of::<PyConnectionResetError>(py)
+        || err.is_instance_of::<PyBrokenPipeError>(py);
     if !disconnect {
         core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any())?;
     }
@@ -2759,11 +2845,15 @@ static ENTER_TASK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static LEAVE_TASK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static CANCELLED_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
-fn cancelled_error(py: Python<'_>) -> PyErr {
-    let cls = CANCELLED_ERROR.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+/// The `asyncio.CancelledError` class (cached).
+fn cancelled_error_type(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+    CANCELLED_ERROR.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
         Ok(py.import("asyncio")?.getattr("CancelledError")?.unbind())
-    });
-    match cls {
+    })
+}
+
+fn cancelled_error(py: Python<'_>) -> PyErr {
+    match cancelled_error_type(py) {
         Ok(cls) => match cls.bind(py).call0() {
             Ok(exc) => PyErr::from_value(exc),
             Err(e) => e,
@@ -3019,10 +3109,10 @@ impl AppTask {
         let core_py = slf.borrow().core.clone_ref(py);
         let core_bound = core_py.bind(py);
         let core = core_bound.get();
-        let self_arg = PyTuple::new(py, [slf.clone().into_any()])?;
+        let self_arg = crate::handles::CallArgs::One(slf.clone().into_any().unbind());
         let handle =
-            core.make_handle(py, callback.bind(py), &self_arg, Some(ctx.bind(py)), "add_done_callback")?;
-        let token: Py<PyAny> = Py::new(py, handle)?.into_any();
+            core.make_handle(py, callback.bind(py), self_arg, Some(ctx.bind(py)), "add_done_callback")?;
+        let token = crate::handles::HandleRef(Py::new(py, handle)?);
         core.with_net(move |_, reactor| reactor.push_ready(token))?;
         Ok(())
     }
@@ -3126,8 +3216,9 @@ impl AppTask {
                     if y.is_none() {
                         // bare `yield`: resume on the ready queue next tick.
                         let resume = slf.getattr(intern!(py, "_resume_bare"))?;
-                        let h = core.make_handle(py, &resume, &PyTuple::empty(py), None, "AppTask")?;
-                        let token: Py<PyAny> = Py::new(py, h)?.into_any();
+                        let h =
+                            core.make_handle(py, &resume, crate::handles::CallArgs::Zero, None, "AppTask")?;
+                        let token = crate::handles::HandleRef(Py::new(py, h)?);
                         core.with_net(move |_, reactor| reactor.push_ready(token))?;
                         return Ok(StepOutcome::Suspended);
                     }

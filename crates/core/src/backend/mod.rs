@@ -24,6 +24,7 @@ use crate::opslab::OpId;
 pub mod epoll;
 #[cfg(windows)]
 pub mod iocp;
+pub mod iocp_util;
 #[cfg(not(any(windows, target_os = "linux")))]
 pub mod portable;
 #[cfg(windows)]
@@ -64,6 +65,45 @@ pub fn is_cancelled_error(code: u32) -> bool {
     }
 }
 
+/// Is this failed accept's error about the CONNECTION being accepted (the
+/// client reset or vanished first) rather than about the listener?
+///
+/// Such failures are retried at once and never reported -- accept(2)
+/// says to treat them like EAGAIN, and asyncio swallows
+/// ConnectionAbortedError the same way. Anything else (descriptor or
+/// memory exhaustion, most often) is a listener-level failure.
+pub fn is_transient_accept_error(code: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_NETNAME_DELETED, ERROR_CONNECTION_ABORTED, WSAECONNABORTED,
+        // WSAECONNRESET: what a failed AcceptEx reports for a peer that
+        // went away before the accept completed.
+        matches!(code, 64 | 1236 | 10053 | 10054)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            code as i32,
+            libc::ECONNABORTED
+                | libc::EPROTO
+                | libc::ECONNRESET
+                | libc::ENETDOWN
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+                | libc::EINTR
+        )
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 /// Gather list entry for scatter/gather sends (R-035: up to 16 per send).
 #[derive(Debug, Clone, Copy)]
 pub struct IoSlice {
@@ -72,6 +112,22 @@ pub struct IoSlice {
 }
 
 pub const MAX_GATHER: usize = 16;
+
+/// The most bytes one send post carries (R-035).
+///
+/// IoSlice lengths are u32 and a completion reports a DWORD count: a slice
+/// of a 4 GiB+ buffer was truncated to `len mod 2^32` -- ZERO for an exact
+/// multiple, a zero-byte send that completed, advanced nothing and was
+/// re-posted forever -- and a gather past 4 GiB wrapped the count the
+/// transport advances its queue by. Bigger writes go out in parts through
+/// the partial-send resumption every backend already performs.
+pub const MAX_SEND_BYTES: usize = 1 << 30;
+
+/// `len` as an [`IoSlice`] length, capped at [`MAX_SEND_BYTES`].
+#[inline]
+pub fn io_len(len: usize) -> u32 {
+    len.min(MAX_SEND_BYTES) as u32
+}
 
 /// R-020 op surface. Ops return an `OpId` whose completion is later
 /// delivered by `poll`. Backends that cannot support an op return
@@ -145,6 +201,14 @@ pub trait IoBackend {
         Err(io::Error::new(io::ErrorKind::Unsupported, "named pipes unsupported on this backend"))
     }
 
+    /// The loop is closed and will never poll again: release the OS object
+    /// only the poll needs (the epoll instance) now, as asyncio's close()
+    /// closes its selector, instead of when the loop is garbage-collected.
+    /// The wakeup object is NOT released: other threads may still hold a
+    /// handle to it, and a closed fd number could be recycled under their
+    /// write. Idempotent; a no-op where nothing can safely go early.
+    fn release_poller(&mut self) {}
+
     /// Request cancellation of an in-flight op. MUST tolerate the op having
     /// already completed (ERROR_NOT_FOUND) — the completion is still
     /// delivered via `poll` either way (R-037).
@@ -152,8 +216,9 @@ pub trait IoBackend {
 
     /// Arm/disarm level-triggered readiness watches for a raw fd (R-057).
     /// `readable`/`writable` express the DESIRED watch set (both false =
-    /// fully unwatched). On IOCP this is emulated with zero-byte probe ops;
-    /// on epoll it is native interest.
+    /// fully unwatched). On IOCP it is an `IOCTL_AFD_POLL` request issued
+    /// through a socket of the backend's own; on epoll it is native
+    /// interest.
     fn set_watch(&mut self, _socket: RawSocket, _readable: bool, _writable: bool) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "set_watch"))
     }
@@ -172,6 +237,16 @@ pub trait IoBackend {
     /// Non-blocking poll used by the spin phase of spin-then-park (R-060).
     fn try_poll(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         self.poll(out, Some(Duration::ZERO))
+    }
+
+    /// Move completions the backend already holds in user space -- inline
+    /// successes and staged cancellations -- into `out`, WITHOUT a kernel
+    /// call. The reactor uses it on busy ticks inside its poll-skip
+    /// window: skipping the syscall is the point of the window, but
+    /// holding back completions that need no syscall only added latency.
+    /// Returns the number appended.
+    fn take_staged(&mut self, _out: &mut Vec<Completion>) -> usize {
+        0
     }
 
     /// Can this backend possibly produce a completion right now -- any op
@@ -313,6 +388,22 @@ pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn Io
     {
         let _ = (kind, opts);
         Ok(Box::new(portable::PortableBackend::new()))
+    }
+}
+
+#[cfg(test)]
+mod io_len_tests {
+    use super::{io_len, MAX_SEND_BYTES};
+
+    #[test]
+    fn huge_lengths_are_capped_never_wrapped() {
+        assert_eq!(io_len(7), 7);
+        assert_eq!(io_len(MAX_SEND_BYTES), MAX_SEND_BYTES as u32);
+        // `as u32` made these 0 and 1 GiB short of the truth respectively:
+        // the first never advanced at all.
+        assert_eq!(io_len(1usize << 32), MAX_SEND_BYTES as u32);
+        assert_eq!(io_len((5usize << 30) + 3), MAX_SEND_BYTES as u32);
+        assert!(MAX_SEND_BYTES as u64 * 16 > u32::MAX as u64, "callers must cap the gather total too");
     }
 }
 

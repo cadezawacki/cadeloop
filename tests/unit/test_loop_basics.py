@@ -185,17 +185,20 @@ def test_time_advances_when_not_running(loop):
     assert t2 > t1
 
 
-def test_time_cached_within_tick(loop):
-    """R-061: loop.time() is stable within one callback."""
+def test_time_advances_within_a_callback(loop):
+    """R-061: loop.time() is read fresh, as asyncio's time.monotonic()
+    is -- a value frozen for the tick made every delta measured inside a
+    callback 0."""
     samples = []
 
     def cb():
         samples.append(loop.time())
+        _time.sleep(0.01)
         samples.append(loop.time())
 
     loop.call_soon(cb)
     run_briefly(loop, 0.01)
-    assert samples[0] == samples[1]
+    assert samples[1] - samples[0] >= 0.009
 
 
 # --------------------------------------------------------------------- #

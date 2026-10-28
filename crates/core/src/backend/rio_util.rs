@@ -77,6 +77,11 @@ impl RegionMap {
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }
+
+    /// Every registered region's cookie: what teardown must deregister.
+    pub fn cookies(&self) -> impl Iterator<Item = u64> + '_ {
+        self.regions.iter().map(|r| r.cookie)
+    }
 }
 
 /// Send-staging slot accounting (R-044): outgoing gather payloads are
@@ -221,6 +226,18 @@ mod tests {
         assert!(!m.remove_cookie(1));
         assert_eq!(m.resolve(0x1800, 8), None);
         assert_eq!(m.resolve(0x2800, 8), Some((4, 0x800)));
+    }
+
+    #[test]
+    fn every_region_is_listed_for_deregistration() {
+        let mut m = RegionMap::new();
+        assert!(m.insert(0x4000, 0x1000, 9));
+        assert!(m.insert(0x1000, 0x1000, 7));
+        assert!(m.remove_cookie(9));
+        assert!(m.insert(0x8000, 0x1000, 11));
+        let mut c: Vec<u64> = m.cookies().collect();
+        c.sort();
+        assert_eq!(c, vec![7, 11], "removed regions are not deregistered twice");
     }
 
     #[test]

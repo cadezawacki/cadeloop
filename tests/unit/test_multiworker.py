@@ -291,7 +291,7 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
     spawned = []
     killed = []
 
-    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None, inherited=()):
+    def fake_spawn(app, host, port, config, idx, cpus, ssl_ctx=None, inherited=(), **_kw):
         if len(spawned) >= 2:
             raise OSError(11, "Resource temporarily unavailable")
         pid = 101 + len(spawned)
@@ -307,14 +307,17 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
     reaped = [False]
 
     def fake_waitpid(pid, flags=0):
-        if pid == -1:
-            if reaped[0]:
-                raise ChildProcessError
-            reaped[0] = True
-            return (101, 256)  # non-zero exit -> restart path
+        # The supervisor polls each of its own children (never
+        # waitpid(-1), which also reaped the embedder's).
+        if flags & os.WNOHANG:
+            if pid == 101 and not reaped[0]:
+                reaped[0] = True
+                return (101, 256)  # non-zero exit -> restart path
+            return (0, 0)
         return (pid, 0)
 
     monkeypatch.setattr(srv, "_spawn_worker", fake_spawn)
+    monkeypatch.setattr(srv, "_probe_port", lambda host, port: None)  # nothing really binds
     monkeypatch.setattr(srv.os, "waitpid", fake_waitpid)
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
@@ -343,7 +346,7 @@ def test_a_slow_failing_worker_still_trips_the_crash_loop_guard(monkeypatch):
     spawned = []
     pending = []
 
-    def fake_spawn(app, host, port, config, idx, ncpu, ssl_ctx=None, inherited=()):
+    def fake_spawn(app, host, port, config, idx, cpus, ssl_ctx=None, inherited=(), **_kw):
         pid = 200 + len(spawned)
         spawned.append(pid)
         r, w = os.pipe()
@@ -353,11 +356,12 @@ def test_a_slow_failing_worker_still_trips_the_crash_loop_guard(monkeypatch):
         return pid, r
 
     def fake_waitpid(pid, flags=0):
-        if pid == -1:
-            if not pending:
-                raise ChildProcessError
-            # Each death looks SLOW: well past _CRASH_FAST_SECS since fork.
-            return (pending.pop(0), 256)
+        if flags & os.WNOHANG:
+            if pid in pending:
+                # Each death looks SLOW: well past _CRASH_FAST_SECS since fork.
+                pending.remove(pid)
+                return (pid, 256)
+            return (0, 0)
         return (pid, 0)
 
     # Every reap reports a death older than the fast-crash window.
@@ -368,6 +372,7 @@ def test_a_slow_failing_worker_still_trips_the_crash_loop_guard(monkeypatch):
         return clock[0]
 
     monkeypatch.setattr(srv, "_spawn_worker", fake_spawn)
+    monkeypatch.setattr(srv, "_probe_port", lambda host, port: None)  # nothing really binds
     monkeypatch.setattr(srv.os, "waitpid", fake_waitpid)
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(srv.time, "monotonic", fake_monotonic)

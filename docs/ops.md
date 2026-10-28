@@ -2,11 +2,13 @@
 
 ## Logging (R-140)
 Logger name: `"cadeloop"` (stdlib `logging`). Default: errors + lifecycle
-only. Access log: opt-in, bounded queue + background writer thread,
-drop-on-overflow counted and reported when the writer catches up — never
-blocks the loop. (Before this was implemented the sink called
-`logger.info()` inline on the loop thread, so a handler doing blocking
-I/O stalled every connection the worker held.)
+only. Access log: opt-in, bounded buffer + background writer thread that
+emits in batches, drop-on-overflow counted and reported when the writer
+catches up — never blocks the loop. (Before this was implemented the sink
+called `logger.info()` inline on the loop thread, so a handler doing
+blocking I/O stalled every connection the worker held.) While the
+`cadeloop.access` logger is not enabled for INFO, nothing is recorded per
+request at all; the level is re-read once a second.
 
 ## Introspection (R-103/R-141)
 `loop.stats()` returns counters: `ticks, polls, completions,
@@ -24,8 +26,13 @@ which makes a counter series meaningless.
 (debug builds).
 
 ## Multi-worker RSS alignment (R-091, M3)
-Workers pin to physical cores (`cfg.pin=True`). For NIC alignment, size RSS
-queues to workers and pin them to the same cores, e.g.:
+Pinning is opt-in (`cfg.pin=True`, `--pin`): each worker's event-loop
+thread is pinned to one CPU of the process's affinity mask, and the threads
+it starts (executors, the access-log writer) are not. On a loopback
+benchmark it measured no gain, and on shared or virtualised CPUs a pinned
+worker cannot move off a busy core; on dedicated hardware, align it with the
+NIC. For NIC alignment, size RSS queues to workers and pin them to the same
+cores, e.g.:
 
 ```powershell
 Set-NetAdapterRss -Name "Ethernet" -BaseProcessorNumber 0 `

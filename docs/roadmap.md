@@ -109,7 +109,7 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       forward + grace drain, round-robin CPU pinning (R-090..R-093);
       end-to-end tested via the CLI (balancing, SIGKILL restart, drain)
 - [x] RIO CQ/RQ machinery implemented (R-040..R-044): hybrid over IOCP
-      (AcceptEx/ConnectEx/probes stay IOCP; recv/send go through
+      (AcceptEx/ConnectEx/watches stay IOCP; recv/send go through
       per-socket RQs into one CQ with IOCP-notification), slab regions
       registered once via the R-043 hook, sends staged into registered
       64 KiB slots, CQ growth by doubling (overflow = creation-time
