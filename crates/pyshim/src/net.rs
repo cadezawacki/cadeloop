@@ -25,6 +25,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -228,9 +229,6 @@ pub(crate) struct TransportEntry {
     eof_wanted: bool,
     eof_sent: bool,
     flush_scheduled: bool,
-    /// loop.sendfile() owns the socket: write() raises, as asyncio's does
-    /// while its sendfile's empty-waiter is set.
-    sendfile_active: bool,
     pub peername: Option<Py<PyAny>>,
     pub sockname: Option<Py<PyAny>>,
     /// Bytes that completed while `reading_paused` was set (R-034).
@@ -243,6 +241,10 @@ pub(crate) struct TransportEntry {
     /// built on first ask. Closed, not merely dropped, at teardown -- see
     /// `graveyard_sockets`.
     pub extra_sock: Option<Py<PyAny>>,
+    /// That duplicate's descriptor, listed in `fd_users` too: it is the
+    /// number `get_extra_info("socket").fileno()` reports, so it is the
+    /// one an add_reader() on "the transport's fd" names.
+    extra_fd: Option<RawSocket>,
     /// The caller's own socket object, for a transport built from one
     /// (`sock=`). It owns the descriptor, as in asyncio: teardown closes
     /// it (through Python, once connection_lost has run) instead of
@@ -438,6 +440,11 @@ pub(crate) struct NetState {
     pub stats_pipeline_pauses: u64,
     /// Cheap gate for `retry_starved_listeners` on the tick path.
     pub any_starved_listener: bool,
+    /// The transport whose `close()` is sending its corked output inline:
+    /// if that drains the queue, its connection_lost is still scheduled
+    /// with call_soon, as asyncio's close() schedules it (see
+    /// `Transport::close`).
+    inline_close: Option<u64>,
     /// R-060 latency mode: put HTTP response bytes on the wire the moment
     /// they are wire-ready instead of corking them until the tick's flush
     /// phase. Off by default -- corking is the throughput choice and the
@@ -818,7 +825,8 @@ fn settle_inline(py: Python<'_>, net: &mut NetState, backend: Backend<'_>) {
 /// eof/close finalization once the write queue is drained. In-cell.
 /// `drained`: the queue just emptied on the I/O path (a send completion,
 /// the tick's flush), where asyncio's `_write_ready` calls
-/// connection_lost directly; a `close()` call itself defers it.
+/// connection_lost directly; a `close()` call itself defers it -- also
+/// when it is close()'s own inline send that drained the queue.
 fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64, drained: bool) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.send_op.is_some() || !entry.wq.is_empty() || entry.conn_lost {
@@ -829,8 +837,25 @@ fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_
         let _ = netsys::shutdown_send(entry.socket);
     }
     if entry.closing {
-        teardown_lost(py, net, backend, tid, LostReason::Clean, drained);
+        let immediate = drained && net.inline_close != Some(tid);
+        teardown_lost(py, net, backend, tid, LostReason::Clean, immediate);
     }
+}
+
+/// Give a transport's corked output (R-035: queued, but no send posted
+/// yet) the send asyncio's write() would already have made. asyncio
+/// writes straight to the socket when nothing is queued ahead, so by the
+/// time a protocol calls close() or abort() its earlier writes have
+/// normally left; only what the kernel refused is still buffered, and
+/// only that is held back (close) or discarded (abort). Called before
+/// either decides. Returns whether a send was posted. In-cell.
+fn send_corked(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) -> bool {
+    let Some(e) = net.transports.get(&tid) else { return false };
+    if e.conn_lost || e.send_op.is_some() || e.wq.is_empty() {
+        return false;
+    }
+    flush_pending(py, net, backend, tid);
+    true
 }
 
 /// Cancel a stream transport's in-flight ops and keep every buffer the
@@ -952,6 +977,9 @@ fn teardown_lost(
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
+    if let Some(fd) = entry.extra_fd.take() {
+        forget_fd(net, fd, tid);
+    }
     if let Some(slot) = entry.recv_slot.take() {
         // The transport's own reference. The posted op holds a second one
         // (R-073) that only the reap releases.
@@ -1042,6 +1070,9 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
+    if let Some(fd) = entry.extra_fd.take() {
+        forget_fd(net, fd, tid);
+    }
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
@@ -3337,9 +3368,9 @@ pub(crate) fn wire_stream(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
-                sendfile_active: false,
                 paused_recv: None,
                 extra_sock: None,
+                extra_fd: None,
                 owner,
                 server,
                 // Kept on the Transport itself (they outlive the entry);
@@ -3418,9 +3449,9 @@ pub(crate) fn wire_http(
                 eof_wanted: false,
                 eof_sent: false,
                 flush_scheduled: false,
-                sendfile_active: false,
                 paused_recv: None,
                 extra_sock: None,
+                extra_fd: None,
                 owner: None,
                 server: None,
                 peername: peer,
@@ -3451,6 +3482,14 @@ pub struct Transport {
     trsock: PyOnceLock<Py<PyAny>>,
     /// The protocol while its connection_lost runs (see `ConnLost`).
     losing: Mutex<Option<Py<PyAny>>>,
+    /// write_eof() was called. Kept here, not only on the entry: asyncio
+    /// refuses every later write() -- an empty one, and one after the
+    /// connection is gone, included -- and the entry does not outlive
+    /// the connection.
+    eof: AtomicBool,
+    /// loop.sendfile() owns the socket: write() raises, as asyncio's does
+    /// while its sendfile's empty-waiter is set.
+    sendfile: AtomicBool,
 }
 
 /// `asyncio.trsock.TransportSocket`, looked up once.
@@ -3474,7 +3513,16 @@ impl Transport {
         peername: Option<Py<PyAny>>,
         sockname: Option<Py<PyAny>>,
     ) -> Self {
-        Transport { core, tid, peername, sockname, trsock: PyOnceLock::new(), losing: Mutex::new(None) }
+        Transport {
+            core,
+            tid,
+            peername,
+            sockname,
+            trsock: PyOnceLock::new(),
+            losing: Mutex::new(None),
+            eof: AtomicBool::new(false),
+            sendfile: AtomicBool::new(false),
+        }
     }
 
     fn core_ref<'a>(&'a self, py: Python<'a>) -> &'a CoreLoop {
@@ -3514,9 +3562,15 @@ impl Transport {
             Some(owner) => owner,
             None => {
                 let dup = build_transport_socket(py, raw)?;
+                let dup_fd: u64 = dup.call_method0(py, intern!(py, "fileno"))?.extract(py)?;
                 let kept = core.with_net(|net, _| match net.transports.get_mut(&self.tid) {
                     Some(e) if e.extra_sock.is_none() => {
                         e.extra_sock = Some(dup.clone_ref(py));
+                        // Open as long as the entry is (the TransportSocket
+                        // wrapper has no close()), so the number cannot be
+                        // reused while it stands for this transport.
+                        e.extra_fd = Some(dup_fd as RawSocket);
+                        net.fd_users.insert(dup_fd as RawSocket, FdUser::Stream(self.tid));
                         true
                     }
                     _ => false,
@@ -3537,6 +3591,18 @@ impl Transport {
 
 /// A transport's facade object and its protocol, as error context.
 type ErrorContext = (Option<Py<PyAny>>, Option<Py<PyAny>>);
+
+/// A validated (non-negative) write-buffer limit as a byte count: an int
+/// as is, any other real number floored, saturating at the top (an
+/// infinite limit never pauses, as there).
+fn byte_limit(v: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if let Ok(n) = v.extract::<u64>() {
+        return Ok(usize::try_from(n).unwrap_or(usize::MAX));
+    }
+    let f: f64 = v.extract()?;
+    // `as` saturates (and maps NaN to 0, which validation already refused).
+    Ok(f.floor() as usize)
+}
 
 /// The facade transport and protocol of a Python-protocol transport, for
 /// the context asyncio's transport error reports carry.
@@ -3645,16 +3711,32 @@ impl Transport {
 
     fn write(&self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
         let core = self.core_ref(py);
+        let bytes = data.cast::<PyBytes>().ok();
+        if bytes.is_none() {
+            check_write_type(&data)?;
+        }
+        // asyncio's order: the type, then these, then the empty-write and
+        // dead-connection shortcuts -- so both of these raise for an empty
+        // write too, and write_eof()'s also once the connection is gone.
+        if self.eof.load(Ordering::Relaxed) {
+            // Half-close MISUSE, not a dead connection: silently
+            // succeeding let protocol code believe output was queued when
+            // it can never reach the peer -- undetected truncation.
+            return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
+        }
+        if self.sendfile.load(Ordering::Relaxed) {
+            // Bytes written now would land in the middle of the file.
+            return Err(PyRuntimeError::new_err("unable to write; sendfile is in progress"));
+        }
         // R-074 retention: exact bytes -> zero-copy retain; bytearray and
         // memoryview -> copy now.
-        let buf: WriteBuf = if let Ok(b) = data.cast::<PyBytes>() {
+        let buf: WriteBuf = if let Some(b) = bytes {
             let len = b.as_bytes().len();
             if len == 0 {
                 return Ok(());
             }
             WriteBuf::Bytes { ptr: b.as_bytes().as_ptr(), len, off: 0, _keep: b.clone().into_any().unbind() }
         } else {
-            check_write_type(&data)?;
             let mut view: ffi::Py_buffer = unsafe { std::mem::zeroed() };
             let rc = unsafe { ffi::PyObject_GetBuffer(data.as_ptr(), &mut view, ffi::PyBUF_SIMPLE) };
             if rc != 0 {
@@ -3676,8 +3758,6 @@ impl Transport {
         let tid = self.tid;
         let mut pause: Option<Py<PyAny>> = None;
         let mut dirty = false;
-        let mut eof_misuse = false;
-        let mut in_sendfile = false;
         core.with_net(|net, reactor| {
             let Some(entry) = net.transports.get_mut(&tid) else {
                 net.graveyard_bufs.push(buf);
@@ -3687,24 +3767,6 @@ impl Transport {
             if entry.conn_lost {
                 net.graveyard_bufs.push(buf);
                 dirty = true;
-                return;
-            }
-            if entry.sendfile_active {
-                // Bytes written now would land in the middle of the file.
-                net.graveyard_bufs.push(buf);
-                dirty = true;
-                in_sendfile = true;
-                return;
-            }
-            if entry.eof_wanted {
-                // Half-close MISUSE, not a dead connection: the asyncio
-                // write-transport contract raises here. Silently
-                // succeeding let protocol code believe output was queued
-                // when it can never reach the peer -- undetected
-                // truncation.
-                net.graveyard_bufs.push(buf);
-                dirty = true;
-                eof_misuse = true;
                 return;
             }
             // A transport that is `closing` but still mapped is draining
@@ -3738,12 +3800,6 @@ impl Transport {
             core.drain_graveyards(py)?;
             schedule_pending_lost(py, core)?;
         }
-        if eof_misuse {
-            return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
-        }
-        if in_sendfile {
-            return Err(PyRuntimeError::new_err("unable to write; sendfile is in progress"));
-        }
         if let Some(pause_writing) = pause {
             report_flow_control_error(py, core, tid, pause_writing.call0(py), PAUSE_WRITING_FAILED)?;
         }
@@ -3759,19 +3815,20 @@ impl Transport {
                 check_write_type(item)?;
             }
         }
+        if items.is_empty() {
+            // asyncio's writelines is write(b"".join(...)): its checks
+            // still apply when there is nothing to write.
+            return self.write(py, PyBytes::new(py, b"").into_any());
+        }
         for item in items {
             self.write(py, item)?;
         }
         Ok(())
     }
 
-    /// loop.sendfile()'s claim on the socket (see `sendfile_active`).
-    fn _set_sendfile_active(&self, py: Python<'_>, active: bool) -> PyResult<()> {
-        self.core_ref(py).with_net(|net, _| {
-            if let Some(e) = net.transports.get_mut(&self.tid) {
-                e.sendfile_active = active;
-            }
-        })
+    /// loop.sendfile()'s claim on the socket (see `Transport::sendfile`).
+    fn _set_sendfile_active(&self, active: bool) {
+        self.sendfile.store(active, Ordering::Relaxed);
     }
 
     /// asyncio.constants._SendfileMode.TRY_NATIVE: loop.sendfile() may use
@@ -3785,12 +3842,20 @@ impl Transport {
     fn write_eof(&self, py: Python<'_>) -> PyResult<()> {
         let core = self.core_ref(py);
         let tid = self.tid;
-        core.with_net(|net, reactor| {
-            if let Some(entry) = net.transports.get_mut(&tid) {
-                entry.eof_wanted = true;
+        let open = core.with_net(|net, reactor| {
+            // asyncio ignores it on a closing transport (`if self._closing
+            // or self._eof: return`), and then later writes do not raise.
+            let Some(entry) = net.transports.get_mut(&tid) else { return false };
+            if entry.closing || entry.conn_lost {
+                return false;
             }
+            entry.eof_wanted = true;
             maybe_finish_shutdown(py, net, reactor.backend_mut(), tid, false);
+            true
         })?;
+        if open {
+            self.eof.store(true, Ordering::Relaxed);
+        }
         core.drain_graveyards(py)?;
         schedule_pending_lost(py, core)
     }
@@ -3810,23 +3875,38 @@ impl Transport {
     }
 
     #[pyo3(signature = (high=None, low=None))]
-    fn set_write_buffer_limits(&self, py: Python<'_>, high: Option<i64>, low: Option<i64>) -> PyResult<()> {
+    fn set_write_buffer_limits(
+        &self,
+        py: Python<'_>,
+        high: Option<Bound<'_, PyAny>>,
+        low: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         let core = self.core_ref(py);
-        // asyncio's rule: high defaults to 4 * low when only `low` is
-        // supplied (not a fixed 64 KiB, which rejected low > 64 KiB
-        // outright and gave a different pause threshold from every other
-        // loop for smaller values).
-        let (high, low) = match (high, low) {
-            (Some(h), Some(l)) => (h, l),
-            (Some(h), None) => (h, h.div_euclid(4)),
-            (None, Some(l)) => (l.saturating_mul(4), l),
-            (None, None) => (64 * 1024, 16 * 1024),
+        // asyncio's _set_write_buffer_limits, in Python arithmetic so that
+        // any real number works as it does there -- a float limit such as
+        // `1.5 * 2**20` raised TypeError here and nowhere else. High
+        // defaults to 4 * low when only `low` is supplied (not a fixed
+        // 64 KiB, which rejected low > 64 KiB outright and gave a
+        // different pause threshold from every other loop).
+        let high = match (high, &low) {
+            (Some(h), _) => h,
+            (None, Some(l)) => l.mul(4)?,
+            (None, None) => 65536i64.into_pyobject(py)?.into_any(),
         };
-        if !(high >= low && low >= 0) {
+        let low = match low {
+            Some(l) => l,
+            None => high.floor_div(4)?,
+        };
+        if !(high.ge(&low)? && low.ge(0)?) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "high ({high}) must be >= low ({low}) must be >= 0"
+                "high ({}) must be >= low ({}) must be >= 0",
+                high.repr()?,
+                low.repr()?
             )));
         }
+        // Compared against whole byte counts, `floor(limit)` decides
+        // exactly as the limit itself does (uvloop truncates too).
+        let (high, low) = (byte_limit(&high)?, byte_limit(&low)?);
         // The queue already has a depth, so the pause decision is re-taken
         // against the new mark, as asyncio's _maybe_pause_protocol does:
         // lowering `high` under an existing backlog pauses now. Raising
@@ -3835,8 +3915,8 @@ impl Transport {
         // completion, never from inside this call.
         let pause = core.with_net(|net, reactor| {
             let e = net.transports.get_mut(&self.tid)?;
-            e.high_water = high as usize;
-            e.low_water = low as usize;
+            e.high_water = high;
+            e.low_water = low;
             maybe_pause(py, net, reactor.backend_mut(), self.tid)
         })?;
         core.drain_graveyards(py)?;
@@ -3918,6 +3998,19 @@ impl Transport {
                 // routed and discarded by the closing/conn_lost checks.
                 let _ = backend.cancel(op);
             }
+            // Whether output is still buffered decides between closing
+            // now and draining first -- and a write() after close() is
+            // queued only in the second case (asyncio drops it once the
+            // connection is closed). Corked output counts as sent if the
+            // kernel takes it now, as it took asyncio's write(), so send
+            // it and apply the inline completion before deciding. With
+            // `closing` already set, a read completing in that settle is
+            // discarded, as asyncio's close() stops reading.
+            if send_corked(py, net, backend, tid) {
+                net.inline_close = Some(tid);
+                settle_inline(py, net, backend);
+                net.inline_close = None;
+            }
             maybe_finish_shutdown(py, net, backend, tid, false);
         })?;
         core.drain_graveyards(py)?;
@@ -3945,7 +4038,16 @@ impl Transport {
             Some(e) if !e.is_none() => LostReason::Exc(e.unbind()),
             _ => LostReason::Clean,
         };
-        core.with_net(|net, reactor| teardown_reason(py, net, reactor.backend_mut(), tid, reason))?;
+        core.with_net(|net, reactor| {
+            let backend = reactor.backend_mut();
+            // What asyncio discards here is its buffer: output the kernel
+            // refused. Corked output had not even been offered yet, and
+            // discarding it lost a reply written just before abort(), which
+            // every other loop delivers. Its completion is left to the
+            // tick (the teardown's reap guard keeps the buffers alive).
+            send_corked(py, net, backend, tid);
+            teardown_reason(py, net, backend, tid, reason)
+        })?;
         core.drain_graveyards(py)?;
         schedule_pending_lost(py, core)
     }

@@ -37,7 +37,7 @@ from asyncio import base_events, constants, events, format_helpers, futures, tas
 from asyncio.log import logger
 
 from . import _core
-from .tcp import TcpSurface, _DatagramTransport, _fileno
+from .tcp import TcpSurface, _DatagramTransport, _fileno, _seekable
 
 __all__ = ["Loop"]
 
@@ -957,14 +957,15 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         Dispatch follows base_events: the transport's
         `_sendfile_compatible` mode says whether to try the native path,
         fall back, or refuse (a datagram or pipe transport)."""
+        if transport.is_closing():
+            raise RuntimeError("Transport is closing")
         # Validated BEFORE a path is chosen, and by the same helper
         # sock_sendfile uses: without it `count=0` quietly returned zero
         # instead of raising, a text-mode file went straight to
         # os.sendfile, and every other bad value failed later with an
-        # exception that depended on which path had been taken.
+        # exception that depended on which path had been taken. (After the
+        # closing check, which asyncio makes first.)
         self._check_sendfile_params(file, offset, count)
-        if transport.is_closing():
-            raise RuntimeError("Transport is closing")
         mode = getattr(transport, "_sendfile_compatible", constants._SendfileMode.UNSUPPORTED)
         if mode is constants._SendfileMode.UNSUPPORTED:
             raise RuntimeError(f"sendfile is not supported for transport {transport!r}")
@@ -1034,6 +1035,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                     sent = None
                 except InterruptedError:
                     continue
+                except OSError as exc:
+                    if total:
+                        raise
+                    # Nothing sent yet: most often a file os.sendfile
+                    # cannot read from (a pipe, a character device), and
+                    # sendfile() falls back to writes, as asyncio's does.
+                    raise asyncio.SendfileNotAvailableError("os.sendfile call failed") from exc
                 if sent == 0:
                     break  # end of file
                 if sent is not None:
@@ -1074,11 +1082,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             return total
         finally:
             # stdlib convention: leave the file positioned after the bytes
-            # actually sent.
-            file.seek(offset + total)
+            # actually sent -- and alone when none were (the fallback that
+            # follows positions it itself) or it has no position (a pipe).
+            if total and _seekable(file):
+                file.seek(offset + total)
 
     async def _sendfile_fallback(self, transport, file, offset, count):
-        # Seek unconditionally: with the default offset=0 the old guard
+        # Seek even for the default offset=0 (any seekable file): the old guard
         # skipped the seek entirely, so a fallback (BytesIO, SSL, Windows)
         # sent from the file's CURRENT position while the native path sent
         # from byte zero — the same call returning different bytes
@@ -1090,8 +1100,12 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # connection the loop is serving for the duration of each read.
         # asyncio's own fallback does the same.
         total = 0
+        # A pipe has no position to start from or restore (and asyncio
+        # seeks neither for it at offset 0).
+        seekable = _seekable(file)
         try:
-            await self.run_in_executor(None, file.seek, offset)
+            if offset or seekable:
+                await self.run_in_executor(None, file.seek, offset)
             while True:
                 blocksize = 16384 if count is None else min(count - total, 16384)
                 if blocksize <= 0:
@@ -1117,7 +1131,8 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             # Synchronous, unlike the reads above: awaiting here would
             # re-raise during a cancellation unwind and the position would
             # never be corrected. One lseek is not worth an executor hop.
-            file.seek(offset + total)
+            if seekable:
+                file.seek(offset + total)
 
     def add_signal_handler(self, sig, callback, *args):
         """R-052. The Python-level handler runs on the main thread once

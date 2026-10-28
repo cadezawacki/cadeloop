@@ -1865,3 +1865,264 @@ def test_datagram_connection_lost_runs_in_call_soon_order(loop):
         assert order == ["before", "lost", "after"]
 
     loop.run_until_complete(main())
+
+
+# --------------------------------------------------------------------- #
+# Corked output at close()/abort(); write()'s order of checks           #
+# --------------------------------------------------------------------- #
+
+
+async def _peer_reads(loop, on_data):
+    """Run `on_data(transport)` in a server's data_received; return what
+    the peer reads until EOF."""
+
+    class Server(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def data_received(self, data):
+            on_data(self.transport)
+
+    server = await loop.create_server(Server, "127.0.0.1", 0)
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+    writer.write(b"go")
+    try:
+        return await asyncio.wait_for(reader.read(), 5)
+    finally:
+        writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+def test_write_then_abort_delivers_the_write(loop):
+    """asyncio's write() hands data to the socket at once, so a reply
+    written just before abort() still reaches the peer; abort() discards
+    only what the kernel would not take. cadeloop corked the write until
+    the end of the tick, and abort() threw it away unsent."""
+
+    def write_abort(transport):
+        transport.write(b"reply")
+        transport.abort()
+
+    def writelines_abort(transport):
+        transport.writelines([b"a", b"b"])
+        transport.abort()
+
+    async def main():
+        assert await _peer_reads(loop, write_abort) == b"reply"
+        assert await _peer_reads(loop, writelines_abort) == b"ab"
+
+        got = bytearray()
+        lost = loop.create_future()
+
+        class Sink(asyncio.Protocol):
+            def data_received(self, data):
+                got.extend(data)
+
+            def connection_lost(self, exc):
+                lost.set_result(None)
+
+        server, transport, _ = await _pair(loop, asyncio.Protocol, Sink)
+        transport.write(b"from-a-task")
+        transport.abort()
+        await asyncio.wait_for(lost, 5)
+        assert bytes(got) == b"from-a-task"
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_close_after_a_sent_write_drops_later_writes(loop):
+    """With nothing left unsent, close() closes at once and a later write()
+    is dropped, as in asyncio. cadeloop's corked first write made the
+    close wait for its queue, and the late write went out with it."""
+
+    def write_close_write(transport):
+        transport.write(b"reply")
+        transport.close()
+        transport.write(b"late")
+
+    async def main():
+        assert await _peer_reads(loop, write_close_write) == b"reply"
+
+    loop.run_until_complete(main())
+
+
+def test_close_after_a_write_runs_connection_lost_in_call_soon_order(loop):
+    async def main():
+        order = []
+
+        class P(asyncio.Protocol):
+            def connection_lost(self, exc):
+                order.append("lost")
+
+        server, transport, _ = await _pair(loop, P)
+        loop.call_soon(order.append, "before")
+        transport.write(b"x")
+        transport.close()
+        loop.call_soon(order.append, "after")
+        await asyncio.sleep(0.05)
+        assert order == ["before", "lost", "after"]
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_write_after_write_eof_raises_in_asyncio_order(loop):
+    """asyncio checks write_eof() ahead of the empty-write and
+    dead-connection shortcuts: an empty write raises too, and so does any
+    write once the transport is closed or gone. A write_eof() on a closing
+    transport is ignored instead."""
+
+    async def main():
+        server, transport, _ = await _pair(loop, asyncio.Protocol)
+        transport.write_eof()
+        for write in (
+            lambda: transport.write(b""),
+            lambda: transport.write(b"x"),
+            lambda: transport.writelines([]),
+        ):
+            with pytest.raises(RuntimeError, match=r"Cannot call write\(\) after write_eof\(\)"):
+                write()
+        transport.close()
+        with pytest.raises(RuntimeError, match="after write_eof"):
+            transport.write(b"x")
+        await asyncio.sleep(0.05)  # connection_lost has run
+        with pytest.raises(RuntimeError, match="after write_eof"):
+            transport.write(b"x")
+
+        other, _ = await loop.create_connection(
+            asyncio.Protocol, "127.0.0.1", server.sockets[0].getsockname()[1]
+        )
+        other.close()
+        other.write_eof()
+        other.write(b"x")  # dropped, not refused
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_add_reader_refuses_the_extra_info_socket(loop):
+    """_ensure_fd_no_transport for the descriptor get_extra_info('socket')
+    reports. A cadeloop transport that owns its descriptor hands out a
+    duplicate there, and add_reader() accepted that one."""
+
+    async def main():
+        server, transport, _ = await _pair(loop, asyncio.Protocol)
+        fd = transport.get_extra_info("socket").fileno()
+        with pytest.raises(RuntimeError, match="is used by transport"):
+            loop.add_reader(fd, lambda: None)
+        with pytest.raises(RuntimeError, match="is used by transport"):
+            loop.remove_writer(fd)
+        transport.close()
+        await asyncio.sleep(0.05)
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_write_buffer_limits_take_any_real_number(loop):
+    """asyncio keeps whatever number it is given, so a float limit such as
+    1.5 * 2**20 works; cadeloop raised TypeError."""
+
+    async def main():
+        server, transport, _ = await _pair(loop, _FlowRecorder)
+        transport.set_write_buffer_limits(high=1.5 * 2**20)
+        low, high = transport.get_write_buffer_limits()
+        assert (int(low), int(high)) == (393216, 1572864)
+        with pytest.raises(ValueError, match=r"high \(1.5\) must be >= low \(1.7\) must be >= 0"):
+            transport.set_write_buffer_limits(high=1.5, low=1.7)
+        with pytest.raises(ValueError, match="must be >= 0"):
+            transport.set_write_buffer_limits(high=float("nan"))
+        transport.set_write_buffer_limits(high=float("inf"), low=0)
+        assert transport.get_write_buffer_limits()[1] > 2**60
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_create_connection_with_only_a_port_dials_the_loopback(loop):
+    """base_events resolves when either host or port is given (no host is
+    getaddrinfo's loopback); cadeloop wanted both."""
+
+    async def main():
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        transport, _ = await loop.create_connection(asyncio.Protocol, port=port)
+        assert transport.get_extra_info("peername")[:2] == ("127.0.0.1", port)
+        transport.close()
+        with pytest.raises(ValueError, match="host and port was not specified"):
+            await loop.create_connection(asyncio.Protocol)
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_sendfile_checks_for_a_closing_transport_first(loop, tmp_path):
+    path = tmp_path / "text.txt"
+    path.write_text("x")
+
+    async def main():
+        server, transport, _ = await _pair(loop, asyncio.Protocol)
+        transport.close()
+        with open(path) as f:  # text mode is an argument error too
+            with pytest.raises(RuntimeError, match="Transport is closing"):
+                await loop.sendfile(transport, f)
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(os, "sendfile"), reason="the native path needs os.sendfile")
+def test_sendfile_falls_back_when_os_sendfile_cannot_read_the_file(cade_loop):
+    """os.sendfile refuses a pipe before sending anything. As in asyncio
+    that is SendfileNotAvailableError, and both entry points fall back to
+    plain sends; cadeloop raised the OSError, then UnsupportedOperation
+    from seeking a file that has no position. (asyncio itself returns 0
+    for a pipe without sending: it sizes the transfer by fstat's
+    st_size.)"""
+    loop = cade_loop
+
+    def pipe_file(data):
+        rfd, wfd = os.pipe()
+        os.write(wfd, data)
+        os.close(wfd)
+        return os.fdopen(rfd, "rb")
+
+    async def main():
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        with a, b, pipe_file(b"pipe-data") as f:
+            assert await loop.sock_sendfile(a, f) == 9
+            assert b.recv(100) == b"pipe-data"
+            with pytest.raises(asyncio.SendfileNotAvailableError):
+                await loop.sock_sendfile(a, f, fallback=False)
+
+        got = bytearray()
+        lost = loop.create_future()
+
+        class Sink(asyncio.Protocol):
+            def data_received(self, data):
+                got.extend(data)
+
+            def connection_lost(self, exc):
+                lost.set_result(None)
+
+        server, transport, _ = await _pair(loop, asyncio.Protocol, Sink)
+        with pipe_file(b"through-the-transport") as f:
+            assert await loop.sendfile(transport, f) == 21
+        transport.close()
+        await asyncio.wait_for(lost, 5)
+        assert bytes(got) == b"through-the-transport"
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())

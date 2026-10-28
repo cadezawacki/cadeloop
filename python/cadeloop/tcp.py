@@ -47,6 +47,19 @@ def _fileno(fd):
     return fileno
 
 
+def _seekable(file):
+    """Whether the sendfile paths may set `file`'s position. They restore
+    it (and the fallbacks start from `offset` even when it is 0), but a
+    pipe or a socket file has no position: seeking one raised
+    UnsupportedOperation after its data had already gone out."""
+    try:
+        return file.seekable()
+    except AttributeError:
+        return hasattr(file, "seek")
+    except (OSError, ValueError):
+        return False
+
+
 def _check_ssl_socket(sock):
     """base_events._check_ssl_socket: a sock= passed to
     create_connection/create_server/connect_accepted_socket must be a
@@ -297,7 +310,9 @@ class TcpSurface:
                 owner=sock,
             )
 
-        if host is None or port is None:
+        # Either one is enough to resolve, as in base_events: a missing
+        # host is getaddrinfo's loopback, a missing port is port 0.
+        if host is None and port is None:
             raise ValueError("host and port was not specified and no sock specified")
 
         if happy_eyeballs_delay is not None and interleave is None:
@@ -1270,13 +1285,17 @@ class TcpSurface:
                 file.fileno()
             except (OSError, AttributeError, ValueError):
                 can_native = False
-        if not can_native:
-            if not fallback:
-                raise asyncio.SendfileNotAvailableError(
-                    "syscall sendfile is not available for this socket/file combination"
-                )
-            return await self._sock_sendfile_fallback(sock, file, offset, count)
-        return await self._sock_sendfile_native(sock, file, offset, count)
+        if can_native:
+            try:
+                return await self._sock_sendfile_native(sock, file, offset, count)
+            except asyncio.SendfileNotAvailableError:
+                if not fallback:
+                    raise
+        elif not fallback:
+            raise asyncio.SendfileNotAvailableError(
+                "syscall sendfile is not available for this socket/file combination"
+            )
+        return await self._sock_sendfile_fallback(sock, file, offset, count)
 
     async def _sock_sendfile_native(self, sock, file, offset, count):
         fd = sock.fileno()
@@ -1297,6 +1316,13 @@ class TcpSurface:
                     sent = None
                 except InterruptedError:
                     continue
+                except OSError as exc:
+                    if total:
+                        raise
+                    # Nothing sent yet: most often a file os.sendfile
+                    # cannot read from (a pipe, a character device).
+                    # asyncio falls back to plain sends then.
+                    raise asyncio.SendfileNotAvailableError("os.sendfile call failed") from exc
                 if sent == 0:
                     break  # end of file
                 if sent is not None:
@@ -1320,10 +1346,13 @@ class TcpSurface:
                     self._watch_done(handle, self._core.remove_writer, fd)
             return total
         finally:
-            file.seek(offset + total)  # stdlib convention
+            # stdlib convention: positioned after what was sent, and left
+            # alone when nothing was (or there is no position to set).
+            if total and _seekable(file):
+                file.seek(offset + total)
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
-        # Unconditional, matching Loop._sendfile_fallback: the old guard
+        # Even at offset 0, matching Loop._sendfile_fallback: the old guard
         # skipped the seek for the default offset=0, so this path sent from
         # the file's current position while the native path sent from byte
         # zero.
@@ -1334,8 +1363,12 @@ class TcpSurface:
         # transfer interrupted part-way must still report how far it got.
         blocksize = min(count, 16384) if count else 16384
         total = 0
+        # A pipe has no position to start from or restore (and asyncio
+        # seeks neither for it at offset 0).
+        seekable = _seekable(file)
         try:
-            await self.run_in_executor(None, file.seek, offset)
+            if offset or seekable:
+                await self.run_in_executor(None, file.seek, offset)
             while True:
                 if count:
                     blocksize = min(count - total, blocksize)
@@ -1350,7 +1383,8 @@ class TcpSurface:
         finally:
             # Synchronous for the same reason as Loop._sendfile_fallback:
             # an await here is skipped when unwinding a cancellation.
-            file.seek(offset + total)
+            if seekable:
+                file.seek(offset + total)
 
 
 class _DatagramTransport(asyncio.DatagramTransport, asyncio.Transport):
