@@ -1076,6 +1076,38 @@ def test_requests_left_by_the_drain_are_cancelled_before_lifespan_shutdown(eager
     assert events == ["request", "request cancelled", "lifespan.shutdown"], events
 
 
+def test_the_lifespan_shutdown_wait_is_what_is_left_of_grace(cadeloop_logs):
+    """lifespan.shutdown() waited a fixed 10s whatever `grace` said: a 1s
+    budget ran ten times over (in a pool worker, into the supervisor's
+    SIGKILL, so nothing after the hook ran), and a long budget cut the hook
+    off with most of it unspent. Its cancellation was then logged as the
+    hook having raised."""
+    cancelled = []
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            asyncio.get_running_loop().call_later(0.1, asyncio.get_running_loop().stop)
+            await receive()
+            try:
+                await asyncio.sleep(30)  # a hook that will not finish in time
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+    began = time.monotonic()
+    t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0))
+    t.join(30)
+    took = time.monotonic() - began
+    assert not t.is_alive() and "error" not in result, result
+    assert took < 5.0, f"shutdown took {took:.1f}s with grace=1.0"
+    assert cancelled == [True]
+    messages = [r.getMessage() for r in cadeloop_logs if r.levelno >= logging.WARNING]
+    assert any("did not complete within" in m for m in messages), messages
+    assert not any("lifespan shutdown raised" in m for m in messages), messages
+
+
 def test_s26_serve_restores_the_callers_current_event_loop():
     """S26: serve() set the thread's current loop to None on return,
     clobbering the embedder's own."""

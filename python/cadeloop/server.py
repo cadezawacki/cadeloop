@@ -188,7 +188,14 @@ class _Lifespan:
                 # machinery re-raises these out of the loop tick.
                 raise
             except BaseException as exc:  # noqa: BLE001 — app may not do lifespan
-                if self._shutdown_requested:
+                if isinstance(exc, asyncio.CancelledError) and self._shutdown_requested:
+                    # _finalize_loop cancelling a shutdown hook that overran
+                    # its timeout -- shutdown() has already said so. Logged
+                    # as "lifespan shutdown raised" with a traceback, it
+                    # blamed the application for the server's own
+                    # cancellation.
+                    logger.debug("lifespan task cancelled")
+                elif self._shutdown_requested:
                     # The application's shutdown hook raised. The worker is
                     # already stopping, so this is not a crash of a serving
                     # worker: report it once (Starlette has already sent
@@ -786,7 +793,10 @@ def _serve_single(
                 access_log.close()
             shutdown.phase = "closing"
             if not shutdown.abandoned:
-                lifespan.shutdown()
+                # Whatever is left of `grace`: a fixed 10s cut a slow hook
+                # off with most of a long budget unspent, and ran a short
+                # budget past the supervisor's SIGKILL.
+                lifespan.shutdown(timeout=max(0.25, config.grace - (time.monotonic() - started)))
             _finalize_loop(loop, config.grace - (time.monotonic() - started))
         finally:
             if lifeline_fd is not None:
