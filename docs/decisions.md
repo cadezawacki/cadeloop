@@ -506,3 +506,62 @@ backend's `Drop` reaps whatever is still in flight before freeing the slab
 the kernel writes into. Compile-verified on Linux; the Windows tests
 (`test_windows_audit.py`, the `#[cfg(windows)]` Rust tests) run in Windows
 CI.
+
+## ADR-31: Callbacks share one context snapshot instead of a copy apiece
+asyncio's `Handle` copies the current `contextvars.Context` when it is
+created, and cadeloop did the same: every pending callback held a
+GC-tracked context. A 200k-callback burst kept 200k of them alive, and the
+young collections they set off -- and the full collections their promotion
+fed -- were most of what the burst cost. rsloop skips the copy only when
+the context is empty, which helps benchmarks and not applications:
+anything that calls `decimal.getcontext()`, as most web stacks end up
+doing, leaves a variable in it.
+
+A context is only a holder for its variables, an immutable map (CPython's
+HAMT) that a copy shares with its source. A callback scheduled without an
+explicit context now keeps a *snapshot*: a context nothing ever enters,
+shared by every callback scheduled while the current context's map is that
+same object. At dispatch the callback runs in a scratch context holding the
+snapshot's variables, which is reused for the next callback only while
+that is unobservable (nothing else holds it, and the callback set nothing
+in it), so each callback still runs in a context of its own. Explicit
+contexts, readiness watches (asyncio runs every call of one watch in the
+same context) and signal handlers keep asyncio's semantics exactly; the
+parity suite runs the context tests against both loops.
+
+Comparing maps by identity reads `PyContext.ctx_vars`, and finding the
+current map without copying the context first reads
+`PyThreadState.context` -- private fields of structs CPython 3.11 ships in
+its headers. Both layouts are verified through public APIs at import
+(entering and exiting a probe context, setting a probe variable, matching
+`interp`, `dict` and `id` against their accessors); a mismatch falls back
+to sharing empty contexts only (found with `len()`) and to copying first.
+Against the previous release: call_soon_burst 3.2x, timer_schedule_cancel
+1.95x, timer_fire 1.6x, threadsafe_throughput 1.4x, call_soon_chain +5%.
+
+## ADR-32: I/O before due timers; transport events routed at dispatch
+The reactor moved expired timers into the ready batch before polling, so an
+iteration ran its due timers ahead of the I/O its poll reported. asyncio's
+`_run_once` runs the previous iteration's callbacks, then the I/O
+callbacks, then the timers due, and current libuv (so uvloop) also polls
+before it runs timers. The order decides races: uvicorn's keep-alive
+timeout, due in the iteration in which the connection's next request
+arrived, closed the connection and lost the request every time, where
+asyncio and uvloop deliver the request and its `data_received` cancels the
+timer. Expired timers now wait in a queue of their own and run at the
+iteration's tail, after the transport events.
+
+Transport events were also bound when their completions were translated,
+before any of the iteration's callbacks had run: each carried the protocol
+method it would call. A callback that closed, aborted or paused the
+transport earlier in the same iteration, or swapped its protocol with
+`set_protocol()` (as `start_tls` does), did not stop it: data and EOF
+reached protocols after `close()`/`abort()` and while paused, datagrams
+after a datagram transport's close, `resume_writing` after `abort()`, and
+the old protocol got bytes meant for the new one -- a TLS ClientHello
+handed to the plaintext protocol stalled `start_tls` until its timeout.
+Inbound events now name their transport, and dispatch decides: dropped once
+it is closing or gone, held while reading is paused (EOF too, delivered
+after the held bytes by `resume_reading`), otherwise delivered to the
+current protocol; `resume_writing` goes only to the protocol that was
+paused.

@@ -615,6 +615,35 @@ def test_removed_and_replaced_watch_handles_are_cancelled(loop):
         b.close()
 
 
+def test_watch_cancelled_through_its_handle_is_dropped_on_its_next_event(loop):
+    """loop._add_reader()/_add_writer() return the watch's Handle, as
+    asyncio's do. A watch cancelled through that Handle stayed registered:
+    every readiness event queued it again only for dispatch to skip it,
+    and an fd that stayed ready kept the loop spinning instead of parking.
+    asyncio's _process_events drops a cancelled watch on its next event."""
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    try:
+        calls = []
+
+        async def main():
+            loop._add_reader(a.fileno(), calls.append, "read").cancel()
+            loop._add_writer(b.fileno(), calls.append, "write").cancel()  # writable at once
+            b.send(b"x")  # `a` stays readable: nobody reads it
+            before = loop.stats()["ticks"]
+            await asyncio.sleep(0.05)
+            return loop.stats()["ticks"] - before
+
+        ticks = loop.run_until_complete(main())
+        assert calls == []
+        assert loop.remove_reader(a.fileno()) is False
+        assert loop.remove_writer(b.fileno()) is False
+        assert ticks < 50, f"the loop spun: {ticks} iterations in 50 ms"
+    finally:
+        a.close()
+        b.close()
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="epoll fd semantics")
 def test_fd_closed_before_remove_reader_can_be_watched_again(loop):
     """epoll forgets a registration when its file is closed. remove_reader
@@ -833,3 +862,42 @@ def test_ready_callbacks_run_before_this_iterations_io_callbacks(loop):
     finally:
         ta.close()
         tb.close()
+
+
+@pytest.mark.parametrize("non_empty", [False, True], ids=["empty-context", "non-empty-context"])
+def test_scheduling_without_a_context_allocates_nothing_the_gc_tracks(loop, non_empty):
+    """A callback scheduled without an explicit context used to keep a copy
+    of the current one alive in the queue: a GC-tracked object per pending
+    callback, which set off a young collection every ~700 calls and fed the
+    full ones -- for a 200k-callback burst, over half the time. Callbacks
+    scheduled while the current variables are unchanged now share one
+    snapshot of them (ctxsnap), and each still runs in a context of its own
+    at dispatch (see the parity tests' callback-context section)."""
+
+    import contextvars
+
+    var = contextvars.ContextVar("request_id")
+
+    def cb():
+        pass
+
+    def schedule():
+        if non_empty:
+            var.set("r-1")
+        for _ in range(5000):
+            loop.call_soon(cb)
+            loop.call_later(60, cb).cancel()
+
+    gc.collect()
+    gc.disable()
+    try:
+        before = gc.get_count()[0]
+        # A fresh context, so "empty" is: the test process's own may not be
+        # (anything that called decimal.getcontext() set a variable in it).
+        contextvars.Context().run(schedule)
+        grown = gc.get_count()[0] - before
+    finally:
+        gc.enable()
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    assert grown < 50, f"{grown} GC-tracked allocations for 10000 scheduling calls"

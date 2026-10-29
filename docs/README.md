@@ -21,7 +21,23 @@ methodology: [benchmarks.md](benchmarks.md).*
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | ASGI | Concurrent `send()` calls parked on write backpressure displaced one another's drain future: every frame was written but only the last sender resumed, and the rest stayed pending until the app's timeout or were destroyed by the GC as pending tasks; waiters now queue and all resolve on drain or teardown | `` |
+> | ASGI | `receive()` takes its message when called, so one cancelled before it ran (`wait_for(receive(), 0)`, an aborted task group) lost the message or request body; an unawaited message now goes back to its connection | `93cfbee` |
+> | Server | Graceful shutdown never cancelled an eager request in flight at the deadline (its driver is not an asyncio Task), and `close()` dropped parked handlers and waiters pending, leaking the coroutine; both are now cancelled and their cleanup runs | `9b9ec0b` |
+> | ASGI | A `cancel()` reaching the eager driver mid-step waited for the next awaited future to finish by itself (forever, for one that never does); it now cancels that future, as `Task.__step` does | `9b9ec0b` |
+> | ASGI | A request pipelined behind one that suspended started with that request's contextvars; a cancelled non-eager request was logged as an application error | `9b9ec0b` |
+> | HTTP | `receive()` after the response was complete parked until the app returned, deadlocking an app that awaited it and holding up the next keep-alive request; it answers `http.disconnect`, as ASGI specifies | `45deebd` |
+> | HTTP | Requests pipelined behind a server-initiated close or a client half-close were run, side effects included, for responses the closing connection discarded | `45deebd` |
+> | HTTP | A parked 400 stopped the connection reading, so a long-poll handler never saw its client leave and the sweep held the connection | `45deebd` |
+> | WS | A receiver whose wake was queued when its connection was torn down was dropped unresolved, and its task GC-destroyed while pending; it now gets `websocket.disconnect` | `5162de0` |
+> | WS | Receivers left when the handler returned got `http.disconnect`; a send on a socket closing under the app (peer close, 1012 drain) raised `RuntimeError` instead of an `OSError` | `5162de0` |
+> | Loop | A readiness watch cancelled through its Handle stayed registered and kept the loop spinning at full CPU | `4f251af` |
+> | Loop | A second `loop.sendfile()` on a transport was accepted, displaced the first's writer watch and hung for good; it is refused, as in asyncio | `24903fb` |
+> | Net | epoll sends completed only once a whole gather was written, so bytes the kernel had taken stayed counted as buffered: two peers that each wrote and drained before reading deadlocked where asyncio and uvloop do not | `3012ea2` |
+> | TCP | A `create_connection` cancelled after its connect completed (a `wait_for` timeout, a Happy Eyeballs race) leaked the connected socket | `9d4e3b5` |
+> | Net | `is_closing()` and `get_write_buffer_size()` raised from another thread while the loop was parked | `a4f4822` |
+> | Net | Transport events were bound before the iteration's callbacks ran: data and EOF reached a protocol after `close()`/`abort()` or while paused, datagrams arrived after a datagram transport's close, `resume_writing` followed `abort()`, and bytes meant for the protocol `set_protocol()` installed (a `start_tls` ClientHello) went to the old one; events are now routed at dispatch (ADR-32) | `3daa46f` |
+> | Loop | An iteration ran its due timers before the I/O its poll reported, so an idle timeout due as a request arrived won the race: uvicorn's keep-alive timeout closed the connection and lost the request; timers now run after the iteration's I/O, as in asyncio (ADR-32) | `3daa46f` |
+> | ASGI | Concurrent `send()` calls parked on write backpressure displaced one another's drain future: every frame was written but only the last sender resumed, and the rest stayed pending until the app's timeout or were destroyed by the GC as pending tasks; waiters now queue and all resolve on drain or teardown | `981dafc` |
 > | CI | The PGO wheel build baked a git-bash POSIX path into the instrumented binary, so Windows wrote the profiles elsewhere and the merge found nothing | `79bab8f` |
 > | TLS | A peer that connected and never sent a ClientHello was never torn down: each sweep staged another unencryptable 408 while the socket and receive slot stayed held | `7069869` |
 > | Loop | `sendfile` held a raw fd across suspensions: a transport closed mid-transfer could aim `os.sendfile` at whatever connection reused the number, or park forever on a dead watcher | `7069869` |

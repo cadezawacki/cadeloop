@@ -353,37 +353,52 @@ class TcpSurface:
         # base_events._connect_sock, so the error raised when every
         # attempt fails is the one asyncio would raise.
         exceptions = []
+        # Every descriptor an attempt connected, until one of them is
+        # wrapped in a transport. A connect hands back a bare descriptor,
+        # not a socket object a collector would close, so anything that
+        # drops one -- a cancellation unwinding this call after an attempt
+        # connected (the caller's timeout, staggered_race abandoning the
+        # winner it had picked), or a second attempt that connected too --
+        # left that connection open for good.
+        connected = []
 
         async def attempt(address, af):
             my_exceptions = []
             exceptions.append(my_exceptions)
             try:
-                return await self._connect_one(address, af, laddr_infos, my_exceptions)
+                fd = await self._connect_one(address, af, laddr_infos, my_exceptions)
             except OSError as exc:
                 my_exceptions.append(exc)
                 raise
+            connected.append(fd)
+            return fd
 
-        if happy_eyeballs_delay is None:
-            fd = None
-            for af, _st, _pr, _cname, address in infos:
-                try:
-                    fd = await attempt(address, af)
-                    break
-                except OSError:
-                    continue
-        else:
-            # Staggered concurrent attempts (RFC 6555): a slow/broken
-            # address family no longer stalls every later candidate
-            # behind it — reuses stdlib's own racing logic, just racing
-            # the native tcp_connect fast path instead of a plain socket.
-            fd, _, _ = await staggered.staggered_race(
-                (
-                    functools.partial(attempt, address, af)
-                    for af, _st, _pr, _cname, address in infos
-                ),
-                happy_eyeballs_delay,
-                loop=self,
-            )
+        fd = None
+        try:
+            if happy_eyeballs_delay is None:
+                for af, _st, _pr, _cname, address in infos:
+                    try:
+                        fd = await attempt(address, af)
+                        break
+                    except OSError:
+                        continue
+            else:
+                # Staggered concurrent attempts (RFC 6555): a slow/broken
+                # address family no longer stalls every later candidate
+                # behind it — reuses stdlib's own racing logic, just racing
+                # the native tcp_connect fast path instead of a plain socket.
+                fd, _, _ = await staggered.staggered_race(
+                    (
+                        functools.partial(attempt, address, af)
+                        for af, _st, _pr, _cname, address in infos
+                    ),
+                    happy_eyeballs_delay,
+                    loop=self,
+                )
+        finally:
+            for other in connected:
+                if other != fd:
+                    self._core.discard_socket(other)
         if fd is None:
             exceptions = [exc for sub in exceptions for exc in sub]
             try:
@@ -443,13 +458,21 @@ class TcpSurface:
         try:
             return await fut
         except asyncio.CancelledError:
-            # Cancel the native op too. Every losing Happy Eyeballs
-            # attempt lands here, so without this each connection
-            # leaves N-1 sockets in a half-open connect until the OS
-            # times them out -- which can be minutes. The completion
-            # still arrives and closes the socket; this only brings
-            # that forward.
-            self._core.cancel_connect(op)
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                # Connected before the cancellation landed -- a timeout
+                # firing in the iteration the connect completed, or a
+                # Happy Eyeballs attempt that finished alongside the
+                # winner: the future holds a connected descriptor that
+                # nothing else will ever close.
+                self._core.discard_socket(fut.result())
+            else:
+                # Cancel the native op too. Every losing Happy Eyeballs
+                # attempt lands here, so without this each connection
+                # leaves N-1 sockets in a half-open connect until the OS
+                # times them out -- which can be minutes. The completion
+                # still arrives and closes the socket; this only brings
+                # that forward.
+                self._core.cancel_connect(op)
             raise
         except OSError as exc:
             if exc.errno is None:

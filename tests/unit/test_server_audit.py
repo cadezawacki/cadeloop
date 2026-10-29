@@ -965,6 +965,46 @@ def test_s17_leftover_tasks_and_async_generators_are_finalized():
     assert sorted(ran) == ["agen", "task"], ran
 
 
+@pytest.mark.parametrize("eager", [True, False])
+def test_s17_a_request_in_flight_at_the_deadline_is_cancelled(eager):
+    """S17 for requests: _finalize_loop cancels what asyncio.all_tasks()
+    lists, and the eager engine's request driver is not an asyncio Task.
+    A handler still awaiting when the drain's deadline passed was never
+    cancelled -- its cleanup never ran -- while with eager_tasks=False the
+    very same handler was."""
+    from cadeloop.server import _drain_connections, _finalize_loop
+
+    ran = []
+    loop = cadeloop.new_event_loop()
+    started = asyncio.Event()
+
+    async def app(scope, receive, send):
+        await receive()
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)  # cleanup that awaits
+            ran.append("cleanup")
+            raise
+
+    s = None
+    try:
+        lid, bound, _fd = loop._core.http_listen("127.0.0.1", 0, app, loop, eager=eager)
+        s = socket.create_connection(("127.0.0.1", bound[1]))
+        s.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        loop.run_until_complete(asyncio.wait_for(started.wait(), 5))
+        # _serve_single's teardown, with the request still in flight.
+        loop._core.listener_close(lid)
+        _drain_connections(loop, 0.2)
+        _finalize_loop(loop, 2.0)
+    finally:
+        loop.close()
+        if s is not None:
+            s.close()
+    assert ran == ["cleanup"], ran
+
+
 def test_s26_serve_restores_the_callers_current_event_loop():
     """S26: serve() set the thread's current loop to None on return,
     clobbering the embedder's own."""

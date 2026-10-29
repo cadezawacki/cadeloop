@@ -12,13 +12,17 @@
 //! ```text
 //! 1. flush corked writes queued by last tick's ready callbacks
 //!    prepare_tick; poll (GIL released, R-021)
-//! 2. translate completions -> NetEvents (in-cell, no Python execution)
-//! 3. dispatch NetEvents (protocol callbacks; GIL, out-of-cell)
-//! 4. flush writes those callbacks corked (R-035 tick-end flush)
-//! 5. dispatch NetEvents produced by the flush (teardowns)
-//! 6. dispatch ready-callback batch (<=128, R-054)
+//! 2. translate completions -> NetEvents, readiness watches -> the ready
+//!    queue (in-cell, no Python execution)
+//! 3. dispatch the ready batch (R-054): last tick's callbacks, then the
+//!    readiness watches this poll reported
+//! 4. dispatch NetEvents (protocol callbacks; GIL, out-of-cell), then
+//!    the timers due -- asyncio's _run_once order
+//! 5. flush writes those callbacks corked (R-035 tick-end flush)
+//! 6. dispatch NetEvents produced by the flush (teardowns)
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -37,6 +41,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
+use crate::ctxsnap::{Scratch, SnapCache};
 use crate::gil_boundary::StateCell;
 use crate::handles::{run_handle, CallArgs, DispatchOutcome, Handle, HandleRef, TimerHandle};
 use crate::net::{self, NetEvent, NetState, Transport};
@@ -78,6 +83,9 @@ impl Drop for LoopState {
 pub struct CoreLoop {
     state: StateCell<LoopState>,
     xqueue: Arc<CrossThreadQueue<HandleRef>>,
+    /// Context snapshot shared by callbacks scheduled without an explicit
+    /// context (see `ctxsnap`).
+    snaps: SnapCache,
     waker: Arc<dyn Wakeup>,
     /// Shared with the reactor: cancellations of still-scheduled timers,
     /// absorbed into the heap's tombstone accounting each tick.
@@ -192,6 +200,17 @@ impl CoreLoop {
         f: impl FnOnce(&mut NetState, &mut Reactor<HandleRef>) -> R,
     ) -> PyResult<R> {
         self.state.with(|st| f(&mut st.net, &mut st.reactor))
+    }
+
+    /// [`CoreLoop::with_net`] for read-only accessors that have an answer
+    /// of their own when the state is out of reach -- another thread while
+    /// the loop is parked in its poll, or a re-entered borrow
+    /// (gil_boundary): None there, `f` not run, instead of a RuntimeError.
+    pub(crate) fn try_with_net<R>(
+        &self,
+        f: impl FnOnce(&mut NetState, &mut Reactor<HandleRef>) -> R,
+    ) -> Option<R> {
+        self.state.try_with(|st| f(&mut st.net, &mut st.reactor)).ok()
     }
 
     pub(crate) fn water_marks(&self) -> (usize, usize) {
@@ -333,47 +352,26 @@ impl CoreLoop {
         // the busiest path in the loop. uvloop, rloop and rsloop skip the
         // check entirely; matching the stdlib's own gating keeps the clear
         // TypeError where a developer will actually see it.
-        if self.debug.load(Ordering::Relaxed) {
-            if !callback.is_callable() {
-                return Err(PyTypeError::new_err(format!(
-                    "a callable object was expected by {method}(), got {}",
-                    callback.repr()?
-                )));
-            }
-            if is_coroutine_function(py, callback) {
-                return Err(PyTypeError::new_err(format!("coroutines cannot be used with {method}()")));
-            }
-        }
-        let context: Py<PyAny> = match context {
-            Some(c) if !c.is_none() => c.clone().unbind(),
-            _ => copy_context(py)?,
-        };
         let debug = self.debug.load(Ordering::Relaxed);
-        // asyncio's debug-mode `_source_traceback`. No frame is pushed for
-        // this native call, so extract_stack()'s default -- its caller's
-        // caller -- is the Python code that called call_soon & co, exactly
-        // the frame asyncio trims its own scheduling frames down to.
-        let source_tb = if debug {
-            Some(
-                py.import(intern!(py, "asyncio.format_helpers"))?
-                    .call_method0(intern!(py, "extract_stack"))?
-                    .unbind(),
-            )
-        } else {
-            None
+        let source_tb = if debug { debug_checks(py, callback, method)? } else { None };
+        let context: (Py<PyAny>, bool) = match context {
+            Some(c) if !c.is_none() => (c.clone().unbind(), false),
+            _ => self.snaps.capture(py)?,
         };
         Handle::new(py, callback.clone().unbind(), args, context, debug, source_tb)
     }
 
-    /// Flush transports whose writes were corked (R-035). Returns pending
-    /// net events produced by the flush (teardowns).
-    fn flush_corked(&self, py: Python<'_>) -> PyResult<Vec<NetEvent>> {
+    /// Flush transports whose writes were corked (R-035), and move the net
+    /// events the flush produced (teardowns) into `out`, which must be
+    /// empty: it trades buffers with the queue, as the tick does.
+    fn flush_corked(&self, py: Python<'_>, out: &mut Vec<NetEvent>) -> PyResult<()> {
+        debug_assert!(out.is_empty());
         self.state.with(|st| {
             let list = std::mem::take(&mut st.net.flush_list);
             for tid in list {
                 net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
             }
-            std::mem::take(&mut st.net.events)
+            std::mem::swap(&mut st.net.events, out);
         })
     }
 
@@ -388,11 +386,18 @@ impl CoreLoop {
     /// `batch` is the dispatch buffer, owned by `run_forever`'s frame and
     /// empty between ticks. It used to live in a `thread_local!`, which in
     /// a cdylib is a `__tls_get_addr` call on every tick.
-    fn tick(&self, slf: &Bound<'_, CoreLoop>, py: Python<'_>, batch: &mut Vec<HandleRef>) -> PyResult<()> {
+    fn tick(
+        &self,
+        slf: &Bound<'_, CoreLoop>,
+        py: Python<'_>,
+        batch: &mut VecDeque<HandleRef>,
+        events: &mut Vec<NetEvent>,
+        scratch: &mut Scratch,
+    ) -> PyResult<()> {
         let stopping = self.stopping.load(Ordering::Acquire);
-        debug_assert!(batch.is_empty());
-        type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Option<Graveyards>, bool);
-        let (poll_result, parked, events, graveyard, special): TickOut = self.state.with(|st| {
+        debug_assert!(batch.is_empty() && events.is_empty());
+        type TickOut = (std::io::Result<()>, bool, Option<Graveyards>, bool, usize);
+        let (poll_result, parked, graveyard, special, timers): TickOut = self.state.with(|st| {
             // Phase 1: flush corked writes from last tick's callbacks.
             if !st.net.flush_list.is_empty() {
                 let list = std::mem::take(&mut st.net.flush_list);
@@ -426,7 +431,7 @@ impl CoreLoop {
                 (py.detach(move || reactor.poll(timeout)), true)
             };
             if poll_result.is_err() {
-                return (poll_result, parked, Vec::new(), None, false);
+                return (poll_result, parked, None, false, 0);
             }
             // Phase 2: translate completions (no Python execution).
             st.reactor.finish_poll_after(parked);
@@ -459,22 +464,26 @@ impl CoreLoop {
                 }
                 st.reactor.absorb_into_batch();
             }
-            let events = std::mem::take(&mut st.net.events);
+            // This tick's transport events: the queue trades buffers with
+            // `events`, as the ready queue does with `batch`, so neither is
+            // reallocated tick after tick (a taken Vec left an empty one
+            // that the next event had to grow from nothing).
+            std::mem::swap(&mut st.net.events, events);
             // The dispatch batch, in the SAME cell entry: every callback
-            // ready when the tick began, plus this tick's timers and
-            // readiness watches (batch_left was snapshotted for exactly
-            // those). It runs BEFORE the transport events below, as
-            // asyncio's _run_once appends an iteration's I/O callbacks
-            // behind the callbacks already in `_ready`.
-            while let Some(token) = st.reactor.pop_ready_batched() {
-                batch.push(token);
-            }
+            // ready when the tick began, plus this tick's readiness watches
+            // (batch_left was snapshotted for exactly those), and at its
+            // tail the timers due now. asyncio's _run_once appends an
+            // iteration's I/O callbacks behind the callbacks already in
+            // `_ready`, and the due timers behind those: so the batch runs
+            // first, then the transport events, then the timers.
+            st.reactor.take_batch(batch);
+            let timers = st.reactor.take_expired(batch);
             let graveyard = if st.net.has_graveyards() || st.reactor.has_graveyard() {
                 Some(take_graveyards(st))
             } else {
                 None
             };
-            (Ok(()), parked, events, graveyard, st.net.has_special_graveyards())
+            (Ok(()), parked, graveyard, st.net.has_special_graveyards(), timers)
         })?;
         drop(graveyard);
         poll_result?;
@@ -494,13 +503,7 @@ impl CoreLoop {
             let interrupted = unsafe { ffi::PyErr_CheckSignals() != 0 };
             if interrupted {
                 let err = PyErr::fetch(py);
-                if !batch.is_empty() {
-                    self.state.with(|st| {
-                        for token in batch.drain(..).rev() {
-                            st.reactor.unpop_ready(token);
-                        }
-                    })?;
-                }
+                self.hand_back(batch, timers)?;
                 // The transport events too: dropped here, they took their
                 // payloads and teardowns with them -- and a caller that
                 // runs the loop again after a KeyboardInterrupt (asyncio.run
@@ -512,29 +515,92 @@ impl CoreLoop {
         }
 
         // Phase 3: ready-callback batch (R-054). A fatal error
-        // (KeyboardInterrupt/SystemExit from a callback) returns the
-        // undispatched tail to the queue front -- and this tick's transport
-        // events, which have not run yet, to theirs -- so nothing is lost
-        // and FIFO order holds across the unwind.
+        // (KeyboardInterrupt/SystemExit from a callback) hands the
+        // undispatched rest back -- callbacks to the ready queue, timers to
+        // theirs -- and this tick's transport events, which have not run
+        // yet, to theirs, so nothing is lost and FIFO order holds across
+        // the unwind.
+        if let Err(err) = self.run_handles(py, batch, batch.len() - timers, scratch) {
+            self.hand_back(batch, timers)?;
+            self.requeue_events(events)?;
+            return Err(err);
+        }
+
+        // Phase 4: the protocol callbacks of this tick's transport events,
+        // then the timers due -- asyncio's _run_once order -- then, when
+        // events fired, flush the writes this tick corked (same tick,
+        // R-035) and dispatch the teardowns that flush produced. Anything
+        // they schedule runs next tick, as in asyncio.
+        let had_events = !events.is_empty();
+        if had_events {
+            if let Err(err) = net::dispatch_events(py, slf, events) {
+                self.hand_back(batch, timers)?;
+                return Err(err);
+            }
+        }
+        if timers > 0 {
+            self.run_timers(py, batch, timers, scratch)?;
+        }
+        // Let the shared context snapshot go once nothing pending uses it.
+        self.snaps.trim(py);
+        if had_events {
+            self.flush_corked(py, events)?;
+            self.drain_graveyards(py)?;
+            if !events.is_empty() {
+                net::dispatch_events(py, slf, events)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The tick's timer phase: [`run_handles`](Self::run_handles) over the
+    /// `timers` expired timers left in `batch`. Out of line so that the
+    /// dispatch loop inlines into the tick once, for the ready batch, which
+    /// runs every tick; a second inlined copy kept the loop out of line
+    /// instead, at a call frame and a thread-local lookup per tick.
+    #[inline(never)]
+    fn run_timers(
+        &self,
+        py: Python<'_>,
+        batch: &mut VecDeque<HandleRef>,
+        timers: usize,
+        scratch: &mut Scratch,
+    ) -> PyResult<()> {
+        if let Err(err) = self.run_handles(py, batch, timers, scratch) {
+            self.hand_back(batch, batch.len())?;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Dispatch the first `n` handles of `batch`, releasing each as it goes.
+    /// A fatal error stops it with the rest still in `batch`, for the
+    /// caller to hand back (`hand_back`).
+    #[inline(always)]
+    fn run_handles(
+        &self,
+        py: Python<'_>,
+        batch: &mut VecDeque<HandleRef>,
+        n: usize,
+        scratch: &mut Scratch,
+    ) -> PyResult<()> {
         let debug = self.debug.load(Ordering::Relaxed);
-        let mut fatal: Option<(usize, PyErr)> = None;
-        for (idx, token) in batch.iter().enumerate() {
+        for _ in 0..n {
+            let Some(token) = batch.pop_front() else { break };
             let started = debug.then(std::time::Instant::now);
-            match run_handle(py, token.get()) {
-                Ok(DispatchOutcome::Done) => {}
+            let fatal = match run_handle(py, token.get(), scratch) {
+                Ok(DispatchOutcome::Done) => None,
+                // A fatal raise from the hook unwinds exactly like one from
+                // the callback itself.
                 Ok(DispatchOutcome::Failed(err)) => {
-                    // A fatal raise from the hook unwinds exactly like
-                    // one from the callback itself: the undispatched
-                    // tail goes back to the queue front below.
-                    if let Err(e) = self.report_failure(py, token.0.bind(py).as_any(), err) {
-                        fatal = Some((idx, e));
-                        break;
-                    }
+                    self.report_failure(py, token.0.bind(py).as_any(), err).err()
                 }
-                Err(e) => {
-                    fatal = Some((idx, e));
-                    break;
-                }
+                Err(e) => Some(e),
+            };
+            if let Some(err) = fatal {
+                // This callback ran (and raised).
+                release_token(py, token);
+                return Err(err);
             }
             if let Some(started) = started {
                 let elapsed = started.elapsed();
@@ -554,50 +620,46 @@ impl CoreLoop {
             // before: CPython 3.11 counts a late free against the next
             // gen-0 trigger and promotes the survivors, so the recursive
             // task_fib ran 16% more young and 33% more full collections
-            // (-24% throughput) until this moved here. (After the hooks
+            // (-24% throughput) until this moved here. The handle itself
+            // goes too: popping each token, rather than iterating the batch
+            // and draining it afterwards, is also the cheaper walk for the
+            // one-callback ticks a coroutine chain runs on. (After the hooks
             // above: the slow-callback report formats the callback.)
-            token.get().release_after_dispatch(py);
-        }
-        if let Some((idx, err)) = fatal {
-            // idx ran (and raised); everything after it goes back.
-            if idx + 1 < batch.len() {
-                self.state.with(|st| {
-                    for token in batch.drain(idx + 1..).rev() {
-                        st.reactor.unpop_ready(token);
-                    }
-                })?;
-            }
-            release_batch(py, batch);
-            self.requeue_events(events)?;
-            return Err(err);
-        }
-        release_batch(py, batch);
-
-        // Phases 4-6 only exist when transport events fired: dispatch the
-        // protocol callbacks, flush the writes this tick corked (same tick,
-        // R-035), then dispatch the teardowns that flush produced. Anything
-        // they schedule runs next tick, as in asyncio.
-        if !events.is_empty() {
-            net::dispatch_events(py, slf, events)?;
-            let events = self.flush_corked(py)?;
-            self.drain_graveyards(py)?;
-            if !events.is_empty() {
-                net::dispatch_events(py, slf, events)?;
-            }
+            release_token(py, token);
         }
         Ok(())
     }
 
+    /// Hand back what an unwind left in `batch` undispatched: the expired
+    /// timers at its tail (`timers` of them) to the front of theirs, the
+    /// rest to the ready queue's front, so the next tick runs both in
+    /// their original order.
+    fn hand_back(&self, batch: &mut VecDeque<HandleRef>, timers: usize) -> PyResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.state.with(|st| {
+            let split = batch.len() - timers.min(batch.len());
+            for t in batch.drain(split..).rev() {
+                st.reactor.unpop_expired(t);
+            }
+            for t in batch.drain(..).rev() {
+                st.reactor.unpop_ready(t);
+            }
+        })
+    }
+
     /// Put transport events this tick took but did not dispatch back at
     /// the FRONT of the queue (ahead of any a callback produced since), so
-    /// the next tick delivers them in their original order.
-    fn requeue_events(&self, events: Vec<NetEvent>) -> PyResult<()> {
+    /// the next tick delivers them in their original order. Leaves
+    /// `events` empty.
+    fn requeue_events(&self, events: &mut Vec<NetEvent>) -> PyResult<()> {
         if events.is_empty() {
             return Ok(());
         }
         self.with_net(|net, _| {
             let mut later = std::mem::take(&mut net.events);
-            net.events = events;
+            net.events = std::mem::take(events);
             net.events.append(&mut later);
         })
     }
@@ -614,12 +676,39 @@ impl CoreLoop {
 /// "am I attached?" probe (a `__tls_get_addr` call in a cdylib) buys
 /// nothing here.
 #[inline]
-fn release_batch(py: Python<'_>, batch: &mut Vec<HandleRef>) {
+fn release_batch(py: Python<'_>, batch: &mut VecDeque<HandleRef>) {
     for token in batch.drain(..) {
-        token.get().release_after_dispatch(py);
-        // SAFETY: attached (see above); into_ptr transfers our reference.
-        unsafe { ffi::Py_DECREF(token.into_ptr()) };
+        release_token(py, token);
     }
+}
+
+/// [`release_batch`] for one token.
+#[inline]
+fn release_token(py: Python<'_>, token: HandleRef) {
+    token.get().release_after_dispatch(py);
+    // SAFETY: attached (see `release_batch`); into_ptr transfers our reference.
+    unsafe { ffi::Py_DECREF(token.into_ptr()) };
+}
+
+/// `make_handle`'s debug-mode work, out of line (it is never on the hot
+/// path): asyncio's `_check_callback`, and its `_source_traceback`. No
+/// frame is pushed for the native call, so extract_stack()'s default --
+/// its caller's caller -- is the Python code that called call_soon & co,
+/// exactly the frame asyncio trims its own scheduling frames down to.
+#[cold]
+#[inline(never)]
+fn debug_checks(py: Python<'_>, callback: &Bound<'_, PyAny>, method: &str) -> PyResult<Option<Py<PyAny>>> {
+    if !callback.is_callable() {
+        return Err(PyTypeError::new_err(format!(
+            "a callable object was expected by {method}(), got {}",
+            callback.repr()?
+        )));
+    }
+    if is_coroutine_function(py, callback) {
+        return Err(PyTypeError::new_err(format!("coroutines cannot be used with {method}()")));
+    }
+    let tb = py.import(intern!(py, "asyncio.format_helpers"))?.call_method0(intern!(py, "extract_stack"))?;
+    Ok(Some(tb.unbind()))
 }
 
 /// What the tick moves out of the cell to drop. `graveyard_sockets` and
@@ -720,6 +809,7 @@ impl CoreLoop {
                 completions_scratch: Vec::with_capacity(512),
             }),
             xqueue,
+            snaps: SnapCache::default(),
             waker,
             timer_cancels,
             closed: AtomicBool::new(false),
@@ -745,9 +835,13 @@ impl CoreLoop {
         let this = slf.get();
         this.check_closed()?;
         let guard = this.state.claim()?;
-        let mut batch: Vec<HandleRef> = Vec::with_capacity(cadeloop_core::ready::INITIAL_BATCH_CAPACITY);
+        // The reactor's spare dispatch buffer, lent for this run: it and the
+        // ready queue trade places every tick (Reactor::take_batch).
+        let mut batch: VecDeque<HandleRef> = this.state.with(|st| st.reactor.take_spare())?;
+        let mut events: Vec<NetEvent> = Vec::new();
+        let mut scratch = Scratch::default();
         let result = loop {
-            match this.tick(slf, py, &mut batch) {
+            match this.tick(slf, py, &mut batch, &mut events, &mut scratch) {
                 Err(e) => break Err(e),
                 Ok(()) => {
                     if this.stopping.load(Ordering::Acquire) {
@@ -757,6 +851,14 @@ impl CoreLoop {
             }
         };
         this.stopping.store(false, Ordering::Release);
+        // Every tick, its unwind paths included, leaves the batch empty; a
+        // straggler is released here, outside the cell, so the buffer goes
+        // back empty.
+        if !batch.is_empty() {
+            release_batch(py, &mut batch);
+        }
+        this.requeue_events(&mut events)?;
+        this.state.with(|st| st.reactor.put_spare(batch))?;
         drop(guard);
         result
     }
@@ -778,9 +880,24 @@ impl CoreLoop {
         if self.state.is_claimed() {
             return Err(PyRuntimeError::new_err("Cannot close a running event loop"));
         }
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Cancel what is still parked on a native HTTP connection before the
+        // teardown below drops it pending (net::http_parked). Done while the
+        // loop is open, so each one's callbacks are queued as usual -- and
+        // released below, unrun, with the rest of the pending work. That is
+        // what lets a parked handler's coroutine be finalized: dropped as
+        // it was, it and the future it awaited kept each other alive.
+        let parked = self.state.with(|st| net::http_parked(py, &st.net))?;
+        for p in &parked {
+            let _ = p.call_method0(py, intern!(py, "cancel"));
+        }
+        drop(parked);
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.snaps.clear(py);
         // R-122 "close with pending ops": tear down every live connection
         // and listener (cancels in-flight kernel ops), then drop all
         // pending work outside the cell.
@@ -1243,7 +1360,7 @@ impl CoreLoop {
     ) -> PyResult<()> {
         self.check_closed()?;
         let addr = addr.filter(|a| !a.is_none()).map(parse_addr_tuple).transpose()?;
-        self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))?
+        self.with_net(|net, reactor| net::udp_sendto(net, reactor.backend_mut(), did, data, addr))?
             .map_err(net::io_error)?;
         self.drain_graveyards(py)
     }
@@ -1372,6 +1489,14 @@ impl CoreLoop {
         let busy = self.with_net(|net, reactor| net::http_begin_shutdown(py, net, reactor.backend_mut()))?;
         self.drain_graveyards(py)?;
         Ok(busy)
+    }
+
+    /// Graceful shutdown, last phase (R-092): the eager request drivers
+    /// still in flight, which the facade cancels along with the tasks the
+    /// application left running (`asyncio.all_tasks()` does not list them).
+    /// Each has `cancel()`, `done()` and `add_done_callback()`.
+    fn http_request_drivers(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.with_net(|net, _| net::http_request_drivers(py, net))
     }
 
     /// R-060 latency mode: when set, HTTP response bytes go on the wire
@@ -1607,8 +1732,9 @@ impl CoreLoop {
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle =
-            self.make_handle(py, &callback, CallArgs::from_tuple(&args), None, "add_reader")?.persistent();
+        let handle = self
+            .make_handle(py, &callback, CallArgs::from_tuple(&args), None, "add_reader")?
+            .persistent(py)?;
         let handle = Py::new(py, handle)?;
         let token: Py<Handle> = handle.clone_ref(py);
         let sock = fd as RawSocket;
@@ -1679,8 +1805,9 @@ impl CoreLoop {
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Py<Handle>> {
         self.check_closed()?;
-        let handle =
-            self.make_handle(py, &callback, CallArgs::from_tuple(&args), None, "add_writer")?.persistent();
+        let handle = self
+            .make_handle(py, &callback, CallArgs::from_tuple(&args), None, "add_writer")?
+            .persistent(py)?;
         let handle = Py::new(py, handle)?;
         let token: Py<Handle> = handle.clone_ref(py);
         let sock = fd as RawSocket;
@@ -1815,6 +1942,11 @@ impl CoreLoop {
                 visit.call(obj)?;
             }
         }
+        // The cached snapshot's variables may reference the loop (a
+        // ContextVar holding it, say): report it, so that cycle is visible.
+        if let Some(snap) = self.snaps.peek() {
+            visit.call(snap)?;
+        }
         if let Some(st) = self.state.peek_for_gc() {
             for h in st.reactor.pending_iter() {
                 h.get().visit_refs(&visit)?;
@@ -1833,6 +1965,7 @@ impl CoreLoop {
         if self.state.is_claimed() {
             return;
         }
+        self.snaps.clear(py);
         let Ok(handles) = self.state.with(|st| {
             let mut out: Vec<HandleRef> = st.reactor.clear_pending();
             out.extend(st.net.readers.drain().map(|(_, h)| HandleRef(h)));

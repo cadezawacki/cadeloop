@@ -23,7 +23,7 @@ One reactor thread per loop == the thread that called `run_forever`. Each
 tick:
 
 1. **GIL held**: drain cross-thread queue, absorb timer cancellations,
-   pop expired timers into the ready queue, compute poll timeout
+   collect expired timers, compute poll timeout
    (0 if ready work exists; else min(next deadline, 100ms) — R-030).
 2. **GIL released** (the only release point): backend poll —
    spin-then-park (R-060), then `GetQueuedCompletionStatusEx` batch 256.
@@ -31,8 +31,12 @@ tick:
    completions -- readiness watches the poll reported join this tick's
    batch -- then dispatch every callback that was ready when the tick
    began (R-054; asyncio's `_run_once` snapshot, so `stop()` takes effect
-   after the whole iteration), each via a direct vectorcall inside
-   `PyContext_Enter`/`Exit`.
+   after the whole iteration), then the transport events' protocol
+   callbacks, then the timers that came due: asyncio's order, previous
+   callbacks, I/O, timers (ADR-32). Callbacks run via a direct vectorcall
+   inside `PyContext_Enter`/`Exit`; a transport event is routed when it is
+   dispatched, so it sees what the iteration's earlier callbacks did to
+   its transport.
 
 The loop clock is `CLOCK_MONOTONIC` -- `time.monotonic()`'s clock -- on
 Linux, and aligned to it at loop creation elsewhere (R-061). The reactor

@@ -7,6 +7,8 @@ import os
 import signal
 import socket
 import sys
+import threading
+import time
 
 import cadeloop
 import pytest
@@ -269,6 +271,72 @@ def test_write_backpressure_pause_resume(loop):
     loop.run_until_complete(main())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="IOCP completes a send whole; partial progress is the epoll backend's"
+)
+def test_write_then_drain_both_ways_does_not_deadlock(loop):
+    """Both ends write, wait out their own pause, and only then read --
+    the shape of drain()-before-read code on each side of a connection.
+    asyncio counts as buffered only what the kernel refused, so with a
+    write just past what the socket buffers take neither side pauses.
+    The epoll backend kept a partly written gather parked until every
+    byte was out and counted all of it as buffered meanwhile: both sides
+    paused, each waiting for the other to read."""
+
+    class Side(asyncio.Protocol):
+        def __init__(self, want):
+            self.want = want
+            self.got = 0
+            self.writable = loop.create_future()
+            self.writable.set_result(None)
+            self.done = loop.create_future()
+
+        def connection_made(self, transport):
+            transport.pause_reading()  # read only once our write is through
+
+        def pause_writing(self):
+            self.writable = loop.create_future()
+
+        def resume_writing(self):
+            if not self.writable.done():
+                self.writable.set_result(None)
+
+        def data_received(self, data):
+            self.got += len(data)
+            if self.got >= self.want and not self.done.done():
+                self.done.set_result(None)
+
+    def kernel_takes():
+        # What the kernel accepts of one large send on such a pair.
+        probe, peer = socket.socketpair()
+        probe.setblocking(False)
+        try:
+            return probe.send(b"x" * (8 << 20))
+        finally:
+            probe.close()
+            peer.close()
+
+    async def run(transport, side, size):
+        transport.write(b"y" * size)
+        assert transport.get_write_buffer_size() < size, "bytes the kernel took still count as buffered"
+        await side.writable  # drain()
+        transport.resume_reading()
+        await side.done
+
+    async def main():
+        size = kernel_takes() + 32 * 1024  # 32 KiB left over: under the 64 KiB high-water mark
+        a, b = socket.socketpair()
+        ta, pa = await loop.create_connection(lambda: Side(size), sock=a)
+        tb, pb = await loop.create_connection(lambda: Side(size), sock=b)
+        try:
+            await asyncio.wait_for(asyncio.gather(run(ta, pa, size), run(tb, pb, size)), 5)
+        finally:
+            ta.abort()
+            tb.abort()
+
+    loop.run_until_complete(main())
+
+
 def test_abort_delivers_connection_lost(loop):
     async def main():
         done = loop.create_future()
@@ -283,6 +351,52 @@ def test_abort_delivers_connection_lost(loop):
         await done  # server side saw the close
         server.close()
         await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_transport_state_reads_from_another_thread(loop):
+    """is_closing() and get_write_buffer_size() from a thread other than
+    the loop's -- the usual guard before call_soon_threadsafe(t.write, ..)
+    -- raised RuntimeError whenever the loop was parked in its poll: both
+    entered the loop state, which refuses other threads then. asyncio
+    answers both with an attribute read from any thread."""
+
+    async def main():
+        a, peer = socket.socketpair()
+        t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
+        t.write(b"x" * (8 << 20))  # the peer never reads: most of it stays queued
+        await asyncio.sleep(0.01)
+        queued = t.get_write_buffer_size()
+        assert queued > 0
+        seen = []
+
+        def probe():
+            for _ in range(10):
+                try:
+                    seen.append((t.is_closing(), t.get_write_buffer_size()))
+                except Exception as exc:
+                    seen.append(exc)
+                time.sleep(0.002)
+
+        async def from_another_thread():
+            seen.clear()
+            th = threading.Thread(target=probe)
+            th.start()
+            while th.is_alive():
+                await asyncio.sleep(0.01)  # parked while the thread asks
+            th.join()
+            return set(seen)
+
+        try:
+            assert await from_another_thread() == {(False, queued)}
+            t.close()  # draining: closing, the queue still there
+            assert await from_another_thread() == {(True, queued)}
+            t.abort()
+            assert await from_another_thread() == {(True, 0)}
+        finally:
+            t.abort()
+            peer.close()
 
     loop.run_until_complete(main())
 
@@ -618,6 +732,121 @@ def test_happy_eyeballs_falls_through_bad_address(loop):
         await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+def _unclosed_peers(lsock):
+    """Accept every connection queued on `lsock` and count those whose
+    client end is still open: no EOF within a short bound."""
+    lsock.settimeout(0.2)
+    still_open = 0
+    while True:
+        try:
+            conn, _ = lsock.accept()
+        except (socket.timeout, BlockingIOError):
+            return still_open
+        with conn:
+            conn.settimeout(1.0)
+            try:
+                if conn.recv(1) != b"":
+                    still_open += 1
+            except socket.timeout:
+                still_open += 1
+            except ConnectionResetError:
+                pass
+
+
+def test_cancelled_connect_closes_a_socket_that_already_connected(loop):
+    """A create_connection() cancelled after its connect had completed --
+    the future already holding the connected descriptor, the task not yet
+    resumed, which is what a timeout firing in the iteration the connect
+    finishes does -- leaked the descriptor: the cancellation path only
+    cancelled the (finished) native op. The connection stayed open for
+    good, and the peer never saw it close."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(16)
+    port = lsock.getsockname()[1]
+
+    async def one():
+        task = loop.create_task(loop.create_connection(asyncio.Protocol, "127.0.0.1", port))
+        cancelled = []
+
+        def poll():
+            # Every iteration, ahead of the task's own wakeup: cancel the
+            # moment the future it awaits is done but before it resumes.
+            waiter = task._fut_waiter
+            if task.done():
+                return
+            if waiter is not None and waiter.done():
+                cancelled.append(task.cancel())
+                return
+            loop.call_soon(poll)
+
+        loop.call_soon(poll)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled == [True]
+
+    async def main():
+        for _ in range(5):
+            await one()
+
+    try:
+        loop.run_until_complete(main())
+        assert _unclosed_peers(lsock) == 0
+    finally:
+        lsock.close()
+
+
+def test_cancelled_happy_eyeballs_connect_closes_what_it_connected(loop):
+    """Happy Eyeballs runs each attempt in a task of its own and returns
+    the winner's descriptor only once every attempt has finished. A
+    cancellation of the whole call in between dropped the winner the race
+    had already picked (and a losing attempt cancelled after it connected
+    dropped its own): the connection stayed open for good. Whatever the
+    call does not hand back must be closed, wherever the cancellation
+    lands -- swept here across the iterations that follow the connect."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(64)
+    addr = lsock.getsockname()
+
+    async def fake_getaddrinfo(host, port, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", addr)]
+
+    async def one(cancel_after):
+        task = loop.create_task(
+            loop.create_connection(asyncio.Protocol, "he.test", addr[1], happy_eyeballs_delay=0)
+        )
+        # Once the connect is in flight, stall the loop so that it has
+        # completed by the next poll, then cancel `cancel_after`
+        # iterations later.
+        for _ in range(200):
+            if task.done() or loop.stats()["ops_by_target"]["connect"]:
+                break
+            await asyncio.sleep(0)
+        time.sleep(0.05)  # noqa: ASYNC251 -- blocking the loop is the point
+        for _ in range(cancel_after):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            transport, _ = await task
+        except asyncio.CancelledError:
+            return False
+        transport.close()
+        return True
+
+    async def main():
+        loop.getaddrinfo = fake_getaddrinfo
+        return [await one(k) for k in range(10)]
+
+    try:
+        outcomes = loop.run_until_complete(main())
+        # The sweep must reach both sides of the race's end.
+        assert False in outcomes and True in outcomes, outcomes
+        assert _unclosed_peers(lsock) == 0
+    finally:
+        lsock.close()
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available")
@@ -1147,6 +1376,92 @@ def test_loop_sendfile_offset_count(loop, tmp_path):
         await asyncio.wait_for(done, 10)
         server.close()
         assert bytes(received) == (bytes(range(256)) * 16)[100:1100]
+
+    loop.run_until_complete(main())
+
+
+def _drain_into(sock, out):
+    """Reader-thread body: append everything `sock` receives, until EOF."""
+    sock.setblocking(True)
+    while True:
+        data = sock.recv(1 << 20)
+        if not data:
+            return
+        out += data
+
+
+@pytest.mark.skipif(not hasattr(os, "sendfile"), reason="native sendfile path (os.sendfile)")
+def test_overlapping_sendfile_is_refused(loop, tmp_path):
+    """A second loop.sendfile() on a transport whose first was still
+    running was accepted. Both transfers parked on the descriptor's one
+    writer watch, the second displacing the first -- which then waited
+    forever -- and whichever finished first re-enabled write() under the
+    other. asyncio refuses the overlap, and so does cadeloop now."""
+    first_file = tmp_path / "a.bin"
+    first_file.write_bytes(b"A" * (4 << 20))
+    second_file = tmp_path / "b.bin"
+    second_file.write_bytes(b"B" * 1024)
+
+    async def main():
+        a, peer = socket.socketpair()
+        t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
+        got = bytearray()
+        reader = threading.Thread(target=_drain_into, args=(peer, got))
+        with open(first_file, "rb") as fa, open(second_file, "rb") as fb:
+            first = asyncio.ensure_future(loop.sendfile(t, fa))
+            await asyncio.sleep(0.05)  # peer not reading yet: the transfer stalls
+            assert not first.done()
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await asyncio.wait_for(loop.sendfile(t, fb), 2)
+            # The refused call left the running transfer's claim alone.
+            with pytest.raises(RuntimeError, match="sendfile is in progress"):
+                t.write(b"x")
+            reader.start()
+            try:
+                assert await asyncio.wait_for(first, 10) == 4 << 20
+            finally:
+                t.close()
+                reader.join(5)
+                peer.close()
+        assert bytes(got) == b"A" * (4 << 20)
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(os, "sendfile"), reason="native sendfile path (os.sendfile)")
+def test_sendfile_survives_its_writer_watch_being_replaced(loop, tmp_path):
+    """A native transfer that finds the socket full waits on a writer watch
+    of the transport's descriptor. Another add_writer() on that descriptor
+    replaces -- and so cancels -- the watch, after which nothing resolved
+    the wait: the transfer re-checked it forever and never sent another
+    byte. It now notices the cancelled watch and retries the send."""
+    payload = tmp_path / "big.bin"
+    payload.write_bytes(b"x" * (4 << 20))
+
+    async def main():
+        a, peer = socket.socketpair()
+        t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
+        fd = t.fileno()
+        got = bytearray()
+        reader = threading.Thread(target=_drain_into, args=(peer, got))
+        with open(payload, "rb") as f:
+            task = asyncio.ensure_future(loop.sendfile(t, f))
+            # The peer is not reading, so the transfer parks on its watch;
+            # take the watch away as a competing add_writer() does.
+            for _ in range(500):
+                if loop._core.remove_writer(fd):
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                pytest.fail("the transfer never parked on a writer watch")
+            reader.start()
+            try:
+                assert await asyncio.wait_for(task, 5) == 4 << 20
+            finally:
+                t.close()
+                reader.join(5)
+                peer.close()
+        assert len(got) == 4 << 20
 
     loop.run_until_complete(main())
 

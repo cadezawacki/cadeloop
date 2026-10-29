@@ -2165,3 +2165,345 @@ def test_sendfile_falls_back_when_os_sendfile_cannot_read_the_file(cade_loop):
         await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+# ---- callback contexts ---------------------------------------------------- #
+# cadeloop keeps no copy of an empty context in the queue: a callback
+# scheduled from one runs in an empty context of its own at dispatch. These
+# pin down that nothing about it is observable.
+
+_CTX_VAR = __import__("contextvars").ContextVar("_CTX_VAR", default="unset")
+
+
+def test_a_callbacks_context_changes_stay_its_own(loop):
+    """Every callback runs in its own copy of the scheduler's context: a
+    set() in one is invisible to the next, whether the scheduling context
+    was empty or not, and a value set before scheduling is visible."""
+    import contextvars
+
+    out = []
+
+    def setter():
+        out.append(_CTX_VAR.get())
+        _CTX_VAR.set("set-by-callback")
+
+    loop.call_soon(setter)
+    loop.call_soon(lambda: out.append(_CTX_VAR.get()))
+    loop.call_later(0, setter)
+    loop.call_later(0, lambda: out.append(_CTX_VAR.get()))
+    ctx = contextvars.copy_context()
+    ctx.run(_CTX_VAR.set, "scheduler")
+    ctx.run(loop.call_soon, setter)
+    ctx.run(loop.call_soon, lambda: out.append(_CTX_VAR.get()))
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    assert out == ["unset", "unset", "scheduler", "scheduler", "unset", "unset"]
+
+
+def test_call_soon_inside_a_callback_copies_that_callbacks_context(loop):
+    out = []
+
+    def parent():
+        _CTX_VAR.set("parent")
+        loop.call_soon(lambda: out.append(_CTX_VAR.get()))
+
+    loop.call_soon(parent)
+    loop.call_soon(lambda: out.append(_CTX_VAR.get()))
+    loop.call_later(0.05, loop.stop)
+    loop.run_forever()
+    assert sorted(out) == ["parent", "unset"]
+
+
+def test_a_reader_keeps_one_context_across_invocations(loop):
+    """asyncio runs every callback of one watch in the context its handle
+    copied once, so a value a reader sets is still there next time."""
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    seen = []
+
+    def on_read():
+        a.recv(16)
+        seen.append(_CTX_VAR.get())
+        _CTX_VAR.set(f"set-{len(seen)}")
+        if len(seen) == 1:
+            b.send(b"y")
+        else:
+            loop.remove_reader(a)
+            loop.stop()
+
+    try:
+        loop.add_reader(a, on_read)
+        b.send(b"x")
+        loop.call_later(5, loop.stop)
+        loop.run_forever()
+    finally:
+        a.close()
+        b.close()
+    assert seen == ["unset", "set-1"]
+
+
+def test_call_soon_threadsafe_carries_the_producer_threads_context(loop):
+    out = []
+
+    def producer(value):
+        if value is not None:
+            _CTX_VAR.set(value)
+        loop.call_soon_threadsafe(lambda: out.append(_CTX_VAR.get()))
+
+    for value in (None, "thread"):
+        t = __import__("threading").Thread(target=producer, args=(value,))
+        t.start()
+        t.join()
+    loop.call_later(0.05, loop.stop)
+    loop.run_forever()
+    assert out == ["unset", "thread"]
+
+
+# ---- one iteration: its order, and state changes made earlier in it ------- #
+#
+# A poll can report a transport's data in the iteration in which an earlier
+# callback closes, pauses or re-protocols that transport, or a timer comes
+# due. asyncio's _run_once runs the previous iteration's callbacks, then
+# the I/O callbacks the poll queued, then the timers due; and an I/O
+# callback acts on its transport as it is when the callback runs.
+
+
+class _Recorder(asyncio.Protocol):
+    def __init__(self, log, name="p"):
+        self.log = log
+        self.name = name
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def data_received(self, data):
+        self.log.append((self.name, "data", data))
+
+    def eof_received(self):
+        self.log.append((self.name, "eof"))
+        return True
+
+    def connection_lost(self, exc):
+        self.log.append((self.name, "lost"))
+
+
+def _in_the_iteration_that_sees(loop, cause, then):
+    """Run `cause()` (which makes our socket readable or a timer due) and
+    queue `then` so that it runs in the very iteration whose poll sees that
+    -- as a callback the previous iteration queued, so ahead of the I/O."""
+
+    def arm():
+        cause()
+        time.sleep(0.05)  # the bytes / FIN arrive, timers come due
+        loop.call_soon(then)
+
+    loop.call_soon(arm)
+
+
+def test_an_iterations_io_callbacks_run_before_its_due_timers(loop):
+    """Running due timers first let an idle timeout close a connection whose
+    next request had already arrived -- uvicorn's keep-alive timeout lost
+    that race every time, where asyncio and uvloop serve the request."""
+    order = []
+
+    class P(asyncio.Protocol):
+        def data_received(self, data):
+            order.append("data_received")
+
+    async def main():
+        r, w = socket.socketpair()
+        a, peer = socket.socketpair()
+        r.setblocking(False)
+        transport, _ = await loop.create_connection(P, sock=a)
+        await asyncio.sleep(0.02)
+
+        def on_readable():
+            order.append("reader")
+            r.recv(100)
+
+        loop.add_reader(r, on_readable)
+        loop.call_later(0.01, order.append, "timer")
+
+        def cause():
+            w.send(b"x")
+            peer.send(b"y")
+
+        _in_the_iteration_that_sees(loop, cause, lambda: order.append("call_soon"))
+        await asyncio.sleep(0.2)
+        loop.remove_reader(r)
+        transport.close()
+        for s in (r, w, peer):
+            s.close()
+        await asyncio.sleep(0.01)
+
+    loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert order == ["call_soon", "reader", "data_received", "timer"]
+
+
+def test_data_wins_the_race_with_an_idle_timeout_due_in_its_iteration(loop):
+    log = []
+
+    class Idle(_Recorder):
+        def connection_made(self, transport):
+            super().connection_made(transport)
+            self.timer = asyncio.get_running_loop().call_later(0.1, self.timed_out)
+
+        def data_received(self, data):
+            super().data_received(data)
+            self.timer.cancel()
+
+        def timed_out(self):
+            self.log.append(("p", "timed out"))
+            self.transport.abort()
+
+    async def main():
+        a, peer = socket.socketpair()
+        transport, _ = await loop.create_connection(lambda: Idle(log), sock=a)
+        await asyncio.sleep(0.05)
+
+        def busy():  # keeps the loop past the deadline as the request lands
+            peer.send(b"request")
+            time.sleep(0.1)
+
+        loop.call_soon(busy)
+        await asyncio.sleep(0.15)
+        alive = not transport.is_closing()
+        transport.close()
+        await asyncio.sleep(0.01)
+        peer.close()
+        return alive
+
+    assert loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert log == [("p", "data", b"request"), ("p", "lost")]
+
+
+@pytest.mark.parametrize("arrives", ["data", "eof"])
+@pytest.mark.parametrize("action", ["close", "abort"])
+def test_nothing_is_received_after_close_or_abort_in_the_same_iteration(loop, action, arrives):
+    log = []
+
+    async def main():
+        a, peer = socket.socketpair()
+        transport, _ = await loop.create_connection(lambda: _Recorder(log), sock=a)
+        await asyncio.sleep(0.02)
+
+        def cause():
+            if arrives == "data":
+                peer.send(b"late")
+            else:
+                peer.shutdown(socket.SHUT_WR)
+
+        _in_the_iteration_that_sees(loop, cause, getattr(transport, action))
+        await asyncio.sleep(0.2)
+        peer.close()
+
+    loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert log == [("p", "lost")]
+
+
+def test_data_and_eof_arriving_as_reading_pauses_wait_for_resume(loop):
+    log = []
+
+    async def main():
+        a, peer = socket.socketpair()
+        transport, _ = await loop.create_connection(lambda: _Recorder(log), sock=a)
+        await asyncio.sleep(0.02)
+
+        def cause():
+            peer.send(b"held")
+            peer.shutdown(socket.SHUT_WR)
+
+        _in_the_iteration_that_sees(loop, cause, transport.pause_reading)
+        await asyncio.sleep(0.2)
+        log.append("resume")
+        transport.resume_reading()
+        await asyncio.sleep(0.1)
+        transport.close()
+        peer.close()
+        await asyncio.sleep(0.01)
+
+    loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert log == ["resume", ("p", "data", b"held"), ("p", "eof"), ("p", "lost")]
+
+
+def test_data_arriving_as_the_protocol_is_swapped_goes_to_the_new_one(loop):
+    log = []
+
+    async def main():
+        a, peer = socket.socketpair()
+        transport, old = await loop.create_connection(lambda: _Recorder(log, "old"), sock=a)
+        await asyncio.sleep(0.02)
+        new = _Recorder(log, "new")
+        new.connection_made(transport)
+        _in_the_iteration_that_sees(loop, lambda: peer.send(b"hello"), lambda: transport.set_protocol(new))
+        await asyncio.sleep(0.2)
+        transport.close()
+        peer.close()
+        await asyncio.sleep(0.01)
+
+    loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert log == [("new", "data", b"hello"), ("new", "lost")]
+
+
+@pytest.mark.parametrize("action", ["close", "abort"])
+def test_no_datagram_is_received_after_close_or_abort_in_the_same_iteration(loop, action):
+    log = []
+
+    class U(asyncio.DatagramProtocol):
+        def datagram_received(self, data, addr):
+            log.append(("datagram", data))
+
+        def connection_lost(self, exc):
+            log.append("lost")
+
+    async def main():
+        transport, _ = await loop.create_datagram_endpoint(U, local_addr=("127.0.0.1", 0))
+        addr = transport.get_extra_info("sockname")
+        peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        await asyncio.sleep(0.02)
+        _in_the_iteration_that_sees(loop, lambda: peer.sendto(b"late", addr), getattr(transport, action))
+        await asyncio.sleep(0.2)
+        peer.close()
+
+    loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert log == ["lost"]
+
+
+def test_resume_writing_does_not_follow_abort_in_the_same_iteration(loop):
+    log = []
+
+    class W(_Recorder):
+        def pause_writing(self):
+            self.log.append("pause_writing")
+
+        def resume_writing(self):
+            self.log.append("resume_writing")
+
+    def drain(sock):
+        while True:
+            try:
+                if not sock.recv(1 << 20):
+                    return
+            except BlockingIOError:
+                return
+
+    async def main():
+        a, peer = socket.socketpair()
+        peer.setblocking(False)
+        transport, _ = await loop.create_connection(lambda: W(log), sock=a)
+        # More than the socket pair buffers, less than a second fill: the
+        # rest parks, past the high-water mark, and one drain of the peer
+        # lets all of it go.
+        transport.write(b"x" * (400 * 1024))
+        await asyncio.sleep(0.05)
+        # Draining the peer lets the parked send finish -- the queue drops
+        # under the low-water mark -- in the iteration that runs abort().
+        _in_the_iteration_that_sees(loop, lambda: drain(peer), transport.abort)
+        await asyncio.sleep(0.2)
+        peer.close()
+
+    loop.run_until_complete(asyncio.wait_for(main(), 10))
+    assert "resume_writing" not in log, log
+    assert log[-1] == ("p", "lost")
+    if sys.platform.startswith("linux"):
+        assert log[0] == "pause_writing"  # the scenario really happened

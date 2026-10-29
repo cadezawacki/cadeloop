@@ -61,6 +61,15 @@ impl<T> ReadyQueue<T> {
         self.queue.push_front(item);
     }
 
+    /// Exchange the queue's contents with `other`, which must be empty:
+    /// takes everything queued in O(1), and leaves `other`'s allocation
+    /// behind for whatever is queued next (see `Reactor::take_batch`).
+    #[inline]
+    pub fn swap_with(&mut self, other: &mut VecDeque<T>) {
+        debug_assert!(other.is_empty());
+        std::mem::swap(&mut self.queue, other);
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.queue.len()

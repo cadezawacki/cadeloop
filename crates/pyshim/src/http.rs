@@ -224,6 +224,11 @@ pub(crate) struct WsConn {
     pub(crate) accepted: bool,
     /// Server sent (or queued) a close frame.
     pub(crate) closing: bool,
+    /// The application itself sent websocket.close. A send after that is
+    /// its own protocol error; `closing` for any other reason (the peer's
+    /// close frame, a protocol failure, the 1012 drain) is the connection
+    /// going away under it.
+    pub(crate) app_closed: bool,
     /// websocket.connect delivered to the app.
     pub(crate) connect_sent: bool,
     /// Client's Sec-WebSocket-Key (accept-key derivation at accept time).
@@ -450,10 +455,11 @@ pub(crate) const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 /// queued, the response parks on the connection instead and
 /// `finish_request` releases it once the last of them has been answered.
 /// Returns whether the caller should pump -- valid requests drained from
-/// the same buffer still get served ahead of the parked 400. Reading
-/// stops either way (neither caller re-posts a recv after an error): the
-/// parser is dead, so later bytes change nothing, and a second error
-/// from them must not displace the parked response.
+/// the same buffer still get served ahead of the parked 400. The parser
+/// is dead either way, so later bytes change nothing, and a second error
+/// from them must not displace the parked response: both callers keep
+/// reading while the 400 is parked (so a peer that leaves is still seen)
+/// but no longer parse what arrives.
 pub(crate) fn conn_parse_failed(
     py: Python<'_>,
     net: &mut NetState,
@@ -806,6 +812,15 @@ fn gone_message(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<Py<PyAny>
     }
 }
 
+/// The websocket.disconnect a WebSocket receive() waiter gets once there
+/// is nothing left to wait for: its connection already torn down (the code
+/// it closed with, when remembered) or past EOF (1006, as `HttpReceive`
+/// answers then).
+pub(crate) fn ws_gone_message(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<Py<PyAny>> {
+    let code = core.with_net(|net, _| net.recent_ws_close(tid))?.unwrap_or(1006);
+    ws_message_dict(py, WsMsg::Disconnect(code))
+}
+
 // --------------------------------------------------------------------- //
 // awaitables                                                            //
 // --------------------------------------------------------------------- //
@@ -837,6 +852,27 @@ pub(crate) fn completed(py: Python<'_>) -> &Py<CompletedAwaitable> {
 #[pyclass(module = "cadeloop._core")]
 pub struct ValueAwaitable {
     value: Option<Py<PyAny>>,
+    /// A message receive() took off its connection, kept as it is until
+    /// this is awaited, and converted then. receive() takes it when
+    /// called, not when awaited, so an awaitable dropped unawaited -- held
+    /// by a task cancelled before its first step: wait_for(receive(), 0),
+    /// a task group aborted in the same tick -- lost the message for good.
+    /// It now goes back where it came from instead.
+    taken: Option<Taken>,
+}
+
+/// See `ValueAwaitable::taken`.
+struct Taken {
+    core: Py<CoreLoop>,
+    tid: u64,
+    epoch: u64,
+    msg: TakenMsg,
+}
+
+enum TakenMsg {
+    Connect,
+    Ws(WsMsg),
+    Body(Vec<u8>),
 }
 
 #[pymethods]
@@ -848,17 +884,111 @@ impl ValueAwaitable {
         slf
     }
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        match self.value.take() {
-            Some(v) => Err(PyErr::from_value(
-                pyo3::exceptions::PyStopIteration::new_err((v,)).value(py).clone().into_any(),
-            )),
-            None => Err(PyRuntimeError::new_err("awaitable already consumed")),
+        let value = match (self.value.take(), self.taken.take()) {
+            (Some(v), _) => v,
+            (None, Some(t)) => t.msg.into_message(py)?,
+            (None, None) => return Err(PyRuntimeError::new_err("awaitable already consumed")),
+        };
+        Err(PyErr::from_value(
+            pyo3::exceptions::PyStopIteration::new_err((value,)).value(py).clone().into_any(),
+        ))
+    }
+}
+
+impl Drop for ValueAwaitable {
+    fn drop(&mut self) {
+        if let Some(taken) = self.taken.take() {
+            Python::attach(|py| taken.put_back(py));
+        }
+    }
+}
+
+impl TakenMsg {
+    fn into_message(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self {
+            TakenMsg::Connect => {
+                let d = PyDict::new(py);
+                d.set_item(intern!(py, "type"), intern!(py, "websocket.connect"))?;
+                Ok(d.into_any().unbind())
+            }
+            TakenMsg::Ws(m) => ws_message_dict(py, m),
+            TakenMsg::Body(b) => {
+                let msg = PyDict::new(py);
+                msg.set_item(intern!(py, "type"), intern!(py, "http.request"))?;
+                let body_obj = if b.is_empty() {
+                    EMPTY_BYTES.get_or_init(py, || PyBytes::new(py, b"").unbind()).bind(py).clone().into_any()
+                } else {
+                    PyBytes::new(py, &b).into_any()
+                };
+                msg.set_item(intern!(py, "body"), body_obj)?;
+                msg.set_item(intern!(py, "more_body"), false)?;
+                Ok(msg.into_any().unbind())
+            }
+        }
+    }
+}
+
+impl Taken {
+    /// Return an unawaited message to the connection it was taken from,
+    /// while that connection is still on the same request: to a receive()
+    /// that parked since -- made after the message left, it is the one
+    /// waiting for it -- or else back where it was (the front of the
+    /// inbox, the request body, the pending connect). Never from inside
+    /// the state cell, which refuses re-entry: the message is then lost,
+    /// as it always was.
+    fn put_back(self, py: Python<'_>) {
+        let Taken { core, tid, epoch, msg } = self;
+        let core = core.bind(py).get();
+        if let TakenMsg::Ws(m) = msg {
+            let _ = core.with_net(|net, reactor| {
+                let conn = net.http_conn_mut(tid).filter(|c| c.req_epoch == epoch);
+                let Some(w) = conn.and_then(|c| c.ws.as_mut()) else { return };
+                w.inbox_bytes += m.charge();
+                w.inbox.push_front(m);
+                // Each parked receive() is woken to take the front message
+                // (or re-park), as on any arrival.
+                if let Some(conn) = net.http_conn_mut(tid) {
+                    for fut in conn.take_recv_waiters() {
+                        net.events.push(net::NetEvent::WsWake { tid, fut });
+                    }
+                }
+                ws_sync_read_pause(py, net, reactor.backend_mut(), tid);
+            });
+            return;
+        }
+        let mut msg = Some(msg);
+        while let Some(m) = msg.take() {
+            let handed = core.with_net(|net, _| {
+                let conn = net.http_conn_mut(tid).filter(|c| c.req_epoch == epoch)?;
+                if let Some(waiter) = conn.recv_waiters.pop_front() {
+                    return Some((waiter, m)); // resolved below, out of the cell
+                }
+                match m {
+                    TakenMsg::Body(b) if conn.req_body.is_none() => conn.req_body = Some(b),
+                    TakenMsg::Connect => {
+                        if let Some(w) = conn.ws.as_mut() {
+                            w.connect_sent = false;
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            });
+            let Ok(Some((waiter, m))) = handed else { break };
+            let waiter = waiter.bind(py);
+            let done: bool =
+                waiter.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+            if done {
+                msg = Some(m); // a cancelled receive(): the next one, then
+            } else if let Ok(value) = m.into_message(py) {
+                let _ = waiter.call_method1(intern!(py, "set_result"), (value,));
+            }
         }
     }
 }
 
 pub(crate) fn value_awaitable(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    Ok(Py::new(py, ValueAwaitable { value: Some(value) })?.into_any())
+    Ok(Py::new(py, ValueAwaitable { value: Some(value), taken: None })?.into_any())
 }
 
 // --------------------------------------------------------------------- //
@@ -886,6 +1016,7 @@ impl HttpReceive {
             Wait(Py<PyAny>),
             WsConnect,
             Ws(WsMsg),
+            WsGone,
         }
         let r = core.with_net(|net, _| match net.http_conn_mut(self.tid) {
             // A receive() from a request that has already finished (the app
@@ -905,7 +1036,7 @@ impl HttpReceive {
                     ws.inbox_bytes = ws.inbox_bytes.saturating_sub(m.charge());
                     R::Ws(m)
                 } else if disconnected {
-                    R::Ws(WsMsg::Disconnect(1006))
+                    R::WsGone
                 } else {
                     R::Wait(pyloop)
                 }
@@ -918,43 +1049,40 @@ impl HttpReceive {
                 // complete POST).
                 if let Some(b) = conn.req_body.take() {
                     R::Body(b)
-                } else if conn.disconnected {
+                } else if conn.disconnected || conn.resp == RespPhase::Done {
+                    // ASGI: http.disconnect is what receive() returns
+                    // "after a response has been sent" too. Parking here
+                    // instead left an app that awaited it after its
+                    // response deadlocked against itself until the client
+                    // left -- and the connection's next request with it.
                     R::Disconnect
                 } else {
                     // Body already delivered: resolve on disconnect (or when
-                    // this request finishes) — Starlette's disconnect
+                    // the response completes) — Starlette's disconnect
                     // listeners await here.
                     R::Wait(conn.pyloop.clone_ref(py))
                 }
             }
         })?;
+        // What was taken off the connection stays restorable until awaited
+        // (`ValueAwaitable::taken`).
+        let taken = |msg: TakenMsg| -> PyResult<Py<PyAny>> {
+            let taken = Taken { core: self.core.clone_ref(py), tid: self.tid, epoch: self.epoch, msg };
+            Ok(Py::new(py, ValueAwaitable { value: None, taken: Some(taken) })?.into_any())
+        };
         match r {
             R::Disconnect => value_awaitable(py, gone_message(py, core, self.tid)?),
-            R::WsConnect => {
-                let d = PyDict::new(py);
-                d.set_item(intern!(py, "type"), intern!(py, "websocket.connect"))?;
-                value_awaitable(py, d.into_any().unbind())
-            }
+            R::WsGone => value_awaitable(py, ws_message_dict(py, WsMsg::Disconnect(1006))?),
+            R::WsConnect => taken(TakenMsg::Connect),
             R::Ws(m) => {
                 // A message just left the inbox, so the budget that
                 // suppressed reading may have freed up (R-087).
                 core.with_net(|net, reactor| {
                     ws_resume_reading(py, net, reactor.backend_mut(), self.tid);
                 })?;
-                value_awaitable(py, ws_message_dict(py, m)?)
+                taken(TakenMsg::Ws(m))
             }
-            R::Body(b) => {
-                let msg = PyDict::new(py);
-                msg.set_item(intern!(py, "type"), intern!(py, "http.request"))?;
-                let body_obj = if b.is_empty() {
-                    EMPTY_BYTES.get_or_init(py, || PyBytes::new(py, b"").unbind()).bind(py).clone().into_any()
-                } else {
-                    PyBytes::new(py, &b).into_any()
-                };
-                msg.set_item(intern!(py, "body"), body_obj)?;
-                msg.set_item(intern!(py, "more_body"), false)?;
-                value_awaitable(py, msg.into_any().unbind())
-            }
+            R::Body(b) => taken(TakenMsg::Body(b)),
             R::Wait(pyloop) => {
                 let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
                 // Prune waiters a cancelled receive() left behind BEFORE
@@ -1536,6 +1664,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         };
                     }
                     net::http_enqueue(py, net, backend, tid, out);
+                    release_after_response(net, tid);
                     Ok(())
                 }
                 RespPhase::Streaming => {
@@ -1566,6 +1695,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         }
                     }
                     net::http_enqueue(py, net, backend, tid, out);
+                    release_after_response(net, tid);
                     Ok(())
                 }
             }
@@ -1630,6 +1760,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 conn.resp = RespPhase::Done;
             }
             net::http_enqueue(py, net, backend, tid, out);
+            release_after_response(net, tid);
             Ok(())
         })?
         .map_err(send_err)?;
@@ -1695,6 +1826,22 @@ fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
     out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
     out.extend_from_slice(body);
     out.extend_from_slice(b"\r\n");
+}
+
+/// Once the response is complete, receive() waiters parked beside it (a
+/// disconnect listener running alongside the response) get
+/// http.disconnect, as a receive() made from then on does (`HttpReceive`).
+/// They used to stay parked until the app coroutine returned, so an app
+/// that awaited one before returning never did. In-cell: the waiters
+/// leave as events.
+fn release_after_response(net: &mut NetState, tid: u64) {
+    let Some(conn) = net.http_conn_mut(tid) else { return };
+    if conn.resp != RespPhase::Done || conn.recv_waiters.is_empty() {
+        return;
+    }
+    for fut in conn.take_recv_waiters() {
+        net.events.push(net::NetEvent::HttpDisconnect { fut, ws: false });
+    }
 }
 
 // --------------------------------------------------------------------- //
@@ -1904,6 +2051,8 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
         if conn.ws.is_some() {
             ws_ingest(py, net, backend, tid, &plaintext);
             false
+        } else if conn.deferred_error.is_some() {
+            false // the parser is dead (conn_parse_failed): discarded
         } else {
             match conn_feed(conn, &plaintext) {
                 // R-087 parity with the plaintext path: a pre-dispatch WS
@@ -2222,16 +2371,25 @@ fn ws_send(
             };
             core.with_net(|net, reactor| {
                 let backend = reactor.backend_mut();
-                let ok = net
+                let state = net
                     .http_conn_mut(tid)
                     .and_then(|c| c.ws.as_ref())
-                    .map(|w| w.accepted && !w.closing)
-                    .unwrap_or(false);
-                if ok {
-                    net::http_enqueue(py, net, backend, tid, payload);
-                    Ok(())
-                } else {
-                    Err(SendErr::Proto("websocket.send before accept or after close"))
+                    .map(|w| (w.accepted, w.closing, w.app_closed));
+                match state {
+                    Some((true, false, _)) => {
+                        net::http_enqueue(py, net, backend, tid, payload);
+                        Ok(())
+                    }
+                    // Closing without the app having closed it: the peer's
+                    // close frame, a protocol failure or the shutdown 1012
+                    // got there first. That is a disconnected client, which
+                    // ASGI reports from send() as an OSError -- the error
+                    // the same send raises a moment later, once the
+                    // connection is torn down. A RuntimeError here read as
+                    // an application bug (Starlette maps only OSError to
+                    // WebSocketDisconnect).
+                    Some((true, true, false)) => Err(SendErr::Gone),
+                    _ => Err(SendErr::Proto("websocket.send before accept or after close")),
                 }
             })?
             .map_err(send_err)?;
@@ -2259,6 +2417,7 @@ fn ws_send(
                 let backend = reactor.backend_mut();
                 let Some(conn) = net.http_conn_mut(tid) else { return };
                 let Some(wsc) = conn.ws.as_mut() else { return };
+                wsc.app_closed = true;
                 if wsc.accepted {
                     if !wsc.closing {
                         wsc.closing = true;
@@ -2554,6 +2713,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                             inbox_paused: false,
                             accepted: false,
                             closing: false,
+                            app_closed: false,
                             connect_sent: false,
                             key: key.clone(),
                             offered: offered_subprotocols(&req),
@@ -2752,6 +2912,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
                 let log = take_access_record(py, net, tid, now_ns);
                 let body = error_response(ParseError { status: 500, reason: "internal server error" }, minor);
                 net::http_enqueue(py, net, backend, tid, body);
+                release_after_response(net, tid);
                 net::http_close_after_write(py, net, backend, tid);
                 log
             })?;
@@ -2804,22 +2965,35 @@ fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
 }
 
 pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let (waiters, log) = core.with_net(|net, reactor| {
+    let (waiters, ws_code, log) = core.with_net(|net, reactor| {
         let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
         let log = take_access_record(py, net, tid, now_ns);
-        let (waiters, driver, close, parked_error) = {
-            let Some(conn) = net.http_conn_mut(tid) else { return (VecDeque::new(), None) };
+        let (waiters, ws_code, driver, close, parked_error) = {
+            let Some(conn) = net.http_conn_mut(tid) else { return (VecDeque::new(), None, None) };
             conn.active = false;
             conn.req_body = None;
             conn.activity = conn.activity.wrapping_add(1);
             // A parse error parked by conn_parse_failed goes out only
             // once everything ahead of it in the pipeline is answered.
             let parked_error = if conn.pending.is_empty() { conn.deferred_error.take() } else { None };
+            let close = !conn.keep_alive || conn.disconnected;
+            if close {
+                // Requests pipelined behind it are never dispatched. The
+                // pump ran them anyway -- the application and its side
+                // effects included -- for responses the closing
+                // connection then discarded (RFC 7230 6.6: no further
+                // requests are processed after a "close").
+                conn.pending.clear();
+                conn.pending_bytes = 0;
+            }
             (
                 conn.take_recv_waiters(),
+                // A WebSocket's waiters are owed websocket.disconnect, with
+                // the code a receive() after the teardown reports.
+                conn.ws.as_ref().map(|w| w.close_code.unwrap_or(1006)),
                 conn.driver.take(),
-                !conn.keep_alive || conn.disconnected,
+                close,
                 parked_error,
             )
         };
@@ -2839,7 +3013,7 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             // that suppressed reading may have freed up.
             net::http_resume_reading(py, net, backend, tid);
         }
-        (waiters, log)
+        (waiters, ws_code, log)
     })?;
     emit_access_record(py, log);
     core.drain_graveyards(py)?;
@@ -2847,7 +3021,11 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
         let fut = fut.bind(py);
         let done: bool = fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
         if !done {
-            let _ = fut.call_method1(intern!(py, "set_result"), (disconnect_message(py)?,));
+            let msg = match ws_code {
+                Some(code) => ws_message_dict(py, WsMsg::Disconnect(code))?,
+                None => disconnect_message(py)?,
+            };
+            let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
         }
     }
     Ok(())
@@ -3294,6 +3472,21 @@ impl AppTask {
                             let wake = slf.getattr(intern!(py, "_wake"))?;
                             y.call_method1(intern!(py, "add_done_callback"), (wake,))?;
                             slf.borrow_mut().waiting_on = Some(yielded.clone_ref(py));
+                            // A cancel() that arrived while this step ran
+                            // could only latch must_cancel (nothing was
+                            // awaited yet). Task.__step applies it to the
+                            // future just awaited; left latched, it waited
+                            // for that future to finish by itself -- for
+                            // ever, for one that never does.
+                            if slf.borrow().must_cancel {
+                                let cancelled: bool = y
+                                    .call_method0(intern!(py, "cancel"))
+                                    .and_then(|v| v.extract())
+                                    .unwrap_or(false);
+                                if cancelled {
+                                    slf.borrow_mut().must_cancel = false;
+                                }
+                            }
                             return Ok(StepOutcome::Suspended);
                         }
                         _ => {
@@ -3327,8 +3520,19 @@ impl AppTask {
             on_coro_finished(py, core, tid)?;
         }
         drop_driver(py, core, tid)?;
-        // Pump pipelined requests that queued while this one ran (R-085).
-        pump_requests(py, core_bound, tid)
+        // Pump pipelined requests that queued while this one ran (R-085)
+        // -- from the event phase, not from here. This runs inside
+        // `_wake`, in a copy of the finished request's own context, and
+        // AppTask::spawn copies whatever context is current: pumping here
+        // started the next request with every contextvar the previous one
+        // had set (a user, a tenant, a DB session). The event phase runs
+        // in the loop's own context, as the first request on a
+        // connection always has.
+        core.with_net(|net, _| {
+            if net.http_conn_mut(tid).is_some_and(|c| !c.active && !c.pending.is_empty()) {
+                net.events.push(net::NetEvent::HttpPump { tid });
+            }
+        })
     }
 }
 
@@ -3347,7 +3551,12 @@ impl HttpTaskDone {
         let cancelled: bool =
             task.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(false);
         if cancelled {
-            app_failure(py, core, self.tid, PyRuntimeError::new_err("ASGI application task cancelled"))?;
+            // As a CancelledError, which app_failure treats as the request
+            // being abandoned -- exactly what the eager driver reports. A
+            // RuntimeError here logged every cancelled request (each one
+            // still in flight at a graceful shutdown's deadline, say) as
+            // an exception in the application.
+            app_failure(py, core, self.tid, cancelled_error(py))?;
         } else {
             let exc = task.call_method0(intern!(py, "exception"))?;
             if exc.is_none() {

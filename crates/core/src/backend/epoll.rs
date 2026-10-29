@@ -442,12 +442,16 @@ impl EpollBackend {
                     let rc = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
                     if rc >= 0 {
                         *done += rc as u32;
-                        let total: u32 = bufs.iter().take(*n as usize).map(|b| b.len).sum();
-                        break if *done >= total {
-                            Some((*done, 0))
-                        } else {
-                            None // partial: stay parked for EPOLLOUT
-                        };
+                        // Any progress completes the op, a short count
+                        // included: the transport retires what the kernel
+                        // took and posts the rest. Parked until the whole
+                        // gather was written, the bytes the kernel had
+                        // already accepted stayed counted as buffered --
+                        // get_write_buffer_size() and the pause/resume marks
+                        // with them -- so two peers that each write and then
+                        // drain() before reading deadlocked where asyncio's
+                        // loop does not.
+                        break if *done > 0 { Some((*done, 0)) } else { None };
                     }
                     match errno() {
                         libc::EINTR => continue,
@@ -1311,5 +1315,52 @@ mod tests {
         let out = drain(&mut b, Duration::from_millis(30));
         assert_eq!(out, vec![Completion::Io { op, bytes: 0, os_error: libc::ECANCELED as u32 }]);
         unsafe { libc::close(lfd) };
+    }
+
+    #[test]
+    fn send_completes_with_whatever_the_kernel_took() {
+        // A send the socket buffer only partly takes completes with the
+        // short count -- inline at post time, and from EPOLLOUT once parked
+        // -- instead of waiting until every byte is written: the transport
+        // retires the accepted bytes, and its write-buffer size and
+        // pause/resume marks are computed from what is left.
+        use std::os::unix::net::UnixStream;
+        let data = vec![7u8; 4 << 20];
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let fd = ours.as_raw_fd();
+        let mut b = EpollBackend::new().unwrap();
+        b.register_socket(fd as RawSocket).unwrap();
+
+        let all = [IoSlice { ptr: data.as_ptr(), len: data.len() as u32 }];
+        let op = b.post_send(fd as RawSocket, &all).unwrap();
+        let first = match drain(&mut b, Duration::ZERO).as_slice() {
+            [Completion::Io { op: o, bytes, os_error: 0 }] if *o == op => *bytes,
+            other => panic!("a partly accepted send did not complete: {other:?}"),
+        };
+        assert!(first > 0 && (first as usize) < data.len(), "{first}");
+
+        // The rest finds the buffer full and parks.
+        let rest = [IoSlice { ptr: data[first as usize..].as_ptr(), len: data.len() as u32 - first }];
+        let op = b.post_send(fd as RawSocket, &rest).unwrap();
+        assert!(drain(&mut b, Duration::from_millis(20)).is_empty(), "a send to a full buffer must park");
+        // The peer reads everything sent so far; EPOLLOUT then completes the
+        // parked send with what fits, not with the whole remainder.
+        let mut sink = vec![0u8; 1 << 20];
+        let mut taken = 0usize;
+        while let Ok(k) = peer.read(&mut sink) {
+            if k == 0 {
+                break;
+            }
+            taken += k;
+        }
+        assert_eq!(taken, first as usize);
+        let second = match drain(&mut b, Duration::from_secs(2)).as_slice() {
+            [Completion::Io { op: o, bytes, os_error: 0 }] if *o == op => *bytes,
+            other => panic!("a parked send did not complete on progress: {other:?}"),
+        };
+        assert!(second > 0 && second < rest[0].len, "{second}");
+        b.detach_socket(fd as RawSocket);
     }
 }
