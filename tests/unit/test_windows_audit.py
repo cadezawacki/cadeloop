@@ -643,3 +643,53 @@ def test_a_short_timer_ends_its_park_on_time(loop):
     assert over[0] > -1e-4, f"a timer fired early: {over}"
     assert over[len(over) // 2] < 0.006, f"median overshoot {over[len(over) // 2] * 1e3:.2f} ms"
     assert loop.stats()["precise_parks"] >= 15
+
+
+@windows_only
+def test_the_extra_info_socket_is_no_second_handle(loop):
+    """get_extra_info("socket") on a transport the loop made its own socket
+    for wrapped a socket.dup() -- on Windows a WSADuplicateSocket, a second
+    handle to the connection held for its life. uvicorn asks for it on
+    every connection, so each one cost two handles. It now wraps the
+    transport's own handle without owning it: no new handle, and the
+    transport's close still both ends the connection and leaves the
+    object reading fileno() -1."""
+
+    n = 32
+
+    async def main():
+        transports = []
+
+        class P(asyncio.Protocol):
+            def connection_made(self, transport):
+                transports.append(transport)
+
+        server = await loop.create_server(P, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()[:2]
+        clients = [socket.create_connection(addr) for _ in range(n)]
+        try:
+            while len(transports) < n:
+                await asyncio.sleep(0.01)
+            before = _process_handle_count()
+            socks = [t.get_extra_info("socket") for t in transports]
+            added = _process_handle_count() - before
+            assert added < n // 4, f"{added} handles for {n} sockets"
+            assert all(s.fileno() != -1 for s in socks)
+            # The number add_reader() refuses is the transport's own.
+            with pytest.raises(RuntimeError, match="is used by transport"):
+                loop.add_reader(socks[0].fileno(), lambda: None)
+            for t in transports:
+                t.close()
+            await asyncio.sleep(0.05)
+            assert all(s.fileno() == -1 for s in socks)
+            # Closed for real: the peer sees its EOF.
+            for c in clients:
+                c.settimeout(3)
+                assert c.recv(1) == b""
+        finally:
+            for c in clients:
+                c.close()
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())

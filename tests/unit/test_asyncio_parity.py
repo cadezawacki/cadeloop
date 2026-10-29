@@ -2046,8 +2046,9 @@ def test_write_after_write_eof_raises_in_asyncio_order(loop):
 
 def test_add_reader_refuses_the_extra_info_socket(loop):
     """_ensure_fd_no_transport for the descriptor get_extra_info('socket')
-    reports. A cadeloop transport that owns its descriptor hands out a
-    duplicate there, and add_reader() accepted that one."""
+    reports. A cadeloop transport that owns its descriptor handed out a
+    duplicate there, and add_reader() accepted that one; it now hands out
+    a wrapper of its own descriptor, which add_reader() must refuse."""
 
     async def main():
         server, transport, _ = await _pair(loop, asyncio.Protocol)

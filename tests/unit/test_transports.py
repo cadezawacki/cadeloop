@@ -2010,10 +2010,9 @@ def test_get_extra_info_socket_is_live_and_non_owning(loop):
             # Stable across calls -- not a fresh dup each time.
             assert transport.get_extra_info("socket") is sock
             # The transport's close must be final even though this
-            # object holds a duplicate. A duplicate is another OWNER of the
-            # connection: leaving it open would deny the peer its EOF and
-            # keep the connection allocated for as long as the application
-            # happened to hold the object.
+            # object wraps the transport's own handle: closed under it, the
+            # handle is let go first, so the object reads -1 rather than a
+            # number the OS may hand to an unrelated connection.
             transport.close()
             await asyncio.sleep(0.05)
             assert sock.fileno() == -1, "the transport's close left its socket open"

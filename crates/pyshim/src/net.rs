@@ -318,15 +318,13 @@ pub(crate) struct TransportEntry {
     /// `paused_recv` (asyncio sees no EOF before resume_reading re-adds
     /// its reader), and delivered after it.
     paused_eof: bool,
-    /// The duplicate behind `get_extra_info("socket")` of a transport
+    /// The socket object behind `get_extra_info("socket")` of a transport
     /// that has no socket object of its own (see `Transport::trsock`),
-    /// built on first ask. Closed, not merely dropped, at teardown -- see
-    /// `graveyard_sockets`.
+    /// built on first ask: a `socket.socket` over the engine's own handle
+    /// that does not own it. `release_socket` detaches it before closing
+    /// the handle, so nothing it does afterwards -- its finalizer's
+    /// close() above all -- can reach a socket that reuses the number.
     pub extra_sock: Option<Py<PyAny>>,
-    /// That duplicate's descriptor, listed in `fd_users` too: it is the
-    /// number `get_extra_info("socket").fileno()` reports, so it is the
-    /// one an add_reader() on "the transport's fd" names.
-    extra_fd: Option<RawSocket>,
     /// The caller's own socket object, for a transport built from one
     /// (`sock=`). It owns the descriptor, as in asyncio: teardown closes
     /// it (through Python, once connection_lost has run) instead of
@@ -878,7 +876,7 @@ pub(crate) enum NetEvent {
 }
 
 /// A socket object a dead transport still holds (the caller's own, or the
-/// duplicate behind `get_extra_info("socket")`), closed -- not merely
+/// detached one behind `get_extra_info("socket")`), closed -- not merely
 /// dropped -- whenever it is let go: after connection_lost normally, but
 /// also when that never runs because the loop closed first, so a
 /// transport's close stays final either way. Dropped attached, outside
@@ -911,7 +909,7 @@ pub(crate) struct ConnLost {
     transport: Option<Py<Transport>>,
     protocol: Py<PyAny>,
     /// Closed after connection_lost: the caller's socket object, or the
-    /// duplicate behind `get_extra_info("socket")`.
+    /// (already detached) one behind `get_extra_info("socket")`.
     close_after: CloseOnDrop,
     server: Option<Py<PyAny>>,
 }
@@ -1195,9 +1193,6 @@ fn teardown_lost(
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
-    if let Some(fd) = entry.extra_fd.take() {
-        forget_fd(net, fd, tid);
-    }
     if let Some(slot) = entry.recv_slot.take() {
         // The transport's own reference. The posted op holds a second one
         // (R-073) that only the reap releases.
@@ -1275,6 +1270,13 @@ fn forget_fd(net: &mut NetState, fd: RawSocket, id: u64) {
 /// (`retire_sockets`, or after connection_lost), never under it.
 fn release_socket(backend: Backend<'_>, entry: &TransportEntry) {
     backend.detach_socket(entry.socket);
+    if let Some(sock) = &entry.extra_sock {
+        // Let go of the handle before it is closed (see `extra_sock`).
+        // The C base class's detach(): socket.socket overrides it in
+        // Python, and no Python code runs in-cell; this one only clears
+        // the object's descriptor.
+        Python::attach(|py| detach_socket_object(py, sock));
+    }
     if entry.owner.is_none() {
         netsys::close(entry.socket);
     }
@@ -1306,9 +1308,6 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
-    if let Some(fd) = entry.extra_fd.take() {
-        forget_fd(net, fd, tid);
-    }
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
@@ -3894,7 +3893,6 @@ pub(crate) fn wire_stream(
                 paused_recv: None,
                 paused_eof: false,
                 extra_sock: None,
-                extra_fd: None,
                 owner,
                 server,
                 // Kept on the Transport itself (they outlive the entry);
@@ -3987,7 +3985,6 @@ pub(crate) fn wire_http(
                 paused_recv: None,
                 paused_eof: false,
                 extra_sock: None,
-                extra_fd: None,
                 owner: None,
                 server: None,
                 peername: peer,
@@ -4096,12 +4093,13 @@ impl Transport {
     /// or set one such as keepalive. A transport built from the caller's
     /// socket (`sock=`) wraps that very object, as asyncio does.
     ///
-    /// Otherwise the engine owns the only descriptor, so the wrapper holds
-    /// a `dup()` rather than a second owner of the engine's: two owners of
-    /// one descriptor means a double close, and by the second one the OS
-    /// may have handed that number to an unrelated connection (ADR-25's
-    /// hazard, reached from the other side). The duplicate is closed at
-    /// teardown (`ConnLost`), which keeps the transport's close final.
+    /// Otherwise the engine owns the only descriptor, and the wrapper
+    /// holds a socket object over it that never owns it: two owners of one
+    /// descriptor means a double close, and by the second one the OS may
+    /// have handed that number to an unrelated connection (ADR-25's
+    /// hazard, reached from the other side). It is detached before the
+    /// engine closes the handle (`release_socket`), which keeps the
+    /// transport's close final: `fileno()` reads -1 from then on.
     fn transport_socket(&self, py: Python<'_>, core: &CoreLoop) -> PyResult<Option<Py<PyAny>>> {
         if let Some(ts) = self.trsock.get(py) {
             return Ok(Some(ts.clone_ref(py)));
@@ -4114,26 +4112,23 @@ impl Transport {
         let sock = match owner {
             Some(owner) => owner,
             None => {
-                let dup = build_transport_socket(py, raw)?;
-                let dup_fd: u64 = dup.call_method0(py, intern!(py, "fileno"))?.extract(py)?;
+                let sock = build_transport_socket(py, raw)?;
+                // Its fileno() is the transport's own descriptor, already in
+                // `fd_users`, so add_reader() refuses it as asyncio does.
                 let kept = core.with_net(|net, _| match net.transports.get_mut(&self.tid) {
-                    Some(e) if e.extra_sock.is_none() => {
-                        e.extra_sock = Some(dup.clone_ref(py));
-                        // Open as long as the entry is (the TransportSocket
-                        // wrapper has no close()), so the number cannot be
-                        // reused while it stands for this transport.
-                        e.extra_fd = Some(dup_fd as RawSocket);
-                        net.fd_users.insert(dup_fd as RawSocket, FdUser::Stream(self.tid));
+                    Some(e) if e.extra_sock.is_none() && e.socket == raw => {
+                        e.extra_sock = Some(sock.clone_ref(py));
                         true
                     }
                     _ => false,
                 })?;
                 if !kept {
-                    // Torn down meanwhile: nothing would ever close it.
-                    let _ = dup.call_method0(py, intern!(py, "close"));
+                    // Torn down meanwhile, its handle closed or about to be:
+                    // this object must not own it.
+                    detach_socket_object(py, &sock);
                     return Ok(None);
                 }
-                dup
+                sock
             }
         };
         let ts = transport_socket(py, sock)?;
@@ -4245,16 +4240,35 @@ fn check_write_type(data: &Bound<'_, PyAny>) -> PyResult<()> {
     )))
 }
 
-/// A plain `socket.socket` over a duplicate of `raw`: the object the
-/// engine closes at teardown. Callers see it only through a
-/// `TransportSocket` (see `Transport::transport_socket`).
+/// `_socket.socket.detach`, looked up once (see `detach_socket_object`).
+static SOCKET_DETACH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Make a `socket.socket` built by `build_transport_socket` let go of its
+/// handle without closing it. The C base class's method, called directly:
+/// it runs no Python code, so it is safe in-cell.
+fn detach_socket_object(py: Python<'_>, sock: &Py<PyAny>) {
+    let detach = SOCKET_DETACH.get_or_try_init(py, || {
+        py.import("_socket")?.getattr("socket")?.getattr("detach").map(Bound::unbind)
+    });
+    if let Ok(detach) = detach {
+        let _ = detach.call1(py, (sock.clone_ref(py),));
+    }
+}
+
+/// A plain `socket.socket` over the engine's own handle `raw`, which it
+/// must never close: `release_socket` detaches it first. Callers see it
+/// only through a `TransportSocket` (see `Transport::transport_socket`),
+/// which has no close() or detach() to offer them.
+///
+/// This used to wrap a `socket.dup()` -- on Windows a
+/// WSADuplicateSocket, a second handle and a second owner of the
+/// connection -- and uvicorn asks for this object on every connection
+/// just to read its addresses: one extra handle per connection, held for
+/// the connection's life, and the duplication's cost on every accept.
 fn build_transport_socket(py: Python<'_>, raw: RawSocket) -> PyResult<Py<PyAny>> {
     let socket_mod = py.import("socket")?;
-    // socket.dup(), not os.dup(): on Windows a SOCKET is not a file
-    // descriptor and only this one does the right thing.
-    let dup = socket_mod.call_method1(intern!(py, "dup"), (raw as u64,))?;
     let kwargs = PyDict::new(py);
-    kwargs.set_item(intern!(py, "fileno"), dup)?;
+    kwargs.set_item(intern!(py, "fileno"), raw as u64)?;
     Ok(socket_mod.getattr(intern!(py, "socket"))?.call((), Some(&kwargs))?.unbind())
 }
 
