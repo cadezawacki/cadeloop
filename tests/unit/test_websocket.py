@@ -902,3 +902,136 @@ def test_parked_ws_senders_are_all_released_when_the_connection_dies(loop):
         pass
     loop._core.listener_close(lid)
     assert sorted(outcome, key=str) == sorted(["filler", *range(n)], key=str), outcome
+
+
+# ---- receivers and senders while the socket goes away ------------------ #
+
+
+def test_a_receiver_whose_wake_outlives_its_connection_is_released(loop):
+    """A receive() handed a wake must be answered even when its connection
+    is torn down before the wake is dispatched. Graceful shutdown queues
+    the wake outside a tick; a callback already queued -- here the handler
+    waking to publish, refused because the socket is closing -- can tear
+    the connection down first. The wake's re-park then found no connection
+    and dropped the future: receive() pending for good, and its task
+    destroyed by the collector while pending."""
+    from cadeloop.server import _drain_connections
+
+    got, reports = [], []
+    loop.set_exception_handler(lambda _loop, ctx: reports.append(ctx.get("message")))
+    parked, publish = asyncio.Event(), asyncio.Event()
+    readers = []
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+
+        async def reader():
+            waiter = receive()  # parks: nothing has arrived
+            parked.set()
+            got.append(await waiter)
+
+        readers.append(asyncio.ensure_future(reader()))
+        await publish.wait()
+        await send({"type": "websocket.send", "text": "news"})
+
+    lid, port = listen(loop, app)
+
+    async def connect():
+        _reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        await asyncio.wait_for(parked.wait(), 5)
+        return writer
+
+    writer = loop.run_until_complete(connect())
+    loop._core.listener_close(lid)
+    publish.set()  # a wakeup already queued when the stop arrives
+    _drain_connections(loop, 1.0)
+    loop.run_until_complete(asyncio.wait(readers, timeout=2))
+    writer.close()
+    assert got == [{"type": "websocket.disconnect", "code": 1012}], got
+    assert not [r for r in reports if "destroyed but it is pending" in str(r)], reports
+
+
+def test_receivers_left_when_the_handler_returns_get_websocket_disconnect(loop):
+    """A receive() still parked in a background task when the handler
+    returns (or raises) was answered {"type": "http.disconnect"} -- an
+    HTTP event, without a close code, on a websocket scope (Starlette's
+    WebSocket.receive rejects it)."""
+    got, readers = [], []
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+
+        async def reader():
+            got.append(await receive())
+
+        readers.append(asyncio.ensure_future(reader()))
+        await asyncio.sleep(0)  # the reader parks
+        if scope["path"] == "/raises":
+            raise ValueError("handler failed")
+
+    loop.set_exception_handler(lambda _loop, _ctx: None)
+    lid, port = listen(loop, app)
+
+    async def main(path):
+        reader, writer, _key, head = await handshake(port, path)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        while (await asyncio.wait_for(read_server_frame(reader), 5))[1] != 0x8:
+            pass
+        writer.close()
+        await asyncio.wait(readers[-1:], timeout=5)
+
+    for path in ("/returns", "/raises"):
+        loop.run_until_complete(main(path))
+    loop._core.listener_close(lid)
+    assert [m["type"] for m in got] == ["websocket.disconnect"] * 2, got
+    assert all(isinstance(m.get("code"), int) for m in got), got
+
+
+def test_a_send_on_a_socket_closing_under_the_app_raises_oserror(loop):
+    """ASGI asks a send() on a closed connection to raise an OSError
+    subclass, as it does once the connection is torn down. In between --
+    the peer's close frame read, or a graceful shutdown's 1012 sent -- the
+    socket is `closing` while the handler can still send, and that send
+    raised RuntimeError, the error for the application's own protocol
+    violations (Starlette maps only OSError to WebSocketDisconnect). A
+    send after the application's own close is still that violation."""
+    from cadeloop.server import _drain_connections
+
+    errors = {}
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        if scope["path"] == "/own-close":
+            await send({"type": "websocket.close"})
+        else:
+            msg = await receive()  # the shutdown's websocket.disconnect
+            assert msg == {"type": "websocket.disconnect", "code": 1012}, msg
+        try:
+            await send({"type": "websocket.send", "text": "late"})
+        except Exception as exc:  # noqa: BLE001
+            errors[scope["path"]] = exc
+
+    lid, port = listen(loop, app)
+
+    async def own_close():
+        reader, writer, _key, _head = await handshake(port, "/own-close")
+        await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+
+    loop.run_until_complete(own_close())
+
+    async def connect():
+        _reader, writer, _key, head = await handshake(port, "/shutdown")
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        return writer
+
+    writer = loop.run_until_complete(connect())
+    loop._core.listener_close(lid)
+    _drain_connections(loop, 1.0)
+    writer.close()
+    assert isinstance(errors.get("/shutdown"), OSError), errors
+    assert isinstance(errors.get("/own-close"), RuntimeError), errors

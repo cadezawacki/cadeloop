@@ -1864,6 +1864,10 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
         if let Some(conn) = net.http_conn_mut(tid) {
             if let Some(wsc) = conn.ws.as_mut() {
                 wsc.closing = true;
+                // What outlives the connection (a receive() after its
+                // teardown, a waiter whose wake was still queued) reports
+                // the code this end closed with, not 1006.
+                wsc.close_code = Some(1012);
                 let m = crate::http::WsMsg::Disconnect(1012);
                 wsc.inbox_bytes += m.charge();
                 wsc.inbox.push_back(m);
@@ -2927,13 +2931,30 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                         let _ = fut.call_method1(intern!(py, "set_result"), (d,));
                     }
                     (false, None) => {
-                        // Spurious wake: park the waiter again.
+                        // Spurious wake: park the waiter again -- while there
+                        // is still something to wait for. The wake took this
+                        // waiter out of recv_waiters, so a teardown between
+                        // queueing it and now (an app callback that ran
+                        // first, during a graceful shutdown say) could not
+                        // release it, and parking it on the gone connection
+                        // dropped it unresolved: receive() pending for good,
+                        // and its task, which asyncio holds only weakly,
+                        // destroyed by the collector while pending. Past EOF
+                        // no message can arrive either.
                         let stored = fut.clone().unbind();
-                        core.with_net(|net, _| {
-                            if let Some(c) = net.http_conn_mut(tid) {
+                        let unparked = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+                            Some(c) if !c.disconnected => {
                                 c.recv_waiters.push_back(stored);
+                                None
                             }
+                            // Handed back so the reference drops out of the
+                            // cell (ADR-5).
+                            _ => Some(stored),
                         })?;
+                        if unparked.is_some() {
+                            let msg = crate::http::ws_gone_message(py, core, tid)?;
+                            let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
+                        }
                     }
                     (true, Some(m)) => {
                         // Waiter was cancelled: keep the event for the next

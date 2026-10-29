@@ -224,6 +224,11 @@ pub(crate) struct WsConn {
     pub(crate) accepted: bool,
     /// Server sent (or queued) a close frame.
     pub(crate) closing: bool,
+    /// The application itself sent websocket.close. A send after that is
+    /// its own protocol error; `closing` for any other reason (the peer's
+    /// close frame, a protocol failure, the 1012 drain) is the connection
+    /// going away under it.
+    pub(crate) app_closed: bool,
     /// websocket.connect delivered to the app.
     pub(crate) connect_sent: bool,
     /// Client's Sec-WebSocket-Key (accept-key derivation at accept time).
@@ -804,6 +809,15 @@ fn gone_message(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<Py<PyAny>
         Some(code) => ws_message_dict(py, WsMsg::Disconnect(code)),
         None => disconnect_message(py),
     }
+}
+
+/// The websocket.disconnect a WebSocket receive() waiter gets once there
+/// is nothing left to wait for: its connection already torn down (the code
+/// it closed with, when remembered) or past EOF (1006, as `HttpReceive`
+/// answers then).
+pub(crate) fn ws_gone_message(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<Py<PyAny>> {
+    let code = core.with_net(|net, _| net.recent_ws_close(tid))?.unwrap_or(1006);
+    ws_message_dict(py, WsMsg::Disconnect(code))
 }
 
 // --------------------------------------------------------------------- //
@@ -2222,16 +2236,25 @@ fn ws_send(
             };
             core.with_net(|net, reactor| {
                 let backend = reactor.backend_mut();
-                let ok = net
+                let state = net
                     .http_conn_mut(tid)
                     .and_then(|c| c.ws.as_ref())
-                    .map(|w| w.accepted && !w.closing)
-                    .unwrap_or(false);
-                if ok {
-                    net::http_enqueue(py, net, backend, tid, payload);
-                    Ok(())
-                } else {
-                    Err(SendErr::Proto("websocket.send before accept or after close"))
+                    .map(|w| (w.accepted, w.closing, w.app_closed));
+                match state {
+                    Some((true, false, _)) => {
+                        net::http_enqueue(py, net, backend, tid, payload);
+                        Ok(())
+                    }
+                    // Closing without the app having closed it: the peer's
+                    // close frame, a protocol failure or the shutdown 1012
+                    // got there first. That is a disconnected client, which
+                    // ASGI reports from send() as an OSError -- the error
+                    // the same send raises a moment later, once the
+                    // connection is torn down. A RuntimeError here read as
+                    // an application bug (Starlette maps only OSError to
+                    // WebSocketDisconnect).
+                    Some((true, true, false)) => Err(SendErr::Gone),
+                    _ => Err(SendErr::Proto("websocket.send before accept or after close")),
                 }
             })?
             .map_err(send_err)?;
@@ -2259,6 +2282,7 @@ fn ws_send(
                 let backend = reactor.backend_mut();
                 let Some(conn) = net.http_conn_mut(tid) else { return };
                 let Some(wsc) = conn.ws.as_mut() else { return };
+                wsc.app_closed = true;
                 if wsc.accepted {
                     if !wsc.closing {
                         wsc.closing = true;
@@ -2554,6 +2578,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                             inbox_paused: false,
                             accepted: false,
                             closing: false,
+                            app_closed: false,
                             connect_sent: false,
                             key: key.clone(),
                             offered: offered_subprotocols(&req),
@@ -2804,12 +2829,12 @@ fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
 }
 
 pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let (waiters, log) = core.with_net(|net, reactor| {
+    let (waiters, ws_code, log) = core.with_net(|net, reactor| {
         let now_ns = reactor.time_cached();
         let backend = reactor.backend_mut();
         let log = take_access_record(py, net, tid, now_ns);
-        let (waiters, driver, close, parked_error) = {
-            let Some(conn) = net.http_conn_mut(tid) else { return (VecDeque::new(), None) };
+        let (waiters, ws_code, driver, close, parked_error) = {
+            let Some(conn) = net.http_conn_mut(tid) else { return (VecDeque::new(), None, None) };
             conn.active = false;
             conn.req_body = None;
             conn.activity = conn.activity.wrapping_add(1);
@@ -2818,6 +2843,9 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             let parked_error = if conn.pending.is_empty() { conn.deferred_error.take() } else { None };
             (
                 conn.take_recv_waiters(),
+                // A WebSocket's waiters are owed websocket.disconnect, with
+                // the code a receive() after the teardown reports.
+                conn.ws.as_ref().map(|w| w.close_code.unwrap_or(1006)),
                 conn.driver.take(),
                 !conn.keep_alive || conn.disconnected,
                 parked_error,
@@ -2839,7 +2867,7 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             // that suppressed reading may have freed up.
             net::http_resume_reading(py, net, backend, tid);
         }
-        (waiters, log)
+        (waiters, ws_code, log)
     })?;
     emit_access_record(py, log);
     core.drain_graveyards(py)?;
@@ -2847,7 +2875,11 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
         let fut = fut.bind(py);
         let done: bool = fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
         if !done {
-            let _ = fut.call_method1(intern!(py, "set_result"), (disconnect_message(py)?,));
+            let msg = match ws_code {
+                Some(code) => ws_message_dict(py, WsMsg::Disconnect(code))?,
+                None => disconnect_message(py)?,
+            };
+            let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
         }
     }
     Ok(())
