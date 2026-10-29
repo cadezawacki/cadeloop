@@ -30,7 +30,7 @@ import threading
 import time
 
 from .config import Config
-from .loop import Loop
+from .loop import Loop, _run_until_complete_cb
 
 __all__ = ["serve", "load_app"]
 
@@ -133,6 +133,10 @@ class _Lifespan:
         self._startup_delivered = False
         self._startup_failed = False
         self._shutdown_failure_reported = False
+        # Set by _serve_single when it gives the startup up (a repeated
+        # Ctrl-C, or the supervisor gone): the cancellation that follows
+        # is the server's doing, not the app lacking lifespan support.
+        self.abandoned = False
         # What a crash while serving does; _serve_single routes it through
         # its shutdown controller.
         self.on_crash = loop.stop
@@ -188,7 +192,17 @@ class _Lifespan:
                 # machinery re-raises these out of the loop tick.
                 raise
             except BaseException as exc:  # noqa: BLE001 — app may not do lifespan
-                if self._shutdown_requested:
+                if isinstance(exc, asyncio.CancelledError) and (
+                    self._shutdown_requested or self.abandoned
+                ):
+                    # _finalize_loop cancelling a shutdown hook that overran
+                    # its timeout -- shutdown() has already said so -- or a
+                    # startup that was given up on. Logged as "lifespan
+                    # shutdown raised" with a traceback, or as a startup
+                    # failure, it blamed the application for the server's
+                    # own cancellation.
+                    logger.debug("lifespan task cancelled")
+                elif self._shutdown_requested:
                     # The application's shutdown hook raised. The worker is
                     # already stopping, so this is not a crash of a serving
                     # worker: report it once (Starlette has already sent
@@ -319,6 +333,14 @@ class _Shutdown:
         self.abandoned = False  # the lifespan startup was given up on
 
     def request(self, reason: str) -> None:
+        if reason == "supervisor" and self.phase == "starting" and not self.abandoned:
+            # The supervisor is gone, and with it whoever would have
+            # enforced `grace` on a startup that does not finish (one
+            # retrying a database that is down): give the startup up. Left
+            # to finish, the worker lived on as an orphan for as long as
+            # the startup hung -- for good, if it never returned.
+            self.abandoned = True
+            self.loop.stop()
         if self.reason is not None:
             return
         self.reason = reason
@@ -693,6 +715,7 @@ def _serve_single(
         except RuntimeError:
             if not shutdown.abandoned:
                 raise
+            lifespan.abandoned = True
             logger.warning("lifespan startup interrupted")
         if shutdown.reason is None:
             if control_channel is not None:
@@ -744,7 +767,7 @@ def _serve_single(
                     pass
             if shutdown.reason is None:  # asked to stop while setting up
                 try:
-                    loop.run_forever()
+                    _serve_in_root_task(loop)
                 except KeyboardInterrupt:
                     # Only reachable when no SIGINT handler could be
                     # installed (a thread other than the main one).
@@ -774,13 +797,22 @@ def _serve_single(
                 # below needs a slice of it -- a drain that spends all of
                 # the budget means the app's cleanup hook never runs.
                 _drain_connections(loop, _drain_budget(config.grace), shutdown)
+                # What the drain could not finish is cancelled before
+                # lifespan.shutdown (uvicorn's order; the ASGI spec sends it
+                # once connections are closed). Left to _finalize_loop, the
+                # handlers ran on while the shutdown hook closed the pools
+                # and clients they were still using.
+                _cancel_requests(loop, min(1.0, (config.grace - (time.monotonic() - started)) / 4))
             if hook is not None:
                 hook.stop()
             if access_log is not None:
                 access_log.close()
             shutdown.phase = "closing"
             if not shutdown.abandoned:
-                lifespan.shutdown()
+                # Whatever is left of `grace`: a fixed 10s cut a slow hook
+                # off with most of a long budget unspent, and ran a short
+                # budget past the supervisor's SIGKILL.
+                lifespan.shutdown(timeout=max(0.25, config.grace - (time.monotonic() - started)))
             _finalize_loop(loop, config.grace - (time.monotonic() - started))
         finally:
             if lifeline_fd is not None:
@@ -803,6 +835,35 @@ def _serve_single(
             loop.close()
             asyncio.set_event_loop(prev_loop)
             shutdown.phase = "closed"
+
+
+def _serve_in_root_task(loop) -> None:
+    """run_forever(), with a root task for anyio.
+
+    anyio pools the worker threads behind to_thread.run_sync -- FastAPI's
+    plain `def` routes and sync dependencies -- under a "root task": the
+    one run_until_complete() drives, else the calling task itself. Under a
+    bare run_forever() there was none, so each request's own task was its
+    root: every request that offloaded work started a worker thread and
+    stopped it again when it finished (200 requests, 200 threads; uvicorn,
+    which serves inside asyncio.run(), starts 1).
+
+    The task waits for nothing and stays pending past the drain, so the
+    workers stay pooled while requests are still finishing; _finalize_loop
+    cancels it with the other tasks left over, which is what releases them.
+    """
+
+    async def serving():
+        await loop.create_future()
+
+    root = loop.create_task(serving(), name="cadeloop.serve")
+    # What run_until_complete() attaches, and what anyio looks for -- without
+    # run_until_complete()'s RuntimeError when loop.stop() ends serving.
+    root.add_done_callback(_run_until_complete_cb)
+    try:
+        loop.run_forever()
+    finally:
+        root.remove_done_callback(_run_until_complete_cb)
 
 
 def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
@@ -878,7 +939,7 @@ def _drain_connections(loop, grace, shutdown=None):
 
     def poll():
         if (
-            loop._core.http_connection_count() == 0
+            loop._core.http_connection_count() + loop._core.http_detached_count() == 0
             or loop.time() >= deadline
             or (shutdown is not None and shutdown.hurry)
         ):
@@ -899,6 +960,26 @@ def _drain_connections(loop, grace, shutdown=None):
         )
 
 
+def _cancel_requests(loop, budget: float) -> None:
+    """Cancel the requests still in flight and give their cleanup up to
+    ``budget`` seconds to run. At least one pass runs, so the cancellation
+    is delivered and cleanup that does not await completes; cleanup that
+    outlasts the budget carries on alongside lifespan.shutdown."""
+    if loop.is_closed():
+        return
+    drivers = loop._core.http_request_drivers()
+    if not drivers:
+        return
+    for driver in drivers:
+        driver.cancel()
+    finished = [_when_finished(loop, driver) for driver in drivers]
+    try:
+        loop.run_until_complete(asyncio.wait(finished, timeout=max(budget, 0.0)))
+    except RuntimeError as exc:
+        # A forced exit stopped the loop under the wait.
+        logger.debug("cadeloop: request cancellation cut short: %r", exc)
+
+
 def _finalize_loop(loop, budget: float) -> None:
     """What asyncio.run() does before closing its loop, bounded by what is
     left of the grace budget: cancel the tasks the application left
@@ -916,7 +997,10 @@ def _finalize_loop(loop, budget: float) -> None:
         # so all_tasks() never lists it: a handler still awaiting here was
         # never cancelled, its cleanup never ran, and close() then dropped
         # it mid-await. Its driver is cancelled with the tasks.
-        drivers = loop._core.http_request_drivers()
+        # Non-eager requests run as asyncio Tasks, which all_tasks() lists
+        # already: counted twice, one still running read as two.
+        listed = {id(t) for t in tasks}
+        drivers = [d for d in loop._core.http_request_drivers() if id(d) not in listed]
         if tasks or drivers:
             for task in tasks:
                 task.cancel()
@@ -1484,6 +1568,17 @@ def _spawn_worker(app, host, port, config: Config, idx: int, cpus, ssl_ctx=None,
     early is held for the worker's own handler instead of killing it.
     """
     ready_r, ready_w = os.pipe()
+    # What the supervisor has buffered but not yet written -- an import-time
+    # print() of the application, with stdout a pipe -- would otherwise be
+    # copied into the child and written again by _exit_worker's flush: once
+    # per worker, and once more per replacement. multiprocessing flushes
+    # before forking for the same reason.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except (OSError, ValueError):
+            pass
     try:
         pid = os.fork()
     except BaseException:
@@ -1592,12 +1687,40 @@ def _reap(children):
     return 0, 0
 
 
+def _stop_children(children, grace, hurry) -> None:
+    """SIGTERM every supervised worker, give them ``grace`` seconds to
+    drain (``hurry()`` cuts that short), then SIGKILL what is left; reap
+    and forget them all."""
+    for pid in list(children):
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace
+    while children and time.monotonic() < deadline and not hurry():
+        pid, _status = _reap(children)
+        if pid == 0:
+            time.sleep(0.05)
+            continue
+        _close_ready_fd(children.pop(pid, None))
+    for pid in list(children):
+        logger.warning("worker pid %d exceeded grace=%ss — SIGKILL", pid, grace)
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+        _close_ready_fd(children.pop(pid, None))
+
+
 def _kill_children(children) -> None:
     """SIGKILL and reap every supervised worker, then forget them.
 
-    Used on any supervisor-side failure: a half-started fleet with no
-    supervisor left to signal it would otherwise keep the port bound and
-    the application's resources held for the life of the machine.
+    The last resort on a supervisor-side failure, when even the graceful
+    stop failed (or the failure was an interrupt): a half-started fleet
+    with no supervisor left to signal it would otherwise keep the port
+    bound and the application's resources held for the life of the
+    machine.
     """
     for pid, entry in list(children.items()):
         try:
@@ -1807,30 +1930,21 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
         # Drain: give survivors `grace` seconds, then SIGKILL (R-092). Told
         # once more first: harmless to a worker already stopping, and it
         # covers one forked after the signal that started the shutdown.
-        for pid in list(children):
-            try:
-                os.kill(pid, _signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + config.grace
-        while children and time.monotonic() < deadline and not force:
-            pid, _status = _reap(children)
-            if pid == 0:
-                time.sleep(0.05)
-                continue
-            _close_ready_fd(children.pop(pid, None))
-        for pid in list(children):
-            logger.warning("worker pid %d exceeded grace=%ss — SIGKILL", pid, config.grace)
-            try:
-                os.kill(pid, _signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
-            _close_ready_fd(children.pop(pid, None))
-    except BaseException:
+        _stop_children(children, config.grace, lambda: force)
+    except Exception:
         # A fork failing partway (a process limit, say), at startup or as a
-        # replacement, raised with workers already running: same cleanup
-        # either way, or they keep serving with no supervisor.
+        # replacement, raised with workers already running: they keep
+        # serving with no supervisor unless stopped. Stopped the way any
+        # other stop stops them -- SIGKILLed outright, every in-flight
+        # request was cut off and no worker ran its lifespan shutdown,
+        # where the spawn model's supervisor drains on the same failure.
+        try:
+            _stop_children(children, config.grace, lambda: force)
+        except BaseException:
+            _kill_children(children)
+            raise
+        raise
+    except BaseException:
         _kill_children(children)
         raise
     finally:

@@ -89,6 +89,71 @@ def test_large_transfer_10mb(loop):
     loop.run_until_complete(main())
 
 
+def test_small_writes_leave_in_one_send_and_in_order(loop):
+    """R-035: small writes are copied onto the last queued buffer. One
+    buffer per write capped a send at 16 of them and the next send waited
+    a tick, so 256 small writes from one callback took 16 sends and 17
+    ticks. Copying must never touch a buffer a parked send still points at,
+    so this also runs the queue against a peer that stops reading -- sends
+    park on a full socket buffer while every kind and size of write keeps
+    arriving -- and checks every byte arrives, in order."""
+
+    class Writer(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.t = transport
+
+        def data_received(self, data):
+            if data == b"burst":
+                for i in range(256):
+                    self.t.write(bytes([i]) * 64)
+                return
+            # data == b"flood": every write shape, far past the socket
+            # buffers, interleaved across callbacks.
+            for round_ in range(40):
+                loop.call_soon(self.flood, round_)
+
+        def flood(self, round_):
+            for i in range(200):
+                n = (round_ * 200 + i) % 251
+                size = (1, 63, 700, 4096, 4097, 9000)[i % 6]
+                payload = bytes([n]) * size
+                wrap = (bytes, bytearray, memoryview)[i % 3]
+                self.t.write(wrap(payload))
+
+    def expected_flood():
+        out = bytearray()
+        for round_ in range(40):
+            for i in range(200):
+                n = (round_ * 200 + i) % 251
+                out += bytes([n]) * (1, 63, 700, 4096, 4097, 9000)[i % 6]
+        return bytes(out)
+
+    async def main():
+        server = await loop.create_server(Writer, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+        sends = loop.stats()["sends_posted"]
+        writer.write(b"burst")
+        got = await reader.readexactly(256 * 64)
+        assert got == b"".join(bytes([i]) * 64 for i in range(256))
+        # Both ends share this loop; the burst itself is one send (the
+        # request write and any coalesced echo of it are the rest).
+        assert loop.stats()["sends_posted"] - sends <= 3
+
+        want = expected_flood()
+        writer.write(b"flood")
+        await writer.drain()
+        await asyncio.sleep(0.2)  # let the server's sends park on a full buffer
+        got = await reader.readexactly(len(want))
+        assert got == want
+        writer.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 def test_many_concurrent_connections(loop):
     async def main():
         server, addr = await _echo_server(loop)
@@ -793,6 +858,85 @@ def test_cancelled_connect_closes_a_socket_that_already_connected(loop):
 
     try:
         loop.run_until_complete(main())
+        assert _unclosed_peers(lsock) == 0
+    finally:
+        lsock.close()
+
+
+def test_a_connect_completing_after_its_cancel_leaves_the_next_op_alone(loop):
+    """A native op's completion racing its Python-side cancellation, in
+    the order that leaves the most stale state about: the task awaiting
+    create_connection() is cancelled -- its future cancelled, its wakeup
+    queued but not yet run -- and in the next poll the connect completes
+    anyway. The completion finds the future cancelled and closes the
+    connection it made; a new connect is posted (into the slot just
+    freed, the freelist being LIFO); and only then does the task resume
+    and cancel the op it started, which no longer exists. That cancel
+    must not land on the new op, and the abandoned connection must not
+    stay open."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(16)
+    addr = lsock.getsockname()
+    seen = {}
+
+    async def main():
+        first = loop.create_task(loop.create_connection(asyncio.Protocol, *addr))
+        for _ in range(200):
+            if loop.stats()["ops_by_target"]["connect"]:
+                break
+            await asyncio.sleep(0)
+        second = loop.create_future()
+
+        def connect_again():
+            # After the first connect's completion was dispatched, before
+            # the cancelled task's wakeup.
+            seen["in_flight"] = loop.stats()["ops_by_target"]["connect"]
+            loop._core.tcp_connect(addr, second, None)
+
+        time.sleep(0.05)  # noqa: ASYNC251 -- the connect completes in the kernel meanwhile
+        loop.call_soon(connect_again)
+        first.cancel()  # its wakeup is queued behind connect_again
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        return await asyncio.wait_for(second, 5)
+
+    try:
+        fd = loop.run_until_complete(main())
+        loop._core.discard_socket(fd)
+        assert seen == {"in_flight": 0}, "the first connect's completion came after the task resumed"
+        assert _unclosed_peers(lsock) == 0
+    finally:
+        lsock.close()
+
+
+def test_a_late_cancel_of_a_completed_connect_misses_the_op_reusing_its_slot(loop):
+    """The core-level half of the test above, with the op ids in view: the
+    connect that completed after its future was cancelled frees its slot,
+    the next connect takes that very slot (a new generation), and the late
+    cancel_connect() carrying the old id is a no-op rather than a cancel of
+    the op now in the slot."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(16)
+    addr = lsock.getsockname()
+
+    async def main():
+        fut1 = loop.create_future()
+        op1 = loop._core.tcp_connect(addr, fut1, None)
+        time.sleep(0.05)  # noqa: ASYNC251 -- it completes in the kernel meanwhile
+        fut1.cancel()
+        await asyncio.sleep(0)  # the completion is reaped and dispatched
+        await asyncio.sleep(0)
+        fut2 = loop.create_future()
+        op2 = loop._core.tcp_connect(addr, fut2, None)
+        loop._core.cancel_connect(op1)  # late, stale
+        return op1, op2, await asyncio.wait_for(fut2, 5)
+
+    try:
+        op1, op2, fd = loop.run_until_complete(main())
+        loop._core.discard_socket(fd)
+        assert op2[0] == op1[0] and op2[1] != op1[1], (op1, op2)
         assert _unclosed_peers(lsock) == 0
     finally:
         lsock.close()

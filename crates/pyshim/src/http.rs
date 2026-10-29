@@ -15,11 +15,14 @@
 //! the awaited future. `Config(eager_tasks=False)` switches to stdlib
 //! `asyncio.Task` wrapping instead (§16 escape hatch).
 //!
-//! Request lifecycle: a request finishes when its app coroutine RETURNS
-//! (not when the response completes) — post-response code (Starlette
-//! background tasks) runs before the next pipelined request is pumped,
-//! matching uvicorn's per-connection serialization, and the pump loop
-//! stays iterative (no recursion on pipelined bursts).
+//! Request lifecycle: a request's turn on its connection ends when its
+//! response completes, as at uvicorn's on_response_complete -- not when its
+//! app coroutine returns. A coroutine that runs on past its response
+//! (Starlette runs a BackgroundTask inside the app call) continues as a
+//! detached request (`net::Detached`), which a graceful shutdown waits for
+//! and then cancels; the next request on the connection starts at once,
+//! and a close-delimited response is closed at once (ADR-18 addendum). The
+//! pump loop stays iterative (no recursion on pipelined bursts).
 
 use std::collections::VecDeque;
 
@@ -143,6 +146,10 @@ pub(crate) struct HttpConn {
     pub(crate) req_epoch: u64,
     /// Suspended continuation (eager path) — kept alive here.
     pub(crate) driver: Option<Py<AppTask>>,
+    /// The asyncio Task running the active request (non-eager path), so a
+    /// graceful shutdown can cancel it before lifespan.shutdown, as it
+    /// cancels `driver` (`http_request_drivers`).
+    pub(crate) task: Option<Py<PyAny>>,
     pub(crate) eager: bool,
     // --- R-080 idle/head timeouts (0 = disabled), driven by http_sweep --
     pub(crate) head_timeout_ns: u64,
@@ -326,6 +333,7 @@ impl HttpConn {
             drain_waiters: VecDeque::new(),
             req_epoch: 0,
             driver: None,
+            task: None,
             eager,
             head_timeout_ns,
             idle_timeout_ns,
@@ -1017,6 +1025,7 @@ impl HttpReceive {
             WsConnect,
             Ws(WsMsg),
             WsGone,
+            WsWait(Py<PyAny>),
         }
         let r = core.with_net(|net, _| match net.http_conn_mut(self.tid) {
             // A receive() from a request that has already finished (the app
@@ -1038,7 +1047,7 @@ impl HttpReceive {
                 } else if disconnected {
                     R::WsGone
                 } else {
-                    R::Wait(pyloop)
+                    R::WsWait(pyloop)
                 }
             }
             Some(conn) => {
@@ -1083,50 +1092,281 @@ impl HttpReceive {
                 taken(TakenMsg::Ws(m))
             }
             R::Body(b) => taken(TakenMsg::Body(b)),
-            R::Wait(pyloop) => {
-                let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
-                // Prune waiters a cancelled receive() left behind BEFORE
-                // parking the new one: the heartbeat pattern
-                // (wait_for(receive(), t) in a loop) cancels one future
-                // per poll, and retaining them grew the queue without
-                // bound on an idle connection. done() is a Python call,
-                // so the queue is taken out of the cell, filtered here,
-                // and put back in one uninterrupted stretch of loop-thread
-                // code.
-                let parked =
-                    core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.take_recv_waiters()))?;
-                let live: VecDeque<Py<PyAny>> = parked
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|w| {
-                        let done: bool = w
-                            .bind(py)
-                            .call_method0(intern!(py, "done"))
-                            .and_then(|v| v.extract())
-                            .unwrap_or(true);
-                        !done
-                    })
-                    .collect();
-                let store = fut.clone().unbind();
-                // Parked, never displacing: an earlier live waiter still
-                // gets resolved (disconnect resolves every one; a WS wake
-                // hands out one message per waiter). The unstored clone
-                // in the None arm drops out-of-cell, here.
-                let unstored = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
-                    Some(conn) => {
-                        conn.recv_waiters = live;
-                        conn.recv_waiters.push_back(store);
-                        None
-                    }
-                    None => Some(store),
-                })?;
-                if unstored.is_some() {
-                    let msg = gone_message(py, core, self.tid)?;
-                    let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
-                }
-                Ok(fut.unbind())
+            R::Wait(pyloop) => park_recv_waiter(py, core, self.tid, &pyloop, false),
+            R::WsWait(pyloop) => {
+                let fut = park_recv_waiter(py, core, self.tid, &pyloop, true)?;
+                let recv = WsRecv {
+                    core: self.core.clone_ref(py),
+                    tid: self.tid,
+                    epoch: self.epoch,
+                    fut: Some(fut),
+                };
+                Ok(Py::new(py, recv)?.into_any())
             }
         }
+    }
+}
+
+/// Park a receive() waiter on `tid`, first pruning the ones a cancelled
+/// receive() left behind. Returns it already resolved with the gone
+/// message when the connection went away meanwhile.
+fn park_recv_waiter(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    pyloop: &Py<PyAny>,
+    ws: bool,
+) -> PyResult<Py<PyAny>> {
+    let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
+    // Prune waiters a cancelled receive() left behind BEFORE parking the
+    // new one: the heartbeat pattern (wait_for(receive(), t) in a loop)
+    // cancels one future per poll, and retaining them grew the queue
+    // without bound on an idle connection. done() is a Python call, so the
+    // queue is taken out of the cell, filtered here, and put back in one
+    // uninterrupted stretch of loop-thread code.
+    let parked = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.take_recv_waiters()))?;
+    let live: VecDeque<Py<PyAny>> = parked
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| {
+            let done: bool =
+                w.bind(py).call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+            !done
+        })
+        .collect();
+    let store = fut.clone().unbind();
+    // Parked, never displacing: an earlier live waiter still gets resolved
+    // (disconnect resolves every one; a WS wake wakes each). The unstored
+    // clone in the None arm drops out-of-cell, here.
+    let unstored = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+        Some(conn) => {
+            conn.recv_waiters = live;
+            conn.recv_waiters.push_back(store);
+            None
+        }
+        None => Some(store),
+    })?;
+    if unstored.is_some() {
+        let msg = if ws { ws_gone_message(py, core, tid)? } else { gone_message(py, core, tid)? };
+        let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
+    }
+    Ok(fut.unbind())
+}
+
+/// A WsWake for a receive() waiter still pending (R-087): resolve it with
+/// None when a message is queued -- `WsRecv` takes it once its task
+/// resumes -- or with the final disconnect once nothing more can arrive.
+///
+/// With nothing queued (another receive() took it first), the waiter is
+/// parked again -- while there is still something to wait for. The wake
+/// took it out of recv_waiters, so a teardown between queueing the wake and
+/// now (an app callback that ran first, during a graceful shutdown say)
+/// could not release it, and parking it on the gone connection dropped it
+/// unresolved: receive() pending for good, and its task, which asyncio
+/// holds only weakly, destroyed by the collector while pending. Past EOF no
+/// message can arrive either.
+pub(crate) fn ws_wake(py: Python<'_>, core: &CoreLoop, tid: u64, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+    let stored = fut.clone().unbind();
+    let (queued, unparked) = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+        Some(c) if c.ws.as_ref().is_some_and(|w| !w.inbox.is_empty()) => (true, Some(stored)),
+        Some(c) if !c.disconnected => {
+            c.recv_waiters.push_back(stored);
+            (false, None)
+        }
+        // Handed back so the reference drops out of the cell (ADR-5).
+        _ => (false, Some(stored)),
+    })?;
+    if queued {
+        let _ = fut.call_method1(intern!(py, "set_result"), (py.None(),));
+    } else if unparked.is_some() {
+        let msg = ws_gone_message(py, core, tid)?;
+        let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
+    }
+    Ok(())
+}
+
+/// What a WebSocket receive() that has to wait returns (R-087): it parks a
+/// waiter, and takes the front inbox message itself once the waiter is
+/// woken and its task resumes.
+///
+/// The wake used to pop the message into the waiter's result. A receive()
+/// cancelled after that but before its task resumed -- asyncio.timeout
+/// firing in the tick the frame arrived, an anyio deadline, a task group
+/// aborting -- then dropped the message with the future: a receive loop
+/// under a 10 ms timeout lost ~2% of a 1500-message stream. Waking only,
+/// and taking the message on resume, is asyncio.Queue.get's discipline:
+/// a cancelled receive() takes nothing, and what it was woken for stays
+/// at the front of the inbox for the next one.
+///
+/// Its waiter is resolved with None for "a message is queued", or with
+/// the final websocket.disconnect once nothing more can arrive -- a
+/// message that is safe to lose, as every later receive() repeats it.
+enum Took {
+    Value(Py<PyAny>),
+    Wait(Py<PyAny>),
+}
+
+#[pyclass(module = "cadeloop._core")]
+pub struct WsRecv {
+    core: Py<CoreLoop>,
+    tid: u64,
+    epoch: u64,
+    /// The parked waiter; `None` once the message has been handed over.
+    fut: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl WsRecv {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.resume(py)
+    }
+    #[pyo3(signature = (_value=None))]
+    fn send(&mut self, py: Python<'_>, _value: Option<Bound<'_, PyAny>>) -> PyResult<Option<Py<PyAny>>> {
+        self.resume(py)
+    }
+    /// The task was cancelled (or something else thrown in) while waiting
+    /// here: take nothing, and pass a wake this receive() will not use on
+    /// to whoever else is parked. Then raise it.
+    #[pyo3(signature = (typ, val=None, _tb=None))]
+    fn throw(
+        &mut self,
+        py: Python<'_>,
+        typ: Bound<'_, PyAny>,
+        val: Option<Bound<'_, PyAny>>,
+        _tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        self.abandon(py);
+        Err(match val {
+            Some(v) if !v.is_none() => PyErr::from_value(v),
+            _ => PyErr::from_value(typ),
+        })
+    }
+    fn close(&mut self, py: Python<'_>) {
+        self.abandon(py);
+    }
+}
+
+impl WsRecv {
+    fn resume(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        loop {
+            let Some(fut) = self.fut.as_ref().map(|f| f.clone_ref(py)) else {
+                return Err(PyRuntimeError::new_err("cannot reuse already awaited receive()"));
+            };
+            let f = fut.bind(py);
+            let done: bool = f.call_method0(intern!(py, "done"))?.extract()?;
+            if !done {
+                // Future.__await__: yield it to the task, which resumes
+                // this once it is resolved.
+                f.setattr(intern!(py, "_asyncio_future_blocking"), true)?;
+                return Ok(Some(fut));
+            }
+            // A cancelled waiter raises here, as awaiting it would.
+            let res = f.call_method0(intern!(py, "result"));
+            let res = match res {
+                Ok(r) if r.is_none() => None,
+                Ok(r) => Some(r.unbind()),
+                Err(e) => {
+                    self.fut = None;
+                    return Err(e);
+                }
+            };
+            let took = match res {
+                Some(final_msg) => Took::Value(final_msg),
+                None => self.take(py)?,
+            };
+            match took {
+                Took::Value(v) => {
+                    self.fut = None;
+                    return Err(PyErr::from_value(
+                        pyo3::exceptions::PyStopIteration::new_err((v,)).value(py).clone().into_any(),
+                    ));
+                }
+                // Woken, and the message went to another receive() first:
+                // wait again.
+                Took::Wait(pyloop) => {
+                    let core = self.core.bind(py).get();
+                    self.fut = Some(park_recv_waiter(py, core, self.tid, &pyloop, true)?);
+                }
+            }
+        }
+    }
+
+    /// The front inbox message, or the final disconnect once nothing more
+    /// can arrive; else the loop to park a fresh waiter on.
+    fn take(&self, py: Python<'_>) -> PyResult<Took> {
+        enum T {
+            Msg(WsMsg),
+            Gone,
+            Wait(Py<PyAny>),
+        }
+        let (tid, epoch) = (self.tid, self.epoch);
+        let core = self.core.bind(py).get();
+        let t = core.with_net(|net, reactor| {
+            let t = match net.http_conn_mut(tid) {
+                Some(conn) if conn.req_epoch == epoch => {
+                    let disconnected = conn.disconnected;
+                    let pyloop = conn.pyloop.clone_ref(py);
+                    match conn.ws.as_mut() {
+                        Some(ws) => match ws.inbox.pop_front() {
+                            Some(m) => {
+                                ws.inbox_bytes = ws.inbox_bytes.saturating_sub(m.charge());
+                                T::Msg(m)
+                            }
+                            None if disconnected => T::Gone,
+                            None => T::Wait(pyloop),
+                        },
+                        None => T::Gone,
+                    }
+                }
+                _ => T::Gone,
+            };
+            if matches!(t, T::Msg(_)) {
+                // A message just left the inbox, so the budget that
+                // suppressed reading may have freed up.
+                ws_resume_reading(py, net, reactor.backend_mut(), tid);
+            }
+            t
+        })?;
+        match t {
+            T::Msg(m) => Ok(Took::Value(ws_message_dict(py, m)?)),
+            T::Gone => Ok(Took::Value(ws_gone_message(py, core, tid)?)),
+            T::Wait(pyloop) => Ok(Took::Wait(pyloop)),
+        }
+    }
+
+    fn abandon(&mut self, py: Python<'_>) {
+        let Some(fut) = self.fut.take() else { return };
+        let f = fut.bind(py);
+        let done: bool = f.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+        if !done {
+            // Not woken yet: leave no live waiter for a wake to land on.
+            let _ = f.call_method0(intern!(py, "cancel"));
+            return;
+        }
+        let cancelled: bool =
+            f.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(true);
+        let woken = !cancelled && f.call_method0(intern!(py, "result")).is_ok_and(|r| r.is_none());
+        if !woken {
+            return;
+        }
+        // Woken for a message it will now never take, which is still at
+        // the front of the inbox: wake whoever else is parked for it.
+        let tid = self.tid;
+        let _ = self.core.bind(py).get().with_net(|net, _| {
+            if let Some(conn) = net.http_conn_mut(tid) {
+                if conn.ws.as_ref().is_some_and(|w| !w.inbox.is_empty()) {
+                    for fut in conn.take_recv_waiters() {
+                        net.events.push(net::NetEvent::WsWake { tid, fut });
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -1163,8 +1403,22 @@ impl HttpSend {
         // stream against a slow client -- the loop monopolised, the queue
         // unbounded, and the configured watermarks never applied to the
         // ASGI producer the way they apply to a Python protocol.
+        let (tid, epoch) = (self.tid, self.epoch);
         let over = core.with_net(|net, _| {
-            net::write_pressure(net, self.tid).map(|(queued, high, _)| queued > high).unwrap_or(false)
+            // A non-eager request's Task runs on past its response out of
+            // the engine's sight (the eager driver is released where it
+            // suspends): release the connection from the event phase.
+            if let Some(c) = net.http_conn_mut(tid) {
+                if !c.eager
+                    && c.task.is_some()
+                    && c.resp == RespPhase::Done
+                    && c.ws.is_none()
+                    && owns(c, epoch)
+                {
+                    net.events.push(net::NetEvent::HttpRelease { tid, epoch });
+                }
+            }
+            net::write_pressure(net, tid).map(|(queued, high, _)| queued > high).unwrap_or(false)
         })?;
         if !over {
             return Ok(completed(py).clone_ref(py).into_any());
@@ -2659,12 +2913,36 @@ fn is_ws_key(k: &[u8]) -> bool {
         && k[..22].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
-/// Phase 2: start queued requests until the queue is empty or one
-/// suspends. ITERATIVE — a pipelined burst of N sync requests runs in one
+/// Pipelined requests one connection runs per pump before yielding to
+/// everyone else (R-085).
+///
+/// One 64 KiB read can carry ~2400 minimal pipelined requests, and the pump
+/// used to run all of them back to back: every other connection's requests,
+/// I/O and timers waited behind one client's burst -- ~6 ms per read here,
+/// and a probe's p99 latency went from 0.9 ms to 7.7 ms under four
+/// pipelining clients. Past the quantum the pump re-queues itself as an
+/// event and the rest run on later passes, after what other connections
+/// have queued meanwhile. uvicorn yields after every request; 16 keeps the
+/// yield's own cost negligible next to the requests it separates.
+const PUMP_QUANTUM: usize = 16;
+
+/// Phase 2: start queued requests until the queue is empty, one suspends,
+/// or `PUMP_QUANTUM` have run. ITERATIVE — a pipelined burst runs in a
 /// loop, not N nested stacks (AppTask::step never pumps).
 pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64) -> PyResult<()> {
     let core = slf.get();
+    let mut ran = 0usize;
     loop {
+        if ran == PUMP_QUANTUM {
+            // Yield: the rest of the pipeline goes behind whatever is queued
+            // now, as a pump of its own.
+            return core.with_net(|net, _| {
+                if net.http_conn_mut(tid).is_some_and(|c| !c.active && !c.pending.is_empty()) {
+                    net.events.push(net::NetEvent::HttpPump { tid });
+                }
+            });
+        }
+        ran += 1;
         // Pop the next request only when no request is active.
         let next = core.with_net(|net, reactor| {
             let logging = net.access_sink.is_some();
@@ -2771,28 +3049,37 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         let recv_obj = Py::new(py, HttpReceive { core: slf.clone().unbind(), tid, epoch })?;
         let send_obj = Py::new(py, HttpSend { core: slf.clone().unbind(), tid, epoch })?;
 
-        let coro = match app.bind(py).call1((scope, recv_obj, send_obj)) {
+        // The application is called inside the context its request then
+        // runs in, as uvicorn calls it inside the request's Task. Called
+        // in the loop's own context, whatever the synchronous part of the
+        // call set there -- an ASGI middleware whose plain `__call__` sets
+        // the user from a header, then returns the inner app's coroutine
+        // -- stayed set for every request after it, on any connection.
+        let ctx = crate::coreloop::copy_context(py)?;
+        let coro = match in_context(py, &ctx, || app.bind(py).call1((scope, recv_obj, send_obj))) {
             Ok(c) => c,
             Err(e) => {
-                app_failure(py, core, tid, e)?;
+                app_failure(py, core, tid, epoch, e)?;
                 continue;
             }
         };
 
         if eager {
             // R-056: step inline; only a suspension allocates a driver.
-            let task = AppTask::spawn(py, slf, tid, coro.unbind(), pyloop)?;
+            let task = AppTask::spawn(py, slf, tid, epoch, coro.unbind(), pyloop, ctx)?;
             let initial = AppTask::step(task.bind(py), py, None)?;
             match initial {
                 StepOutcome::Suspended => {
-                    core.with_net(|net, _| {
-                        if let Some(c) = net.http_conn_mut(tid) {
-                            c.driver = Some(task.clone_ref(py));
-                        }
-                    })?;
+                    let parked = core.with_net(|net, _| park_driver(py, net, tid, epoch, &task))?;
+                    if parked == Parked::Released {
+                        // Its response is complete; it runs on detached,
+                        // and the next pipelined request goes now.
+                        finish_request(py, core, tid)?;
+                        continue;
+                    }
                     return Ok(()); // resumes via future callbacks
                 }
-                StepOutcome::Finished => on_coro_finished(py, core, tid)?,
+                StepOutcome::Finished => on_coro_finished(py, core, tid, epoch)?,
                 StepOutcome::Failed => {} // app_failure already ran in step
             }
         } else {
@@ -2807,27 +3094,146 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
             // turns the same per-request mistake into a 500 and keeps
             // serving everyone else. Route it the same way.
             let spawned = (|| -> PyResult<()> {
-                let task = pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))?;
-                let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid })?;
+                // Created in the call's context, so the Task copies it. Its
+                // done callback, below, is not: that pumps the connection's
+                // next request, which must not start in this one's context.
+                let task = in_context(py, &ctx, || {
+                    pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))
+                })?;
+                let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid, epoch })?;
                 task.call_method1(intern!(py, "add_done_callback"), (cb,))?;
+                let stored = task.unbind();
+                // Handed back when the connection is gone, so the reference
+                // drops out of the cell (ADR-5).
+                let unstored = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+                    Some(c) => {
+                        c.task = Some(stored);
+                        None
+                    }
+                    None => Some(stored),
+                })?;
+                drop(unstored);
                 Ok(())
             })();
             if let Err(e) = spawned {
-                app_failure(py, core, tid, e)?;
+                app_failure(py, core, tid, epoch, e)?;
             }
             return Ok(());
         }
     }
 }
 
-/// The app coroutine returned: verify the response completed (R-086) and
-/// finish the request cycle.
-fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let (complete, is_ws, disconnected) = core.with_net(|net, _| {
-        net.http_conn_mut(tid)
-            .map(|c| (c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected))
-            .unwrap_or((true, false, false))
+/// Run `f` with `ctx` entered as the current context.
+fn in_context<'py, T>(py: Python<'py>, ctx: &Py<PyAny>, f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    if unsafe { ffi::PyContext_Enter(ctx.as_ptr()) } != 0 {
+        return Err(PyErr::fetch(py));
+    }
+    let out = f();
+    if unsafe { ffi::PyContext_Exit(ctx.as_ptr()) } != 0 {
+        return Err(PyErr::fetch(py));
+    }
+    out
+}
+
+/// Is request `epoch` still the one running on its connection? Not once it
+/// has been released (`release_request`), and not once a later request
+/// has started.
+pub(crate) fn owns(conn: &HttpConn, epoch: u64) -> bool {
+    conn.active && conn.req_epoch == epoch
+}
+
+#[derive(PartialEq)]
+enum Parked {
+    OnConnection,
+    Released,
+    Detached,
+}
+
+/// An eager request just suspended: keep its driver on the connection --
+/// or, when its response is already complete, release the connection
+/// instead and keep the driver as a detached request (`release_request`).
+/// In-cell.
+fn park_driver(py: Python<'_>, net: &mut NetState, tid: u64, epoch: u64, task: &Py<AppTask>) -> Parked {
+    let owned = match net.http_conn_mut(tid) {
+        Some(c) => owns(c, epoch),
+        None => false,
+    };
+    if !owned {
+        // Off its connection already -- released, or torn off it (RST,
+        // EPIPE), possibly while this very step ran: it runs on detached.
+        // Torn off mid-request, it is reclaimed after the dead-peer
+        // deadline unless it finishes first.
+        if !net.is_detached(task.as_ptr()) {
+            // The connection's own deadline went with it.
+            let reclaim =
+                if net.http_conn_mut(tid).is_none() { net::DISCONNECTED_RECLAIM_FALLBACK_NS } else { 0 };
+            net.detach(net::Detached::driver(task.clone_ref(py), reclaim));
+        }
+        return Parked::Detached;
+    }
+    let Some(c) = net.http_conn_mut(tid) else { return Parked::Detached };
+    if c.resp == RespPhase::Done && c.ws.is_none() {
+        if let Some(d) = c.driver.take() {
+            net.graveyard_py.push(d.into_any());
+        }
+        net.detach(net::Detached::driver(task.clone_ref(py), 0));
+        return Parked::Released;
+    }
+    if c.driver.as_ref().is_none_or(|d| !d.is(task)) {
+        if let Some(d) = c.driver.replace(task.clone_ref(py)) {
+            net.graveyard_py.push(d.into_any());
+        }
+    }
+    Parked::OnConnection
+}
+
+/// The response of request `epoch` is complete but its coroutine runs on
+/// (background work: Starlette's BackgroundTask runs inside the app call,
+/// after the last body message): end its turn on the connection now, as
+/// uvicorn does at response completion. The next request on the
+/// connection then starts at once, and a close-delimited response is
+/// closed at once, rather than both waiting for the background work. The
+/// coroutine runs on as a detached request (`net::Detached`), which a
+/// graceful shutdown waits for and cancels.
+///
+/// For the eager driver this happens where it suspends (`park_driver`).
+/// A non-eager Task suspends out of sight, so its final send() queues an
+/// `HttpRelease` event that lands here.
+pub(crate) fn release_request(
+    py: Python<'_>,
+    slf: &Bound<'_, CoreLoop>,
+    tid: u64,
+    epoch: u64,
+) -> PyResult<()> {
+    let core = slf.get();
+    let released = core.with_net(|net, _| {
+        let Some(c) = net.http_conn_mut(tid) else { return false };
+        if !owns(c, epoch) || c.resp != RespPhase::Done || c.ws.is_some() {
+            return false;
+        }
+        let task = c.task.take();
+        if let Some(t) = task {
+            net.detach(net::Detached::task(t));
+        }
+        true
     })?;
+    if released {
+        finish_request(py, core, tid)?;
+        pump_requests(py, slf, tid)?;
+    }
+    Ok(())
+}
+
+/// The app coroutine of request `epoch` returned: verify the response
+/// completed (R-086) and finish the request cycle -- unless the request was
+/// released already, in which case its connection has moved on.
+fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> PyResult<()> {
+    let state = core.with_net(|net, _| match net.http_conn_mut(tid) {
+        Some(c) if !owns(c, epoch) => None,
+        Some(c) => Some((c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected)),
+        None => Some((true, false, false)),
+    })?;
+    let Some((complete, is_ws, disconnected)) = state else { return Ok(()) };
     if is_ws {
         return ws_app_done(py, core, tid);
     }
@@ -2845,6 +3251,7 @@ fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
             py,
             core,
             tid,
+            epoch,
             PyRuntimeError::new_err("ASGI application returned without completing the response"),
         )
     }
@@ -2852,8 +3259,14 @@ fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
 
 /// App raised (R-086): 500 if the response never started, teardown if it
 /// died mid-response. Client disconnects are not reported as app errors.
-pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr) -> PyResult<()> {
-    if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
+pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64, err: PyErr) -> PyResult<()> {
+    if is_process_exit(py, &err) {
+        // SystemExit and KeyboardInterrupt ask the process to stop rather
+        // than fail the request: they go on out of the loop, as from an
+        // asyncio Task -- once the request is answered like any failed
+        // one. Raised before that, they left its client with no answer
+        // until the shutdown's deadline closed the connection under it.
+        fail_request(py, core, tid, epoch)?;
         return Err(err);
     }
     // CancelledError is not an application error: it is how a request is
@@ -2866,6 +3279,23 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
         || err.is_instance_of::<PyBrokenPipeError>(py);
     if !disconnect {
         core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any())?;
+    }
+    fail_request(py, core, tid, epoch)
+}
+
+fn is_process_exit(py: Python<'_>, err: &PyErr) -> bool {
+    err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py)
+}
+
+/// What a request whose coroutine raised gets (R-086): 500 if its response
+/// never started, a hard close if it died mid-response; a WebSocket, 1011.
+fn fail_request(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> PyResult<()> {
+    // A request already released (it failed in its background work) or
+    // superseded: its connection has moved on to another request, which
+    // this must neither answer for nor tear down.
+    let owned = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| owns(c, epoch)).unwrap_or(true))?;
+    if !owned {
+        return Ok(());
     }
     let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
     if is_ws {
@@ -3033,11 +3463,17 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
 
 /// Drop the stored driver reference (failure paths where finish_request
 /// did not run).
-fn drop_driver(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
+fn drop_driver(py: Python<'_>, core: &CoreLoop, tid: u64, driver: *mut ffi::PyObject) -> PyResult<()> {
     let dropped = core.with_net(|net, _| {
-        let d = net.http_conn_mut(tid).and_then(|c| c.driver.take());
+        // On its connection, or detached: never another request's driver.
+        let on_conn =
+            net.http_conn_mut(tid).filter(|c| c.driver.as_ref().is_some_and(|d| d.as_ptr() == driver));
+        let d = match on_conn {
+            Some(c) => c.driver.take().map(Py::into_any),
+            None => net.forget_detached(driver),
+        };
         if let Some(d) = d {
-            net.graveyard_py.push(d.into_any());
+            net.graveyard_py.push(d);
             true
         } else {
             false
@@ -3077,11 +3513,17 @@ fn cancelled_error_type(py: Python<'_>) -> PyResult<&Py<PyAny>> {
 }
 
 fn cancelled_error(py: Python<'_>) -> PyErr {
-    match cancelled_error_type(py) {
-        Ok(cls) => match cls.bind(py).call0() {
-            Ok(exc) => PyErr::from_value(exc),
-            Err(e) => e,
-        },
+    cancelled_error_with(py, None)
+}
+
+/// `CancelledError(msg)`, or a bare one (Future._make_cancelled_error).
+fn cancelled_error_with(py: Python<'_>, msg: Option<Py<PyAny>>) -> PyErr {
+    let made = cancelled_error_type(py).and_then(|cls| match msg {
+        Some(m) => cls.bind(py).call1((m,)),
+        None => cls.bind(py).call0(),
+    });
+    match made {
+        Ok(exc) => PyErr::from_value(exc),
         Err(e) => e,
     }
 }
@@ -3100,23 +3542,38 @@ fn task_hook<'py>(
 /// Lightweight Task stand-in driving eagerly-stepped app coroutines
 /// (R-056). While stepping it registers as `asyncio.current_task()` and
 /// exposes the Task surface anyio-based frameworks touch (weakref,
-/// cancel/uncancel, get_loop/get_name); it is still not a full
-/// `asyncio.Task` — switch `eager_tasks` off (§16) for libraries that
-/// need complete Task semantics (e.g. task introspection, eager cancel
-/// counts).
+/// cancel(msg)/cancelling/uncancel, get_loop/get_name); it is still not a
+/// full `asyncio.Task` — switch `eager_tasks` off (§16) for libraries that
+/// need complete Task semantics (e.g. task introspection).
 #[pyclass(weakref, module = "cadeloop._core")]
 pub struct AppTask {
     core: Py<CoreLoop>,
     tid: u64,
+    /// The connection's `req_epoch` for the request this drives: once the
+    /// request has been released or superseded, its completion must leave
+    /// the connection alone (`owns`).
+    epoch: u64,
     coro: Py<PyAny>,
     pyloop: Py<PyAny>,
     finished: bool,
     must_cancel: bool,
+    /// The message of the cancel() that latched `must_cancel`
+    /// (Task._cancel_message). anyio tells its own cancellations from
+    /// anyone else's by it: delivered as a bare CancelledError, a
+    /// cancel scope hit at a checkpoint did not recognise its own
+    /// cancel and let it escape the `with` block.
+    cancel_msg: Option<Py<PyAny>>,
+    /// Task._num_cancels_requested: what cancelling() reports and
+    /// uncancel() takes back. asyncio.timeout and anyio decide by it
+    /// whether a CancelledError is theirs to absorb; pinned at 0, an
+    /// inner scope absorbed an outer scope's cancellation as well.
+    cancels_requested: u32,
     /// The future this task is suspended on (cancel() forwards to it,
     /// mirroring Task.cancel()).
     waiting_on: Option<Py<PyAny>>,
-    /// Captured at spawn() time (contextvars.Context.copy(), mirroring
-    /// real asyncio.Task.__init__) and entered/exited around every
+    /// A copy of the loop's context taken before the application was
+    /// called -- the call itself runs in it (`pump_requests`), as it does
+    /// inside a uvicorn request Task -- and entered/exited around every
     /// coroutine step in step_inner — without this, contextvars set
     /// during one request are visible to unrelated concurrent or later
     /// requests on the same worker (handles.rs::run_handle already
@@ -3158,33 +3615,34 @@ impl AppTask {
             if this.finished {
                 return Ok(false);
             }
-            match this.waiting_on.as_ref() {
-                Some(f) => Some(f.clone_ref(py)),
-                None => {
-                    this.must_cancel = true;
-                    None
-                }
-            }
+            this.cancels_requested += 1;
+            this.waiting_on.as_ref().map(|f| f.clone_ref(py))
         };
         if let Some(fut) = waiting {
             // Task.cancel semantics: cancel the awaited future; the
             // CancelledError arrives through _wake.
-            let forwarded: bool = match msg {
+            let forwarded: bool = match &msg {
                 Some(m) => fut.call_method1(py, intern!(py, "cancel"), (m,))?,
                 None => fut.call_method0(py, intern!(py, "cancel"))?,
             }
             .extract(py)
             .unwrap_or(false);
-            if !forwarded {
-                // The awaited future completed first, so cancelling it was a
-                // no-op and no CancelledError will arrive through _wake —
-                // the queued wake would otherwise resume the coroutine with
-                // the successful result and silently swallow the cancel.
-                // asyncio.Task latches the request instead; mirror that so
-                // request timeouts and anyio cancel scopes still fire.
-                slf.borrow_mut().must_cancel = true;
+            if forwarded {
+                return Ok(true);
             }
+            // The awaited future completed first, so cancelling it was a
+            // no-op and no CancelledError will arrive through _wake —
+            // the queued wake would otherwise resume the coroutine with
+            // the successful result and silently swallow the cancel.
         }
+        // Nothing awaited (a bare yield, or a cancel() from inside the
+        // step), or the future above completed first: asyncio.Task
+        // latches the request, message and all, for the next step to
+        // deliver -- mirror that so request timeouts and anyio cancel
+        // scopes still fire, and still know their own cancellation.
+        let mut this = slf.borrow_mut();
+        this.must_cancel = true;
+        this.cancel_msg = msg.map(Bound::unbind);
         Ok(true)
     }
 
@@ -3197,11 +3655,12 @@ impl AppTask {
     }
 
     fn cancelling(&self) -> u32 {
-        0
+        self.cancels_requested
     }
 
-    fn uncancel(&self) -> u32 {
-        0
+    fn uncancel(&mut self) -> u32 {
+        self.cancels_requested = self.cancels_requested.saturating_sub(1);
+        self.cancels_requested
     }
 
     /// asyncio.Task private surface read directly (not called) by anyio's
@@ -3297,23 +3756,31 @@ fn future_loop<'py>(py: Python<'py>, fut: &Bound<'py, PyAny>) -> Option<Bound<'p
 }
 
 impl AppTask {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     pub(crate) fn spawn(
         py: Python<'_>,
         slf: &Bound<'_, CoreLoop>,
         tid: u64,
+        epoch: u64,
         coro: Py<PyAny>,
         pyloop: Py<PyAny>,
+        context: Py<PyAny>,
     ) -> PyResult<Py<AppTask>> {
-        let context = crate::coreloop::copy_context(py)?;
         Py::new(
             py,
             AppTask {
                 core: slf.clone().unbind(),
                 tid,
+                epoch,
                 coro,
                 pyloop,
                 finished: false,
                 must_cancel: false,
+                cancel_msg: None,
+                cancels_requested: 0,
                 waiting_on: None,
                 context,
                 callbacks: Vec::new(),
@@ -3372,7 +3839,12 @@ impl AppTask {
         if let Err(e) = task_hook(py, &LEAVE_TASK, "_leave_task").and_then(|f| f.call1(py, (&pyloop, slf))) {
             e.write_unraisable(py, None);
         }
-        if matches!(out, Ok(StepOutcome::Finished) | Ok(StepOutcome::Failed)) {
+        let finished = match &out {
+            Ok(o) => matches!(o, StepOutcome::Finished | StepOutcome::Failed),
+            // A process-exit exception the coroutine raised (step_body).
+            Err(_) => slf.borrow().finished,
+        };
+        if finished {
             slf.borrow_mut().finished = true;
             AppTask::fire_done_callbacks(slf, py)?;
         }
@@ -3400,14 +3872,29 @@ impl AppTask {
     }
 
     fn step_body(slf: &Bound<'_, Self>, py: Python<'_>, mut throw: Option<PyErr>) -> PyResult<StepOutcome> {
-        let (coro, core_py, tid) = {
+        let (coro, core_py, tid, epoch, latched) = {
             let mut this = slf.borrow_mut();
-            if this.must_cancel {
+            let latched = if this.must_cancel {
                 this.must_cancel = false;
-                throw = Some(cancelled_error(py));
-            }
-            (this.coro.clone_ref(py), this.core.clone_ref(py), this.tid)
+                Some(this.cancel_msg.take())
+            } else {
+                None
+            };
+            (this.coro.clone_ref(py), this.core.clone_ref(py), this.tid, this.epoch, latched)
         };
+        if let Some(msg) = latched {
+            // Task.__step: a CancelledError already on its way in (the
+            // awaited future's, carrying the message its cancel() was
+            // given) is kept; anything else is replaced by one carrying
+            // the latched cancel's message.
+            let incoming = match &throw {
+                Some(e) => e.is_instance(py, cancelled_error_type(py)?.bind(py)),
+                None => false,
+            };
+            if !incoming {
+                throw = Some(cancelled_error_with(py, msg));
+            }
+        }
         let core = core_py.bind(py).get();
         loop {
             let step_result: Result<Option<Py<PyAny>>, PyErr> = if let Some(exc) = throw.take() {
@@ -3478,13 +3965,21 @@ impl AppTask {
                             // future just awaited; left latched, it waited
                             // for that future to finish by itself -- for
                             // ever, for one that never does.
-                            if slf.borrow().must_cancel {
-                                let cancelled: bool = y
-                                    .call_method0(intern!(py, "cancel"))
-                                    .and_then(|v| v.extract())
-                                    .unwrap_or(false);
+                            let latched = {
+                                let this = slf.borrow();
+                                this.must_cancel.then(|| this.cancel_msg.as_ref().map(|m| m.clone_ref(py)))
+                            };
+                            if let Some(msg) = latched {
+                                let cancelled: bool = match msg {
+                                    Some(m) => y.call_method1(intern!(py, "cancel"), (m,)),
+                                    None => y.call_method0(intern!(py, "cancel")),
+                                }
+                                .and_then(|v| v.extract())
+                                .unwrap_or(false);
                                 if cancelled {
-                                    slf.borrow_mut().must_cancel = false;
+                                    let mut this = slf.borrow_mut();
+                                    this.must_cancel = false;
+                                    this.cancel_msg = None;
                                 }
                             }
                             return Ok(StepOutcome::Suspended);
@@ -3496,7 +3991,15 @@ impl AppTask {
                     }
                 }
                 Err(e) => {
-                    app_failure(py, core, tid, e)?;
+                    if let Err(fatal) = app_failure(py, core, tid, epoch, e) {
+                        // SystemExit or KeyboardInterrupt, going on out of
+                        // the loop: the coroutine that raised it is
+                        // finished all the same (`step` fires its done
+                        // callbacks), and no longer the connection's.
+                        slf.borrow_mut().finished = true;
+                        drop_driver(py, core, tid, slf.as_ptr())?;
+                        return Err(fatal);
+                    }
                     return Ok(StepOutcome::Failed);
                 }
             }
@@ -3507,19 +4010,31 @@ impl AppTask {
     /// _resume_bare). The initial eager step in pump_requests handles its
     /// outcomes inline instead.
     fn after_step(slf: &Bound<'_, Self>, py: Python<'_>, out: StepOutcome) -> PyResult<()> {
-        if matches!(out, StepOutcome::Suspended) {
-            return Ok(());
-        }
-        let (core_py, tid) = {
+        let (core_py, tid, epoch) = {
             let this = slf.borrow();
-            (this.core.clone_ref(py), this.tid)
+            (this.core.clone_ref(py), this.tid, this.epoch)
         };
         let core_bound = core_py.bind(py);
         let core = core_bound.get();
-        if matches!(out, StepOutcome::Finished) {
-            on_coro_finished(py, core, tid)?;
+        if matches!(out, StepOutcome::Suspended) {
+            // Suspended with its response complete: release the connection
+            // now rather than when the coroutine returns (`release_request`).
+            let task = slf.clone().unbind();
+            let parked = core.with_net(|net, _| park_driver(py, net, tid, epoch, &task))?;
+            if parked == Parked::Released {
+                finish_request(py, core, tid)?;
+                core.with_net(|net, _| {
+                    if net.http_conn_mut(tid).is_some_and(|c| !c.active && !c.pending.is_empty()) {
+                        net.events.push(net::NetEvent::HttpPump { tid });
+                    }
+                })?;
+            }
+            return Ok(());
         }
-        drop_driver(py, core, tid)?;
+        if matches!(out, StepOutcome::Finished) {
+            on_coro_finished(py, core, tid, epoch)?;
+        }
+        drop_driver(py, core, tid, slf.as_ptr())?;
         // Pump pipelined requests that queued while this one ran (R-085)
         // -- from the event phase, not from here. This runs inside
         // `_wake`, in a copy of the finished request's own context, and
@@ -3541,6 +4056,8 @@ impl AppTask {
 pub struct HttpTaskDone {
     core: Py<CoreLoop>,
     tid: u64,
+    /// See `AppTask::epoch`.
+    epoch: u64,
 }
 
 #[pymethods]
@@ -3548,6 +4065,20 @@ impl HttpTaskDone {
     fn __call__(&self, py: Python<'_>, task: Bound<'_, PyAny>) -> PyResult<()> {
         let core_bound = self.core.bind(py);
         let core = core_bound.get();
+        // Done whichever way it ended, so it is no longer a request a
+        // shutdown has to cancel -- on its connection or detached. Dropped
+        // out here: the caller holds the same task, so this is never the
+        // last reference.
+        let ptr = task.as_ptr();
+        let stored = core.with_net(|net, _| {
+            let on_conn =
+                net.http_conn_mut(self.tid).filter(|c| c.task.as_ref().is_some_and(|t| t.as_ptr() == ptr));
+            match on_conn {
+                Some(c) => c.task.take(),
+                None => net.forget_detached(ptr),
+            }
+        })?;
+        drop(stored);
         let cancelled: bool =
             task.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(false);
         if cancelled {
@@ -3556,13 +4087,21 @@ impl HttpTaskDone {
             // RuntimeError here logged every cancelled request (each one
             // still in flight at a graceful shutdown's deadline, say) as
             // an exception in the application.
-            app_failure(py, core, self.tid, cancelled_error(py))?;
+            app_failure(py, core, self.tid, self.epoch, cancelled_error(py))?;
         } else {
             let exc = task.call_method0(intern!(py, "exception"))?;
             if exc.is_none() {
-                on_coro_finished(py, core, self.tid)?;
+                on_coro_finished(py, core, self.tid, self.epoch)?;
             } else {
-                app_failure(py, core, self.tid, PyErr::from_value(exc))?;
+                let err = PyErr::from_value(exc);
+                if is_process_exit(py, &err) {
+                    // The Task raised it out of the loop itself already;
+                    // raised again from here it would cut the shutdown
+                    // that it started short.
+                    fail_request(py, core, self.tid, self.epoch)?;
+                } else {
+                    app_failure(py, core, self.tid, self.epoch, err)?;
+                }
             }
         }
         pump_requests(py, core_bound, self.tid)

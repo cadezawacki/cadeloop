@@ -59,13 +59,13 @@ def _not_yet(feature: str, key: str):
     )
 
 
-def _run_until_complete_cb(fut):
-    if not fut.cancelled():
-        exc = fut.exception()
-        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
-            # Leave it to run_forever to propagate.
-            return
-    futures._get_loop(fut).stop()
+# asyncio's own, not a copy of it: anyio recognises the task
+# run_until_complete() drives -- its "root task", which it pools the
+# worker threads behind to_thread.run_sync under -- by this very function
+# (uvloop's by module name). With an identical copy, no task was ever the
+# root, and every task that offloaded work started a worker thread of its
+# own and stopped it again when it finished.
+_run_until_complete_cb = base_events._run_until_complete_cb
 
 
 class Loop(TcpSurface, asyncio.AbstractEventLoop):

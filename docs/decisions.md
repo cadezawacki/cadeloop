@@ -126,6 +126,29 @@ recursion); (c) response-completion bookkeeping needs no per-request
 sequence numbers. The cost — a slow background task delays the next
 request on THAT connection — matches uvicorn's observable behavior.
 
+**Addendum (later review pass): reversed.** The parity claim was wrong.
+uvicorn (h11 and httptools alike) starts the next request on a connection,
+and closes a close-delimited response, at `on_response_complete`, while the
+previous request's task carries on with its background work. Measured
+against uvicorn 0.54: behind a 1.5 s BackgroundTask the next keep-alive
+request took 1.5 s here and 0.0 s there, and an HTTP/1.0 streaming response
+reached EOF after 1.52 s against 0.02 s. The dead-peer sweep (H4) also
+cancelled background work once its client had read the response and gone.
+A request's turn on its connection now ends when its response completes.
+An eager driver that suspends after that point, or a non-eager Task whose
+final `send()` has gone out, becomes a *detached* request (`net::Detached`,
+keyed by object). The connection is released through `finish_request`, so
+the keep-alive or close decision and the pipeline pump run at once. A
+detached request's completion is told apart from its connection's later
+requests by the request epoch that `AppTask` and `HttpTaskDone` now carry.
+A graceful drain waits for detached requests, `_cancel_requests` and
+`close()` cancel them, and the sweep never reclaims one whose response was
+complete. The same mechanism now keeps a request whose connection was torn
+down under it (RST, EPIPE). Before, its eager driver was dropped with the
+entry, so it could never be cancelled or finalized. Such a request is
+reclaimed after the dead-peer deadline, like a parked request whose client
+has gone. Consequence (b) still holds: the pump never recurses.
+
 ## ADR-19: Eager AppTask registers as asyncio.current_task()
 The R-056 eager path steps app coroutines without allocating asyncio
 Tasks. anyio (Starlette's task groups, StreamingResponse) weakrefs and

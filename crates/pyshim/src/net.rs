@@ -51,6 +51,40 @@ use crate::http::HttpConn;
 
 /// R-035: cork flush threshold.
 const CORK_FLUSH_BYTES: usize = 64 * 1024;
+
+/// Writes at most this big are copied onto the end of the last queued
+/// buffer instead of queuing a buffer of their own (see `coalesce_tail`).
+///
+/// A send carries at most MAX_GATHER (16) buffers, and the next one is
+/// posted only once the last one's completion is reaped -- the following
+/// tick. One buffer per write therefore capped a transport at 16 small
+/// writes per syscall AND per tick: a protocol writing 256 64-byte
+/// messages from one callback took 16 sends and 17 ticks to get them out,
+/// and pipelined HTTP responses left 16 to a send. Past this size a
+/// write is big enough that the iovec is not the cost, and `bytes` keeps
+/// its zero-copy retention (R-074).
+const COALESCE_MAX: usize = 4096;
+
+/// Append `data` to the last queued buffer if that buffer is an owned copy
+/// that no send in flight points at, keeping it under CORK_FLUSH_BYTES.
+/// Returns whether it did; the caller queues a buffer of its own if not.
+///
+/// The in-flight buffers are left strictly alone: IOCP reads them through
+/// the WSABUFs the posted op holds, and a parked epoll send through its
+/// saved iovec pointers, so growing (and so possibly moving) one of them
+/// before its completion is reaped would hand the kernel freed memory.
+fn coalesce_tail(entry: &mut TransportEntry, data: &[u8]) -> bool {
+    if data.len() > COALESCE_MAX || entry.wq.len() <= entry.inflight {
+        return false;
+    }
+    match entry.wq.back_mut() {
+        Some(WriteBuf::Owned { data: tail, off }) if tail.len() - *off + data.len() <= CORK_FLUSH_BYTES => {
+            tail.extend_from_slice(data);
+            true
+        }
+        _ => false,
+    }
+}
 /// Recv slot class: 64 KiB reads.
 const RECV_CLASS: SizeClass = SizeClass::S64K;
 
@@ -165,6 +199,14 @@ pub(crate) enum WriteBuf {
     Owned { data: Vec<u8>, off: usize },
 }
 
+/// What one `Transport.write()` call queues.
+enum Queued<'a> {
+    /// A small write, copied in the cell: onto the tail buffer when it can
+    /// be (`coalesce_tail`), else as a buffer of its own.
+    Small(&'a [u8]),
+    Buf(WriteBuf),
+}
+
 impl WriteBuf {
     fn remaining(&self) -> usize {
         match self {
@@ -218,6 +260,11 @@ pub(crate) struct TransportEntry {
     recv_slot: Option<SlotId>,
     recv_op: Option<OpId>,
     send_op: Option<OpId>,
+    /// How many buffers at the front of `wq` the send in flight points the
+    /// kernel at (0 with none in flight). Those must not move or change
+    /// until its completion is reaped; `coalesce_tail` only ever extends a
+    /// buffer past them.
+    inflight: usize,
     wq: VecDeque<WriteBuf>,
     queued_bytes: usize,
     high_water: usize,
@@ -378,6 +425,95 @@ const ENOBUFS: u32 = 10055; // WSAENOBUFS
 #[cfg(not(windows))]
 const ENOBUFS: u32 = 105; // ENOBUFS on Linux
 
+/// A request whose coroutine runs on without a place on its connection:
+/// one released when its response completed while it still had work to do
+/// (a Starlette BackgroundTask), or one whose connection was torn down
+/// under it (RST, EPIPE). Held so a graceful shutdown waits for and then
+/// cancels it, as it does a request still on its connection
+/// (`http_request_drivers`), and `close()` cancels it. Dropped with its
+/// entry, as it used to be, an eager driver was never cancelled or
+/// finalized at all: AppTask is opaque to the cycle collector, and the
+/// awaited future kept it alive.
+pub(crate) struct Detached {
+    pub(crate) run: DetachedRun,
+    /// 0: left to run to completion. Otherwise the abandoned request is
+    /// cancelled once it has been detached this long, as `http_sweep`
+    /// reclaims a parked request whose peer has gone (H4).
+    pub(crate) reclaim_ns: u64,
+    /// When the sweep first saw it (0: not yet).
+    pub(crate) anchor_ns: u64,
+}
+
+pub(crate) enum DetachedRun {
+    /// The eager driver.
+    Driver(Py<crate::http::AppTask>),
+    /// The asyncio Task of the non-eager path; its done callback
+    /// (`HttpTaskDone`) removes it.
+    Task(Py<PyAny>),
+}
+
+impl Detached {
+    pub(crate) fn driver(driver: Py<crate::http::AppTask>, reclaim_ns: u64) -> Self {
+        Detached { run: DetachedRun::Driver(driver), reclaim_ns, anchor_ns: 0 }
+    }
+
+    pub(crate) fn task(task: Py<PyAny>) -> Self {
+        Detached { run: DetachedRun::Task(task), reclaim_ns: 0, anchor_ns: 0 }
+    }
+
+    fn key(&self) -> usize {
+        match &self.run {
+            DetachedRun::Driver(d) => d.as_ptr() as usize,
+            DetachedRun::Task(t) => t.as_ptr() as usize,
+        }
+    }
+
+    pub(crate) fn into_any(self) -> Py<PyAny> {
+        match self.run {
+            DetachedRun::Driver(d) => d.into_any(),
+            DetachedRun::Task(t) => t,
+        }
+    }
+
+    fn clone_any(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.run {
+            DetachedRun::Driver(d) => d.clone_ref(py).into_any(),
+            DetachedRun::Task(t) => t.clone_ref(py),
+        }
+    }
+
+    /// An eager driver whose coroutine has finished (a Task's own done
+    /// callback removes it instead: telling needs a Python call).
+    fn finished(&self, py: Python<'_>) -> bool {
+        match &self.run {
+            DetachedRun::Driver(d) => d.try_borrow(py).map(|t| t.is_finished()).unwrap_or(false),
+            DetachedRun::Task(_) => false,
+        }
+    }
+}
+
+impl NetState {
+    /// Track a request running off its connection, once.
+    pub(crate) fn detach(&mut self, d: Detached) {
+        match self.detached.entry(d.key()) {
+            std::collections::hash_map::Entry::Occupied(_) => self.graveyard_py.push(d.into_any()),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(d);
+            }
+        }
+    }
+
+    pub(crate) fn is_detached(&self, obj: *mut pyo3::ffi::PyObject) -> bool {
+        self.detached.contains_key(&(obj as usize))
+    }
+
+    /// Stop tracking `obj`, handing its reference back for the caller to
+    /// drop outside the cell.
+    pub(crate) fn forget_detached(&mut self, obj: *mut pyo3::ffi::PyObject) -> Option<Py<PyAny>> {
+        self.detached.remove(&(obj as usize)).map(Detached::into_any)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NetState {
     pub ops: HashMap<OpId, OpTarget>,
@@ -411,6 +547,11 @@ pub(crate) struct NetState {
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
+    /// Requests still running off their connection (`Detached`), keyed by
+    /// the driver or Task object's address: each is looked up and removed
+    /// as it suspends and finishes, and there can be one per connection
+    /// the server has had in the last background-task's lifetime.
+    pub(crate) detached: HashMap<usize, Detached>,
     /// Watch handles the loop gave up (removed or displaced readers and
     /// writers): released, then dropped, outside the cell.
     pub graveyard_handles: Vec<Py<Handle>>,
@@ -660,6 +801,13 @@ pub(crate) enum NetEvent {
     HttpPump {
         tid: u64,
     },
+    /// Native HTTP, non-eager path: the response of request `epoch` is
+    /// complete; release the connection if its Task is still running
+    /// (`http::release_request`).
+    HttpRelease {
+        tid: u64,
+        epoch: u64,
+    },
     /// Native HTTP: resolve a pending `receive()` waiter with
     /// `http.disconnect` (or `websocket.disconnect` for WS sessions).
     HttpDisconnect {
@@ -758,6 +906,7 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
             net.stats_sends_posted += 1;
             if let Some(entry) = net.transports.get_mut(&tid) {
                 entry.send_op = Some(op);
+                entry.inflight = n;
             }
             net.ops.insert(op, OpTarget::Send(tid));
         }
@@ -887,6 +1036,7 @@ fn cancel_transport_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut Tr
             net.reap_guards.insert(op, ReapGuard::Writes(wq));
         }
     }
+    entry.inflight = 0;
     entry.queued_bytes = 0;
 }
 
@@ -1028,6 +1178,20 @@ fn teardown_lost(
             }
             for fut in conn.take_recv_waiters() {
                 net.events.push(NetEvent::HttpDisconnect { fut, ws });
+            }
+            // The request running on it, if any, runs on without it: kept
+            // where shutdown can still cancel it, and an eager one is
+            // reclaimed after the dead-peer deadline unless it finishes.
+            if let Some(driver) = conn.driver.take() {
+                let reclaim = if conn.idle_timeout_ns > 0 {
+                    conn.idle_timeout_ns
+                } else {
+                    DISCONNECTED_RECLAIM_FALLBACK_NS
+                };
+                net.detach(Detached::driver(driver, reclaim));
+            }
+            if let Some(task) = conn.task.take() {
+                net.detach(Detached::task(task));
             }
         }
     }
@@ -1277,7 +1441,9 @@ pub(crate) fn http_enqueue_raw(
         return;
     }
     entry.queued_bytes += data.len();
-    entry.wq.push_back(WriteBuf::Owned { data, off: 0 });
+    if !coalesce_tail(entry, &data) {
+        entry.wq.push_back(WriteBuf::Owned { data, off: 0 });
+    }
     let no_send = entry.send_op.is_none();
     let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
     let unscheduled = !entry.flush_scheduled;
@@ -1673,7 +1839,7 @@ fn http_conn_busy(entry: &TransportEntry) -> bool {
 /// the disconnect reclaim (H4) falls back to this when there is no idle
 /// deadline to borrow. Generous, because we cannot tell a full close from
 /// a half-close whose app is still producing a response.
-const DISCONNECTED_RECLAIM_FALLBACK_NS: u64 = 60 * 1_000_000_000;
+pub(crate) const DISCONNECTED_RECLAIM_FALLBACK_NS: u64 = 60 * 1_000_000_000;
 
 /// Sweep phases. `Dead` (peer disconnected, nothing left to send) is
 /// checked before `Busy`: an app parked on a non-receive() awaitable while
@@ -1804,6 +1970,31 @@ pub(crate) fn http_sweep(
         // Idle keep-alive expiry closes silently (uvicorn-compatible).
         teardown_with(py, net, backend, tid, None);
     }
+    // Requests running off their connection: drop the finished, and
+    // reclaim the abandoned ones past their deadline.
+    let mut finished: Vec<usize> = Vec::new();
+    let mut expired: Vec<usize> = Vec::new();
+    for (&key, d) in net.detached.iter_mut() {
+        if d.finished(py) {
+            finished.push(key);
+        } else if d.reclaim_ns > 0 {
+            if d.anchor_ns == 0 {
+                d.anchor_ns = now_ns;
+            } else if now_ns.saturating_sub(d.anchor_ns) >= d.reclaim_ns {
+                expired.push(key);
+            }
+        }
+    }
+    for key in finished {
+        if let Some(d) = net.detached.remove(&key) {
+            net.graveyard_py.push(d.into_any());
+        }
+    }
+    for key in expired {
+        if let Some(d) = net.detached.remove(&key) {
+            cancel_drivers.push(d.into_any());
+        }
+    }
     // Disconnect reclaims count as idle closes for the facade's stats.
     let idle = (expire_idle.len() + expire_dead.len()) as u32;
     (expire_head.len() as u32, idle, cancel_drivers)
@@ -1885,7 +2076,10 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
     for tid in idle {
         teardown_with(py, net, backend, tid, None);
     }
-    busy
+    // Requests running off their connection are in flight too: the drain
+    // waits for them as it does for the rest (uvicorn waits for every
+    // request task, background work included).
+    busy + net.detached.len()
 }
 
 /// Graceful shutdown, last phase: the eager request drivers (AppTasks)
@@ -1898,9 +2092,14 @@ pub(crate) fn http_request_drivers(py: Python<'_>, net: &NetState) -> Vec<Py<PyA
     net.transports
         .values()
         .filter_map(|e| match &e.proto {
-            ProtoKind::Http(conn) => conn.driver.as_ref().map(|d| d.clone_ref(py).into_any()),
+            ProtoKind::Http(conn) => match (&conn.driver, &conn.task) {
+                (Some(d), _) => Some(d.clone_ref(py).into_any()),
+                (None, Some(t)) => Some(t.clone_ref(py)),
+                (None, None) => None,
+            },
             ProtoKind::Py(_) => None,
         })
+        .chain(net.detached.values().map(|d| d.clone_any(py)))
         .collect()
 }
 
@@ -2650,6 +2849,7 @@ fn on_send_done(
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.send_op == Some(op) {
         entry.send_op = None;
+        entry.inflight = 0;
     }
     if entry.conn_lost {
         return;
@@ -3083,6 +3283,9 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             NetEvent::HttpPump { tid } => {
                 crate::http::pump_requests(py, slf, tid)?;
             }
+            NetEvent::HttpRelease { tid, epoch } => {
+                crate::http::release_request(py, slf, tid, epoch)?;
+            }
             NetEvent::HttpDisconnect { fut, ws } => {
                 let fut = fut.bind(py);
                 let done: bool =
@@ -3105,80 +3308,19 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 }
             }
             NetEvent::WsWake { tid, fut } => {
-                // Deliver ONE queued WS event to the waiter (R-087).
-                //
-                // This is the STEADY-STATE path -- an app already parked in
-                // receive() is woken here, not through HttpReceive.__call__
-                // -- so the inbox budget must be decremented here too. It
-                // was not, so inbox_bytes only ever grew: after ~4 MiB of
-                // cumulative traffic ws_ingest paused reads permanently on
-                // a connection whose application had consumed every single
-                // message.
-                let msg = core.with_net(|net, _| {
-                    let m =
-                        net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()).and_then(|w| w.inbox.pop_front());
-                    if let Some(m) = m.as_ref() {
-                        if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-                            w.inbox_bytes = w.inbox_bytes.saturating_sub(m.charge());
-                        }
-                    }
-                    m
-                })?;
-                if msg.is_some() {
-                    core.with_net(|net, reactor| {
-                        crate::http::ws_resume_reading(py, net, reactor.backend_mut(), tid);
-                    })?;
-                }
+                // Wake ONE parked WebSocket receive() (R-087). It takes the
+                // front inbox message itself once its task resumes
+                // (http::WsRecv). Popped here into the waiter's result, as
+                // it was, a receive() cancelled before its task resumed --
+                // asyncio.timeout firing in the tick the frame arrived --
+                // dropped the message along with the future.
                 let fut = fut.bind(py);
                 let done: bool =
                     fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
-                match (done, msg) {
-                    (false, Some(m)) => {
-                        let d = crate::http::ws_message_dict(py, m)?;
-                        let _ = fut.call_method1(intern!(py, "set_result"), (d,));
-                    }
-                    (false, None) => {
-                        // Spurious wake: park the waiter again -- while there
-                        // is still something to wait for. The wake took this
-                        // waiter out of recv_waiters, so a teardown between
-                        // queueing it and now (an app callback that ran
-                        // first, during a graceful shutdown say) could not
-                        // release it, and parking it on the gone connection
-                        // dropped it unresolved: receive() pending for good,
-                        // and its task, which asyncio holds only weakly,
-                        // destroyed by the collector while pending. Past EOF
-                        // no message can arrive either.
-                        let stored = fut.clone().unbind();
-                        let unparked = core.with_net(move |net, _| match net.http_conn_mut(tid) {
-                            Some(c) if !c.disconnected => {
-                                c.recv_waiters.push_back(stored);
-                                None
-                            }
-                            // Handed back so the reference drops out of the
-                            // cell (ADR-5).
-                            _ => Some(stored),
-                        })?;
-                        if unparked.is_some() {
-                            let msg = crate::http::ws_gone_message(py, core, tid)?;
-                            let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
-                        }
-                    }
-                    (true, Some(m)) => {
-                        // Waiter was cancelled: keep the event for the next
-                        // receive() -- and put its bytes BACK on the inbox
-                        // budget, which was debited when it was popped
-                        // above. Without this, repeated cancellable
-                        // receives drift the accounting down until real
-                        // traffic can exceed WS_MAX_INBOX with the read
-                        // pause never engaging.
-                        core.with_net(|net, _| {
-                            if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-                                w.inbox_bytes = w.inbox_bytes.saturating_add(m.charge());
-                                w.inbox.push_front(m);
-                            }
-                        })?;
-                    }
-                    (true, None) => {}
+                // A cancelled receive() took nothing, so whatever the wake
+                // was for is still queued for the next one.
+                if !done {
+                    crate::http::ws_wake(py, core, tid, fut)?;
                 }
             }
             NetEvent::TlsData { tid, data } => {
@@ -3585,6 +3727,7 @@ pub(crate) fn wire_stream(
                 recv_slot: None,
                 recv_op: None,
                 send_op: None,
+                inflight: 0,
                 wq: VecDeque::new(),
                 queued_bytes: 0,
                 high_water: high,
@@ -3645,14 +3788,20 @@ pub(crate) fn wire_http(
     // here as well as in the caller's error path meant a failed adoption
     // closed the same descriptor number twice -- and if another thread had
     // been handed that number meanwhile, it closed an unrelated socket.
-    let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
-    if let Err(e) = reg {
-        return Err(e.into());
-    }
+    //
+    // The TLS state first: registered and then failed, the socket went
+    // back to a caller that closes it without detaching it, leaving the
+    // backend a stale record for a handle value the OS reissues (on IOCP,
+    // its skip mode and port association passed to the next socket given
+    // that number -- ADR-25). A bad SSLContext failed every adoption so.
     let tls_state = match &tls {
         Some(ctx) => Some(Box::new(crate::http::tls_wrap(py, ctx)?)),
         None => None,
     };
+    let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
+    if let Err(e) = reg {
+        return Err(e.into());
+    }
     core.with_net(|net, reactor| {
         let tid = net.next_id();
         let mut conn =
@@ -3667,6 +3816,7 @@ pub(crate) fn wire_http(
                 recv_slot: None,
                 recv_op: None,
                 send_op: None,
+                inflight: 0,
                 wq: VecDeque::new(),
                 queued_bytes: 0,
                 high_water: high,
@@ -3976,13 +4126,24 @@ impl Transport {
             return Err(PyRuntimeError::new_err("unable to write; sendfile is in progress"));
         }
         // R-074 retention: exact bytes -> zero-copy retain; bytearray and
-        // memoryview -> copy now.
-        let buf: WriteBuf = if let Some(b) = bytes {
+        // memoryview -> copy now. Small writes of either kind are copied in
+        // the cell instead, onto the tail buffer where they can be
+        // (`coalesce_tail`).
+        let queued: Queued<'_> = if let Some(b) = bytes.as_ref() {
             let len = b.as_bytes().len();
             if len == 0 {
                 return Ok(());
             }
-            WriteBuf::Bytes { ptr: b.as_bytes().as_ptr(), len, off: 0, _keep: b.clone().into_any().unbind() }
+            if len <= COALESCE_MAX {
+                Queued::Small(b.as_bytes())
+            } else {
+                Queued::Buf(WriteBuf::Bytes {
+                    ptr: b.as_bytes().as_ptr(),
+                    len,
+                    off: 0,
+                    _keep: b.as_any().clone().unbind(),
+                })
+            }
         } else {
             let mut view: ffi::Py_buffer = unsafe { std::mem::zeroed() };
             let rc = unsafe { ffi::PyObject_GetBuffer(data.as_ptr(), &mut view, ffi::PyBUF_SIMPLE) };
@@ -3999,23 +4160,22 @@ impl Transport {
                 std::ptr::copy_nonoverlapping(view.buf.cast::<u8>(), owned.as_mut_ptr(), len);
                 ffi::PyBuffer_Release(&mut view);
             }
-            WriteBuf::Owned { data: owned, off: 0 }
+            Queued::Buf(WriteBuf::Owned { data: owned, off: 0 })
         };
 
         let tid = self.tid;
         let mut pause: Option<Py<PyAny>> = None;
         let mut dirty = false;
         core.with_net(|net, reactor| {
-            let Some(entry) = net.transports.get_mut(&tid) else {
-                net.graveyard_bufs.push(buf);
-                dirty = true;
-                return; // write after connection_lost: silently dropped
-            };
-            if entry.conn_lost {
-                net.graveyard_bufs.push(buf);
-                dirty = true;
+            let Some(entry) = net.transports.get_mut(&tid).filter(|e| !e.conn_lost) else {
+                // Write after connection_lost: silently dropped (a retained
+                // `bytes` via the graveyard, never in-cell).
+                if let Queued::Buf(buf) = queued {
+                    net.graveyard_bufs.push(buf);
+                    dirty = true;
+                }
                 return;
-            }
+            };
             // A transport that is `closing` but still mapped is draining
             // its queue before the close completes (an idle one is torn
             // down at once by close()). asyncio still sends what is
@@ -4023,12 +4183,25 @@ impl Transport {
             // close_notify can be written from resume_writing after the
             // app closed. Dropping it ended TLS sessions under
             // backpressure with a bare FIN.
-            entry.queued_bytes += buf.remaining();
+            match queued {
+                Queued::Small(data) => {
+                    entry.queued_bytes += data.len();
+                    if !coalesce_tail(entry, data) {
+                        entry.wq.push_back(WriteBuf::Owned { data: data.to_vec(), off: 0 });
+                    }
+                }
+                Queued::Buf(buf) => {
+                    entry.queued_bytes += buf.remaining();
+                    let merged = matches!(&buf, WriteBuf::Owned { data, .. } if coalesce_tail(entry, data));
+                    if !merged {
+                        entry.wq.push_back(buf);
+                    }
+                }
+            }
             // The foreign-thread mirror (see `queued`), stored here where
             // the entry is already in hand: every later change to the
             // count goes through on_send_done, which stores it again.
             self.queued.store(entry.queued_bytes, Ordering::Relaxed);
-            entry.wq.push_back(buf);
             let no_send = entry.send_op.is_none();
             let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
             let scheduled = entry.flush_scheduled;

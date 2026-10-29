@@ -922,8 +922,12 @@ impl CoreLoop {
             // above, so they would keep their futures, buffers and (for
             // connect) an open socket alive for the closed core's
             // lifetime.
-            let dropped_py: Vec<Py<PyAny>> =
+            let mut dropped_py: Vec<Py<PyAny>> =
                 net::cancel_standalone_ops(&mut st.net, st.reactor.backend_mut());
+            // Requests that ran on off their connections: cancelled above
+            // (`http_parked`), released here with everything else.
+            dropped_py
+                .extend(std::mem::take(&mut st.net.detached).into_values().map(net::Detached::into_any));
             let mut dropped: Vec<HandleRef> = Vec::new();
             // R-073 reap guards: the sweeps above could not free the
             // buffers of the ops they cancelled, because the kernel may
@@ -1491,10 +1495,11 @@ impl CoreLoop {
         Ok(busy)
     }
 
-    /// Graceful shutdown, last phase (R-092): the eager request drivers
-    /// still in flight, which the facade cancels along with the tasks the
-    /// application left running (`asyncio.all_tasks()` does not list them).
-    /// Each has `cancel()`, `done()` and `add_done_callback()`.
+    /// Graceful shutdown, last phase (R-092): the requests still in flight
+    /// -- eager drivers, which `asyncio.all_tasks()` does not list, and the
+    /// asyncio Tasks of the non-eager path -- which the facade cancels
+    /// before lifespan.shutdown. Each has `cancel()`, `done()` and
+    /// `add_done_callback()`.
     fn http_request_drivers(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.with_net(|net, _| net::http_request_drivers(py, net))
     }
@@ -1515,6 +1520,13 @@ impl CoreLoop {
     /// would make every such deployment wait out the whole grace period.
     fn http_connection_count(&self) -> PyResult<usize> {
         self.with_net(|net, _| net.http_conn_count())
+    }
+
+    /// Requests still running off their connection: released with work
+    /// left after their response (background tasks), or torn off by a
+    /// reset. A graceful drain waits for these too.
+    fn http_detached_count(&self) -> PyResult<usize> {
+        self.with_net(|net, _| net.detached.len())
     }
 
     /// Count of live connections spawned by any listener (facade

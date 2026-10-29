@@ -2507,3 +2507,23 @@ def test_resume_writing_does_not_follow_abort_in_the_same_iteration(loop):
     assert log[-1] == ("p", "lost")
     if sys.platform.startswith("linux"):
         assert log[0] == "pause_writing"  # the scenario really happened
+
+
+def test_anyio_pools_to_thread_workers_under_the_run_until_complete_task(loop):
+    """anyio finds its "root task" -- the one run_until_complete() drives --
+    by asyncio's own _run_until_complete_cb, and pools the worker threads
+    behind to_thread.run_sync under it. cadeloop attached an identical copy
+    of that callback, so no task was ever the root: each task that
+    offloaded work started a worker thread of its own and stopped it again
+    when it finished."""
+    anyio = pytest.importorskip("anyio")
+    import threading
+
+    async def child():
+        return await anyio.to_thread.run_sync(threading.current_thread)
+
+    async def main():
+        return [await asyncio.create_task(child()) for _ in range(3)]
+
+    workers = loop.run_until_complete(main())
+    assert len({id(w) for w in workers}) == 1, workers

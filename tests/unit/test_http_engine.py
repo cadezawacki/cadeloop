@@ -1571,6 +1571,60 @@ def test_pipelined_burst_behind_a_slow_request_is_bounded(loop):
     loop._core.listener_close(lid)
 
 
+def test_a_pipelining_client_does_not_starve_other_connections(loop):
+    """R-085 fairness: one 64 KiB read carries ~2400 minimal pipelined
+    requests, and the pump served all of them back to back in one pass --
+    every other connection's requests waited behind the whole burst. It
+    now yields after a quantum, so a request arriving on another
+    connection is served within a few quanta, while the burst itself is
+    still answered completely and in order."""
+    order = []
+
+    async def app(scope, receive, send):
+        order.append(scope["path"])
+        await send(
+            {"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]}
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    n = 4000
+
+    def read_responses(sock, count):
+        buf = b""
+        while buf.count(b"HTTP/1.1 200 ") < count:
+            chunk = sock.recv(1 << 16)
+            assert chunk, "connection closed before every response arrived"
+            buf += chunk
+        return buf
+
+    def client():
+        a = socket.create_connection(("127.0.0.1", port))
+        b = socket.create_connection(("127.0.0.1", port))
+        try:
+            for s in (a, b):
+                s.settimeout(20)
+            # Both connections live on the server before the burst starts.
+            b.sendall(b"GET /warm HTTP/1.1\r\nHost: h\r\n\r\n")
+            read_responses(b, 1)
+            a.sendall(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n" * n)
+            b.sendall(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+            read_responses(b, 1)
+            read_responses(a, n)
+        finally:
+            a.close()
+            b.close()
+
+    loop.run_until_complete(loop.run_in_executor(None, client))
+    loop._core.listener_close(lid)
+    assert order.count("/a") == n, "the burst was not answered in full"
+    behind = order.index("/b") - 1
+    # Served back to back, /b waited for the whole first read of the burst
+    # (~700 requests on a fresh loopback connection, up to ~2400 per
+    # 64 KiB); with the quantum it is a few quanta at most.
+    assert behind < 256, f"/b was served only after {behind} of the other client's requests"
+
+
 def test_oversized_body_is_rejected_by_default(loop):
     """R-086: the engine buffers a whole request body before dispatching,
     so an unlimited default let any unauthenticated client turn one
@@ -2979,6 +3033,130 @@ def test_a_cancel_requested_while_the_handler_runs_cancels_its_next_await(loop):
     assert len(seen) == 1 and seen[0] != "not cancelled" and seen[0] < 1.0, seen
 
 
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_cancel_scope_knows_its_own_cancellation_at_a_checkpoint(loop, eager):
+    """anyio tells its own cancellations from anyone else's by the message
+    Task.cancel(msg) was given. The eager driver latched a cancel that
+    found nothing awaited -- a checkpoint, sleep(0), an uncontended Lock --
+    without its message and delivered a bare CancelledError, which the
+    cancel scope did not recognise as its own: it escaped the `with`
+    block, and a FastAPI route under move_on_after() answered 500."""
+    anyio = pytest.importorskip("anyio")
+    out = []
+
+    async def app(scope, receive, send):
+        await receive()
+        with anyio.CancelScope() as cs:
+            cs.cancel()
+            await anyio.sleep(0)
+        out.append(cs.cancelled_caught)
+        with anyio.move_on_after(0.02) as cs2:
+            while True:
+                await anyio.lowlevel.checkpoint()
+        out.append(cs2.cancelled_caught)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app, eager=eager)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert resp.startswith(b"HTTP/1.1 204"), resp
+    assert out == [True, True], out
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_nested_timeouts_sharing_a_deadline_fire_the_outer_one(loop, eager):
+    """cancelling() and uncancel() pinned at 0 told every asyncio.timeout
+    that no other cancellation was pending: two nested scopes expiring
+    together both cancelled the driver, the inner one absorbed both, and
+    the code after it ran on past the outer deadline."""
+    out = []
+
+    async def app(scope, receive, send):
+        await receive()
+        when = asyncio.get_running_loop().time() + 0.05
+        try:
+            async with asyncio.timeout_at(when):
+                try:
+                    async with asyncio.timeout_at(when):
+                        await asyncio.sleep(1)
+                except TimeoutError:
+                    out.append("inner")
+                await asyncio.sleep(0.5)
+                out.append("ran past the outer deadline")
+        except TimeoutError:
+            out.append("outer")
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app, eager=eager)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert resp.startswith(b"HTTP/1.1 204"), resp
+    assert out == ["outer"], out
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_what_the_apps_synchronous_call_sets_stays_with_its_request(loop, eager):
+    """The application was called in the loop's own context; only the
+    coroutine it returned ran in a copy. A middleware whose plain
+    `__call__` sets a contextvar -- the user, from a header -- before
+    returning the inner app's coroutine left it set for every request
+    after it, on any connection."""
+    import contextvars
+
+    user = contextvars.ContextVar("cadeloop_test_user", default=None)
+
+    async def inner(scope, receive, send):
+        await receive()
+        body = json.dumps({"user": user.get()}).encode()
+        headers = [(b"content-length", str(len(body)).encode())]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
+
+    class Auth:
+        def __call__(self, scope, receive, send):
+            for k, v in scope["headers"]:
+                if k == b"x-user":
+                    user.set(v.decode())
+            return inner(scope, receive, send)
+
+    lid, port = listen(loop, Auth(), eager=eager)
+    first = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\nX-User: alice\r\n\r\n"))
+    second = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert json.loads(_body(first)) == {"user": "alice"}
+    assert json.loads(_body(second)) == {"user": None}, _body(second)
+    assert user.get() is None, "set in the context the loop runs in"
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_handler_raising_systemexit_still_answers_its_request(loop, eager):
+    """SystemExit (or KeyboardInterrupt) from a handler stops the loop, as
+    from any asyncio Task -- but it left before its request was answered,
+    with the driver never marked finished: the client got nothing until
+    the shutdown's deadline closed the connection, and the shutdown
+    reported a task still running. The request is now answered (500)
+    first. On the non-eager path the Task already raised it out of the
+    loop; its done callback no longer raises it a second time, which cut
+    short the shutdown the first one started."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await asyncio.sleep(0.01)
+        sys.exit(3)
+
+    lid, port = listen(loop, app, eager=eager)
+    client = loop.create_task(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    with pytest.raises(SystemExit):
+        loop.run_until_complete(client)
+    # The loop runs on, as serve()'s shutdown drain does.
+    resp = loop.run_until_complete(client)
+    loop._core.listener_close(lid)
+    assert resp.startswith(b"HTTP/1.1 500"), resp
+    assert all(d.done() for d in loop._core.http_request_drivers())
+
+
 def test_contextvar_isolation_pipelined_requests(loop):
     """A request pipelined behind one that suspended started with every
     contextvar that one had set: the eager driver pumped it from inside
@@ -3094,3 +3272,188 @@ def test_close_cancels_what_is_parked_on_a_connection(loop):
     writer.close()
     assert waiters and waiters[0].cancelled(), waiters
     assert ran == ["finally"] and refs["coro"]() is None, (ran, refs["coro"]())
+
+
+# --------------------------------------------------------------------- #
+# a request's turn on its connection ends with its response             #
+# --------------------------------------------------------------------- #
+
+
+def _ok_then(work):
+    """An app that answers "ok" and then does ``work(path)`` inside the same
+    ASGI call -- where Starlette runs a BackgroundTask."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]})
+        await send({"type": "http.response.body", "body": b"ok"})
+        await work(scope["path"])
+
+    return app
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_background_work_does_not_hold_up_the_next_request(loop, eager):
+    """A request ended when its coroutine returned, not when its response
+    completed, so work done after the response -- Starlette runs a
+    BackgroundTask inside the app call, after the last body message --
+    held the connection: the next request on it, pipelined or not, waited
+    for that work (1.5 s behind a 1.5 s task; uvicorn answers it at once).
+    The connection is now released when the response completes, and the
+    coroutine runs on by itself."""
+    finished = []
+
+    async def work(path):
+        if path == "/slow":
+            await asyncio.sleep(1.0)
+            finished.append(path)
+
+    lid, port = listen(loop, _ok_then(work), eager=eager)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /slow HTTP/1.1\r\nHost: h\r\n\r\nGET /a HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        t0 = loop.time()
+        for _ in range(2):
+            await asyncio.wait_for(_read_one_response(reader), 5)
+        pipelined = loop.time() - t0
+        t0 = loop.time()
+        writer.write(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(_read_one_response(reader), 5)
+        sequential = loop.time() - t0
+        writer.close()
+        await asyncio.sleep(1.2)  # the background work still completes
+        return pipelined, sequential
+
+    pipelined, sequential = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert pipelined < 0.5 and sequential < 0.5, (pipelined, sequential)
+    assert finished == ["/slow"], finished
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_close_delimited_response_ends_before_background_work(loop, eager):
+    """An HTTP/1.0 response without a length ends when the connection
+    closes, and the close waited for the coroutine to return: the client
+    sat through the background work before it saw the end of its response
+    (1.52 s against uvicorn's 0.02 s)."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"hello ", "more_body": True})
+        await send({"type": "http.response.body", "body": b"world"})
+        await asyncio.sleep(1.0)
+
+    lid, port = listen(loop, app, eager=eager)
+
+    async def main():
+        t0 = loop.time()
+        data = await _request(port, b"GET / HTTP/1.0\r\n\r\n", read_all=True)
+        return data, loop.time() - t0
+
+    data, took = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert data.endswith(b"hello world"), data
+    assert took < 0.5, took
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_background_work_survives_the_dead_peer_reclaim(loop, eager):
+    """The sweep reclaims a request whose client has gone (H4) -- and it
+    counted one still doing background work after a complete response as
+    such: a client that read its response and closed had the work
+    cancelled once the idle deadline passed."""
+    outcome = []
+
+    async def work(path):
+        try:
+            await asyncio.sleep(0.6)
+            outcome.append("done")
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+            raise
+
+    lid, port = listen(loop, _ok_then(work), eager=eager, keepalive_idle=0.1)
+
+    def sweep():
+        loop._core.http_sweep()
+        sweeper[0] = loop.call_later(0.03, sweep)
+
+    sweeper = [loop.call_soon(sweep)]
+
+    async def main():
+        await _request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")  # reads, then closes
+        await asyncio.sleep(1.0)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        sweeper[0].cancel()
+    loop._core.listener_close(lid)
+    assert outcome == ["done"], outcome
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_request_torn_off_by_a_reset_can_still_be_cancelled(loop, eager):
+    """A connection reset tore the connection down and dropped the eager
+    driver with it: nothing could reach the handler any more, so a
+    graceful shutdown never cancelled it -- its `finally` never ran -- and,
+    AppTask being opaque to the cycle collector, the coroutine was never
+    reclaimed either."""
+    import struct
+
+    from cadeloop.server import _cancel_requests
+
+    started = asyncio.Event()
+    ran = []
+
+    async def app(scope, receive, send):
+        await receive()
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            ran.append("finally")
+
+    lid, port = listen(loop, app, eager=eager)
+    s = socket.create_connection(("127.0.0.1", port))
+    try:
+        s.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        loop.run_until_complete(asyncio.wait_for(started.wait(), 5))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        s.close()  # RST
+
+    async def gone():
+        while loop._core.http_connection_count():
+            await asyncio.sleep(0.01)
+
+    loop.run_until_complete(asyncio.wait_for(gone(), 5))
+    loop._core.listener_close(lid)
+    assert len(loop._core.http_request_drivers()) == 1
+    _cancel_requests(loop, 2.0)
+    assert ran == ["finally"], ran
+    assert loop._core.http_request_drivers() == []
+
+
+def test_the_drain_waits_for_background_work(loop):
+    """Released at its response, background work no longer keeps a
+    connection open, so the drain counts it by itself: a graceful
+    shutdown lets it finish within the grace period, as uvicorn waits for
+    every request task."""
+    from cadeloop.server import _drain_connections
+
+    ran = []
+
+    async def work(path):
+        await asyncio.sleep(0.4)
+        ran.append("background")
+
+    lid, port = listen(loop, _ok_then(work))
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    _drain_connections(loop, 5.0)
+    assert ran == ["background"], ran

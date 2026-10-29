@@ -165,16 +165,18 @@ pub struct WsRx {
     frag_op: Option<u8>,
     frag: Vec<u8>,
     pub max_message: usize,
-    failed: bool,
+    /// The peer's Close frame, or a protocol failure, ended the stream:
+    /// nothing after it is parsed.
+    ended: bool,
 }
 
 impl WsRx {
     pub fn new(max_message: usize) -> Self {
-        WsRx { buf: Vec::new(), pos: 0, frag_op: None, frag: Vec::new(), max_message, failed: false }
+        WsRx { buf: Vec::new(), pos: 0, frag_op: None, frag: Vec::new(), max_message, ended: false }
     }
 
     pub fn push(&mut self, data: &[u8], out: &mut Vec<WsEvent>) {
-        if self.failed {
+        if self.ended {
             return;
         }
         self.buf.extend_from_slice(data);
@@ -182,10 +184,17 @@ impl WsRx {
             match self.parse_one() {
                 ParseOne::NeedMore => break,
                 ParseOne::Event(ev) => {
-                    let fail = matches!(ev, WsEvent::Fail(..));
+                    // A Close ends the stream as a failure does. A peer may
+                    // send nothing after its Close (RFC 6455 5.5.1), and the
+                    // application has been told websocket.disconnect, the
+                    // last message ASGI ever delivers: frames behind it --
+                    // in the same read, or still arriving while our echo
+                    // drains -- were queued as messages after the
+                    // disconnect, and charged to the inbox, all the same.
+                    let last = matches!(ev, WsEvent::Fail(..) | WsEvent::Close(..));
                     out.push(ev);
-                    if fail {
-                        self.failed = true;
+                    if last {
+                        self.ended = true;
                         // Nothing more will be parsed; drop the buffer.
                         self.buf = Vec::new();
                         self.pos = 0;
@@ -455,6 +464,25 @@ mod tests {
         close_payload.extend_from_slice(b"bye");
         rx.push(&client_frame(OP_CLOSE, &close_payload, true), &mut out);
         assert_eq!(out, vec![WsEvent::Ping(b"p".to_vec()), WsEvent::Close(1000, "bye".into())]);
+    }
+
+    #[test]
+    fn nothing_after_the_peers_close_is_parsed() {
+        let mut close_payload = 1000u16.to_be_bytes().to_vec();
+        close_payload.extend_from_slice(b"bye");
+        // Data, a Close, then more data in the same read...
+        let mut rx = WsRx::new(1024);
+        let mut out = Vec::new();
+        let mut read = client_frame(OP_TEXT, b"before", true);
+        read.extend(client_frame(OP_CLOSE, &close_payload, true));
+        read.extend(client_frame(OP_TEXT, b"after", true));
+        read.extend(client_frame(OP_PING, b"p", true));
+        rx.push(&read, &mut out);
+        assert_eq!(out, vec![WsEvent::Text("before".into()), WsEvent::Close(1000, "bye".into())]);
+        // ...and in later reads.
+        out.clear();
+        rx.push(&client_frame(OP_BINARY, b"later", true), &mut out);
+        assert!(out.is_empty(), "frames after the Close were delivered: {out:?}");
     }
 
     #[test]

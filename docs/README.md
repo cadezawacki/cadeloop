@@ -21,6 +21,23 @@ methodology: [benchmarks.md](benchmarks.md).*
 >
 > | Area | Fix | Commit |
 > |---|---|---|
+> | Server | A fork supervisor failing with workers running (a replacement fork refused by a pids limit) SIGKILLed them all: in-flight requests cut off, no lifespan shutdown; they now get SIGTERM and the grace period first | `928e28c` |
+> | IOCP | Paths that closed a socket without detaching it left its record to the next socket reissued that handle value: `wire_http` failing on TLS after registering, a RIO registration failing after the inner association; a cancelled connect also updated the connect context of a possibly reissued handle, and a never-posted slot's id resolved to slot 0 (compile-checked, not run on Windows) | `4cd952d` |
+> | IOCP | The slot quarantine only drained after a short dequeue, which a port with a few hundred busy connections never returns: the op slab grew by a chunk every 256 holds and kept it (2.56M slots in a 10k-tick model); a FIFO drain sentinel now releases it under any load (compile-checked, not run on Windows) | `c66e81f` |
+> | ASGI | `SystemExit`/`KeyboardInterrupt` from a handler left before the request was answered and with the driver unfinished: the client waited out the grace period for an empty close; on the non-eager path the Task's done callback raised it a second time, mid-shutdown | `b53915c` |
+> | ASGI | The application was called in the loop's own context, so what a synchronous `__call__` set (middleware setting the user from a header) leaked into every later request | `f8a4e1e` |
+> | HTTP | A request held its connection until its coroutine returned (ADR-18, whose uvicorn-parity claim was wrong): the next keep-alive request waited for a BackgroundTask, a close-delimited response's EOF waited for it, and the dead-peer sweep cancelled it once the client left; an eager driver whose connection was reset was dropped, never cancelled or finalized. The connection is now released when the response completes, and such requests run on detached, waited for and cancelled at shutdown | `2799902` |
+> | ASGI | anyio found no root task (a copied `_run_until_complete_cb`, and `serve()` ran a bare `run_forever()`), so every request that offloaded work started and stopped a worker thread (200 requests, 200 threads); pooled, a FastAPI `def` route's mean keep-alive latency went from 606-663 µs to 308-347 µs here | `67dbf83` |
+> | WS | A `receive()` cancelled after the wake for an arriving frame (an `asyncio.timeout` expiring in that tick) dropped the frame: 30-36 of 1500 lost under a 10 ms timeout; the wake now only wakes, and `receive()` takes the message as it resumes | `95b1f7c` |
+> | ASGI | The eager driver dropped `cancel(msg)`'s message when it latched a cancel, so anyio cancel scopes did not recognise their own (a FastAPI route under `move_on_after` answered 500), and `cancelling()`/`uncancel()` were pinned at 0 (nested timeouts sharing a deadline fired the inner one) | `0634fe5` |
+> | Server | A fork worker still in its lifespan startup ignored its supervisor's death and lived on as an orphan for as long as the startup hung | `ae8dce7` |
+> | Server | `lifespan.shutdown()` always waited a fixed 10s, past a short grace (into the supervisor's SIGKILL) and short of a long one | `3288338` |
+> | Server | `lifespan.shutdown` went out while requests the drain could not finish were still running against the resources it closed; they are now cancelled first, as uvicorn does | `2f6541c` |
+> | Server | Output the supervisor had buffered at a fork was written again by every worker's exit flush | `56c3aa4` |
+> | Net | Each `write()` queued its own buffer, and a send carries 16: 256 small writes took 16 sends over 17 ticks; small writes now coalesce into the tail buffer | `f6aff28` |
+> | HTTP | One pipelining client's burst (~2400 requests per 64 KiB read) ran back to back while every other connection waited; the pump now yields after 16 | `5075760` |
+> | WS | Frames after the peer's Close were still parsed and queued behind `websocket.disconnect` | `b6db6b6` |
+> | Perf | Buffer regions were `alloc_zeroed` (memset under mimalloc), so every slot counted against RSS from the start and a burst's growth stayed resident; they are lazily-faulted mappings on Linux with released slots paged out past a warm set (3,000 idle connections: 243 MB to 53 MB) | `179759d` |
 > | ASGI | `receive()` takes its message when called, so one cancelled before it ran (`wait_for(receive(), 0)`, an aborted task group) lost the message or request body; an unawaited message now goes back to its connection | `93cfbee` |
 > | Server | Graceful shutdown never cancelled an eager request in flight at the deadline (its driver is not an asyncio Task), and `close()` dropped parked handlers and waiters pending, leaking the coroutine; both are now cancelled and their cleanup runs | `9b9ec0b` |
 > | ASGI | A `cancel()` reaching the eager driver mid-step waited for the next awaited future to finish by itself (forever, for one that never does); it now cancels that future, as `Task.__step` does | `9b9ec0b` |
@@ -211,8 +228,7 @@ methodology: [benchmarks.md](benchmarks.md).*
 > error responses hardcode an `HTTP/1.1` status line for HTTP/1.0
 > requests (`http.rs` ~383); supervisor grace is not reserved for
 > lifespan shutdown (`server.py` ~483); WS close-code state evicts after
-> 64 teardowns (`net.rs` ~699); WS frames keep parsing after a close
-> event (`http.rs` ~2101); a handed-in listener fd can double-close
+> 64 teardowns (`net.rs` ~699); a handed-in listener fd can double-close
 > (`coreloop.rs` ~1634); the spawn supervisor binds only the first
 > resolved address (`server.py` ~1237); signal state is not rolled back
 > when installation fails (`loop.py` ~917); datagram `sendto` does not

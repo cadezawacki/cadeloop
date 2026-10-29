@@ -508,6 +508,26 @@ def test_s3_workers_stop_when_their_supervisor_is_killed(tmp_path):
 @posix_only
 @needs_fork
 @needs_proc
+def test_output_buffered_at_the_fork_is_written_once(tmp_path):
+    """A print() the supervisor still had buffered when it forked (stdout
+    a pipe, so block-buffered) was copied into every worker and written
+    again by each one's exit flush: once per worker, and once more per
+    replacement. multiprocessing flushes before forking for this reason."""
+    code = """
+        print("buffered-at-the-fork")
+        import cadeloop
+        cadeloop.serve("auditapp:app", "127.0.0.1", PORT, workers=2, grace=2.0)
+    """
+    with _Server(tmp_path, code=code, env={"PYTHONUNBUFFERED": ""}) as srv:
+        _wait_all_serving(srv, 2)
+        srv.proc.send_signal(signal.SIGTERM)
+        assert srv.wait() == 0, srv.output
+    assert srv.output.count("buffered-at-the-fork") == 1, srv.output
+
+
+@posix_only
+@needs_fork
+@needs_proc
 def test_s3_sigterm_while_the_pool_is_forking_leaves_no_orphans(tmp_path):
     """S3: the supervisor's handlers were installed only after every worker
     was forked; a SIGTERM in between killed it outright (SIG_DFL) and the
@@ -1003,6 +1023,154 @@ def test_s17_a_request_in_flight_at_the_deadline_is_cancelled(eager):
         if s is not None:
             s.close()
     assert ran == ["cleanup"], ran
+
+
+def _connect(port, deadline=10.0):
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            if time.monotonic() > end:
+                raise
+            time.sleep(0.02)
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_requests_left_by_the_drain_are_cancelled_before_lifespan_shutdown(eager):
+    """A request still running when the drain's deadline passed was only
+    cancelled in _finalize_loop, after lifespan.shutdown: the shutdown hook
+    closed the pool the handler was still using, and the handler then
+    carried on against it. uvicorn cancels request tasks first, and the
+    ASGI spec sends lifespan.shutdown once connections are closed. On the
+    non-eager path the engine never recorded the request's Task, so
+    nothing but all_tasks() could reach it."""
+    events = []
+    port = _free_port()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            events.append("lifespan.shutdown")
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        await receive()
+        events.append("request")
+        asyncio.get_running_loop().stop()  # shutdown starts with this one in flight
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            events.append("request cancelled")
+            raise
+
+    t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0, eager_tasks=eager), port=port)
+    s = _connect(port)
+    try:
+        s.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        t.join(30)
+    finally:
+        s.close()
+    assert not t.is_alive() and "error" not in result, result
+    assert events == ["request", "request cancelled", "lifespan.shutdown"], events
+
+
+def test_the_lifespan_shutdown_wait_is_what_is_left_of_grace(cadeloop_logs):
+    """lifespan.shutdown() waited a fixed 10s whatever `grace` said: a 1s
+    budget ran ten times over (in a pool worker, into the supervisor's
+    SIGKILL, so nothing after the hook ran), and a long budget cut the hook
+    off with most of it unspent. Its cancellation was then logged as the
+    hook having raised."""
+    cancelled = []
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            asyncio.get_running_loop().call_later(0.1, asyncio.get_running_loop().stop)
+            await receive()
+            try:
+                await asyncio.sleep(30)  # a hook that will not finish in time
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+    began = time.monotonic()
+    t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0))
+    t.join(30)
+    took = time.monotonic() - began
+    assert not t.is_alive() and "error" not in result, result
+    assert took < 5.0, f"shutdown took {took:.1f}s with grace=1.0"
+    assert cancelled == [True]
+    messages = [r.getMessage() for r in cadeloop_logs if r.levelno >= logging.WARNING]
+    assert any("did not complete within" in m for m in messages), messages
+    assert not any("lifespan shutdown raised" in m for m in messages), messages
+
+
+@posix_only
+def test_a_worker_still_starting_stops_when_its_supervisor_is_gone(cadeloop_logs):
+    """The lifeline's EOF stopped only a worker already serving. One still
+    in its lifespan startup (retrying a database that is down) outlived
+    its supervisor for as long as the startup hung -- with nobody left to
+    enforce `grace`, for good if it never returned."""
+    started = threading.Event()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            started.set()
+            await asyncio.sleep(3600)  # a startup that does not finish
+
+    r, w = os.pipe()
+    try:
+        t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0), lifeline_fd=r)
+        assert started.wait(10)
+        os.close(w)  # the supervisor is gone
+        w = None
+        t.join(10)
+        assert not t.is_alive(), "the worker outlived its supervisor"
+    finally:
+        if w is not None:
+            os.close(w)
+    os.close(r)
+    assert result.get("reason") == "supervisor", result
+    messages = [r.getMessage() for r in cadeloop_logs if r.levelno >= logging.WARNING]
+    assert not any("WITHOUT the application's lifespan" in m for m in messages), messages
+
+
+def test_requests_share_pooled_to_thread_workers():
+    """serve() ran the loop with a bare run_forever(), so anyio found no
+    root task to pool its to_thread workers under and took each request's
+    own task instead: every request that offloaded work -- FastAPI's `def`
+    routes and sync dependencies -- started a worker thread and stopped it
+    when it finished (200 requests, 200 threads; uvicorn, 1), roughly
+    doubling such a route's latency."""
+    anyio = pytest.importorskip("anyio")
+    port = _free_port()
+    workers = []
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        await receive()
+        workers.append(await anyio.to_thread.run_sync(threading.current_thread))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+        if len(workers) == 5:
+            asyncio.get_running_loop().stop()
+
+    t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0), port=port)
+    _wait_up(port)
+    for _ in range(4):
+        _get(port)
+    t.join(30)
+    assert not t.is_alive() and "error" not in result, result
+    assert len(workers) == 5 and len({id(w) for w in workers}) == 1, workers
 
 
 def test_s26_serve_restores_the_callers_current_event_loop():

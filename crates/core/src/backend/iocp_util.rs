@@ -191,14 +191,27 @@ pub fn afd_outcome(status: i32, events: u32, read: bool, write: bool) -> PollOut
 /// A packet for a synchronous completion is queued before the issuing call
 /// returns, so once a dequeue comes back short of a full batch, every id
 /// held before that dequeue started has had its packet (if any) seen.
+///
+/// A port busy enough never comes back short -- with a few hundred
+/// connections active every dequeue is a full batch -- so that proof alone
+/// never arrived: nothing held was ever released, and the op slab grew by a
+/// chunk every `batch` holds and kept it (a FIFO-port model holding 256 a
+/// tick reached 2.56M slots, ~1.6 GiB, in 10k ticks). The port hands packets
+/// out in the order they were queued, so a packet posted now comes back
+/// only after every packet that could belong to an id held now: the drain
+/// sentinel (`sentinel_wanted`) is the proof in that case.
 #[derive(Debug, Default)]
 pub struct Quarantine<T> {
     held: Vec<T>,
+    /// The drain sentinel on the port, if one is: its generation (carried
+    /// in the packet) and how many of the oldest held ids it covers.
+    sentinel: Option<(u32, usize)>,
+    next_sentinel: u32,
 }
 
 impl<T: Copy> Quarantine<T> {
     pub fn new() -> Self {
-        Quarantine { held: Vec::new() }
+        Quarantine { held: Vec::new(), sentinel: None, next_sentinel: 0 }
     }
 
     pub fn hold(&mut self, id: T) {
@@ -222,11 +235,47 @@ impl<T: Copy> Quarantine<T> {
     /// `mark` ids held and returned `dequeued` of a possible `batch`.
     pub fn drained(&mut self, mark: usize, dequeued: usize, batch: usize) -> std::vec::Drain<'_, T> {
         let n = if dequeued < batch { mark.min(self.held.len()) } else { 0 };
+        if let Some((_, covered)) = &mut self.sentinel {
+            // Released from the front: the sentinel covers that many fewer.
+            *covered = covered.saturating_sub(n);
+        }
+        self.held.drain(..n)
+    }
+
+    /// After a dequeue that returned `dequeued` of a possible `batch`: the
+    /// generation of a drain sentinel to post now, if one is needed -- the
+    /// batch was full, ids are held, and no sentinel is on the port yet.
+    /// The caller posts it and reports it with `sentinel_posted`.
+    pub fn sentinel_wanted(&mut self, dequeued: usize, batch: usize) -> Option<u32> {
+        if dequeued < batch || self.sentinel.is_some() || self.held.is_empty() {
+            return None;
+        }
+        self.next_sentinel = self.next_sentinel.wrapping_add(1);
+        Some(self.next_sentinel)
+    }
+
+    /// Sentinel `generation` is on the port: it covers everything held now.
+    pub fn sentinel_posted(&mut self, generation: u32) {
+        self.sentinel = Some((generation, self.held.len()));
+    }
+
+    /// A drain sentinel came back off the port: the ids it covers are now
+    /// safe to recycle. One from before `drain_all` is stale, and covers
+    /// nothing.
+    pub fn sentinel_arrived(&mut self, generation: u32) -> std::vec::Drain<'_, T> {
+        let n = match self.sentinel {
+            Some((g, covered)) if g == generation => {
+                self.sentinel = None;
+                covered.min(self.held.len())
+            }
+            _ => 0,
+        };
         self.held.drain(..n)
     }
 
     /// Everything, unconditionally (teardown, once nothing can arrive).
     pub fn drain_all(&mut self) -> std::vec::Drain<'_, T> {
+        self.sentinel = None;
         self.held.drain(..)
     }
 }
@@ -407,6 +456,87 @@ mod tests {
         let mark = q.mark();
         assert_eq!(q.drained(mark, 0, 256).collect::<Vec<_>>(), vec![3]);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_sentinel_drains_a_port_that_never_runs_short() {
+        const BATCH: usize = 256;
+        let mut q: Quarantine<u32> = Quarantine::new();
+        for id in 0..3 {
+            q.hold(id);
+        }
+        let mark = q.mark();
+        assert_eq!(q.drained(mark, BATCH, BATCH).count(), 0);
+        let generation = q.sentinel_wanted(BATCH, BATCH).expect("a full batch with ids held");
+        q.sentinel_posted(generation);
+        assert_eq!(q.sentinel_wanted(BATCH, BATCH), None, "one sentinel on the port at a time");
+        q.hold(3); // held after the sentinel was posted: not covered by it
+        let mark = q.mark();
+        assert_eq!(q.drained(mark, BATCH, BATCH).count(), 0);
+        assert_eq!(q.sentinel_arrived(generation.wrapping_add(1)).count(), 0, "not this sentinel");
+        assert_eq!(q.sentinel_arrived(generation).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(q.len(), 1);
+        // The next full batch posts a sentinel for 3 -- which a short
+        // dequeue then releases first, leaving the sentinel nothing.
+        let next = q.sentinel_wanted(BATCH, BATCH).unwrap();
+        assert_ne!(next, generation);
+        q.sentinel_posted(next);
+        let mark = q.mark();
+        assert_eq!(q.drained(mark, 7, BATCH).collect::<Vec<_>>(), vec![3]);
+        q.hold(4);
+        assert_eq!(q.sentinel_arrived(next).count(), 0, "4 came after the sentinel");
+        assert_eq!(q.len(), 1);
+        // A sentinel still on the port at teardown covers nothing after it.
+        let late = q.sentinel_wanted(BATCH, BATCH).unwrap();
+        q.sentinel_posted(late);
+        assert_eq!(q.drain_all().count(), 1);
+        q.hold(5);
+        assert_eq!(q.sentinel_arrived(late).count(), 0);
+    }
+
+    /// The liveness property against a FIFO port model: every tick
+    /// dequeues a full batch, and each I/O packet it reaps retires one slot
+    /// inline (held) and posts one more op. Without the sentinel, nothing
+    /// held is ever released.
+    #[test]
+    fn a_saturated_port_keeps_its_quarantine_bounded() {
+        use std::collections::VecDeque;
+        const BATCH: usize = 256;
+        #[derive(Clone, Copy)]
+        enum Packet {
+            Io,
+            Sentinel(u32),
+        }
+        for conns in [257usize, 1000, 5000] {
+            let mut port: VecDeque<Packet> = (0..conns).map(|_| Packet::Io).collect();
+            let mut q: Quarantine<u64> = Quarantine::new();
+            let mut next_id = 0u64;
+            let mut peak = 0usize;
+            for _tick in 0..2_000 {
+                let mark = q.mark();
+                let n = port.len().min(BATCH);
+                for _ in 0..n {
+                    match port.pop_front().unwrap() {
+                        Packet::Io => {
+                            q.hold(next_id); // a re-post that completed inline
+                            next_id += 1;
+                            port.push_back(Packet::Io); // and the next op's packet
+                        }
+                        Packet::Sentinel(g) => {
+                            q.sentinel_arrived(g).count();
+                        }
+                    }
+                }
+                q.drained(mark, n, BATCH).count();
+                if let Some(g) = q.sentinel_wanted(n, BATCH) {
+                    port.push_back(Packet::Sentinel(g));
+                    q.sentinel_posted(g);
+                }
+                peak = peak.max(q.len());
+            }
+            // Each id waits for at most two trips through the port.
+            assert!(peak <= 2 * (conns + BATCH), "{conns} connections: {peak} slots held");
+        }
     }
 
     #[test]

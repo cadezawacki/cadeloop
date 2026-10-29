@@ -460,20 +460,28 @@ impl IoBackend for RioBackend {
         self.inner.register_socket(socket)?;
         // R-042: attach a request queue. CQ capacity is reserved per RQ,
         // growing the CQ by doubling when needed (R-041).
+        //
+        // Failing past the inner registration, it is undone first: callers
+        // treat a failed registration as never having happened and close
+        // the socket without detaching it, which left the inner backend's
+        // records for a handle value the OS reissues (ADR-25).
         let reserve = self.rq_recv + self.rq_send;
         let grow = match self.cq_ledger.plan_reserve(reserve) {
             Ok(g) => g,
             Err(()) => {
+                self.inner.detach_socket(socket);
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
                     "RIO completion queue at maximum capacity",
-                ))
+                ));
             }
         };
         if let Some(new_size) = grow {
             let ok = unsafe { (self.t.RIOResizeCompletionQueue.unwrap())(self.cq, new_size) };
             if ok == 0 {
-                return Err(wsa_named("RIOResizeCompletionQueue"));
+                let err = wsa_named("RIOResizeCompletionQueue");
+                self.inner.detach_socket(socket);
+                return Err(err);
             }
         }
         let rq = unsafe {
