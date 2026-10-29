@@ -290,7 +290,10 @@ fn empty_op() -> IocpOp {
         // SAFETY: all-zero is a valid representation for these C structs
         // (the Vec below is NOT zeroable and is constructed normally).
         overlapped: unsafe { zeroed() },
-        id: OpId { index: 0, generation: 0 },
+        // No slot's: a stray packet pointing into a slot never posted
+        // since its chunk was allocated resolves to nothing, rather than to
+        // slot 0 -- which, at its own generation 0, may be live.
+        id: OpId { index: u32::MAX, generation: 0 },
         socket: 0,
         accept_socket: 0,
         from_len: 0,
@@ -1023,7 +1026,10 @@ impl IocpBackend {
                 self.slab.release(id);
             }
             OpKind::Connect => {
-                if os_error == 0 {
+                // A cancelled connect's socket may already be closed -- loop
+                // close shuts it right after CancelIoEx -- and its handle
+                // value reissued, even when the connect raced to success.
+                if os_error == 0 && !was_cancelled {
                     // R-034: SO_UPDATE_CONNECT_CONTEXT on completion.
                     unsafe {
                         setsockopt(socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0);

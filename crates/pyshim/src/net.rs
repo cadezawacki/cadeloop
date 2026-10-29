@@ -3788,14 +3788,20 @@ pub(crate) fn wire_http(
     // here as well as in the caller's error path meant a failed adoption
     // closed the same descriptor number twice -- and if another thread had
     // been handed that number meanwhile, it closed an unrelated socket.
-    let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
-    if let Err(e) = reg {
-        return Err(e.into());
-    }
+    //
+    // The TLS state first: registered and then failed, the socket went
+    // back to a caller that closes it without detaching it, leaving the
+    // backend a stale record for a handle value the OS reissues (on IOCP,
+    // its skip mode and port association passed to the next socket given
+    // that number -- ADR-25). A bad SSLContext failed every adoption so.
     let tls_state = match &tls {
         Some(ctx) => Some(Box::new(crate::http::tls_wrap(py, ctx)?)),
         None => None,
     };
+    let reg = core.with_net(|_net, reactor| reactor.backend_mut().register_socket(sock))?;
+    if let Err(e) = reg {
+        return Err(e.into());
+    }
     core.with_net(|net, reactor| {
         let tid = net.next_id();
         let mut conn =
