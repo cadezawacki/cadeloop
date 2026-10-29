@@ -2044,6 +2044,8 @@ impl CoreLoop {
                     st.net.accept_ops_outstanding(),
                     st.net.buffers.stale_rejections(),
                     st.net.reap_guards.len(),
+                    st.net.buffers.bytes_in_use(),
+                    st.net.buffers.bytes_held(),
                 ),
                 net::op_breakdown(&st.net),
                 st.reactor.backend_mut().diag(),
@@ -2063,11 +2065,16 @@ impl CoreLoop {
         d.set_item("xthread_items", stats.xthread_items)?;
         d.set_item("spin_hits", stats.spin_hits)?;
         d.set_item("polls_elided", stats.polls_elided)?;
+        d.set_item("precise_parks", stats.precise_parks)?;
         d.set_item("ready_len", ready)?;
         d.set_item("timers_len", timers)?;
         d.set_item("connections", netstats.0)?;
         d.set_item("listeners", netstats.1)?;
         d.set_item("buffers_in_use", netstats.2)?;
+        // What those buffers occupy, and what the pool keeps from the OS
+        // in all: free slots past a warm set are handed back.
+        d.set_item("buffer_bytes_in_use", netstats.12)?;
+        d.set_item("buffer_bytes_held", netstats.13)?;
         d.set_item("bytes_received", netstats.3)?;
         d.set_item("bytes_sent", netstats.4)?;
         d.set_item("connections_accepted", netstats.5)?;

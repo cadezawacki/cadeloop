@@ -1577,7 +1577,15 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
     every other connection's requests waited behind the whole burst. It
     now yields after a quantum, so a request arriving on another
     connection is served within a few quanta, while the burst itself is
-    still answered completely and in order."""
+    still answered completely and in order.
+
+    /b is sent once the server is serving the burst, from a thread of its
+    own: how much of the burst the kernel buffers depends on how much the
+    server reads ahead of its pipeline budget, and a client that sent /b
+    only after the whole burst had been written measured that instead."""
+    import threading
+    import time
+
     order = []
 
     async def app(scope, receive, send):
@@ -1598,6 +1606,8 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
             buf += chunk
         return buf
 
+    served_before_b = []
+
     def client():
         a = socket.create_connection(("127.0.0.1", port))
         b = socket.create_connection(("127.0.0.1", port))
@@ -1607,10 +1617,16 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
             # Both connections live on the server before the burst starts.
             b.sendall(b"GET /warm HTTP/1.1\r\nHost: h\r\n\r\n")
             read_responses(b, 1)
-            a.sendall(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n" * n)
+            burst = threading.Thread(target=a.sendall, args=(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n" * n,))
+            burst.start()
+            deadline = time.monotonic() + 10
+            while order.count("/a") < 1 and time.monotonic() < deadline:
+                time.sleep(0.0005)
+            served_before_b.append(order.count("/a"))
             b.sendall(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
             read_responses(b, 1)
             read_responses(a, n)
+            burst.join()
         finally:
             a.close()
             b.close()
@@ -1618,12 +1634,11 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
     loop.run_until_complete(loop.run_in_executor(None, client))
     loop._core.listener_close(lid)
     assert order.count("/a") == n, "the burst was not answered in full"
-    behind = order.index("/b") - 1
+    behind = order.index("/b") - 1 - served_before_b[0]
     # Served back to back, /b waited for the whole first read of the burst
     # (~700 requests on a fresh loopback connection, up to ~2400 per
     # 64 KiB); with the quantum it is a few quanta at most.
-    assert behind < 256, f"/b was served only after {behind} of the other client's requests"
-
+    assert behind < 256, f"/b was served only after {behind} more of the other client's requests"
 
 def test_oversized_body_is_rejected_by_default(loop):
     """R-086: the engine buffers a whole request body before dispatching,
@@ -3457,3 +3472,204 @@ def test_the_drain_waits_for_background_work(loop):
     loop._core.listener_close(lid)
     _drain_connections(loop, 5.0)
     assert ran == ["background"], ran
+
+
+# --------------------------------------------------------------------- #
+# 100 Continue in pipeline order; HTTP/1.0 keep-alive announced          #
+# --------------------------------------------------------------------- #
+
+
+async def _stream_then_upload_app(scope, receive, send):
+    if scope["path"] == "/stream":
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"a" * 10, "more_body": True})
+        await asyncio.sleep(0.2)
+        await send({"type": "http.response.body", "body": b"b" * 10, "more_body": True})
+        await send({"type": "http.response.body", "body": b""})
+        return
+    msg = await receive()
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"got:" + msg["body"]})
+
+
+def test_a_pipelined_expect_waits_for_the_responses_ahead_of_it(loop):
+    """The 100 Continue for a pipelined `Expect` head was written as soon
+    as the head was parsed -- into the middle of the earlier request's
+    streamed response, breaking its chunked framing. It now follows every
+    response ahead of it, and still arrives before the body is sent."""
+    lid, port = listen(loop, _stream_then_upload_app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"GET /stream HTTP/1.1\r\nHost: h\r\n\r\n"
+            b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+        )
+        await w.drain()
+        first = await asyncio.wait_for(_read_one_response(r), 5.0)
+        interim = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5.0)
+        w.write(b"hello")
+        await w.drain()
+        second = await asyncio.wait_for(_read_one_response(r), 5.0)
+        w.close()
+        return first, interim, second
+
+    first, interim, second = loop.run_until_complete(client())
+    assert b"100 Continue" not in first, first
+    assert first.endswith(b"0\r\n\r\n") and b"a" * 10 in first and b"b" * 10 in first, first
+    assert interim == b"HTTP/1.1 100 Continue\r\n\r\n", interim
+    assert second.startswith(b"HTTP/1.1 200") and second.endswith(b"got:hello"), second
+    loop._core.listener_close(lid)
+
+
+def test_an_expect_whose_body_already_arrived_gets_no_interim_response(loop):
+    """A client that sent the body with the head needs no 100 (RFC 7231
+    5.1.1 lets the server omit it). Pipelined behind a streaming response
+    it was written into that response; sent after this request's own
+    response it would answer the next request instead."""
+    lid, port = listen(loop, _stream_then_upload_app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(
+            b"GET /stream HTTP/1.1\r\nHost: h\r\n\r\n"
+            b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello"
+            b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi"
+        )
+        await w.drain()
+        out = [await asyncio.wait_for(_read_one_response(r), 5.0) for _ in range(3)]
+        w.close()
+        return out
+
+    first, second, third = loop.run_until_complete(client())
+    assert b"100 Continue" not in first, first
+    assert second.startswith(b"HTTP/1.1 200") and second.endswith(b"got:hello"), second
+    assert third.startswith(b"HTTP/1.1 200") and third.endswith(b"got:hi"), third
+    loop._core.listener_close(lid)
+
+
+def test_http10_keep_alive_is_announced(loop):
+    """An HTTP/1.0 connection persists only if the response says so. One
+    that asked for keep-alive was kept open without being told, so a 1.0
+    client reading to EOF waited out the idle timeout."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def client():
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        req = b"GET / HTTP/1.0\r\nHost: h\r\nConnection: keep-alive\r\n\r\n"
+        w.write(req)
+        first = await asyncio.wait_for(_read_one_response(r), 5.0)
+        w.write(req)
+        second = await asyncio.wait_for(_read_one_response(r), 5.0)
+        w.close()
+        # Without the request, no promise: the server closes after one.
+        plain_req = b"GET / HTTP/1.0\r\nHost: h\r\n\r\n"
+        plain = await asyncio.wait_for(_request(port, plain_req, read_all=True), 5.0)
+        return first, second, plain
+
+    first, second, plain = loop.run_until_complete(client())
+    for resp in (first, second):
+        assert resp.startswith(b"HTTP/1.0 200"), resp
+        head = resp.split(b"\r\n\r\n")[0] + b"\r\n\r\n"
+        assert _parse_headers(head).get("connection") == "keep-alive", resp
+    assert b"keep-alive" not in plain.lower(), plain
+    loop._core.listener_close(lid)
+
+
+def test_a_close_delimited_http10_response_is_not_announced_persistent(loop):
+    """A streamed response to a 1.0 client has no length to frame it, so it
+    ends at close -- and must not claim the connection will persist."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"one", "more_body": True})
+        await send({"type": "http.response.body", "body": b"two"})
+
+    lid, port = listen(loop, app)
+    raw = b"GET / HTTP/1.0\r\nHost: h\r\nConnection: keep-alive\r\n\r\n"
+    resp = loop.run_until_complete(_request(port, raw, read_all=True))
+    assert resp.startswith(b"HTTP/1.0 200") and resp.endswith(b"onetwo"), resp
+    assert b"keep-alive" not in resp.lower(), resp
+    loop._core.listener_close(lid)
+
+
+def test_idle_connections_hold_small_receive_buffers(loop):
+    """A connection keeps a receive posted, buffer and all, for as long as
+    it is idle. At a fixed 64 KiB that was 64 KiB of committed memory per
+    idle keep-alive connection; reads now start at 4 KiB and grow only
+    when they fill the buffer -- so a large upload still arrives whole."""
+
+    async def app(scope, receive, send):
+        n, more = 0, True
+        while more:
+            msg = await receive()
+            n += len(msg.get("body", b""))
+            more = msg.get("more_body", False)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": str(n).encode()})
+
+    lid, port = listen(loop, app)
+
+    async def client():
+        conns = []
+        for _ in range(32):
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+            await asyncio.wait_for(_read_one_response(r), 5.0)
+            conns.append((r, w))
+        await asyncio.sleep(0.05)
+        idle = loop.stats()["buffer_bytes_in_use"]
+        r, w = conns[0]
+        size = 4 * 1024 * 1024
+        w.write(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n" % size + b"z" * size)
+        resp = await asyncio.wait_for(_read_one_response(r), 10.0)
+        for _, w in conns:
+            w.close()
+        return idle, resp, size
+
+    idle, resp, size = loop.run_until_complete(client())
+    # 32 server-side connections and the 32 client streams, all on this
+    # loop: 64 receives posted. At 64 KiB apiece that was 4 MiB.
+    assert idle <= 64 * 16384, f"{idle / 64 / 1024:.1f} KiB per idle receive"
+    assert _body(resp) == str(size).encode(), resp[-80:]
+    loop._core.listener_close(lid)
+
+
+def test_an_early_answer_to_an_upload_survives_the_close(loop):
+    """Closing with the peer's upload still arriving made the close a
+    reset, and Windows discards what a connection received but had not yet
+    read when the RST lands: a client answered 413 at headers-complete
+    while still sending got ECONNRESET instead of the 413. The response is
+    now followed by a FIN, and the peer's input drained, before the close."""
+
+    async def app(scope, receive, send):  # pragma: no cover - never reached
+        raise AssertionError("the app must not see an over-cap request")
+
+    lid, port = listen(loop, app, max_body=1024)
+    size = 8 * 1024 * 1024
+
+    def uploader():
+        s = socket.create_connection(("127.0.0.1", port))
+        try:
+            s.sendall(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n" % size)
+            chunk = b"z" * 65536
+            for _ in range(size // len(chunk)):
+                s.sendall(chunk)  # a naive client: it never reads while sending
+            s.settimeout(5)
+            data = b""
+            while chunk := s.recv(65536):
+                data += chunk
+            return data
+        finally:
+            s.close()
+
+    data = loop.run_until_complete(loop.run_in_executor(None, uploader))
+    assert data.startswith(b"HTTP/1.1 413"), data[:80]
+    loop._core.listener_close(lid)

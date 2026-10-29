@@ -170,6 +170,12 @@ struct Acc {
     /// The head just parsed carried `Expect: 100-continue` and the caller
     /// still owes the client an interim response (RFC 7231 5.1.1).
     owes_continue: bool,
+    /// A request that expects `100 Continue` is still waiting for its
+    /// body: an interim response sent now can still matter. Once the
+    /// message completes it cannot (RFC 7231 5.1.1 lets a server omit it
+    /// then), and one written after the final response would be read as
+    /// the NEXT request's.
+    expecting_body: bool,
 }
 
 impl Acc {
@@ -298,6 +304,7 @@ unsafe extern "C" fn on_headers_complete(p: *mut Llhttp) -> c_int {
     // interim response, because it owns the wire.
     if minor >= 1 && a.expects_continue() {
         a.owes_continue = true;
+        a.expecting_body = true;
     }
     0
 }
@@ -319,6 +326,9 @@ unsafe extern "C" fn on_message_complete(p: *mut Llhttp) -> c_int {
     let (method, minor) = unsafe { ((*p).method, (*p).http_minor) };
     let a = unsafe { acc(p) };
     let method_name = method_str(method);
+    // The body arrived with (or before) any interim response could matter.
+    a.owes_continue = false;
+    a.expecting_body = false;
     a.completed.push_back(Request {
         method: method_name,
         upgrade,
@@ -413,6 +423,7 @@ impl HttpParser {
             error: None,
             in_head: false,
             owes_continue: false,
+            expecting_body: false,
         });
         unsafe {
             llhttp_init(&mut *raw, HTTP_REQUEST, &SETTINGS);
@@ -492,6 +503,12 @@ impl HttpParser {
     /// indefinite one for the stricter clients that never give up.
     pub fn take_owes_continue(&mut self) -> bool {
         std::mem::take(&mut self.acc.owes_continue)
+    }
+
+    /// A request expecting `100 Continue` is still waiting for its body
+    /// (see `Acc::expecting_body`).
+    pub fn expecting_body(&self) -> bool {
+        self.acc.expecting_body
     }
 }
 
