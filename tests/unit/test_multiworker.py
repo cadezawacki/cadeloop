@@ -285,7 +285,9 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
     limit), and the exception unwound through a `finally` that only
     restored signal dispositions -- leaving every surviving worker
     running, listening and unsupervised while the caller was told the
-    server had failed."""
+    server had failed. They are stopped as any stop stops them: SIGTERM
+    and the grace period first (SIGKILLed outright, every request in
+    flight was cut off and no lifespan shutdown ran), then SIGKILL."""
     from cadeloop import server as srv
 
     spawned = []
@@ -322,10 +324,13 @@ def test_replacement_fork_failure_stops_the_survivors(monkeypatch):
     monkeypatch.setattr(srv.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
     with pytest.raises(OSError):
-        srv._serve_multi(_noop_app, "127.0.0.1", 8123, cadeloop.Config(), 2)
+        srv._serve_multi(_noop_app, "127.0.0.1", 8123, cadeloop.Config(grace=0.3), 2)
 
     assert (102, signal.SIGKILL) in killed, (
         f"surviving worker 102 was left running; kills seen: {killed}"
+    )
+    assert killed.index((102, signal.SIGTERM)) < killed.index((102, signal.SIGKILL)), (
+        f"worker 102 was not given its grace period first; kills seen: {killed}"
     )
 
 

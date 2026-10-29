@@ -1687,12 +1687,40 @@ def _reap(children):
     return 0, 0
 
 
+def _stop_children(children, grace, hurry) -> None:
+    """SIGTERM every supervised worker, give them ``grace`` seconds to
+    drain (``hurry()`` cuts that short), then SIGKILL what is left; reap
+    and forget them all."""
+    for pid in list(children):
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace
+    while children and time.monotonic() < deadline and not hurry():
+        pid, _status = _reap(children)
+        if pid == 0:
+            time.sleep(0.05)
+            continue
+        _close_ready_fd(children.pop(pid, None))
+    for pid in list(children):
+        logger.warning("worker pid %d exceeded grace=%ss — SIGKILL", pid, grace)
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+        _close_ready_fd(children.pop(pid, None))
+
+
 def _kill_children(children) -> None:
     """SIGKILL and reap every supervised worker, then forget them.
 
-    Used on any supervisor-side failure: a half-started fleet with no
-    supervisor left to signal it would otherwise keep the port bound and
-    the application's resources held for the life of the machine.
+    The last resort on a supervisor-side failure, when even the graceful
+    stop failed (or the failure was an interrupt): a half-started fleet
+    with no supervisor left to signal it would otherwise keep the port
+    bound and the application's resources held for the life of the
+    machine.
     """
     for pid, entry in list(children.items()):
         try:
@@ -1902,30 +1930,21 @@ def _serve_multi(app, host, port, config: Config, n: int, ssl_ctx=None):
         # Drain: give survivors `grace` seconds, then SIGKILL (R-092). Told
         # once more first: harmless to a worker already stopping, and it
         # covers one forked after the signal that started the shutdown.
-        for pid in list(children):
-            try:
-                os.kill(pid, _signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + config.grace
-        while children and time.monotonic() < deadline and not force:
-            pid, _status = _reap(children)
-            if pid == 0:
-                time.sleep(0.05)
-                continue
-            _close_ready_fd(children.pop(pid, None))
-        for pid in list(children):
-            logger.warning("worker pid %d exceeded grace=%ss — SIGKILL", pid, config.grace)
-            try:
-                os.kill(pid, _signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
-            _close_ready_fd(children.pop(pid, None))
-    except BaseException:
+        _stop_children(children, config.grace, lambda: force)
+    except Exception:
         # A fork failing partway (a process limit, say), at startup or as a
-        # replacement, raised with workers already running: same cleanup
-        # either way, or they keep serving with no supervisor.
+        # replacement, raised with workers already running: they keep
+        # serving with no supervisor unless stopped. Stopped the way any
+        # other stop stops them -- SIGKILLed outright, every in-flight
+        # request was cut off and no worker ran its lifespan shutdown,
+        # where the spawn model's supervisor drains on the same failure.
+        try:
+            _stop_children(children, config.grace, lambda: force)
+        except BaseException:
+            _kill_children(children)
+            raise
+        raise
+    except BaseException:
         _kill_children(children)
         raise
     finally:
