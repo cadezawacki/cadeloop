@@ -3096,6 +3096,40 @@ def test_nested_timeouts_sharing_a_deadline_fire_the_outer_one(loop, eager):
     assert out == ["outer"], out
 
 
+@pytest.mark.parametrize("eager", [True, False])
+def test_what_the_apps_synchronous_call_sets_stays_with_its_request(loop, eager):
+    """The application was called in the loop's own context; only the
+    coroutine it returned ran in a copy. A middleware whose plain
+    `__call__` sets a contextvar -- the user, from a header -- before
+    returning the inner app's coroutine left it set for every request
+    after it, on any connection."""
+    import contextvars
+
+    user = contextvars.ContextVar("cadeloop_test_user", default=None)
+
+    async def inner(scope, receive, send):
+        await receive()
+        body = json.dumps({"user": user.get()}).encode()
+        headers = [(b"content-length", str(len(body)).encode())]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
+
+    class Auth:
+        def __call__(self, scope, receive, send):
+            for k, v in scope["headers"]:
+                if k == b"x-user":
+                    user.set(v.decode())
+            return inner(scope, receive, send)
+
+    lid, port = listen(loop, Auth(), eager=eager)
+    first = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\nX-User: alice\r\n\r\n"))
+    second = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert json.loads(_body(first)) == {"user": "alice"}
+    assert json.loads(_body(second)) == {"user": None}, _body(second)
+    assert user.get() is None, "set in the context the loop runs in"
+
+
 def test_contextvar_isolation_pipelined_requests(loop):
     """A request pipelined behind one that suspended started with every
     contextvar that one had set: the eager driver pumped it from inside

@@ -3049,7 +3049,14 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         let recv_obj = Py::new(py, HttpReceive { core: slf.clone().unbind(), tid, epoch })?;
         let send_obj = Py::new(py, HttpSend { core: slf.clone().unbind(), tid, epoch })?;
 
-        let coro = match app.bind(py).call1((scope, recv_obj, send_obj)) {
+        // The application is called inside the context its request then
+        // runs in, as uvicorn calls it inside the request's Task. Called
+        // in the loop's own context, whatever the synchronous part of the
+        // call set there -- an ASGI middleware whose plain `__call__` sets
+        // the user from a header, then returns the inner app's coroutine
+        // -- stayed set for every request after it, on any connection.
+        let ctx = crate::coreloop::copy_context(py)?;
+        let coro = match in_context(py, &ctx, || app.bind(py).call1((scope, recv_obj, send_obj))) {
             Ok(c) => c,
             Err(e) => {
                 app_failure(py, core, tid, epoch, e)?;
@@ -3059,7 +3066,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
 
         if eager {
             // R-056: step inline; only a suspension allocates a driver.
-            let task = AppTask::spawn(py, slf, tid, epoch, coro.unbind(), pyloop)?;
+            let task = AppTask::spawn(py, slf, tid, epoch, coro.unbind(), pyloop, ctx)?;
             let initial = AppTask::step(task.bind(py), py, None)?;
             match initial {
                 StepOutcome::Suspended => {
@@ -3087,7 +3094,12 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
             // turns the same per-request mistake into a 500 and keeps
             // serving everyone else. Route it the same way.
             let spawned = (|| -> PyResult<()> {
-                let task = pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))?;
+                // Created in the call's context, so the Task copies it. Its
+                // done callback, below, is not: that pumps the connection's
+                // next request, which must not start in this one's context.
+                let task = in_context(py, &ctx, || {
+                    pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))
+                })?;
                 let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid, epoch })?;
                 task.call_method1(intern!(py, "add_done_callback"), (cb,))?;
                 let stored = task.unbind();
@@ -3109,6 +3121,18 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
             return Ok(());
         }
     }
+}
+
+/// Run `f` with `ctx` entered as the current context.
+fn in_context<'py, T>(py: Python<'py>, ctx: &Py<PyAny>, f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    if unsafe { ffi::PyContext_Enter(ctx.as_ptr()) } != 0 {
+        return Err(PyErr::fetch(py));
+    }
+    let out = f();
+    if unsafe { ffi::PyContext_Exit(ctx.as_ptr()) } != 0 {
+        return Err(PyErr::fetch(py));
+    }
+    out
 }
 
 /// Is request `epoch` still the one running on its connection? Not once it
@@ -3531,8 +3555,9 @@ pub struct AppTask {
     /// The future this task is suspended on (cancel() forwards to it,
     /// mirroring Task.cancel()).
     waiting_on: Option<Py<PyAny>>,
-    /// Captured at spawn() time (contextvars.Context.copy(), mirroring
-    /// real asyncio.Task.__init__) and entered/exited around every
+    /// A copy of the loop's context taken before the application was
+    /// called -- the call itself runs in it (`pump_requests`), as it does
+    /// inside a uvicorn request Task -- and entered/exited around every
     /// coroutine step in step_inner — without this, contextvars set
     /// during one request are visible to unrelated concurrent or later
     /// requests on the same worker (handles.rs::run_handle already
@@ -3726,8 +3751,8 @@ impl AppTask {
         epoch: u64,
         coro: Py<PyAny>,
         pyloop: Py<PyAny>,
+        context: Py<PyAny>,
     ) -> PyResult<Py<AppTask>> {
-        let context = crate::coreloop::copy_context(py)?;
         Py::new(
             py,
             AppTask {
