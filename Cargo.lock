@@ -31,7 +31,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "cadeloop-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cc",
  "crossbeam-queue",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "cadeloop-pyshim"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cadeloop-core",
  "mimalloc",
