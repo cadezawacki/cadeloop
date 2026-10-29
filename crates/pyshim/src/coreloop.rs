@@ -1491,10 +1491,11 @@ impl CoreLoop {
         Ok(busy)
     }
 
-    /// Graceful shutdown, last phase (R-092): the eager request drivers
-    /// still in flight, which the facade cancels along with the tasks the
-    /// application left running (`asyncio.all_tasks()` does not list them).
-    /// Each has `cancel()`, `done()` and `add_done_callback()`.
+    /// Graceful shutdown, last phase (R-092): the requests still in flight
+    /// -- eager drivers, which `asyncio.all_tasks()` does not list, and the
+    /// asyncio Tasks of the non-eager path -- which the facade cancels
+    /// before lifespan.shutdown. Each has `cancel()`, `done()` and
+    /// `add_done_callback()`.
     fn http_request_drivers(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.with_net(|net, _| net::http_request_drivers(py, net))
     }

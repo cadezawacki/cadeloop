@@ -1949,7 +1949,11 @@ pub(crate) fn http_request_drivers(py: Python<'_>, net: &NetState) -> Vec<Py<PyA
     net.transports
         .values()
         .filter_map(|e| match &e.proto {
-            ProtoKind::Http(conn) => conn.driver.as_ref().map(|d| d.clone_ref(py).into_any()),
+            ProtoKind::Http(conn) => match (&conn.driver, &conn.task) {
+                (Some(d), _) => Some(d.clone_ref(py).into_any()),
+                (None, Some(t)) => Some(t.clone_ref(py)),
+                (None, None) => None,
+            },
             ProtoKind::Py(_) => None,
         })
         .collect()

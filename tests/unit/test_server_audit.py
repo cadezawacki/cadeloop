@@ -1025,6 +1025,57 @@ def test_s17_a_request_in_flight_at_the_deadline_is_cancelled(eager):
     assert ran == ["cleanup"], ran
 
 
+def _connect(port, deadline=10.0):
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            if time.monotonic() > end:
+                raise
+            time.sleep(0.02)
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_requests_left_by_the_drain_are_cancelled_before_lifespan_shutdown(eager):
+    """A request still running when the drain's deadline passed was only
+    cancelled in _finalize_loop, after lifespan.shutdown: the shutdown hook
+    closed the pool the handler was still using, and the handler then
+    carried on against it. uvicorn cancels request tasks first, and the
+    ASGI spec sends lifespan.shutdown once connections are closed. On the
+    non-eager path the engine never recorded the request's Task, so
+    nothing but all_tasks() could reach it."""
+    events = []
+    port = _free_port()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            events.append("lifespan.shutdown")
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        await receive()
+        events.append("request")
+        asyncio.get_running_loop().stop()  # shutdown starts with this one in flight
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            events.append("request cancelled")
+            raise
+
+    t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0, eager_tasks=eager), port=port)
+    s = _connect(port)
+    try:
+        s.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        t.join(30)
+    finally:
+        s.close()
+    assert not t.is_alive() and "error" not in result, result
+    assert events == ["request", "request cancelled", "lifespan.shutdown"], events
+
+
 def test_s26_serve_restores_the_callers_current_event_loop():
     """S26: serve() set the thread's current loop to None on return,
     clobbering the embedder's own."""

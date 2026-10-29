@@ -143,6 +143,10 @@ pub(crate) struct HttpConn {
     pub(crate) req_epoch: u64,
     /// Suspended continuation (eager path) — kept alive here.
     pub(crate) driver: Option<Py<AppTask>>,
+    /// The asyncio Task running the active request (non-eager path), so a
+    /// graceful shutdown can cancel it before lifespan.shutdown, as it
+    /// cancels `driver` (`http_request_drivers`).
+    pub(crate) task: Option<Py<PyAny>>,
     pub(crate) eager: bool,
     // --- R-080 idle/head timeouts (0 = disabled), driven by http_sweep --
     pub(crate) head_timeout_ns: u64,
@@ -326,6 +330,7 @@ impl HttpConn {
             drain_waiters: VecDeque::new(),
             req_epoch: 0,
             driver: None,
+            task: None,
             eager,
             head_timeout_ns,
             idle_timeout_ns,
@@ -2834,6 +2839,17 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 let task = pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))?;
                 let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid })?;
                 task.call_method1(intern!(py, "add_done_callback"), (cb,))?;
+                let stored = task.unbind();
+                // Handed back when the connection is gone, so the reference
+                // drops out of the cell (ADR-5).
+                let unstored = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+                    Some(c) => {
+                        c.task = Some(stored);
+                        None
+                    }
+                    None => Some(stored),
+                })?;
+                drop(unstored);
                 Ok(())
             })();
             if let Err(e) = spawned {
@@ -3572,6 +3588,11 @@ impl HttpTaskDone {
     fn __call__(&self, py: Python<'_>, task: Bound<'_, PyAny>) -> PyResult<()> {
         let core_bound = self.core.bind(py);
         let core = core_bound.get();
+        // Done whichever way it ended, so it is no longer a request a
+        // shutdown has to cancel. Dropped out here: the caller holds the
+        // same task, so this is never the last reference.
+        let stored = core.with_net(|net, _| net.http_conn_mut(self.tid).and_then(|c| c.task.take()))?;
+        drop(stored);
         let cancelled: bool =
             task.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(false);
         if cancelled {

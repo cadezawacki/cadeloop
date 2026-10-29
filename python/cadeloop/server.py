@@ -774,6 +774,12 @@ def _serve_single(
                 # below needs a slice of it -- a drain that spends all of
                 # the budget means the app's cleanup hook never runs.
                 _drain_connections(loop, _drain_budget(config.grace), shutdown)
+                # What the drain could not finish is cancelled before
+                # lifespan.shutdown (uvicorn's order; the ASGI spec sends it
+                # once connections are closed). Left to _finalize_loop, the
+                # handlers ran on while the shutdown hook closed the pools
+                # and clients they were still using.
+                _cancel_requests(loop, min(1.0, (config.grace - (time.monotonic() - started)) / 4))
             if hook is not None:
                 hook.stop()
             if access_log is not None:
@@ -899,6 +905,26 @@ def _drain_connections(loop, grace, shutdown=None):
         )
 
 
+def _cancel_requests(loop, budget: float) -> None:
+    """Cancel the requests still in flight and give their cleanup up to
+    ``budget`` seconds to run. At least one pass runs, so the cancellation
+    is delivered and cleanup that does not await completes; cleanup that
+    outlasts the budget carries on alongside lifespan.shutdown."""
+    if loop.is_closed():
+        return
+    drivers = loop._core.http_request_drivers()
+    if not drivers:
+        return
+    for driver in drivers:
+        driver.cancel()
+    finished = [_when_finished(loop, driver) for driver in drivers]
+    try:
+        loop.run_until_complete(asyncio.wait(finished, timeout=max(budget, 0.0)))
+    except RuntimeError as exc:
+        # A forced exit stopped the loop under the wait.
+        logger.debug("cadeloop: request cancellation cut short: %r", exc)
+
+
 def _finalize_loop(loop, budget: float) -> None:
     """What asyncio.run() does before closing its loop, bounded by what is
     left of the grace budget: cancel the tasks the application left
@@ -916,7 +942,10 @@ def _finalize_loop(loop, budget: float) -> None:
         # so all_tasks() never lists it: a handler still awaiting here was
         # never cancelled, its cleanup never ran, and close() then dropped
         # it mid-await. Its driver is cancelled with the tasks.
-        drivers = loop._core.http_request_drivers()
+        # Non-eager requests run as asyncio Tasks, which all_tasks() lists
+        # already: counted twice, one still running read as two.
+        listed = {id(t) for t in tasks}
+        drivers = [d for d in loop._core.http_request_drivers() if id(d) not in listed]
         if tasks or drivers:
             for task in tasks:
                 task.cancel()
