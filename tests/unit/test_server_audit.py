@@ -1108,6 +1108,37 @@ def test_the_lifespan_shutdown_wait_is_what_is_left_of_grace(cadeloop_logs):
     assert not any("lifespan shutdown raised" in m for m in messages), messages
 
 
+@posix_only
+def test_a_worker_still_starting_stops_when_its_supervisor_is_gone(cadeloop_logs):
+    """The lifeline's EOF stopped only a worker already serving. One still
+    in its lifespan startup (retrying a database that is down) outlived
+    its supervisor for as long as the startup hung -- with nobody left to
+    enforce `grace`, for good if it never returned."""
+    started = threading.Event()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            started.set()
+            await asyncio.sleep(3600)  # a startup that does not finish
+
+    r, w = os.pipe()
+    try:
+        t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0), lifeline_fd=r)
+        assert started.wait(10)
+        os.close(w)  # the supervisor is gone
+        w = None
+        t.join(10)
+        assert not t.is_alive(), "the worker outlived its supervisor"
+    finally:
+        if w is not None:
+            os.close(w)
+    os.close(r)
+    assert result.get("reason") == "supervisor", result
+    messages = [r.getMessage() for r in cadeloop_logs if r.levelno >= logging.WARNING]
+    assert not any("WITHOUT the application's lifespan" in m for m in messages), messages
+
+
 def test_s26_serve_restores_the_callers_current_event_loop():
     """S26: serve() set the thread's current loop to None on return,
     clobbering the embedder's own."""

@@ -133,6 +133,10 @@ class _Lifespan:
         self._startup_delivered = False
         self._startup_failed = False
         self._shutdown_failure_reported = False
+        # Set by _serve_single when it gives the startup up (a repeated
+        # Ctrl-C, or the supervisor gone): the cancellation that follows
+        # is the server's doing, not the app lacking lifespan support.
+        self.abandoned = False
         # What a crash while serving does; _serve_single routes it through
         # its shutdown controller.
         self.on_crash = loop.stop
@@ -188,12 +192,15 @@ class _Lifespan:
                 # machinery re-raises these out of the loop tick.
                 raise
             except BaseException as exc:  # noqa: BLE001 — app may not do lifespan
-                if isinstance(exc, asyncio.CancelledError) and self._shutdown_requested:
+                if isinstance(exc, asyncio.CancelledError) and (
+                    self._shutdown_requested or self.abandoned
+                ):
                     # _finalize_loop cancelling a shutdown hook that overran
-                    # its timeout -- shutdown() has already said so. Logged
-                    # as "lifespan shutdown raised" with a traceback, it
-                    # blamed the application for the server's own
-                    # cancellation.
+                    # its timeout -- shutdown() has already said so -- or a
+                    # startup that was given up on. Logged as "lifespan
+                    # shutdown raised" with a traceback, or as a startup
+                    # failure, it blamed the application for the server's
+                    # own cancellation.
                     logger.debug("lifespan task cancelled")
                 elif self._shutdown_requested:
                     # The application's shutdown hook raised. The worker is
@@ -326,6 +333,14 @@ class _Shutdown:
         self.abandoned = False  # the lifespan startup was given up on
 
     def request(self, reason: str) -> None:
+        if reason == "supervisor" and self.phase == "starting" and not self.abandoned:
+            # The supervisor is gone, and with it whoever would have
+            # enforced `grace` on a startup that does not finish (one
+            # retrying a database that is down): give the startup up. Left
+            # to finish, the worker lived on as an orphan for as long as
+            # the startup hung -- for good, if it never returned.
+            self.abandoned = True
+            self.loop.stop()
         if self.reason is not None:
             return
         self.reason = reason
@@ -700,6 +715,7 @@ def _serve_single(
         except RuntimeError:
             if not shutdown.abandoned:
                 raise
+            lifespan.abandoned = True
             logger.warning("lifespan startup interrupted")
         if shutdown.reason is None:
             if control_channel is not None:
