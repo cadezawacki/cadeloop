@@ -3211,3 +3211,188 @@ def test_close_cancels_what_is_parked_on_a_connection(loop):
     writer.close()
     assert waiters and waiters[0].cancelled(), waiters
     assert ran == ["finally"] and refs["coro"]() is None, (ran, refs["coro"]())
+
+
+# --------------------------------------------------------------------- #
+# a request's turn on its connection ends with its response             #
+# --------------------------------------------------------------------- #
+
+
+def _ok_then(work):
+    """An app that answers "ok" and then does ``work(path)`` inside the same
+    ASGI call -- where Starlette runs a BackgroundTask."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]})
+        await send({"type": "http.response.body", "body": b"ok"})
+        await work(scope["path"])
+
+    return app
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_background_work_does_not_hold_up_the_next_request(loop, eager):
+    """A request ended when its coroutine returned, not when its response
+    completed, so work done after the response -- Starlette runs a
+    BackgroundTask inside the app call, after the last body message --
+    held the connection: the next request on it, pipelined or not, waited
+    for that work (1.5 s behind a 1.5 s task; uvicorn answers it at once).
+    The connection is now released when the response completes, and the
+    coroutine runs on by itself."""
+    finished = []
+
+    async def work(path):
+        if path == "/slow":
+            await asyncio.sleep(1.0)
+            finished.append(path)
+
+    lid, port = listen(loop, _ok_then(work), eager=eager)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /slow HTTP/1.1\r\nHost: h\r\n\r\nGET /a HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        t0 = loop.time()
+        for _ in range(2):
+            await asyncio.wait_for(_read_one_response(reader), 5)
+        pipelined = loop.time() - t0
+        t0 = loop.time()
+        writer.write(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(_read_one_response(reader), 5)
+        sequential = loop.time() - t0
+        writer.close()
+        await asyncio.sleep(1.2)  # the background work still completes
+        return pipelined, sequential
+
+    pipelined, sequential = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert pipelined < 0.5 and sequential < 0.5, (pipelined, sequential)
+    assert finished == ["/slow"], finished
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_close_delimited_response_ends_before_background_work(loop, eager):
+    """An HTTP/1.0 response without a length ends when the connection
+    closes, and the close waited for the coroutine to return: the client
+    sat through the background work before it saw the end of its response
+    (1.52 s against uvicorn's 0.02 s)."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"hello ", "more_body": True})
+        await send({"type": "http.response.body", "body": b"world"})
+        await asyncio.sleep(1.0)
+
+    lid, port = listen(loop, app, eager=eager)
+
+    async def main():
+        t0 = loop.time()
+        data = await _request(port, b"GET / HTTP/1.0\r\n\r\n", read_all=True)
+        return data, loop.time() - t0
+
+    data, took = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert data.endswith(b"hello world"), data
+    assert took < 0.5, took
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_background_work_survives_the_dead_peer_reclaim(loop, eager):
+    """The sweep reclaims a request whose client has gone (H4) -- and it
+    counted one still doing background work after a complete response as
+    such: a client that read its response and closed had the work
+    cancelled once the idle deadline passed."""
+    outcome = []
+
+    async def work(path):
+        try:
+            await asyncio.sleep(0.6)
+            outcome.append("done")
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+            raise
+
+    lid, port = listen(loop, _ok_then(work), eager=eager, keepalive_idle=0.1)
+
+    def sweep():
+        loop._core.http_sweep()
+        sweeper[0] = loop.call_later(0.03, sweep)
+
+    sweeper = [loop.call_soon(sweep)]
+
+    async def main():
+        await _request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")  # reads, then closes
+        await asyncio.sleep(1.0)
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        sweeper[0].cancel()
+    loop._core.listener_close(lid)
+    assert outcome == ["done"], outcome
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_request_torn_off_by_a_reset_can_still_be_cancelled(loop, eager):
+    """A connection reset tore the connection down and dropped the eager
+    driver with it: nothing could reach the handler any more, so a
+    graceful shutdown never cancelled it -- its `finally` never ran -- and,
+    AppTask being opaque to the cycle collector, the coroutine was never
+    reclaimed either."""
+    import struct
+
+    from cadeloop.server import _cancel_requests
+
+    started = asyncio.Event()
+    ran = []
+
+    async def app(scope, receive, send):
+        await receive()
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            ran.append("finally")
+
+    lid, port = listen(loop, app, eager=eager)
+    s = socket.create_connection(("127.0.0.1", port))
+    try:
+        s.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        loop.run_until_complete(asyncio.wait_for(started.wait(), 5))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        s.close()  # RST
+
+    async def gone():
+        while loop._core.http_connection_count():
+            await asyncio.sleep(0.01)
+
+    loop.run_until_complete(asyncio.wait_for(gone(), 5))
+    loop._core.listener_close(lid)
+    assert len(loop._core.http_request_drivers()) == 1
+    _cancel_requests(loop, 2.0)
+    assert ran == ["finally"], ran
+    assert loop._core.http_request_drivers() == []
+
+
+def test_the_drain_waits_for_background_work(loop):
+    """Released at its response, background work no longer keeps a
+    connection open, so the drain counts it by itself: a graceful
+    shutdown lets it finish within the grace period, as uvicorn waits for
+    every request task."""
+    from cadeloop.server import _drain_connections
+
+    ran = []
+
+    async def work(path):
+        await asyncio.sleep(0.4)
+        ran.append("background")
+
+    lid, port = listen(loop, _ok_then(work))
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    _drain_connections(loop, 5.0)
+    assert ran == ["background"], ran

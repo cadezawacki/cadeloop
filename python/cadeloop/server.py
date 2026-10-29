@@ -939,7 +939,7 @@ def _drain_connections(loop, grace, shutdown=None):
 
     def poll():
         if (
-            loop._core.http_connection_count() == 0
+            loop._core.http_connection_count() + loop._core.http_detached_count() == 0
             or loop.time() >= deadline
             or (shutdown is not None and shutdown.hurry)
         ):

@@ -15,11 +15,14 @@
 //! the awaited future. `Config(eager_tasks=False)` switches to stdlib
 //! `asyncio.Task` wrapping instead (§16 escape hatch).
 //!
-//! Request lifecycle: a request finishes when its app coroutine RETURNS
-//! (not when the response completes) — post-response code (Starlette
-//! background tasks) runs before the next pipelined request is pumped,
-//! matching uvicorn's per-connection serialization, and the pump loop
-//! stays iterative (no recursion on pipelined bursts).
+//! Request lifecycle: a request's turn on its connection ends when its
+//! response completes, as at uvicorn's on_response_complete -- not when its
+//! app coroutine returns. A coroutine that runs on past its response
+//! (Starlette runs a BackgroundTask inside the app call) continues as a
+//! detached request (`net::Detached`), which a graceful shutdown waits for
+//! and then cancels; the next request on the connection starts at once,
+//! and a close-delimited response is closed at once (ADR-18 addendum). The
+//! pump loop stays iterative (no recursion on pipelined bursts).
 
 use std::collections::VecDeque;
 
@@ -1400,8 +1403,22 @@ impl HttpSend {
         // stream against a slow client -- the loop monopolised, the queue
         // unbounded, and the configured watermarks never applied to the
         // ASGI producer the way they apply to a Python protocol.
+        let (tid, epoch) = (self.tid, self.epoch);
         let over = core.with_net(|net, _| {
-            net::write_pressure(net, self.tid).map(|(queued, high, _)| queued > high).unwrap_or(false)
+            // A non-eager request's Task runs on past its response out of
+            // the engine's sight (the eager driver is released where it
+            // suspends): release the connection from the event phase.
+            if let Some(c) = net.http_conn_mut(tid) {
+                if !c.eager
+                    && c.task.is_some()
+                    && c.resp == RespPhase::Done
+                    && c.ws.is_none()
+                    && owns(c, epoch)
+                {
+                    net.events.push(net::NetEvent::HttpRelease { tid, epoch });
+                }
+            }
+            net::write_pressure(net, tid).map(|(queued, high, _)| queued > high).unwrap_or(false)
         })?;
         if !over {
             return Ok(completed(py).clone_ref(py).into_any());
@@ -3035,25 +3052,27 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         let coro = match app.bind(py).call1((scope, recv_obj, send_obj)) {
             Ok(c) => c,
             Err(e) => {
-                app_failure(py, core, tid, e)?;
+                app_failure(py, core, tid, epoch, e)?;
                 continue;
             }
         };
 
         if eager {
             // R-056: step inline; only a suspension allocates a driver.
-            let task = AppTask::spawn(py, slf, tid, coro.unbind(), pyloop)?;
+            let task = AppTask::spawn(py, slf, tid, epoch, coro.unbind(), pyloop)?;
             let initial = AppTask::step(task.bind(py), py, None)?;
             match initial {
                 StepOutcome::Suspended => {
-                    core.with_net(|net, _| {
-                        if let Some(c) = net.http_conn_mut(tid) {
-                            c.driver = Some(task.clone_ref(py));
-                        }
-                    })?;
+                    let parked = core.with_net(|net, _| park_driver(py, net, tid, epoch, &task))?;
+                    if parked == Parked::Released {
+                        // Its response is complete; it runs on detached,
+                        // and the next pipelined request goes now.
+                        finish_request(py, core, tid)?;
+                        continue;
+                    }
                     return Ok(()); // resumes via future callbacks
                 }
-                StepOutcome::Finished => on_coro_finished(py, core, tid)?,
+                StepOutcome::Finished => on_coro_finished(py, core, tid, epoch)?,
                 StepOutcome::Failed => {} // app_failure already ran in step
             }
         } else {
@@ -3069,7 +3088,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
             // serving everyone else. Route it the same way.
             let spawned = (|| -> PyResult<()> {
                 let task = pyloop.bind(py).call_method1(intern!(py, "create_task"), (coro,))?;
-                let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid })?;
+                let cb = Py::new(py, HttpTaskDone { core: slf.clone().unbind(), tid, epoch })?;
                 task.call_method1(intern!(py, "add_done_callback"), (cb,))?;
                 let stored = task.unbind();
                 // Handed back when the connection is gone, so the reference
@@ -3085,21 +3104,112 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 Ok(())
             })();
             if let Err(e) = spawned {
-                app_failure(py, core, tid, e)?;
+                app_failure(py, core, tid, epoch, e)?;
             }
             return Ok(());
         }
     }
 }
 
-/// The app coroutine returned: verify the response completed (R-086) and
-/// finish the request cycle.
-fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
-    let (complete, is_ws, disconnected) = core.with_net(|net, _| {
-        net.http_conn_mut(tid)
-            .map(|c| (c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected))
-            .unwrap_or((true, false, false))
+/// Is request `epoch` still the one running on its connection? Not once it
+/// has been released (`release_request`), and not once a later request
+/// has started.
+pub(crate) fn owns(conn: &HttpConn, epoch: u64) -> bool {
+    conn.active && conn.req_epoch == epoch
+}
+
+#[derive(PartialEq)]
+enum Parked {
+    OnConnection,
+    Released,
+    Detached,
+}
+
+/// An eager request just suspended: keep its driver on the connection --
+/// or, when its response is already complete, release the connection
+/// instead and keep the driver as a detached request (`release_request`).
+/// In-cell.
+fn park_driver(py: Python<'_>, net: &mut NetState, tid: u64, epoch: u64, task: &Py<AppTask>) -> Parked {
+    let owned = match net.http_conn_mut(tid) {
+        Some(c) => owns(c, epoch),
+        None => false,
+    };
+    if !owned {
+        // Off its connection already -- released, or torn off it (RST,
+        // EPIPE), possibly while this very step ran: it runs on detached.
+        // Torn off mid-request, it is reclaimed after the dead-peer
+        // deadline unless it finishes first.
+        if !net.is_detached(task.as_ptr()) {
+            // The connection's own deadline went with it.
+            let reclaim =
+                if net.http_conn_mut(tid).is_none() { net::DISCONNECTED_RECLAIM_FALLBACK_NS } else { 0 };
+            net.detach(net::Detached::driver(task.clone_ref(py), reclaim));
+        }
+        return Parked::Detached;
+    }
+    let Some(c) = net.http_conn_mut(tid) else { return Parked::Detached };
+    if c.resp == RespPhase::Done && c.ws.is_none() {
+        if let Some(d) = c.driver.take() {
+            net.graveyard_py.push(d.into_any());
+        }
+        net.detach(net::Detached::driver(task.clone_ref(py), 0));
+        return Parked::Released;
+    }
+    if c.driver.as_ref().is_none_or(|d| !d.is(task)) {
+        if let Some(d) = c.driver.replace(task.clone_ref(py)) {
+            net.graveyard_py.push(d.into_any());
+        }
+    }
+    Parked::OnConnection
+}
+
+/// The response of request `epoch` is complete but its coroutine runs on
+/// (background work: Starlette's BackgroundTask runs inside the app call,
+/// after the last body message): end its turn on the connection now, as
+/// uvicorn does at response completion. The next request on the
+/// connection then starts at once, and a close-delimited response is
+/// closed at once, rather than both waiting for the background work. The
+/// coroutine runs on as a detached request (`net::Detached`), which a
+/// graceful shutdown waits for and cancels.
+///
+/// For the eager driver this happens where it suspends (`park_driver`).
+/// A non-eager Task suspends out of sight, so its final send() queues an
+/// `HttpRelease` event that lands here.
+pub(crate) fn release_request(
+    py: Python<'_>,
+    slf: &Bound<'_, CoreLoop>,
+    tid: u64,
+    epoch: u64,
+) -> PyResult<()> {
+    let core = slf.get();
+    let released = core.with_net(|net, _| {
+        let Some(c) = net.http_conn_mut(tid) else { return false };
+        if !owns(c, epoch) || c.resp != RespPhase::Done || c.ws.is_some() {
+            return false;
+        }
+        let task = c.task.take();
+        if let Some(t) = task {
+            net.detach(net::Detached::task(t));
+        }
+        true
     })?;
+    if released {
+        finish_request(py, core, tid)?;
+        pump_requests(py, slf, tid)?;
+    }
+    Ok(())
+}
+
+/// The app coroutine of request `epoch` returned: verify the response
+/// completed (R-086) and finish the request cycle -- unless the request was
+/// released already, in which case its connection has moved on.
+fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> PyResult<()> {
+    let state = core.with_net(|net, _| match net.http_conn_mut(tid) {
+        Some(c) if !owns(c, epoch) => None,
+        Some(c) => Some((c.resp == RespPhase::Done, c.ws.is_some(), c.disconnected)),
+        None => Some((true, false, false)),
+    })?;
+    let Some((complete, is_ws, disconnected)) = state else { return Ok(()) };
     if is_ws {
         return ws_app_done(py, core, tid);
     }
@@ -3117,6 +3227,7 @@ fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
             py,
             core,
             tid,
+            epoch,
             PyRuntimeError::new_err("ASGI application returned without completing the response"),
         )
     }
@@ -3124,7 +3235,7 @@ fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
 
 /// App raised (R-086): 500 if the response never started, teardown if it
 /// died mid-response. Client disconnects are not reported as app errors.
-pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr) -> PyResult<()> {
+pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64, err: PyErr) -> PyResult<()> {
     if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
         return Err(err);
     }
@@ -3138,6 +3249,13 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
         || err.is_instance_of::<PyBrokenPipeError>(py);
     if !disconnect {
         core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any())?;
+    }
+    // A request already released (it failed in its background work) or
+    // superseded: its connection has moved on to another request, which
+    // this must neither answer for nor tear down.
+    let owned = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| owns(c, epoch)).unwrap_or(true))?;
+    if !owned {
+        return Ok(());
     }
     let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
     if is_ws {
@@ -3305,11 +3423,17 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
 
 /// Drop the stored driver reference (failure paths where finish_request
 /// did not run).
-fn drop_driver(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyResult<()> {
+fn drop_driver(py: Python<'_>, core: &CoreLoop, tid: u64, driver: *mut ffi::PyObject) -> PyResult<()> {
     let dropped = core.with_net(|net, _| {
-        let d = net.http_conn_mut(tid).and_then(|c| c.driver.take());
+        // On its connection, or detached: never another request's driver.
+        let on_conn =
+            net.http_conn_mut(tid).filter(|c| c.driver.as_ref().is_some_and(|d| d.as_ptr() == driver));
+        let d = match on_conn {
+            Some(c) => c.driver.take().map(Py::into_any),
+            None => net.forget_detached(driver),
+        };
         if let Some(d) = d {
-            net.graveyard_py.push(d.into_any());
+            net.graveyard_py.push(d);
             true
         } else {
             false
@@ -3385,6 +3509,10 @@ fn task_hook<'py>(
 pub struct AppTask {
     core: Py<CoreLoop>,
     tid: u64,
+    /// The connection's `req_epoch` for the request this drives: once the
+    /// request has been released or superseded, its completion must leave
+    /// the connection alone (`owns`).
+    epoch: u64,
     coro: Py<PyAny>,
     pyloop: Py<PyAny>,
     finished: bool,
@@ -3587,10 +3715,15 @@ fn future_loop<'py>(py: Python<'py>, fut: &Bound<'py, PyAny>) -> Option<Bound<'p
 }
 
 impl AppTask {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     pub(crate) fn spawn(
         py: Python<'_>,
         slf: &Bound<'_, CoreLoop>,
         tid: u64,
+        epoch: u64,
         coro: Py<PyAny>,
         pyloop: Py<PyAny>,
     ) -> PyResult<Py<AppTask>> {
@@ -3600,6 +3733,7 @@ impl AppTask {
             AppTask {
                 core: slf.clone().unbind(),
                 tid,
+                epoch,
                 coro,
                 pyloop,
                 finished: false,
@@ -3692,7 +3826,7 @@ impl AppTask {
     }
 
     fn step_body(slf: &Bound<'_, Self>, py: Python<'_>, mut throw: Option<PyErr>) -> PyResult<StepOutcome> {
-        let (coro, core_py, tid, latched) = {
+        let (coro, core_py, tid, epoch, latched) = {
             let mut this = slf.borrow_mut();
             let latched = if this.must_cancel {
                 this.must_cancel = false;
@@ -3700,7 +3834,7 @@ impl AppTask {
             } else {
                 None
             };
-            (this.coro.clone_ref(py), this.core.clone_ref(py), this.tid, latched)
+            (this.coro.clone_ref(py), this.core.clone_ref(py), this.tid, this.epoch, latched)
         };
         if let Some(msg) = latched {
             // Task.__step: a CancelledError already on its way in (the
@@ -3811,7 +3945,7 @@ impl AppTask {
                     }
                 }
                 Err(e) => {
-                    app_failure(py, core, tid, e)?;
+                    app_failure(py, core, tid, epoch, e)?;
                     return Ok(StepOutcome::Failed);
                 }
             }
@@ -3822,19 +3956,31 @@ impl AppTask {
     /// _resume_bare). The initial eager step in pump_requests handles its
     /// outcomes inline instead.
     fn after_step(slf: &Bound<'_, Self>, py: Python<'_>, out: StepOutcome) -> PyResult<()> {
-        if matches!(out, StepOutcome::Suspended) {
-            return Ok(());
-        }
-        let (core_py, tid) = {
+        let (core_py, tid, epoch) = {
             let this = slf.borrow();
-            (this.core.clone_ref(py), this.tid)
+            (this.core.clone_ref(py), this.tid, this.epoch)
         };
         let core_bound = core_py.bind(py);
         let core = core_bound.get();
-        if matches!(out, StepOutcome::Finished) {
-            on_coro_finished(py, core, tid)?;
+        if matches!(out, StepOutcome::Suspended) {
+            // Suspended with its response complete: release the connection
+            // now rather than when the coroutine returns (`release_request`).
+            let task = slf.clone().unbind();
+            let parked = core.with_net(|net, _| park_driver(py, net, tid, epoch, &task))?;
+            if parked == Parked::Released {
+                finish_request(py, core, tid)?;
+                core.with_net(|net, _| {
+                    if net.http_conn_mut(tid).is_some_and(|c| !c.active && !c.pending.is_empty()) {
+                        net.events.push(net::NetEvent::HttpPump { tid });
+                    }
+                })?;
+            }
+            return Ok(());
         }
-        drop_driver(py, core, tid)?;
+        if matches!(out, StepOutcome::Finished) {
+            on_coro_finished(py, core, tid, epoch)?;
+        }
+        drop_driver(py, core, tid, slf.as_ptr())?;
         // Pump pipelined requests that queued while this one ran (R-085)
         // -- from the event phase, not from here. This runs inside
         // `_wake`, in a copy of the finished request's own context, and
@@ -3856,6 +4002,8 @@ impl AppTask {
 pub struct HttpTaskDone {
     core: Py<CoreLoop>,
     tid: u64,
+    /// See `AppTask::epoch`.
+    epoch: u64,
 }
 
 #[pymethods]
@@ -3864,9 +4012,18 @@ impl HttpTaskDone {
         let core_bound = self.core.bind(py);
         let core = core_bound.get();
         // Done whichever way it ended, so it is no longer a request a
-        // shutdown has to cancel. Dropped out here: the caller holds the
-        // same task, so this is never the last reference.
-        let stored = core.with_net(|net, _| net.http_conn_mut(self.tid).and_then(|c| c.task.take()))?;
+        // shutdown has to cancel -- on its connection or detached. Dropped
+        // out here: the caller holds the same task, so this is never the
+        // last reference.
+        let ptr = task.as_ptr();
+        let stored = core.with_net(|net, _| {
+            let on_conn =
+                net.http_conn_mut(self.tid).filter(|c| c.task.as_ref().is_some_and(|t| t.as_ptr() == ptr));
+            match on_conn {
+                Some(c) => c.task.take(),
+                None => net.forget_detached(ptr),
+            }
+        })?;
         drop(stored);
         let cancelled: bool =
             task.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(false);
@@ -3876,13 +4033,13 @@ impl HttpTaskDone {
             // RuntimeError here logged every cancelled request (each one
             // still in flight at a graceful shutdown's deadline, say) as
             // an exception in the application.
-            app_failure(py, core, self.tid, cancelled_error(py))?;
+            app_failure(py, core, self.tid, self.epoch, cancelled_error(py))?;
         } else {
             let exc = task.call_method0(intern!(py, "exception"))?;
             if exc.is_none() {
-                on_coro_finished(py, core, self.tid)?;
+                on_coro_finished(py, core, self.tid, self.epoch)?;
             } else {
-                app_failure(py, core, self.tid, PyErr::from_value(exc))?;
+                app_failure(py, core, self.tid, self.epoch, PyErr::from_value(exc))?;
             }
         }
         pump_requests(py, core_bound, self.tid)

@@ -425,6 +425,95 @@ const ENOBUFS: u32 = 10055; // WSAENOBUFS
 #[cfg(not(windows))]
 const ENOBUFS: u32 = 105; // ENOBUFS on Linux
 
+/// A request whose coroutine runs on without a place on its connection:
+/// one released when its response completed while it still had work to do
+/// (a Starlette BackgroundTask), or one whose connection was torn down
+/// under it (RST, EPIPE). Held so a graceful shutdown waits for and then
+/// cancels it, as it does a request still on its connection
+/// (`http_request_drivers`), and `close()` cancels it. Dropped with its
+/// entry, as it used to be, an eager driver was never cancelled or
+/// finalized at all: AppTask is opaque to the cycle collector, and the
+/// awaited future kept it alive.
+pub(crate) struct Detached {
+    pub(crate) run: DetachedRun,
+    /// 0: left to run to completion. Otherwise the abandoned request is
+    /// cancelled once it has been detached this long, as `http_sweep`
+    /// reclaims a parked request whose peer has gone (H4).
+    pub(crate) reclaim_ns: u64,
+    /// When the sweep first saw it (0: not yet).
+    pub(crate) anchor_ns: u64,
+}
+
+pub(crate) enum DetachedRun {
+    /// The eager driver.
+    Driver(Py<crate::http::AppTask>),
+    /// The asyncio Task of the non-eager path; its done callback
+    /// (`HttpTaskDone`) removes it.
+    Task(Py<PyAny>),
+}
+
+impl Detached {
+    pub(crate) fn driver(driver: Py<crate::http::AppTask>, reclaim_ns: u64) -> Self {
+        Detached { run: DetachedRun::Driver(driver), reclaim_ns, anchor_ns: 0 }
+    }
+
+    pub(crate) fn task(task: Py<PyAny>) -> Self {
+        Detached { run: DetachedRun::Task(task), reclaim_ns: 0, anchor_ns: 0 }
+    }
+
+    fn key(&self) -> usize {
+        match &self.run {
+            DetachedRun::Driver(d) => d.as_ptr() as usize,
+            DetachedRun::Task(t) => t.as_ptr() as usize,
+        }
+    }
+
+    pub(crate) fn into_any(self) -> Py<PyAny> {
+        match self.run {
+            DetachedRun::Driver(d) => d.into_any(),
+            DetachedRun::Task(t) => t,
+        }
+    }
+
+    fn clone_any(&self, py: Python<'_>) -> Py<PyAny> {
+        match &self.run {
+            DetachedRun::Driver(d) => d.clone_ref(py).into_any(),
+            DetachedRun::Task(t) => t.clone_ref(py),
+        }
+    }
+
+    /// An eager driver whose coroutine has finished (a Task's own done
+    /// callback removes it instead: telling needs a Python call).
+    fn finished(&self, py: Python<'_>) -> bool {
+        match &self.run {
+            DetachedRun::Driver(d) => d.try_borrow(py).map(|t| t.is_finished()).unwrap_or(false),
+            DetachedRun::Task(_) => false,
+        }
+    }
+}
+
+impl NetState {
+    /// Track a request running off its connection, once.
+    pub(crate) fn detach(&mut self, d: Detached) {
+        match self.detached.entry(d.key()) {
+            std::collections::hash_map::Entry::Occupied(_) => self.graveyard_py.push(d.into_any()),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(d);
+            }
+        }
+    }
+
+    pub(crate) fn is_detached(&self, obj: *mut pyo3::ffi::PyObject) -> bool {
+        self.detached.contains_key(&(obj as usize))
+    }
+
+    /// Stop tracking `obj`, handing its reference back for the caller to
+    /// drop outside the cell.
+    pub(crate) fn forget_detached(&mut self, obj: *mut pyo3::ffi::PyObject) -> Option<Py<PyAny>> {
+        self.detached.remove(&(obj as usize)).map(Detached::into_any)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NetState {
     pub ops: HashMap<OpId, OpTarget>,
@@ -458,6 +547,11 @@ pub(crate) struct NetState {
     pub graveyard_entries: Vec<TransportEntry>,
     pub graveyard_bufs: Vec<WriteBuf>,
     pub graveyard_py: Vec<Py<PyAny>>,
+    /// Requests still running off their connection (`Detached`), keyed by
+    /// the driver or Task object's address: each is looked up and removed
+    /// as it suspends and finishes, and there can be one per connection
+    /// the server has had in the last background-task's lifetime.
+    pub(crate) detached: HashMap<usize, Detached>,
     /// Watch handles the loop gave up (removed or displaced readers and
     /// writers): released, then dropped, outside the cell.
     pub graveyard_handles: Vec<Py<Handle>>,
@@ -706,6 +800,13 @@ pub(crate) enum NetEvent {
     /// Native HTTP: parsed request(s) queued — run the request pump.
     HttpPump {
         tid: u64,
+    },
+    /// Native HTTP, non-eager path: the response of request `epoch` is
+    /// complete; release the connection if its Task is still running
+    /// (`http::release_request`).
+    HttpRelease {
+        tid: u64,
+        epoch: u64,
     },
     /// Native HTTP: resolve a pending `receive()` waiter with
     /// `http.disconnect` (or `websocket.disconnect` for WS sessions).
@@ -1077,6 +1178,20 @@ fn teardown_lost(
             }
             for fut in conn.take_recv_waiters() {
                 net.events.push(NetEvent::HttpDisconnect { fut, ws });
+            }
+            // The request running on it, if any, runs on without it: kept
+            // where shutdown can still cancel it, and an eager one is
+            // reclaimed after the dead-peer deadline unless it finishes.
+            if let Some(driver) = conn.driver.take() {
+                let reclaim = if conn.idle_timeout_ns > 0 {
+                    conn.idle_timeout_ns
+                } else {
+                    DISCONNECTED_RECLAIM_FALLBACK_NS
+                };
+                net.detach(Detached::driver(driver, reclaim));
+            }
+            if let Some(task) = conn.task.take() {
+                net.detach(Detached::task(task));
             }
         }
     }
@@ -1724,7 +1839,7 @@ fn http_conn_busy(entry: &TransportEntry) -> bool {
 /// the disconnect reclaim (H4) falls back to this when there is no idle
 /// deadline to borrow. Generous, because we cannot tell a full close from
 /// a half-close whose app is still producing a response.
-const DISCONNECTED_RECLAIM_FALLBACK_NS: u64 = 60 * 1_000_000_000;
+pub(crate) const DISCONNECTED_RECLAIM_FALLBACK_NS: u64 = 60 * 1_000_000_000;
 
 /// Sweep phases. `Dead` (peer disconnected, nothing left to send) is
 /// checked before `Busy`: an app parked on a non-receive() awaitable while
@@ -1855,6 +1970,31 @@ pub(crate) fn http_sweep(
         // Idle keep-alive expiry closes silently (uvicorn-compatible).
         teardown_with(py, net, backend, tid, None);
     }
+    // Requests running off their connection: drop the finished, and
+    // reclaim the abandoned ones past their deadline.
+    let mut finished: Vec<usize> = Vec::new();
+    let mut expired: Vec<usize> = Vec::new();
+    for (&key, d) in net.detached.iter_mut() {
+        if d.finished(py) {
+            finished.push(key);
+        } else if d.reclaim_ns > 0 {
+            if d.anchor_ns == 0 {
+                d.anchor_ns = now_ns;
+            } else if now_ns.saturating_sub(d.anchor_ns) >= d.reclaim_ns {
+                expired.push(key);
+            }
+        }
+    }
+    for key in finished {
+        if let Some(d) = net.detached.remove(&key) {
+            net.graveyard_py.push(d.into_any());
+        }
+    }
+    for key in expired {
+        if let Some(d) = net.detached.remove(&key) {
+            cancel_drivers.push(d.into_any());
+        }
+    }
     // Disconnect reclaims count as idle closes for the facade's stats.
     let idle = (expire_idle.len() + expire_dead.len()) as u32;
     (expire_head.len() as u32, idle, cancel_drivers)
@@ -1936,7 +2076,10 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
     for tid in idle {
         teardown_with(py, net, backend, tid, None);
     }
-    busy
+    // Requests running off their connection are in flight too: the drain
+    // waits for them as it does for the rest (uvicorn waits for every
+    // request task, background work included).
+    busy + net.detached.len()
 }
 
 /// Graceful shutdown, last phase: the eager request drivers (AppTasks)
@@ -1956,6 +2099,7 @@ pub(crate) fn http_request_drivers(py: Python<'_>, net: &NetState) -> Vec<Py<PyA
             },
             ProtoKind::Py(_) => None,
         })
+        .chain(net.detached.values().map(|d| d.clone_any(py)))
         .collect()
 }
 
@@ -3138,6 +3282,9 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             }
             NetEvent::HttpPump { tid } => {
                 crate::http::pump_requests(py, slf, tid)?;
+            }
+            NetEvent::HttpRelease { tid, epoch } => {
+                crate::http::release_request(py, slf, tid, epoch)?;
             }
             NetEvent::HttpDisconnect { fut, ws } => {
                 let fut = fut.bind(py);
