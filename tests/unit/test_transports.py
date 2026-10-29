@@ -668,6 +668,121 @@ def test_happy_eyeballs_falls_through_bad_address(loop):
     loop.run_until_complete(main())
 
 
+def _unclosed_peers(lsock):
+    """Accept every connection queued on `lsock` and count those whose
+    client end is still open: no EOF within a short bound."""
+    lsock.settimeout(0.2)
+    still_open = 0
+    while True:
+        try:
+            conn, _ = lsock.accept()
+        except (socket.timeout, BlockingIOError):
+            return still_open
+        with conn:
+            conn.settimeout(1.0)
+            try:
+                if conn.recv(1) != b"":
+                    still_open += 1
+            except socket.timeout:
+                still_open += 1
+            except ConnectionResetError:
+                pass
+
+
+def test_cancelled_connect_closes_a_socket_that_already_connected(loop):
+    """A create_connection() cancelled after its connect had completed --
+    the future already holding the connected descriptor, the task not yet
+    resumed, which is what a timeout firing in the iteration the connect
+    finishes does -- leaked the descriptor: the cancellation path only
+    cancelled the (finished) native op. The connection stayed open for
+    good, and the peer never saw it close."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(16)
+    port = lsock.getsockname()[1]
+
+    async def one():
+        task = loop.create_task(loop.create_connection(asyncio.Protocol, "127.0.0.1", port))
+        cancelled = []
+
+        def poll():
+            # Every iteration, ahead of the task's own wakeup: cancel the
+            # moment the future it awaits is done but before it resumes.
+            waiter = task._fut_waiter
+            if task.done():
+                return
+            if waiter is not None and waiter.done():
+                cancelled.append(task.cancel())
+                return
+            loop.call_soon(poll)
+
+        loop.call_soon(poll)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancelled == [True]
+
+    async def main():
+        for _ in range(5):
+            await one()
+
+    try:
+        loop.run_until_complete(main())
+        assert _unclosed_peers(lsock) == 0
+    finally:
+        lsock.close()
+
+
+def test_cancelled_happy_eyeballs_connect_closes_what_it_connected(loop):
+    """Happy Eyeballs runs each attempt in a task of its own and returns
+    the winner's descriptor only once every attempt has finished. A
+    cancellation of the whole call in between dropped the winner the race
+    had already picked (and a losing attempt cancelled after it connected
+    dropped its own): the connection stayed open for good. Whatever the
+    call does not hand back must be closed, wherever the cancellation
+    lands -- swept here across the iterations that follow the connect."""
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(64)
+    addr = lsock.getsockname()
+
+    async def fake_getaddrinfo(host, port, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", addr)]
+
+    async def one(cancel_after):
+        task = loop.create_task(
+            loop.create_connection(asyncio.Protocol, "he.test", addr[1], happy_eyeballs_delay=0)
+        )
+        # Once the connect is in flight, stall the loop so that it has
+        # completed by the next poll, then cancel `cancel_after`
+        # iterations later.
+        for _ in range(200):
+            if task.done() or loop.stats()["ops_by_target"]["connect"]:
+                break
+            await asyncio.sleep(0)
+        time.sleep(0.05)  # noqa: ASYNC251 -- blocking the loop is the point
+        for _ in range(cancel_after):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            transport, _ = await task
+        except asyncio.CancelledError:
+            return False
+        transport.close()
+        return True
+
+    async def main():
+        loop.getaddrinfo = fake_getaddrinfo
+        return [await one(k) for k in range(10)]
+
+    try:
+        outcomes = loop.run_until_complete(main())
+        # The sweep must reach both sides of the race's end.
+        assert False in outcomes and True in outcomes, outcomes
+        assert _unclosed_peers(lsock) == 0
+    finally:
+        lsock.close()
+
+
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX not available")
 def test_unix_socket_echo_roundtrip(loop, tmp_path):
     """create_unix_connection/create_unix_server previously fell through
