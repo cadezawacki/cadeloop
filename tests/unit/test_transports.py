@@ -89,6 +89,71 @@ def test_large_transfer_10mb(loop):
     loop.run_until_complete(main())
 
 
+def test_small_writes_leave_in_one_send_and_in_order(loop):
+    """R-035: small writes are copied onto the last queued buffer. One
+    buffer per write capped a send at 16 of them and the next send waited
+    a tick, so 256 small writes from one callback took 16 sends and 17
+    ticks. Copying must never touch a buffer a parked send still points at,
+    so this also runs the queue against a peer that stops reading -- sends
+    park on a full socket buffer while every kind and size of write keeps
+    arriving -- and checks every byte arrives, in order."""
+
+    class Writer(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.t = transport
+
+        def data_received(self, data):
+            if data == b"burst":
+                for i in range(256):
+                    self.t.write(bytes([i]) * 64)
+                return
+            # data == b"flood": every write shape, far past the socket
+            # buffers, interleaved across callbacks.
+            for round_ in range(40):
+                loop.call_soon(self.flood, round_)
+
+        def flood(self, round_):
+            for i in range(200):
+                n = (round_ * 200 + i) % 251
+                size = (1, 63, 700, 4096, 4097, 9000)[i % 6]
+                payload = bytes([n]) * size
+                wrap = (bytes, bytearray, memoryview)[i % 3]
+                self.t.write(wrap(payload))
+
+    def expected_flood():
+        out = bytearray()
+        for round_ in range(40):
+            for i in range(200):
+                n = (round_ * 200 + i) % 251
+                out += bytes([n]) * (1, 63, 700, 4096, 4097, 9000)[i % 6]
+        return bytes(out)
+
+    async def main():
+        server = await loop.create_server(Writer, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+        sends = loop.stats()["sends_posted"]
+        writer.write(b"burst")
+        got = await reader.readexactly(256 * 64)
+        assert got == b"".join(bytes([i]) * 64 for i in range(256))
+        # Both ends share this loop; the burst itself is one send (the
+        # request write and any coalesced echo of it are the rest).
+        assert loop.stats()["sends_posted"] - sends <= 3
+
+        want = expected_flood()
+        writer.write(b"flood")
+        await writer.drain()
+        await asyncio.sleep(0.2)  # let the server's sends park on a full buffer
+        got = await reader.readexactly(len(want))
+        assert got == want
+        writer.close()
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 def test_many_concurrent_connections(loop):
     async def main():
         server, addr = await _echo_server(loop)

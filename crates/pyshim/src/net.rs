@@ -51,6 +51,40 @@ use crate::http::HttpConn;
 
 /// R-035: cork flush threshold.
 const CORK_FLUSH_BYTES: usize = 64 * 1024;
+
+/// Writes at most this big are copied onto the end of the last queued
+/// buffer instead of queuing a buffer of their own (see `coalesce_tail`).
+///
+/// A send carries at most MAX_GATHER (16) buffers, and the next one is
+/// posted only once the last one's completion is reaped -- the following
+/// tick. One buffer per write therefore capped a transport at 16 small
+/// writes per syscall AND per tick: a protocol writing 256 64-byte
+/// messages from one callback took 16 sends and 17 ticks to get them out,
+/// and pipelined HTTP responses left 16 to a send. Past this size a
+/// write is big enough that the iovec is not the cost, and `bytes` keeps
+/// its zero-copy retention (R-074).
+const COALESCE_MAX: usize = 4096;
+
+/// Append `data` to the last queued buffer if that buffer is an owned copy
+/// that no send in flight points at, keeping it under CORK_FLUSH_BYTES.
+/// Returns whether it did; the caller queues a buffer of its own if not.
+///
+/// The in-flight buffers are left strictly alone: IOCP reads them through
+/// the WSABUFs the posted op holds, and a parked epoll send through its
+/// saved iovec pointers, so growing (and so possibly moving) one of them
+/// before its completion is reaped would hand the kernel freed memory.
+fn coalesce_tail(entry: &mut TransportEntry, data: &[u8]) -> bool {
+    if data.len() > COALESCE_MAX || entry.wq.len() <= entry.inflight {
+        return false;
+    }
+    match entry.wq.back_mut() {
+        Some(WriteBuf::Owned { data: tail, off }) if tail.len() - *off + data.len() <= CORK_FLUSH_BYTES => {
+            tail.extend_from_slice(data);
+            true
+        }
+        _ => false,
+    }
+}
 /// Recv slot class: 64 KiB reads.
 const RECV_CLASS: SizeClass = SizeClass::S64K;
 
@@ -165,6 +199,14 @@ pub(crate) enum WriteBuf {
     Owned { data: Vec<u8>, off: usize },
 }
 
+/// What one `Transport.write()` call queues.
+enum Queued<'a> {
+    /// A small write, copied in the cell: onto the tail buffer when it can
+    /// be (`coalesce_tail`), else as a buffer of its own.
+    Small(&'a [u8]),
+    Buf(WriteBuf),
+}
+
 impl WriteBuf {
     fn remaining(&self) -> usize {
         match self {
@@ -218,6 +260,11 @@ pub(crate) struct TransportEntry {
     recv_slot: Option<SlotId>,
     recv_op: Option<OpId>,
     send_op: Option<OpId>,
+    /// How many buffers at the front of `wq` the send in flight points the
+    /// kernel at (0 with none in flight). Those must not move or change
+    /// until its completion is reaped; `coalesce_tail` only ever extends a
+    /// buffer past them.
+    inflight: usize,
     wq: VecDeque<WriteBuf>,
     queued_bytes: usize,
     high_water: usize,
@@ -758,6 +805,7 @@ pub(crate) fn flush_pending(py: Python<'_>, net: &mut NetState, backend: Backend
             net.stats_sends_posted += 1;
             if let Some(entry) = net.transports.get_mut(&tid) {
                 entry.send_op = Some(op);
+                entry.inflight = n;
             }
             net.ops.insert(op, OpTarget::Send(tid));
         }
@@ -887,6 +935,7 @@ fn cancel_transport_ops(net: &mut NetState, backend: Backend<'_>, entry: &mut Tr
             net.reap_guards.insert(op, ReapGuard::Writes(wq));
         }
     }
+    entry.inflight = 0;
     entry.queued_bytes = 0;
 }
 
@@ -1277,7 +1326,9 @@ pub(crate) fn http_enqueue_raw(
         return;
     }
     entry.queued_bytes += data.len();
-    entry.wq.push_back(WriteBuf::Owned { data, off: 0 });
+    if !coalesce_tail(entry, &data) {
+        entry.wq.push_back(WriteBuf::Owned { data, off: 0 });
+    }
     let no_send = entry.send_op.is_none();
     let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
     let unscheduled = !entry.flush_scheduled;
@@ -2650,6 +2701,7 @@ fn on_send_done(
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.send_op == Some(op) {
         entry.send_op = None;
+        entry.inflight = 0;
     }
     if entry.conn_lost {
         return;
@@ -3585,6 +3637,7 @@ pub(crate) fn wire_stream(
                 recv_slot: None,
                 recv_op: None,
                 send_op: None,
+                inflight: 0,
                 wq: VecDeque::new(),
                 queued_bytes: 0,
                 high_water: high,
@@ -3667,6 +3720,7 @@ pub(crate) fn wire_http(
                 recv_slot: None,
                 recv_op: None,
                 send_op: None,
+                inflight: 0,
                 wq: VecDeque::new(),
                 queued_bytes: 0,
                 high_water: high,
@@ -3976,13 +4030,24 @@ impl Transport {
             return Err(PyRuntimeError::new_err("unable to write; sendfile is in progress"));
         }
         // R-074 retention: exact bytes -> zero-copy retain; bytearray and
-        // memoryview -> copy now.
-        let buf: WriteBuf = if let Some(b) = bytes {
+        // memoryview -> copy now. Small writes of either kind are copied in
+        // the cell instead, onto the tail buffer where they can be
+        // (`coalesce_tail`).
+        let queued: Queued<'_> = if let Some(b) = bytes.as_ref() {
             let len = b.as_bytes().len();
             if len == 0 {
                 return Ok(());
             }
-            WriteBuf::Bytes { ptr: b.as_bytes().as_ptr(), len, off: 0, _keep: b.clone().into_any().unbind() }
+            if len <= COALESCE_MAX {
+                Queued::Small(b.as_bytes())
+            } else {
+                Queued::Buf(WriteBuf::Bytes {
+                    ptr: b.as_bytes().as_ptr(),
+                    len,
+                    off: 0,
+                    _keep: b.as_any().clone().unbind(),
+                })
+            }
         } else {
             let mut view: ffi::Py_buffer = unsafe { std::mem::zeroed() };
             let rc = unsafe { ffi::PyObject_GetBuffer(data.as_ptr(), &mut view, ffi::PyBUF_SIMPLE) };
@@ -3999,23 +4064,22 @@ impl Transport {
                 std::ptr::copy_nonoverlapping(view.buf.cast::<u8>(), owned.as_mut_ptr(), len);
                 ffi::PyBuffer_Release(&mut view);
             }
-            WriteBuf::Owned { data: owned, off: 0 }
+            Queued::Buf(WriteBuf::Owned { data: owned, off: 0 })
         };
 
         let tid = self.tid;
         let mut pause: Option<Py<PyAny>> = None;
         let mut dirty = false;
         core.with_net(|net, reactor| {
-            let Some(entry) = net.transports.get_mut(&tid) else {
-                net.graveyard_bufs.push(buf);
-                dirty = true;
-                return; // write after connection_lost: silently dropped
-            };
-            if entry.conn_lost {
-                net.graveyard_bufs.push(buf);
-                dirty = true;
+            let Some(entry) = net.transports.get_mut(&tid).filter(|e| !e.conn_lost) else {
+                // Write after connection_lost: silently dropped (a retained
+                // `bytes` via the graveyard, never in-cell).
+                if let Queued::Buf(buf) = queued {
+                    net.graveyard_bufs.push(buf);
+                    dirty = true;
+                }
                 return;
-            }
+            };
             // A transport that is `closing` but still mapped is draining
             // its queue before the close completes (an idle one is torn
             // down at once by close()). asyncio still sends what is
@@ -4023,12 +4087,25 @@ impl Transport {
             // close_notify can be written from resume_writing after the
             // app closed. Dropping it ended TLS sessions under
             // backpressure with a bare FIN.
-            entry.queued_bytes += buf.remaining();
+            match queued {
+                Queued::Small(data) => {
+                    entry.queued_bytes += data.len();
+                    if !coalesce_tail(entry, data) {
+                        entry.wq.push_back(WriteBuf::Owned { data: data.to_vec(), off: 0 });
+                    }
+                }
+                Queued::Buf(buf) => {
+                    entry.queued_bytes += buf.remaining();
+                    let merged = matches!(&buf, WriteBuf::Owned { data, .. } if coalesce_tail(entry, data));
+                    if !merged {
+                        entry.wq.push_back(buf);
+                    }
+                }
+            }
             // The foreign-thread mirror (see `queued`), stored here where
             // the entry is already in hand: every later change to the
             // count goes through on_send_done, which stores it again.
             self.queued.store(entry.queued_bytes, Ordering::Relaxed);
-            entry.wq.push_back(buf);
             let no_send = entry.send_op.is_none();
             let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
             let scheduled = entry.flush_scheduled;
