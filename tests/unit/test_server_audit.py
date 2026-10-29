@@ -508,6 +508,26 @@ def test_s3_workers_stop_when_their_supervisor_is_killed(tmp_path):
 @posix_only
 @needs_fork
 @needs_proc
+def test_output_buffered_at_the_fork_is_written_once(tmp_path):
+    """A print() the supervisor still had buffered when it forked (stdout
+    a pipe, so block-buffered) was copied into every worker and written
+    again by each one's exit flush: once per worker, and once more per
+    replacement. multiprocessing flushes before forking for this reason."""
+    code = """
+        print("buffered-at-the-fork")
+        import cadeloop
+        cadeloop.serve("auditapp:app", "127.0.0.1", PORT, workers=2, grace=2.0)
+    """
+    with _Server(tmp_path, code=code, env={"PYTHONUNBUFFERED": ""}) as srv:
+        _wait_all_serving(srv, 2)
+        srv.proc.send_signal(signal.SIGTERM)
+        assert srv.wait() == 0, srv.output
+    assert srv.output.count("buffered-at-the-fork") == 1, srv.output
+
+
+@posix_only
+@needs_fork
+@needs_proc
 def test_s3_sigterm_while_the_pool_is_forking_leaves_no_orphans(tmp_path):
     """S3: the supervisor's handlers were installed only after every worker
     was forked; a SIGTERM in between killed it outright (SIG_DFL) and the

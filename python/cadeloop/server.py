@@ -1484,6 +1484,17 @@ def _spawn_worker(app, host, port, config: Config, idx: int, cpus, ssl_ctx=None,
     early is held for the worker's own handler instead of killing it.
     """
     ready_r, ready_w = os.pipe()
+    # What the supervisor has buffered but not yet written -- an import-time
+    # print() of the application, with stdout a pipe -- would otherwise be
+    # copied into the child and written again by _exit_worker's flush: once
+    # per worker, and once more per replacement. multiprocessing flushes
+    # before forking for the same reason.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except (OSError, ValueError):
+            pass
     try:
         pid = os.fork()
     except BaseException:
