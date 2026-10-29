@@ -87,6 +87,9 @@ const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
 const KEY_IO: usize = 1;
 const KEY_WAKEUP: usize = 2;
 pub(crate) const KEY_RIO: usize = 3;
+/// The quarantine's drain sentinel (`Quarantine::sentinel_wanted`); its
+/// generation rides in the byte count.
+const KEY_DRAIN: usize = 4;
 
 /// R-030: dequeue batch size.
 pub(crate) const POLL_BATCH: usize = 256;
@@ -811,6 +814,17 @@ impl IocpBackend {
         for id in self.quarantine.drained(mark, dequeued, POLL_BATCH) {
             slab.release(id);
         }
+        // A full batch proves nothing; under sustained load every batch is
+        // full, and without this the quarantine (and the slab under it)
+        // grew for as long as the load lasted.
+        if let Some(generation) = self.quarantine.sentinel_wanted(dequeued, POLL_BATCH) {
+            let posted = unsafe {
+                PostQueuedCompletionStatus(self.port.0, generation, KEY_DRAIN, std::ptr::null_mut())
+            };
+            if posted != 0 {
+                self.quarantine.sentinel_posted(generation);
+            }
+        }
     }
 
     fn listener_protocol(&mut self, listener: SOCKET) -> io::Result<WSAPROTOCOL_INFOW> {
@@ -926,6 +940,15 @@ impl IocpBackend {
     pub(crate) fn translate_entry(&mut self, entry: &OVERLAPPED_ENTRY, out: &mut Vec<Completion>) {
         if entry.lpCompletionKey == KEY_WAKEUP {
             out.push(Completion::Wakeup);
+            return;
+        }
+        if entry.lpCompletionKey == KEY_DRAIN {
+            // Every packet queued before the sentinel has now been seen,
+            // in this batch or an earlier one (the port is FIFO).
+            let slab = &mut self.slab;
+            for id in self.quarantine.sentinel_arrived(entry.dwNumberOfBytesTransferred) {
+                slab.release(id);
+            }
             return;
         }
         if entry.lpOverlapped.is_null() {
