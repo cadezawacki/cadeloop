@@ -4024,6 +4024,10 @@ impl Transport {
             // app closed. Dropping it ended TLS sessions under
             // backpressure with a bare FIN.
             entry.queued_bytes += buf.remaining();
+            // The foreign-thread mirror (see `queued`), stored here where
+            // the entry is already in hand: every later change to the
+            // count goes through on_send_done, which stores it again.
+            self.queued.store(entry.queued_bytes, Ordering::Relaxed);
             entry.wq.push_back(buf);
             let no_send = entry.send_op.is_none();
             let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
@@ -4040,9 +4044,6 @@ impl Transport {
                 }
             }
             pause = maybe_pause(py, net, reactor.backend_mut(), tid);
-            if let Some(e) = net.transports.get(&tid) {
-                self.queued.store(e.queued_bytes, Ordering::Relaxed);
-            }
             dirty |= !net.graveyard_bufs.is_empty() || !net.graveyard_entries.is_empty();
         })?;
         if dirty {
