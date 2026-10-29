@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -974,6 +974,9 @@ fn teardown_lost(
         return;
     }
     entry.conn_lost = true;
+    if let Some(t) = &entry.pyobj {
+        t.get().mark_lost();
+    }
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
@@ -1068,6 +1071,9 @@ fn retire_sockets(net: &mut NetState, entry: &mut TransportEntry) {
 pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err: Option<u32>) {
     let Some(mut entry) = net.transports.remove(&tid) else { return };
     entry.conn_lost = true;
+    if let Some(t) = &entry.pyobj {
+        t.get().mark_lost();
+    }
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
@@ -2589,6 +2595,9 @@ fn on_send_done(
     // Pop consumed buffers into the graveyard (Py refs drop out-of-cell).
     let mut consumed = bytes as usize;
     entry.queued_bytes -= consumed.min(entry.queued_bytes);
+    if let Some(t) = &entry.pyobj {
+        t.get().queued.store(entry.queued_bytes, Ordering::Relaxed);
+    }
     while consumed > 0 {
         let Some(front) = entry.wq.front_mut() else { break };
         let rem = front.remaining();
@@ -3503,6 +3512,14 @@ pub struct Transport {
     /// loop.sendfile() owns the socket: write() raises, as asyncio's does
     /// while its sendfile's empty-waiter is set.
     sendfile: AtomicBool,
+    /// The entry's `closing || conn_lost` and `queued_bytes`, mirrored
+    /// wherever those change. `is_closing()` and `get_write_buffer_size()`
+    /// answer from them when the state is out of reach -- another thread
+    /// asking while the loop is parked in its poll, which the state cell
+    /// refuses (gil_boundary) -- as asyncio answers both with an attribute
+    /// read from any thread.
+    closing: AtomicBool,
+    queued: AtomicUsize,
 }
 
 /// `asyncio.trsock.TransportSocket`, looked up once.
@@ -3535,7 +3552,16 @@ impl Transport {
             losing: Mutex::new(None),
             eof: AtomicBool::new(false),
             sendfile: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
         }
+    }
+
+    /// The connection is gone: what `is_closing()` and
+    /// `get_write_buffer_size()` answer from now on (see `closing`).
+    pub(crate) fn mark_lost(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        self.queued.store(0, Ordering::Relaxed);
     }
 
     fn core_ref<'a>(&'a self, py: Python<'a>) -> &'a CoreLoop {
@@ -3806,6 +3832,9 @@ impl Transport {
                 }
             }
             pause = maybe_pause(py, net, reactor.backend_mut(), tid);
+            if let Some(e) = net.transports.get(&tid) {
+                self.queued.store(e.queued_bytes, Ordering::Relaxed);
+            }
             dirty |= !net.graveyard_bufs.is_empty() || !net.graveyard_entries.is_empty();
         })?;
         if dirty {
@@ -3879,7 +3908,8 @@ impl Transport {
 
     fn get_write_buffer_size(&self, py: Python<'_>) -> PyResult<usize> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| net.transports.get(&self.tid).map_or(0, |e| e.queued_bytes))
+        let exact = core.try_with_net(|net, _| net.transports.get(&self.tid).map_or(0, |e| e.queued_bytes));
+        Ok(exact.unwrap_or_else(|| self.queued.load(Ordering::Relaxed)))
     }
 
     fn get_write_buffer_limits(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
@@ -4006,6 +4036,7 @@ impl Transport {
                 return;
             }
             entry.closing = true;
+            self.closing.store(true, Ordering::Relaxed);
             if let Some(op) = entry.recv_op.take() {
                 // Keep the mapping (see pause_reading): the completion is
                 // routed and discarded by the closing/conn_lost checks.
@@ -4073,7 +4104,9 @@ impl Transport {
 
     fn is_closing(&self, py: Python<'_>) -> PyResult<bool> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| net.transports.get(&self.tid).is_none_or(|e| e.closing || e.conn_lost))
+        let exact = core
+            .try_with_net(|net, _| net.transports.get(&self.tid).is_none_or(|e| e.closing || e.conn_lost));
+        Ok(exact.unwrap_or_else(|| self.closing.load(Ordering::Relaxed)))
     }
 
     // ---- protocol / introspection ---------------------------------------

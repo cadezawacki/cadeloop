@@ -7,6 +7,8 @@ import os
 import signal
 import socket
 import sys
+import threading
+import time
 
 import cadeloop
 import pytest
@@ -283,6 +285,52 @@ def test_abort_delivers_connection_lost(loop):
         await done  # server side saw the close
         server.close()
         await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_transport_state_reads_from_another_thread(loop):
+    """is_closing() and get_write_buffer_size() from a thread other than
+    the loop's -- the usual guard before call_soon_threadsafe(t.write, ..)
+    -- raised RuntimeError whenever the loop was parked in its poll: both
+    entered the loop state, which refuses other threads then. asyncio
+    answers both with an attribute read from any thread."""
+
+    async def main():
+        a, peer = socket.socketpair()
+        t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
+        t.write(b"x" * (8 << 20))  # the peer never reads: most of it stays queued
+        await asyncio.sleep(0.01)
+        queued = t.get_write_buffer_size()
+        assert queued > 0
+        seen = []
+
+        def probe():
+            for _ in range(10):
+                try:
+                    seen.append((t.is_closing(), t.get_write_buffer_size()))
+                except Exception as exc:
+                    seen.append(exc)
+                time.sleep(0.002)
+
+        async def from_another_thread():
+            seen.clear()
+            th = threading.Thread(target=probe)
+            th.start()
+            while th.is_alive():
+                await asyncio.sleep(0.01)  # parked while the thread asks
+            th.join()
+            return set(seen)
+
+        try:
+            assert await from_another_thread() == {(False, queued)}
+            t.close()  # draining: closing, the queue still there
+            assert await from_another_thread() == {(True, queued)}
+            t.abort()
+            assert await from_another_thread() == {(True, 0)}
+        finally:
+            t.abort()
+            peer.close()
 
     loop.run_until_complete(main())
 
