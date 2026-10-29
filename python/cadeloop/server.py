@@ -2143,13 +2143,36 @@ def _send_frame(worker: _SpawnWorker, payload: bytes, fd=None) -> None:
         worker.stdin.flush()
 
 
+def _worker_command():
+    """The command (and environment) that starts a worker interpreter.
+
+    A Windows venv's ``python.exe`` is a launcher that runs the base
+    interpreter as a CHILD process. Spawned through it, a worker's
+    ``proc.pid`` named the launcher, and every connection the supervisor
+    handed over with ``socket.share(proc.pid)`` was duplicated into the
+    launcher instead of the worker: the worker's ``fromshare`` produced a
+    handle value that was invalid in its own process ("could not adopt a
+    connection: the handle is invalid"; no request was ever served), and
+    the launcher leaked a socket handle per connection. As multiprocessing
+    does since bpo-35797, the base interpreter is started directly and
+    told which venv it is running for.
+    """
+    exe = sys.executable
+    base = getattr(sys, "_base_executable", None) or exe
+    if _WIN and os.path.normcase(os.path.abspath(base)) != os.path.normcase(os.path.abspath(exe)):
+        return [base, "-m", "cadeloop._winworker"], dict(os.environ, __PYVENV_LAUNCHER__=exe)
+    return [exe, "-m", "cadeloop._winworker"], None
+
+
 def _spawn_shared_worker(spec, config: Config, idx: int, cpus) -> _SpawnWorker:
     """Spawn one worker and hand it its startup header. Unlike the model
     this replaced, no listener crosses the boundary — only connections do."""
     if _WIN:
+        cmd, env = _worker_command()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "cadeloop._winworker"],
+            cmd,
             stdin=subprocess.PIPE,
+            env=env,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
         worker = _SpawnWorker(proc, None, proc.stdin, idx, time.monotonic())
