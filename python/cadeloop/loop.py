@@ -990,8 +990,10 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
             raise asyncio.SendfileNotAvailableError("not a regular file") from None
         # No byte may interleave: write() raises until the transfer ends
-        # (asyncio's "sendfile is in progress"), and writes already queued
-        # in the engine go out first.
+        # (asyncio's "sendfile is in progress"), a second sendfile() on the
+        # transport is refused with RuntimeError, and writes already queued
+        # in the engine go out first. Claimed before the try: a refused
+        # claim must not release the running transfer's.
         transport._set_sendfile_active(True)
         try:
             while transport.get_write_buffer_size() > 0:
@@ -1067,6 +1069,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                             raise ConnectionResetError(
                                 "transport closed during sendfile"
                             )
+                        if handle.cancelled():
+                            # Another add_writer() on this descriptor replaced
+                            # the watch (which cancels it), so nothing will
+                            # resolve `fut` now. Retry the send instead: it
+                            # parks on a fresh watch if the socket is still
+                            # full. Waiting on regardless parked for good.
+                            break
                         try:
                             await tasks.wait_for(tasks.shield(fut), 0.1)
                         except TimeoutError:

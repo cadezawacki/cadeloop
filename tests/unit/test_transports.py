@@ -1380,6 +1380,92 @@ def test_loop_sendfile_offset_count(loop, tmp_path):
     loop.run_until_complete(main())
 
 
+def _drain_into(sock, out):
+    """Reader-thread body: append everything `sock` receives, until EOF."""
+    sock.setblocking(True)
+    while True:
+        data = sock.recv(1 << 20)
+        if not data:
+            return
+        out += data
+
+
+@pytest.mark.skipif(not hasattr(os, "sendfile"), reason="native sendfile path (os.sendfile)")
+def test_overlapping_sendfile_is_refused(loop, tmp_path):
+    """A second loop.sendfile() on a transport whose first was still
+    running was accepted. Both transfers parked on the descriptor's one
+    writer watch, the second displacing the first -- which then waited
+    forever -- and whichever finished first re-enabled write() under the
+    other. asyncio refuses the overlap, and so does cadeloop now."""
+    first_file = tmp_path / "a.bin"
+    first_file.write_bytes(b"A" * (4 << 20))
+    second_file = tmp_path / "b.bin"
+    second_file.write_bytes(b"B" * 1024)
+
+    async def main():
+        a, peer = socket.socketpair()
+        t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
+        got = bytearray()
+        reader = threading.Thread(target=_drain_into, args=(peer, got))
+        with open(first_file, "rb") as fa, open(second_file, "rb") as fb:
+            first = asyncio.ensure_future(loop.sendfile(t, fa))
+            await asyncio.sleep(0.05)  # peer not reading yet: the transfer stalls
+            assert not first.done()
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await asyncio.wait_for(loop.sendfile(t, fb), 2)
+            # The refused call left the running transfer's claim alone.
+            with pytest.raises(RuntimeError, match="sendfile is in progress"):
+                t.write(b"x")
+            reader.start()
+            try:
+                assert await asyncio.wait_for(first, 10) == 4 << 20
+            finally:
+                t.close()
+                reader.join(5)
+                peer.close()
+        assert bytes(got) == b"A" * (4 << 20)
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.skipif(not hasattr(os, "sendfile"), reason="native sendfile path (os.sendfile)")
+def test_sendfile_survives_its_writer_watch_being_replaced(loop, tmp_path):
+    """A native transfer that finds the socket full waits on a writer watch
+    of the transport's descriptor. Another add_writer() on that descriptor
+    replaces -- and so cancels -- the watch, after which nothing resolved
+    the wait: the transfer re-checked it forever and never sent another
+    byte. It now notices the cancelled watch and retries the send."""
+    payload = tmp_path / "big.bin"
+    payload.write_bytes(b"x" * (4 << 20))
+
+    async def main():
+        a, peer = socket.socketpair()
+        t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
+        fd = t.fileno()
+        got = bytearray()
+        reader = threading.Thread(target=_drain_into, args=(peer, got))
+        with open(payload, "rb") as f:
+            task = asyncio.ensure_future(loop.sendfile(t, f))
+            # The peer is not reading, so the transfer parks on its watch;
+            # take the watch away as a competing add_writer() does.
+            for _ in range(500):
+                if loop._core.remove_writer(fd):
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                pytest.fail("the transfer never parked on a writer watch")
+            reader.start()
+            try:
+                assert await asyncio.wait_for(task, 5) == 4 << 20
+            finally:
+                t.close()
+                reader.join(5)
+                peer.close()
+        assert len(got) == 4 << 20
+
+    loop.run_until_complete(main())
+
+
 def test_rst_during_write_surfaces_connection_lost(loop):
     # R-122: peer sets SO_LINGER=0 and closes -> RST. The writer's
     # transport must report connection_lost with an error, not hang.

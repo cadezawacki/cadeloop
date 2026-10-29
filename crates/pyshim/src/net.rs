@@ -3869,8 +3869,19 @@ impl Transport {
     }
 
     /// loop.sendfile()'s claim on the socket (see `Transport::sendfile`).
-    fn _set_sendfile_active(&self, active: bool) {
-        self.sendfile.store(active, Ordering::Relaxed);
+    ///
+    /// Exclusive, as asyncio's: a second transfer while one is running is
+    /// refused. Overlapping transfers interleaved their chunks on the wire
+    /// and parked on the descriptor's one writer watch, where the second
+    /// displaced the first -- which then waited for good -- and whichever
+    /// finished first dropped the claim for both.
+    fn _set_sendfile_active(&self, active: bool) -> PyResult<()> {
+        if !active {
+            self.sendfile.store(false, Ordering::Relaxed);
+        } else if self.sendfile.swap(true, Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("sendfile is already in progress on this transport"));
+        }
+        Ok(())
     }
 
     /// asyncio.constants._SendfileMode.TRY_NATIVE: loop.sendfile() may use
