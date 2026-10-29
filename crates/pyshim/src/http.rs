@@ -885,6 +885,20 @@ pub(crate) fn completed(py: Python<'_>) -> &Py<CompletedAwaitable> {
     COMPLETED.get_or_init(py, || Py::new(py, CompletedAwaitable {}).unwrap())
 }
 
+/// Finish an awaitable with `value`: StopIteration carrying it, raised as
+/// (StopIteration, value) rather than as an exception instance. That is
+/// the form the awaiting frame reads the result straight out of (CPython
+/// 3.11's `_PyGen_FetchStopIterationValue`), so no exception object or
+/// args tuple is built -- which a normalized StopIteration cost every
+/// receive(). A tuple value would be read as the exception's args, so
+/// one of those goes wrapped, normalized on the way out as before.
+fn stop_iteration(py: Python<'_>, value: Py<PyAny>) -> PyErr {
+    if value.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
+        return pyo3::exceptions::PyStopIteration::new_err((value,));
+    }
+    PyErr::from_type(py.get_type::<pyo3::exceptions::PyStopIteration>(), value)
+}
+
 /// One-shot "already done -> value" awaitable (receive() results).
 #[pyclass(module = "cadeloop._core")]
 pub struct ValueAwaitable {
@@ -926,9 +940,7 @@ impl ValueAwaitable {
             (None, Some(t)) => t.msg.into_message(py)?,
             (None, None) => return Err(PyRuntimeError::new_err("awaitable already consumed")),
         };
-        Err(PyErr::from_value(
-            pyo3::exceptions::PyStopIteration::new_err((value,)).value(py).clone().into_any(),
-        ))
+        Err(stop_iteration(py, value))
     }
 }
 
@@ -1123,12 +1135,13 @@ impl HttpReceive {
             R::Body(b) => taken(TakenMsg::Body(b)),
             R::Wait(pyloop) => park_recv_waiter(py, core, self.tid, &pyloop, false),
             R::WsWait(pyloop) => {
-                let fut = park_recv_waiter(py, core, self.tid, &pyloop, true)?;
+                let (fut, pending) = park_recv_waiter_pending(py, core, self.tid, &pyloop, true)?;
                 let recv = WsRecv {
                     core: self.core.clone_ref(py),
                     tid: self.tid,
                     epoch: self.epoch,
                     fut: Some(fut),
+                    parked_pending: pending,
                 };
                 Ok(Py::new(py, recv)?.into_any())
             }
@@ -1146,7 +1159,33 @@ fn park_recv_waiter(
     pyloop: &Py<PyAny>,
     ws: bool,
 ) -> PyResult<Py<PyAny>> {
+    park_recv_waiter_pending(py, core, tid, pyloop, ws).map(|(fut, _)| fut)
+}
+
+/// `park_recv_waiter`, also saying whether the waiter is still pending
+/// (false: the connection was gone, and it is already resolved).
+fn park_recv_waiter_pending(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    pyloop: &Py<PyAny>,
+    ws: bool,
+) -> PyResult<(Py<PyAny>, bool)> {
     let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
+    // The receive loop's case -- nothing parked yet -- in one entry: no
+    // queue to take out, filter and put back.
+    let store = fut.clone().unbind();
+    let first = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+        Some(conn) if conn.recv_waiters.is_empty() => {
+            conn.recv_waiters.push_back(store);
+            None
+        }
+        _ => Some(store),
+    })?;
+    if first.is_none() {
+        return Ok((fut.unbind(), true));
+    }
+    drop(first);
     // Prune waiters a cancelled receive() left behind BEFORE parking the
     // new one: the heartbeat pattern (wait_for(receive(), t) in a loop)
     // cancels one future per poll, and retaining them grew the queue
@@ -1175,11 +1214,12 @@ fn park_recv_waiter(
         }
         None => Some(store),
     })?;
-    if unstored.is_some() {
+    let pending = unstored.is_none();
+    if !pending {
         let msg = if ws { ws_gone_message(py, core, tid)? } else { gone_message(py, core, tid)? };
         let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
     }
-    Ok(fut.unbind())
+    Ok((fut.unbind(), pending))
 }
 
 /// A WsWake for a receive() waiter still pending (R-087): resolve it with
@@ -1242,6 +1282,11 @@ pub struct WsRecv {
     epoch: u64,
     /// The parked waiter; `None` once the message has been handed over.
     fut: Option<Py<PyAny>>,
+    /// The waiter was parked unresolved and has not been looked at since:
+    /// the first resume yields it without asking done(). Only a wake can
+    /// resolve it, and a wake is a later loop callback; awaited late, a
+    /// done future yielded to the task just resumes it a tick later.
+    parked_pending: bool,
 }
 
 #[pymethods]
@@ -1288,7 +1333,11 @@ impl WsRecv {
                 return Err(PyRuntimeError::new_err("cannot reuse already awaited receive()"));
             };
             let f = fut.bind(py);
-            let done: bool = f.call_method0(intern!(py, "done"))?.extract()?;
+            let done: bool = if std::mem::take(&mut self.parked_pending) {
+                false
+            } else {
+                f.call_method0(intern!(py, "done"))?.extract()?
+            };
             if !done {
                 // Future.__await__: yield it to the task, which resumes
                 // this once it is resolved.
@@ -1312,15 +1361,15 @@ impl WsRecv {
             match took {
                 Took::Value(v) => {
                     self.fut = None;
-                    return Err(PyErr::from_value(
-                        pyo3::exceptions::PyStopIteration::new_err((v,)).value(py).clone().into_any(),
-                    ));
+                    return Err(stop_iteration(py, v));
                 }
                 // Woken, and the message went to another receive() first:
                 // wait again.
                 Took::Wait(pyloop) => {
                     let core = self.core.bind(py).get();
-                    self.fut = Some(park_recv_waiter(py, core, self.tid, &pyloop, true)?);
+                    let (fut, pending) = park_recv_waiter_pending(py, core, self.tid, &pyloop, true)?;
+                    self.fut = Some(fut);
+                    self.parked_pending = pending;
                 }
             }
         }
@@ -3818,10 +3867,27 @@ impl AppTask {
     }
 }
 
+/// `_asyncio.Future` and `_asyncio.Task`, the C types (see `future_loop`).
+static C_FUTURE_TYPES: PyOnceLock<(Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
+
 /// The loop a future is attached to, mirroring `asyncio.futures._get_loop`:
 /// `get_loop()` when it exists, else the `_loop` attribute. `None` when
 /// neither is available -- an awaitable too exotic to judge, left alone.
 fn future_loop<'py>(py: Python<'py>, fut: &Bound<'py, PyAny>) -> Option<Bound<'py, PyAny>> {
+    // asyncio's C Future and Task -- exactly those types, so no override
+    // of get_loop() is skipped -- answer by their `_loop`, which is what
+    // their get_loop() returns: a slot read, where get_loop() was a
+    // bound-method allocation and a call on every suspension.
+    let c_types = C_FUTURE_TYPES.get_or_try_init(py, || -> PyResult<_> {
+        let m = py.import("_asyncio")?;
+        Ok((m.getattr("Future")?.unbind(), m.getattr("Task")?.unbind()))
+    });
+    if let Ok((future, task)) = c_types {
+        let ty = fut.get_type();
+        if ty.is(future.bind(py)) || ty.is(task.bind(py)) {
+            return fut.getattr(intern!(py, "_loop")).ok();
+        }
+    }
     if let Ok(get_loop) = fut.getattr(intern!(py, "get_loop")) {
         return get_loop.call0().ok();
     }

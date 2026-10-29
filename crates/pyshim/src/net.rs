@@ -2792,10 +2792,13 @@ fn on_recv_done(
                 // R-059: ciphertext — record processing needs _ssl (phase 2).
                 net.events.push(NetEvent::TlsData { tid, data: data.to_vec() });
             } else if conn.ws.is_some() {
-                // R-087: WS mode — bytes go to the frame parser, not llhttp.
-                // Copied out first: ws_ingest needs &mut NetState.
-                let owned = data.to_vec();
-                crate::http::ws_ingest(py, net, backend, tid, &owned);
+                // R-087: WS mode — bytes go to the frame parser, not llhttp,
+                // straight from the receive slot: ws_ingest reads them only
+                // inside the parser's push (or into the pre-accept buffer),
+                // before anything it does can post a receive into this slot
+                // again or tear the connection down and release it. (They
+                // were copied out first, a heap copy of every read.)
+                crate::http::ws_ingest(py, net, backend, tid, data);
             } else if conn.deferred_error.is_none() {
                 // In-cell parse (R-080): llhttp over the recv slot; the
                 // parser copies what it keeps, so the slot re-posts below.
