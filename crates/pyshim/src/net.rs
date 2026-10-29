@@ -2413,9 +2413,16 @@ fn on_recv_done(
                 // Copied out first: ws_ingest needs &mut NetState.
                 let owned = data.to_vec();
                 crate::http::ws_ingest(py, net, backend, tid, &owned);
-            } else {
+            } else if conn.deferred_error.is_none() {
                 // In-cell parse (R-080): llhttp over the recv slot; the
                 // parser copies what it keeps, so the slot re-posts below.
+                // (Once a parse error is parked behind requests still being
+                // answered, the parser is dead: what arrives is discarded
+                // unread, but the recv still re-posts -- reading is the
+                // only way to see the peer leave. Stopped, a long-poll
+                // handler parked in receive() for exactly that was never
+                // told, and the sweep, seeing a request still active, held
+                // the connection for good.)
                 match crate::http::conn_feed(conn, data) {
                     Ok(outcome) => {
                         // Oversized pre-dispatch WS buffer (see conn_feed):
@@ -2461,7 +2468,9 @@ fn on_recv_done(
         if crate::http::conn_parse_failed(py, net, backend, tid, err) {
             net.events.push(NetEvent::HttpPump { tid });
         }
-        return; // no recv re-post: the parser is dead
+        // The parser is dead. An idle connection was answered at once and
+        // is closing, so post_recv declines it; one whose 400 is parked
+        // keeps reading, discarding what arrives (above).
     }
     if continue_owed {
         // Before the body, not after: the client is holding it back until

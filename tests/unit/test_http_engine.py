@@ -447,7 +447,8 @@ def test_concurrent_receive_waiters_all_resolve_on_disconnect(loop):
     async def app(scope, receive, send):
         await receive()  # body
         await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"ok"})
+        # Still streaming: both receive() calls park until the disconnect.
+        await send({"type": "http.response.body", "body": b"ok", "more_body": True})
         r1, r2 = await asyncio.gather(receive(), receive())
         results["types"] = (r1["type"], r2["type"])
         done.set()
@@ -458,7 +459,7 @@ def test_concurrent_receive_waiters_all_resolve_on_disconnect(loop):
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
         await writer.drain()
-        await asyncio.wait_for(_read_one_response(reader), 5)
+        await asyncio.wait_for(reader.readuntil(b"ok\r\n"), 5)  # the first chunk
         writer.close()  # disconnect must release BOTH waiters
         await asyncio.wait_for(done.wait(), 5)
 
@@ -654,8 +655,11 @@ def test_receive_resolves_disconnect(loop):
         first = await receive()
         events.append(first["type"])
         await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"ok"})
-        second = await receive()  # must block until the client goes away
+        await send({"type": "http.response.body", "body": b"ok", "more_body": True})
+        # The response is still streaming, so this must block until the
+        # client goes away. (Once the response is complete, receive()
+        # answers http.disconnect at once.)
+        second = await receive()
         events.append(second["type"])
         done.set()
 
@@ -667,7 +671,7 @@ def test_receive_resolves_disconnect(loop):
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
         await writer.drain()
-        await asyncio.wait_for(_read_one_response(reader), 5)
+        await asyncio.wait_for(reader.readuntil(b"ok\r\n"), 5)  # the first chunk
         assert events == ["http.request"]  # second receive() is parked
         writer.close()
         await asyncio.wait_for(done.wait(), 5)
@@ -2792,3 +2796,129 @@ def test_scope_metadata_dicts_are_not_shared_between_requests(loop):
     assert seen[0] == seen[1], f"request 2 inherited request 1's mutations: {seen}"
     assert seen[1][0]["spec_version"] == "2.3", seen[1][0]
     assert "http.response.trailers" in seen[1][1], seen[1][1]
+
+
+# --------------------------------------------------------------------- #
+# receive() and the request lifecycle                                   #
+# --------------------------------------------------------------------- #
+
+
+def test_receive_after_the_response_answers_http_disconnect(loop):
+    """ASGI: receive() returns http.disconnect "if receive is called after
+    a response has been sent". It parked until the app coroutine returned
+    instead, so an app that awaited it after responding deadlocked against
+    itself -- and the connection's next keep-alive request, served only
+    once the app returns, waited with it. A listener parked before the
+    response completed is released at completion, too."""
+    seen = []
+
+    async def app(scope, receive, send):
+        await receive()
+        listener = receive()  # parked beside the response
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"2")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+        try:
+            after = await asyncio.wait_for(receive(), 2)
+            parked = await asyncio.wait_for(listener, 2)
+            seen.append((after["type"], parked["type"]))
+        except asyncio.TimeoutError:
+            seen.append("timed out")
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        for _ in range(2):
+            writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+            await writer.drain()
+            await asyncio.wait_for(_read_one_response(reader), 1)
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert seen == [("http.disconnect", "http.disconnect")] * 2, seen
+
+
+@pytest.mark.parametrize("variant", ["response-close", "client-half-close"])
+def test_requests_pipelined_behind_a_close_are_not_run(loop, variant):
+    """Once the connection closes after a response -- the response said
+    `connection: close`, or the client half-closed -- no request pipelined
+    behind it is processed (RFC 7230 6.6). The pump dispatched them anyway:
+    the application ran, side effects included, for responses the closing
+    connection then discarded."""
+    calls = []
+    release = asyncio.Event()
+
+    async def app(scope, receive, send):
+        calls.append(scope["path"])
+        await receive()
+        headers = [(b"content-length", b"2")]
+        if scope["path"] == "/first":
+            await release.wait()  # the rest is queued behind it by now
+            if variant == "response-close":
+                headers.append((b"connection", b"close"))
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /first HTTP/1.1\r\nHost: h\r\n\r\n"
+            b"POST /charge HTTP/1.1\r\nHost: h\r\ncontent-length: 0\r\n\r\n"
+        )
+        if variant == "client-half-close":
+            writer.write_eof()
+        await writer.drain()
+        await asyncio.sleep(0.1)  # all of it (the EOF included) has landed
+        release.set()
+        data = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        return data
+
+    data = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert calls == ["/first"], calls
+    assert data.count(b"HTTP/1.1 200") == 1, data
+
+
+def test_a_parked_parse_error_still_sees_the_client_leave(loop):
+    """A malformed request pipelined behind one still being served parks
+    its 400 -- and the engine stopped reading. A long-poll handler waiting
+    in receive() for its client to leave was never told when it did, and
+    the sweep, seeing a request still active, held the connection for
+    good."""
+    parked = asyncio.Event()
+    seen = []
+
+    async def app(scope, receive, send):
+        await receive()
+        waiter = receive()
+        parked.set()
+        seen.append((await waiter)["type"])
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /poll HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(parked.wait(), 5)
+        writer.write(b"\x01\x02 not http\r\n\r\n")
+        await writer.drain()
+        writer.close()  # ...and the client leaves
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert seen == ["http.disconnect"], seen

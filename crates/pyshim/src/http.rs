@@ -455,10 +455,11 @@ pub(crate) const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 /// queued, the response parks on the connection instead and
 /// `finish_request` releases it once the last of them has been answered.
 /// Returns whether the caller should pump -- valid requests drained from
-/// the same buffer still get served ahead of the parked 400. Reading
-/// stops either way (neither caller re-posts a recv after an error): the
-/// parser is dead, so later bytes change nothing, and a second error
-/// from them must not displace the parked response.
+/// the same buffer still get served ahead of the parked 400. The parser
+/// is dead either way, so later bytes change nothing, and a second error
+/// from them must not displace the parked response: both callers keep
+/// reading while the 400 is parked (so a peer that leaves is still seen)
+/// but no longer parse what arrives.
 pub(crate) fn conn_parse_failed(
     py: Python<'_>,
     net: &mut NetState,
@@ -932,11 +933,16 @@ impl HttpReceive {
                 // complete POST).
                 if let Some(b) = conn.req_body.take() {
                     R::Body(b)
-                } else if conn.disconnected {
+                } else if conn.disconnected || conn.resp == RespPhase::Done {
+                    // ASGI: http.disconnect is what receive() returns
+                    // "after a response has been sent" too. Parking here
+                    // instead left an app that awaited it after its
+                    // response deadlocked against itself until the client
+                    // left -- and the connection's next request with it.
                     R::Disconnect
                 } else {
                     // Body already delivered: resolve on disconnect (or when
-                    // this request finishes) — Starlette's disconnect
+                    // the response completes) — Starlette's disconnect
                     // listeners await here.
                     R::Wait(conn.pyloop.clone_ref(py))
                 }
@@ -1550,6 +1556,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         };
                     }
                     net::http_enqueue(py, net, backend, tid, out);
+                    release_after_response(net, tid);
                     Ok(())
                 }
                 RespPhase::Streaming => {
@@ -1580,6 +1587,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         }
                     }
                     net::http_enqueue(py, net, backend, tid, out);
+                    release_after_response(net, tid);
                     Ok(())
                 }
             }
@@ -1644,6 +1652,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 conn.resp = RespPhase::Done;
             }
             net::http_enqueue(py, net, backend, tid, out);
+            release_after_response(net, tid);
             Ok(())
         })?
         .map_err(send_err)?;
@@ -1709,6 +1718,22 @@ fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
     out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
     out.extend_from_slice(body);
     out.extend_from_slice(b"\r\n");
+}
+
+/// Once the response is complete, receive() waiters parked beside it (a
+/// disconnect listener running alongside the response) get
+/// http.disconnect, as a receive() made from then on does (`HttpReceive`).
+/// They used to stay parked until the app coroutine returned, so an app
+/// that awaited one before returning never did. In-cell: the waiters
+/// leave as events.
+fn release_after_response(net: &mut NetState, tid: u64) {
+    let Some(conn) = net.http_conn_mut(tid) else { return };
+    if conn.resp != RespPhase::Done || conn.recv_waiters.is_empty() {
+        return;
+    }
+    for fut in conn.take_recv_waiters() {
+        net.events.push(net::NetEvent::HttpDisconnect { fut, ws: false });
+    }
 }
 
 // --------------------------------------------------------------------- //
@@ -1918,6 +1943,8 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
         if conn.ws.is_some() {
             ws_ingest(py, net, backend, tid, &plaintext);
             false
+        } else if conn.deferred_error.is_some() {
+            false // the parser is dead (conn_parse_failed): discarded
         } else {
             match conn_feed(conn, &plaintext) {
                 // R-087 parity with the plaintext path: a pre-dispatch WS
@@ -2777,6 +2804,7 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, err: PyErr)
                 let log = take_access_record(py, net, tid, now_ns);
                 let body = error_response(ParseError { status: 500, reason: "internal server error" }, minor);
                 net::http_enqueue(py, net, backend, tid, body);
+                release_after_response(net, tid);
                 net::http_close_after_write(py, net, backend, tid);
                 log
             })?;
@@ -2841,13 +2869,23 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             // A parse error parked by conn_parse_failed goes out only
             // once everything ahead of it in the pipeline is answered.
             let parked_error = if conn.pending.is_empty() { conn.deferred_error.take() } else { None };
+            let close = !conn.keep_alive || conn.disconnected;
+            if close {
+                // Requests pipelined behind it are never dispatched. The
+                // pump ran them anyway -- the application and its side
+                // effects included -- for responses the closing
+                // connection then discarded (RFC 7230 6.6: no further
+                // requests are processed after a "close").
+                conn.pending.clear();
+                conn.pending_bytes = 0;
+            }
             (
                 conn.take_recv_waiters(),
                 // A WebSocket's waiters are owed websocket.disconnect, with
                 // the code a receive() after the teardown reports.
                 conn.ws.as_ref().map(|w| w.close_code.unwrap_or(1006)),
                 conn.driver.take(),
-                !conn.keep_alive || conn.disconnected,
+                close,
                 parked_error,
             )
         };
