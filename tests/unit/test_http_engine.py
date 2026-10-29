@@ -3033,6 +3033,69 @@ def test_a_cancel_requested_while_the_handler_runs_cancels_its_next_await(loop):
     assert len(seen) == 1 and seen[0] != "not cancelled" and seen[0] < 1.0, seen
 
 
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_cancel_scope_knows_its_own_cancellation_at_a_checkpoint(loop, eager):
+    """anyio tells its own cancellations from anyone else's by the message
+    Task.cancel(msg) was given. The eager driver latched a cancel that
+    found nothing awaited -- a checkpoint, sleep(0), an uncontended Lock --
+    without its message and delivered a bare CancelledError, which the
+    cancel scope did not recognise as its own: it escaped the `with`
+    block, and a FastAPI route under move_on_after() answered 500."""
+    anyio = pytest.importorskip("anyio")
+    out = []
+
+    async def app(scope, receive, send):
+        await receive()
+        with anyio.CancelScope() as cs:
+            cs.cancel()
+            await anyio.sleep(0)
+        out.append(cs.cancelled_caught)
+        with anyio.move_on_after(0.02) as cs2:
+            while True:
+                await anyio.lowlevel.checkpoint()
+        out.append(cs2.cancelled_caught)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app, eager=eager)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert resp.startswith(b"HTTP/1.1 204"), resp
+    assert out == [True, True], out
+
+
+@pytest.mark.parametrize("eager", [True, False])
+def test_nested_timeouts_sharing_a_deadline_fire_the_outer_one(loop, eager):
+    """cancelling() and uncancel() pinned at 0 told every asyncio.timeout
+    that no other cancellation was pending: two nested scopes expiring
+    together both cancelled the driver, the inner one absorbed both, and
+    the code after it ran on past the outer deadline."""
+    out = []
+
+    async def app(scope, receive, send):
+        await receive()
+        when = asyncio.get_running_loop().time() + 0.05
+        try:
+            async with asyncio.timeout_at(when):
+                try:
+                    async with asyncio.timeout_at(when):
+                        await asyncio.sleep(1)
+                except TimeoutError:
+                    out.append("inner")
+                await asyncio.sleep(0.5)
+                out.append("ran past the outer deadline")
+        except TimeoutError:
+            out.append("outer")
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app, eager=eager)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert resp.startswith(b"HTTP/1.1 204"), resp
+    assert out == ["outer"], out
+
+
 def test_contextvar_isolation_pipelined_requests(loop):
     """A request pipelined behind one that suspended started with every
     contextvar that one had set: the eager driver pumped it from inside

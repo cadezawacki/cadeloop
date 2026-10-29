@@ -3117,11 +3117,17 @@ fn cancelled_error_type(py: Python<'_>) -> PyResult<&Py<PyAny>> {
 }
 
 fn cancelled_error(py: Python<'_>) -> PyErr {
-    match cancelled_error_type(py) {
-        Ok(cls) => match cls.bind(py).call0() {
-            Ok(exc) => PyErr::from_value(exc),
-            Err(e) => e,
-        },
+    cancelled_error_with(py, None)
+}
+
+/// `CancelledError(msg)`, or a bare one (Future._make_cancelled_error).
+fn cancelled_error_with(py: Python<'_>, msg: Option<Py<PyAny>>) -> PyErr {
+    let made = cancelled_error_type(py).and_then(|cls| match msg {
+        Some(m) => cls.bind(py).call1((m,)),
+        None => cls.bind(py).call0(),
+    });
+    match made {
+        Ok(exc) => PyErr::from_value(exc),
         Err(e) => e,
     }
 }
@@ -3140,10 +3146,9 @@ fn task_hook<'py>(
 /// Lightweight Task stand-in driving eagerly-stepped app coroutines
 /// (R-056). While stepping it registers as `asyncio.current_task()` and
 /// exposes the Task surface anyio-based frameworks touch (weakref,
-/// cancel/uncancel, get_loop/get_name); it is still not a full
-/// `asyncio.Task` — switch `eager_tasks` off (§16) for libraries that
-/// need complete Task semantics (e.g. task introspection, eager cancel
-/// counts).
+/// cancel(msg)/cancelling/uncancel, get_loop/get_name); it is still not a
+/// full `asyncio.Task` — switch `eager_tasks` off (§16) for libraries that
+/// need complete Task semantics (e.g. task introspection).
 #[pyclass(weakref, module = "cadeloop._core")]
 pub struct AppTask {
     core: Py<CoreLoop>,
@@ -3152,6 +3157,17 @@ pub struct AppTask {
     pyloop: Py<PyAny>,
     finished: bool,
     must_cancel: bool,
+    /// The message of the cancel() that latched `must_cancel`
+    /// (Task._cancel_message). anyio tells its own cancellations from
+    /// anyone else's by it: delivered as a bare CancelledError, a
+    /// cancel scope hit at a checkpoint did not recognise its own
+    /// cancel and let it escape the `with` block.
+    cancel_msg: Option<Py<PyAny>>,
+    /// Task._num_cancels_requested: what cancelling() reports and
+    /// uncancel() takes back. asyncio.timeout and anyio decide by it
+    /// whether a CancelledError is theirs to absorb; pinned at 0, an
+    /// inner scope absorbed an outer scope's cancellation as well.
+    cancels_requested: u32,
     /// The future this task is suspended on (cancel() forwards to it,
     /// mirroring Task.cancel()).
     waiting_on: Option<Py<PyAny>>,
@@ -3198,33 +3214,34 @@ impl AppTask {
             if this.finished {
                 return Ok(false);
             }
-            match this.waiting_on.as_ref() {
-                Some(f) => Some(f.clone_ref(py)),
-                None => {
-                    this.must_cancel = true;
-                    None
-                }
-            }
+            this.cancels_requested += 1;
+            this.waiting_on.as_ref().map(|f| f.clone_ref(py))
         };
         if let Some(fut) = waiting {
             // Task.cancel semantics: cancel the awaited future; the
             // CancelledError arrives through _wake.
-            let forwarded: bool = match msg {
+            let forwarded: bool = match &msg {
                 Some(m) => fut.call_method1(py, intern!(py, "cancel"), (m,))?,
                 None => fut.call_method0(py, intern!(py, "cancel"))?,
             }
             .extract(py)
             .unwrap_or(false);
-            if !forwarded {
-                // The awaited future completed first, so cancelling it was a
-                // no-op and no CancelledError will arrive through _wake —
-                // the queued wake would otherwise resume the coroutine with
-                // the successful result and silently swallow the cancel.
-                // asyncio.Task latches the request instead; mirror that so
-                // request timeouts and anyio cancel scopes still fire.
-                slf.borrow_mut().must_cancel = true;
+            if forwarded {
+                return Ok(true);
             }
+            // The awaited future completed first, so cancelling it was a
+            // no-op and no CancelledError will arrive through _wake —
+            // the queued wake would otherwise resume the coroutine with
+            // the successful result and silently swallow the cancel.
         }
+        // Nothing awaited (a bare yield, or a cancel() from inside the
+        // step), or the future above completed first: asyncio.Task
+        // latches the request, message and all, for the next step to
+        // deliver -- mirror that so request timeouts and anyio cancel
+        // scopes still fire, and still know their own cancellation.
+        let mut this = slf.borrow_mut();
+        this.must_cancel = true;
+        this.cancel_msg = msg.map(Bound::unbind);
         Ok(true)
     }
 
@@ -3237,11 +3254,12 @@ impl AppTask {
     }
 
     fn cancelling(&self) -> u32 {
-        0
+        self.cancels_requested
     }
 
-    fn uncancel(&self) -> u32 {
-        0
+    fn uncancel(&mut self) -> u32 {
+        self.cancels_requested = self.cancels_requested.saturating_sub(1);
+        self.cancels_requested
     }
 
     /// asyncio.Task private surface read directly (not called) by anyio's
@@ -3354,6 +3372,8 @@ impl AppTask {
                 pyloop,
                 finished: false,
                 must_cancel: false,
+                cancel_msg: None,
+                cancels_requested: 0,
                 waiting_on: None,
                 context,
                 callbacks: Vec::new(),
@@ -3440,14 +3460,29 @@ impl AppTask {
     }
 
     fn step_body(slf: &Bound<'_, Self>, py: Python<'_>, mut throw: Option<PyErr>) -> PyResult<StepOutcome> {
-        let (coro, core_py, tid) = {
+        let (coro, core_py, tid, latched) = {
             let mut this = slf.borrow_mut();
-            if this.must_cancel {
+            let latched = if this.must_cancel {
                 this.must_cancel = false;
-                throw = Some(cancelled_error(py));
-            }
-            (this.coro.clone_ref(py), this.core.clone_ref(py), this.tid)
+                Some(this.cancel_msg.take())
+            } else {
+                None
+            };
+            (this.coro.clone_ref(py), this.core.clone_ref(py), this.tid, latched)
         };
+        if let Some(msg) = latched {
+            // Task.__step: a CancelledError already on its way in (the
+            // awaited future's, carrying the message its cancel() was
+            // given) is kept; anything else is replaced by one carrying
+            // the latched cancel's message.
+            let incoming = match &throw {
+                Some(e) => e.is_instance(py, cancelled_error_type(py)?.bind(py)),
+                None => false,
+            };
+            if !incoming {
+                throw = Some(cancelled_error_with(py, msg));
+            }
+        }
         let core = core_py.bind(py).get();
         loop {
             let step_result: Result<Option<Py<PyAny>>, PyErr> = if let Some(exc) = throw.take() {
@@ -3518,13 +3553,21 @@ impl AppTask {
                             // future just awaited; left latched, it waited
                             // for that future to finish by itself -- for
                             // ever, for one that never does.
-                            if slf.borrow().must_cancel {
-                                let cancelled: bool = y
-                                    .call_method0(intern!(py, "cancel"))
-                                    .and_then(|v| v.extract())
-                                    .unwrap_or(false);
+                            let latched = {
+                                let this = slf.borrow();
+                                this.must_cancel.then(|| this.cancel_msg.as_ref().map(|m| m.clone_ref(py)))
+                            };
+                            if let Some(msg) = latched {
+                                let cancelled: bool = match msg {
+                                    Some(m) => y.call_method1(intern!(py, "cancel"), (m,)),
+                                    None => y.call_method0(intern!(py, "cancel")),
+                                }
+                                .and_then(|v| v.extract())
+                                .unwrap_or(false);
                                 if cancelled {
-                                    slf.borrow_mut().must_cancel = false;
+                                    let mut this = slf.borrow_mut();
+                                    this.must_cancel = false;
+                                    this.cancel_msg = None;
                                 }
                             }
                             return Ok(StepOutcome::Suspended);
