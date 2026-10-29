@@ -329,14 +329,22 @@ jobs:
           # accepts manylinux_2_39, which is what a build that escaped the
           # container back onto the runner's own glibc produces -- the
           # original bug this job exists to prevent.
-          case "$(basename dist/*.whl)" in
-            *-cp311-cp311-manylinux2014_x86_64.whl) ;;
-            *-cp311-cp311-manylinux_2_17_x86_64*.whl) ;;
-            *)
-              echo "not a cp311 manylinux2014 wheel: $(basename dist/*.whl)" >&2
-              exit 1
-              ;;
-          esac
+          #
+          # And matched as a set, not as one spelling of it. The platform
+          # field is a compressed tag set -- every tag the wheel satisfies,
+          # joined by `.` in whatever order the build tool picks. maturin
+          # 1.15 wrote manylinux_2_17_x86_64.manylinux2014_x86_64 and 1.16
+          # writes manylinux2014_x86_64.manylinux_2_17_x86_64: the same
+          # wheel, which the case patterns that stood here -- each pinned
+          # to one order -- rejected, failing the v1.1.0 release. So: one
+          # or more tags, each a name for glibc 2.17 x86_64, in any order.
+          tag='(manylinux2014_x86_64|manylinux_2_17_x86_64)'
+          re="-cp311-cp311-$tag(\.$tag)*\.whl$"
+          wheel=$(basename dist/*.whl)
+          if ! [[ $wheel =~ $re ]]; then
+            echo "not a cp311 manylinux2014 wheel: $wheel" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-linux
