@@ -1139,6 +1139,40 @@ def test_a_worker_still_starting_stops_when_its_supervisor_is_gone(cadeloop_logs
     assert not any("WITHOUT the application's lifespan" in m for m in messages), messages
 
 
+def test_requests_share_pooled_to_thread_workers():
+    """serve() ran the loop with a bare run_forever(), so anyio found no
+    root task to pool its to_thread workers under and took each request's
+    own task instead: every request that offloaded work -- FastAPI's `def`
+    routes and sync dependencies -- started a worker thread and stopped it
+    when it finished (200 requests, 200 threads; uvicorn, 1), roughly
+    doubling such a route's latency."""
+    anyio = pytest.importorskip("anyio")
+    port = _free_port()
+    workers = []
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        await receive()
+        workers.append(await anyio.to_thread.run_sync(threading.current_thread))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+        if len(workers) == 5:
+            asyncio.get_running_loop().stop()
+
+    t, result = _serve_in_thread(app, cadeloop.Config(grace=1.0), port=port)
+    _wait_up(port)
+    for _ in range(4):
+        _get(port)
+    t.join(30)
+    assert not t.is_alive() and "error" not in result, result
+    assert len(workers) == 5 and len({id(w) for w in workers}) == 1, workers
+
+
 def test_s26_serve_restores_the_callers_current_event_loop():
     """S26: serve() set the thread's current loop to None on return,
     clobbering the embedder's own."""

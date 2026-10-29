@@ -30,7 +30,7 @@ import threading
 import time
 
 from .config import Config
-from .loop import Loop
+from .loop import Loop, _run_until_complete_cb
 
 __all__ = ["serve", "load_app"]
 
@@ -767,7 +767,7 @@ def _serve_single(
                     pass
             if shutdown.reason is None:  # asked to stop while setting up
                 try:
-                    loop.run_forever()
+                    _serve_in_root_task(loop)
                 except KeyboardInterrupt:
                     # Only reachable when no SIGINT handler could be
                     # installed (a thread other than the main one).
@@ -835,6 +835,35 @@ def _serve_single(
             loop.close()
             asyncio.set_event_loop(prev_loop)
             shutdown.phase = "closed"
+
+
+def _serve_in_root_task(loop) -> None:
+    """run_forever(), with a root task for anyio.
+
+    anyio pools the worker threads behind to_thread.run_sync -- FastAPI's
+    plain `def` routes and sync dependencies -- under a "root task": the
+    one run_until_complete() drives, else the calling task itself. Under a
+    bare run_forever() there was none, so each request's own task was its
+    root: every request that offloaded work started a worker thread and
+    stopped it again when it finished (200 requests, 200 threads; uvicorn,
+    which serves inside asyncio.run(), starts 1).
+
+    The task waits for nothing and stays pending past the drain, so the
+    workers stay pooled while requests are still finishing; _finalize_loop
+    cancels it with the other tasks left over, which is what releases them.
+    """
+
+    async def serving():
+        await loop.create_future()
+
+    root = loop.create_task(serving(), name="cadeloop.serve")
+    # What run_until_complete() attaches, and what anyio looks for -- without
+    # run_until_complete()'s RuntimeError when loop.stop() ends serving.
+    root.add_done_callback(_run_until_complete_cb)
+    try:
+        loop.run_forever()
+    finally:
+        root.remove_done_callback(_run_until_complete_cb)
 
 
 def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
