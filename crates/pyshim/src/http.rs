@@ -1022,6 +1022,7 @@ impl HttpReceive {
             WsConnect,
             Ws(WsMsg),
             WsGone,
+            WsWait(Py<PyAny>),
         }
         let r = core.with_net(|net, _| match net.http_conn_mut(self.tid) {
             // A receive() from a request that has already finished (the app
@@ -1043,7 +1044,7 @@ impl HttpReceive {
                 } else if disconnected {
                     R::WsGone
                 } else {
-                    R::Wait(pyloop)
+                    R::WsWait(pyloop)
                 }
             }
             Some(conn) => {
@@ -1088,50 +1089,281 @@ impl HttpReceive {
                 taken(TakenMsg::Ws(m))
             }
             R::Body(b) => taken(TakenMsg::Body(b)),
-            R::Wait(pyloop) => {
-                let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
-                // Prune waiters a cancelled receive() left behind BEFORE
-                // parking the new one: the heartbeat pattern
-                // (wait_for(receive(), t) in a loop) cancels one future
-                // per poll, and retaining them grew the queue without
-                // bound on an idle connection. done() is a Python call,
-                // so the queue is taken out of the cell, filtered here,
-                // and put back in one uninterrupted stretch of loop-thread
-                // code.
-                let parked =
-                    core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.take_recv_waiters()))?;
-                let live: VecDeque<Py<PyAny>> = parked
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|w| {
-                        let done: bool = w
-                            .bind(py)
-                            .call_method0(intern!(py, "done"))
-                            .and_then(|v| v.extract())
-                            .unwrap_or(true);
-                        !done
-                    })
-                    .collect();
-                let store = fut.clone().unbind();
-                // Parked, never displacing: an earlier live waiter still
-                // gets resolved (disconnect resolves every one; a WS wake
-                // hands out one message per waiter). The unstored clone
-                // in the None arm drops out-of-cell, here.
-                let unstored = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
-                    Some(conn) => {
-                        conn.recv_waiters = live;
-                        conn.recv_waiters.push_back(store);
-                        None
-                    }
-                    None => Some(store),
-                })?;
-                if unstored.is_some() {
-                    let msg = gone_message(py, core, self.tid)?;
-                    let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
-                }
-                Ok(fut.unbind())
+            R::Wait(pyloop) => park_recv_waiter(py, core, self.tid, &pyloop, false),
+            R::WsWait(pyloop) => {
+                let fut = park_recv_waiter(py, core, self.tid, &pyloop, true)?;
+                let recv = WsRecv {
+                    core: self.core.clone_ref(py),
+                    tid: self.tid,
+                    epoch: self.epoch,
+                    fut: Some(fut),
+                };
+                Ok(Py::new(py, recv)?.into_any())
             }
         }
+    }
+}
+
+/// Park a receive() waiter on `tid`, first pruning the ones a cancelled
+/// receive() left behind. Returns it already resolved with the gone
+/// message when the connection went away meanwhile.
+fn park_recv_waiter(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    pyloop: &Py<PyAny>,
+    ws: bool,
+) -> PyResult<Py<PyAny>> {
+    let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
+    // Prune waiters a cancelled receive() left behind BEFORE parking the
+    // new one: the heartbeat pattern (wait_for(receive(), t) in a loop)
+    // cancels one future per poll, and retaining them grew the queue
+    // without bound on an idle connection. done() is a Python call, so the
+    // queue is taken out of the cell, filtered here, and put back in one
+    // uninterrupted stretch of loop-thread code.
+    let parked = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.take_recv_waiters()))?;
+    let live: VecDeque<Py<PyAny>> = parked
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| {
+            let done: bool =
+                w.bind(py).call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+            !done
+        })
+        .collect();
+    let store = fut.clone().unbind();
+    // Parked, never displacing: an earlier live waiter still gets resolved
+    // (disconnect resolves every one; a WS wake wakes each). The unstored
+    // clone in the None arm drops out-of-cell, here.
+    let unstored = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+        Some(conn) => {
+            conn.recv_waiters = live;
+            conn.recv_waiters.push_back(store);
+            None
+        }
+        None => Some(store),
+    })?;
+    if unstored.is_some() {
+        let msg = if ws { ws_gone_message(py, core, tid)? } else { gone_message(py, core, tid)? };
+        let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
+    }
+    Ok(fut.unbind())
+}
+
+/// A WsWake for a receive() waiter still pending (R-087): resolve it with
+/// None when a message is queued -- `WsRecv` takes it once its task
+/// resumes -- or with the final disconnect once nothing more can arrive.
+///
+/// With nothing queued (another receive() took it first), the waiter is
+/// parked again -- while there is still something to wait for. The wake
+/// took it out of recv_waiters, so a teardown between queueing the wake and
+/// now (an app callback that ran first, during a graceful shutdown say)
+/// could not release it, and parking it on the gone connection dropped it
+/// unresolved: receive() pending for good, and its task, which asyncio
+/// holds only weakly, destroyed by the collector while pending. Past EOF no
+/// message can arrive either.
+pub(crate) fn ws_wake(py: Python<'_>, core: &CoreLoop, tid: u64, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+    let stored = fut.clone().unbind();
+    let (queued, unparked) = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+        Some(c) if c.ws.as_ref().is_some_and(|w| !w.inbox.is_empty()) => (true, Some(stored)),
+        Some(c) if !c.disconnected => {
+            c.recv_waiters.push_back(stored);
+            (false, None)
+        }
+        // Handed back so the reference drops out of the cell (ADR-5).
+        _ => (false, Some(stored)),
+    })?;
+    if queued {
+        let _ = fut.call_method1(intern!(py, "set_result"), (py.None(),));
+    } else if unparked.is_some() {
+        let msg = ws_gone_message(py, core, tid)?;
+        let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
+    }
+    Ok(())
+}
+
+/// What a WebSocket receive() that has to wait returns (R-087): it parks a
+/// waiter, and takes the front inbox message itself once the waiter is
+/// woken and its task resumes.
+///
+/// The wake used to pop the message into the waiter's result. A receive()
+/// cancelled after that but before its task resumed -- asyncio.timeout
+/// firing in the tick the frame arrived, an anyio deadline, a task group
+/// aborting -- then dropped the message with the future: a receive loop
+/// under a 10 ms timeout lost ~2% of a 1500-message stream. Waking only,
+/// and taking the message on resume, is asyncio.Queue.get's discipline:
+/// a cancelled receive() takes nothing, and what it was woken for stays
+/// at the front of the inbox for the next one.
+///
+/// Its waiter is resolved with None for "a message is queued", or with
+/// the final websocket.disconnect once nothing more can arrive -- a
+/// message that is safe to lose, as every later receive() repeats it.
+enum Took {
+    Value(Py<PyAny>),
+    Wait(Py<PyAny>),
+}
+
+#[pyclass(module = "cadeloop._core")]
+pub struct WsRecv {
+    core: Py<CoreLoop>,
+    tid: u64,
+    epoch: u64,
+    /// The parked waiter; `None` once the message has been handed over.
+    fut: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl WsRecv {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.resume(py)
+    }
+    #[pyo3(signature = (_value=None))]
+    fn send(&mut self, py: Python<'_>, _value: Option<Bound<'_, PyAny>>) -> PyResult<Option<Py<PyAny>>> {
+        self.resume(py)
+    }
+    /// The task was cancelled (or something else thrown in) while waiting
+    /// here: take nothing, and pass a wake this receive() will not use on
+    /// to whoever else is parked. Then raise it.
+    #[pyo3(signature = (typ, val=None, _tb=None))]
+    fn throw(
+        &mut self,
+        py: Python<'_>,
+        typ: Bound<'_, PyAny>,
+        val: Option<Bound<'_, PyAny>>,
+        _tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        self.abandon(py);
+        Err(match val {
+            Some(v) if !v.is_none() => PyErr::from_value(v),
+            _ => PyErr::from_value(typ),
+        })
+    }
+    fn close(&mut self, py: Python<'_>) {
+        self.abandon(py);
+    }
+}
+
+impl WsRecv {
+    fn resume(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        loop {
+            let Some(fut) = self.fut.as_ref().map(|f| f.clone_ref(py)) else {
+                return Err(PyRuntimeError::new_err("cannot reuse already awaited receive()"));
+            };
+            let f = fut.bind(py);
+            let done: bool = f.call_method0(intern!(py, "done"))?.extract()?;
+            if !done {
+                // Future.__await__: yield it to the task, which resumes
+                // this once it is resolved.
+                f.setattr(intern!(py, "_asyncio_future_blocking"), true)?;
+                return Ok(Some(fut));
+            }
+            // A cancelled waiter raises here, as awaiting it would.
+            let res = f.call_method0(intern!(py, "result"));
+            let res = match res {
+                Ok(r) if r.is_none() => None,
+                Ok(r) => Some(r.unbind()),
+                Err(e) => {
+                    self.fut = None;
+                    return Err(e);
+                }
+            };
+            let took = match res {
+                Some(final_msg) => Took::Value(final_msg),
+                None => self.take(py)?,
+            };
+            match took {
+                Took::Value(v) => {
+                    self.fut = None;
+                    return Err(PyErr::from_value(
+                        pyo3::exceptions::PyStopIteration::new_err((v,)).value(py).clone().into_any(),
+                    ));
+                }
+                // Woken, and the message went to another receive() first:
+                // wait again.
+                Took::Wait(pyloop) => {
+                    let core = self.core.bind(py).get();
+                    self.fut = Some(park_recv_waiter(py, core, self.tid, &pyloop, true)?);
+                }
+            }
+        }
+    }
+
+    /// The front inbox message, or the final disconnect once nothing more
+    /// can arrive; else the loop to park a fresh waiter on.
+    fn take(&self, py: Python<'_>) -> PyResult<Took> {
+        enum T {
+            Msg(WsMsg),
+            Gone,
+            Wait(Py<PyAny>),
+        }
+        let (tid, epoch) = (self.tid, self.epoch);
+        let core = self.core.bind(py).get();
+        let t = core.with_net(|net, reactor| {
+            let t = match net.http_conn_mut(tid) {
+                Some(conn) if conn.req_epoch == epoch => {
+                    let disconnected = conn.disconnected;
+                    let pyloop = conn.pyloop.clone_ref(py);
+                    match conn.ws.as_mut() {
+                        Some(ws) => match ws.inbox.pop_front() {
+                            Some(m) => {
+                                ws.inbox_bytes = ws.inbox_bytes.saturating_sub(m.charge());
+                                T::Msg(m)
+                            }
+                            None if disconnected => T::Gone,
+                            None => T::Wait(pyloop),
+                        },
+                        None => T::Gone,
+                    }
+                }
+                _ => T::Gone,
+            };
+            if matches!(t, T::Msg(_)) {
+                // A message just left the inbox, so the budget that
+                // suppressed reading may have freed up.
+                ws_resume_reading(py, net, reactor.backend_mut(), tid);
+            }
+            t
+        })?;
+        match t {
+            T::Msg(m) => Ok(Took::Value(ws_message_dict(py, m)?)),
+            T::Gone => Ok(Took::Value(ws_gone_message(py, core, tid)?)),
+            T::Wait(pyloop) => Ok(Took::Wait(pyloop)),
+        }
+    }
+
+    fn abandon(&mut self, py: Python<'_>) {
+        let Some(fut) = self.fut.take() else { return };
+        let f = fut.bind(py);
+        let done: bool = f.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
+        if !done {
+            // Not woken yet: leave no live waiter for a wake to land on.
+            let _ = f.call_method0(intern!(py, "cancel"));
+            return;
+        }
+        let cancelled: bool =
+            f.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(true);
+        let woken = !cancelled && f.call_method0(intern!(py, "result")).is_ok_and(|r| r.is_none());
+        if !woken {
+            return;
+        }
+        // Woken for a message it will now never take, which is still at
+        // the front of the inbox: wake whoever else is parked for it.
+        let tid = self.tid;
+        let _ = self.core.bind(py).get().with_net(|net, _| {
+            if let Some(conn) = net.http_conn_mut(tid) {
+                if conn.ws.as_ref().is_some_and(|w| !w.inbox.is_empty()) {
+                    for fut in conn.take_recv_waiters() {
+                        net.events.push(net::NetEvent::WsWake { tid, fut });
+                    }
+                }
+            }
+        });
     }
 }
 

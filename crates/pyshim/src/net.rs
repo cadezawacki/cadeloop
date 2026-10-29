@@ -3161,80 +3161,19 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 }
             }
             NetEvent::WsWake { tid, fut } => {
-                // Deliver ONE queued WS event to the waiter (R-087).
-                //
-                // This is the STEADY-STATE path -- an app already parked in
-                // receive() is woken here, not through HttpReceive.__call__
-                // -- so the inbox budget must be decremented here too. It
-                // was not, so inbox_bytes only ever grew: after ~4 MiB of
-                // cumulative traffic ws_ingest paused reads permanently on
-                // a connection whose application had consumed every single
-                // message.
-                let msg = core.with_net(|net, _| {
-                    let m =
-                        net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()).and_then(|w| w.inbox.pop_front());
-                    if let Some(m) = m.as_ref() {
-                        if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-                            w.inbox_bytes = w.inbox_bytes.saturating_sub(m.charge());
-                        }
-                    }
-                    m
-                })?;
-                if msg.is_some() {
-                    core.with_net(|net, reactor| {
-                        crate::http::ws_resume_reading(py, net, reactor.backend_mut(), tid);
-                    })?;
-                }
+                // Wake ONE parked WebSocket receive() (R-087). It takes the
+                // front inbox message itself once its task resumes
+                // (http::WsRecv). Popped here into the waiter's result, as
+                // it was, a receive() cancelled before its task resumed --
+                // asyncio.timeout firing in the tick the frame arrived --
+                // dropped the message along with the future.
                 let fut = fut.bind(py);
                 let done: bool =
                     fut.call_method0(intern!(py, "done")).and_then(|v| v.extract()).unwrap_or(true);
-                match (done, msg) {
-                    (false, Some(m)) => {
-                        let d = crate::http::ws_message_dict(py, m)?;
-                        let _ = fut.call_method1(intern!(py, "set_result"), (d,));
-                    }
-                    (false, None) => {
-                        // Spurious wake: park the waiter again -- while there
-                        // is still something to wait for. The wake took this
-                        // waiter out of recv_waiters, so a teardown between
-                        // queueing it and now (an app callback that ran
-                        // first, during a graceful shutdown say) could not
-                        // release it, and parking it on the gone connection
-                        // dropped it unresolved: receive() pending for good,
-                        // and its task, which asyncio holds only weakly,
-                        // destroyed by the collector while pending. Past EOF
-                        // no message can arrive either.
-                        let stored = fut.clone().unbind();
-                        let unparked = core.with_net(move |net, _| match net.http_conn_mut(tid) {
-                            Some(c) if !c.disconnected => {
-                                c.recv_waiters.push_back(stored);
-                                None
-                            }
-                            // Handed back so the reference drops out of the
-                            // cell (ADR-5).
-                            _ => Some(stored),
-                        })?;
-                        if unparked.is_some() {
-                            let msg = crate::http::ws_gone_message(py, core, tid)?;
-                            let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
-                        }
-                    }
-                    (true, Some(m)) => {
-                        // Waiter was cancelled: keep the event for the next
-                        // receive() -- and put its bytes BACK on the inbox
-                        // budget, which was debited when it was popped
-                        // above. Without this, repeated cancellable
-                        // receives drift the accounting down until real
-                        // traffic can exceed WS_MAX_INBOX with the read
-                        // pause never engaging.
-                        core.with_net(|net, _| {
-                            if let Some(w) = net.http_conn_mut(tid).and_then(|c| c.ws.as_mut()) {
-                                w.inbox_bytes = w.inbox_bytes.saturating_add(m.charge());
-                                w.inbox.push_front(m);
-                            }
-                        })?;
-                    }
-                    (true, None) => {}
+                // A cancelled receive() took nothing, so whatever the wake
+                // was for is still queued for the next one.
+                if !done {
+                    crate::http::ws_wake(py, core, tid, fut)?;
                 }
             }
             NetEvent::TlsData { tid, data } => {

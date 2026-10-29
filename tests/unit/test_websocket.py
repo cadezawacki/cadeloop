@@ -1075,3 +1075,84 @@ def test_a_receive_cancelled_before_it_runs_loses_no_message(loop):
     loop.run_until_complete(main())
     loop._core.listener_close(lid)
     assert got == [{"type": "websocket.receive", "text": "hello"}], got
+
+
+def _cancelled_after_wake_app(got, cancel_self):
+    """An app whose receive() is woken for "m1" and cancelled before its task
+    resumes -- what asyncio.timeout firing in the frame's own tick does.
+    ``cancel_self``: the cancelled receive() is the handler's own (the eager
+    driver, with eager tasks on); otherwise a Task the handler runs it in."""
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        if cancel_self:
+            me = asyncio.current_task()
+
+            async def canceller():
+                while True:
+                    w = getattr(me, "_fut_waiter", None)
+                    if w is not None and w.done():
+                        me.cancel()
+                        return
+                    await asyncio.sleep(0)
+
+            asyncio.ensure_future(canceller())
+            await send({"type": "websocket.send", "text": "ready"})
+            try:
+                got.append(("got", (await receive()).get("text")))
+            except asyncio.CancelledError:
+                got.append(("cancelled",))
+        else:
+
+            async def recv():
+                return await receive()
+
+            t = asyncio.ensure_future(recv())
+            await asyncio.sleep(0)  # t parks on its waiter
+            await send({"type": "websocket.send", "text": "ready"})
+            while not t.done():
+                w = getattr(t, "_fut_waiter", None)
+                if w is not None and w.done():
+                    break
+                await asyncio.sleep(0)
+            t.cancel()
+            try:
+                got.append(("got", (await t).get("text")))
+            except asyncio.CancelledError:
+                got.append(("cancelled",))
+        got.append((await asyncio.wait_for(receive(), 2)).get("text"))
+        await send({"type": "websocket.close"})
+
+    return app
+
+
+@pytest.mark.parametrize("cancel_self", [True, False], ids=["driver", "task"])
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_receive_cancelled_after_its_wake_loses_no_message(loop, eager, cancel_self):
+    """A receive() parked for a message was resolved WITH the message when
+    the frame arrived. Cancelled after that but before its task resumed --
+    asyncio.timeout or an anyio deadline expiring in the frame's own tick --
+    it dropped the message along with the future, and the next receive()
+    got the one after it: a receive loop under a 10 ms timeout lost ~2% of
+    a 1500-message stream. A wake now only wakes, and receive() takes the
+    message once it resumes (asyncio.Queue.get's discipline)."""
+    got = []
+    lid, port = listen(loop, _cancelled_after_wake_app(got, cancel_self), eager=eager)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        _fin, op, payload = await asyncio.wait_for(read_server_frame(reader), 5)
+        assert (op, payload) == (0x1, b"ready")
+        writer.write(client_frame(0x1, b"m1"))
+        await writer.drain()
+        await asyncio.sleep(0.3)
+        writer.write(client_frame(0x1, b"m2"))
+        await writer.drain()
+        await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert got == [("cancelled",), "m1"], got
