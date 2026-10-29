@@ -230,12 +230,19 @@ bytes of the server's process tree:
 <tbody>
 <tr><td><b>cadeloop</b> <code>serve()</code></td><td align="right">30 MiB</td><td align="right" style="background-color: #00f0d11a"><b>68 MiB</b></td><td align="right" style="background-color: #00f0d11a"><b>6.6 KiB</b></td><td align="right" style="background-color: #00f0d11a"><b>42 MiB</b></td><td align="right">1</td></tr>
 <tr><td>cadeloop 1.0.1</td><td align="right">31 MiB</td><td align="right">365 MiB</td><td align="right">54.6 KiB</td><td align="right">355 MiB</td><td align="right">1</td></tr>
-<tr><td>uvicorn + cadeloop</td><td align="right">36 MiB</td><td align="right">106 MiB</td><td align="right">11.2 KiB</td><td align="right">67 MiB</td><td align="right">2</td></tr>
+<tr><td>uvicorn + cadeloop</td><td align="right">36 MiB</td><td align="right">106 MiB</td><td align="right">11.2 KiB</td><td align="right">67 MiB</td><td align="right">1*</td></tr>
 <tr><td>uvicorn + winloop</td><td align="right">61 MiB</td><td align="right">98 MiB</td><td align="right">6.4 KiB</td><td align="right">79 MiB</td><td align="right">1</td></tr>
 <tr><td>uvicorn + asyncio</td><td align="right">25 MiB</td><td align="right">376 MiB</td><td align="right">57.9 KiB</td><td align="right">376 MiB</td><td align="right">1</td></tr>
 <tr><td>hypercorn</td><td align="right">23 MiB</td><td align="right">408 MiB</td><td align="right">63.0 KiB</td><td align="right">408 MiB</td><td align="right">1</td></tr>
 </tbody>
 </table>
+
+\* 2 in this run: cadeloop duplicated the socket that uvicorn asks every
+connection for. It now wraps the connection's own handle. Re-measured
+against this build in a later session: 1.00 handle per connection at
+1,000 and 5,000, and 11.7–12.1 KiB of private memory per connection at
+5,000 against this build's 11.2–11.3 KiB in the same session
+([follow-up A/B](docs/benchmarks-windows.md#follow-up-ab-socket-handle-and-websocket-receive-path)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-mem-dark.svg">

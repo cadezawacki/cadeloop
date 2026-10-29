@@ -237,3 +237,58 @@ current build, "cadeloop 1.0.1" the previous release.
 | uvicorn+winloop | 5000 | 6.4 KiB | 6.6 KiB | 1.00 | 79 MiB |
 | uvicorn+asyncio | 5000 | 57.9 KiB | 57.6 KiB | 1.00 | 376 MiB |
 | hypercorn+asyncio | 5000 | 63.0 KiB | 62.8 KiB | 1.00 | 408 MiB |
+
+
+## Follow-up A/B: socket handle and WebSocket receive path
+
+A later session on the same machine, comparing the build measured above
+("pass") with one that stops duplicating the socket behind
+`get_extra_info("socket")` and trims the WebSocket receive path
+("follow-up"). Data: `followup-runs.jsonl.gz` and `ab-followup.json` in
+[bench/baselines/windows-2026-10/](../bench/baselines/windows-2026-10/).
+
+cadeloop `serve()`, five rotated reps per build (median, slowest–fastest;
+p99 from the merged histograms; CPU is user + kernel per message or
+request, user alone in brackets):
+
+| workload | pass | follow-up | change | server CPU / op | p99 | peak private |
+|---|---|---|---|---|---|---|
+| WebSocket 64 B, 1 conn | 48.0 K (46.5 K–49.5 K) | 48.9 K (47.2 K–50.0 K) | +1.8% | 20.4 → 20.1 µs (4.65 → 4.80) | 51 → 52 µs | 31.1 → 30.9 MiB |
+| WebSocket 64 B, 64 conns | 77.5 K (75.8 K–78.4 K) | 78.9 K (78.3 K–80.4 K) | +1.8% | 12.8 → 12.5 µs (1.67 → 1.30) | 1.04 → 1.10 ms | 32.7 → 32.6 MiB |
+| WebSocket 16 KiB, 16 conns | 47.6 K (46.6 K–47.9 K) | 49.3 K (49.0 K–50.4 K) | +3.6% | 21.0 → 20.2 µs (6.66 → 5.82) | 512 → 496 µs | 38.0 → 37.7 MiB |
+| WebSocket stream 1 KiB, window 32, 16 conns | 408 K (401 K–413 K) | 432 K (420 K–439 K) | +5.9% | 2.43 → 2.30 µs (0.87 → 0.58) | 1.69 → 1.59 ms | 41.5 → 38.5 MiB |
+| HTTP plaintext, 64 conns | 78.1 K (77.4 K–78.7 K) | 78.1 K (77.7 K–79.0 K) | 0.0% | 12.8 → 12.7 µs | 983 → 975 µs | 33.0 → 32.9 MiB |
+| HTTP JSON, 64 conns | 58.4 K (57.8 K–58.7 K) | 58.6 K (58.5 K–58.7 K) | +0.4% | 17.1 → 17.0 µs | 1.52 → 1.51 ms | 32.9 → 32.8 MiB |
+| HTTP `/sleep` 1 ms, 64 conns | 32.4 K (31.8 K–32.6 K) | 32.1 K (30.9 K–32.4 K) | −0.6% | 14.9 → 15.3 µs | 2.59 → 2.59 ms | 32.9 → 32.7 MiB |
+
+The WebSocket gains are the user-mode CPU per message that the receive
+path no longer spends; most of each message's cost is the kernel's
+(about 11 µs of the 12.5 µs at 64 connections), which this does not
+touch. The 1-connection 64-byte case moved by less than its spread. The
+stream's lower peak comes from the frame parser no longer holding a
+buffer the size of the largest read for each connection.
+
+uvicorn on cadeloop, one build per server process, alternated three times
+each:
+
+| | pass | follow-up |
+|---|---|---|
+| handles per idle connection (1,000 / 5,000) | 2.00 / 2.00 | **1.00 / 1.00** |
+| private memory per idle connection, 5,000 held | 11.2–11.3 KiB | 11.7–12.1 KiB |
+| private memory per idle connection, 1,000 held | 19.8–20.6 KiB | 19.8–22.6 KiB |
+| plaintext, 64 conns | 18.6 K (18.5 K–18.9 K), 53.3 µs/req | 18.5 K (18.4 K–18.6 K), 54.0 µs/req |
+| churn, 16 conns | 9.04 K (8.99 K–9.11 K), 110 µs/req | 8.78 K (8.77 K–8.80 K), 113 µs/req |
+
+The churn workload is 2.9% slower, and that is the close, not the
+handle. Churn asks for `Connection: close` and the client then aborts its
+end with a reset. With the duplicate, uvicorn's `transport.close()` did
+not end the connection: the duplicate still held it until it was closed
+after `connection_lost`, a loop pass later, so the client's reset usually
+arrived first and the server never sent a FIN. Now the FIN leaves when
+the transport closes, as it always did for cadeloop transports nobody
+asked the socket of, and the server pays for that exchange. The TCP
+counters show it: connections reset from ESTABLISHED went from two per
+connection to one (only the client's side now). The private memory per
+idle connection at 5,000 is 0.4–0.9 KiB higher in the follow-up runs;
+the change adds no Python objects or allocations per connection, and the
+difference is not explained.

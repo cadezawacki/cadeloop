@@ -3,3 +3,4 @@ cand2: rev=5285fdc dirty=True sha256=da735aceda98ec899944ee62a764147127f56b35c68
 cand3: rev=5285fdc dirty=True sha256=3f6e1e37ca10d723b5905a9c6dbc7d32fef37f7d2f5a343c434af51403b31a82
 cand4: rev=5285fdc dirty=True sha256=4be886a4fe45df4b0abc9fd55648c8164b1f94944b291a33d97cebcb25dea578
 final: rev=5285fdc dirty=True sha256=0a914e332f65709d800c139f73bd04dd1a15824ad2e3372025eb208659e3bce5
+followup: rev=f55d784 + the follow-up changes (two comments edited after the build) sha256=b8a489c46e2cc0b39afc73d69a4c61dcc9bb2929088aeb6acd3c1808c97c2057

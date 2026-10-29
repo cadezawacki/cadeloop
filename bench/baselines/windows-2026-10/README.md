@@ -12,6 +12,7 @@ Machine, software and method: [docs/benchmarks.md](../../../docs/benchmarks.md#w
 | `timers.json` | `bench/windows/latency.py`: sleep overshoot and cross-thread wakeup latency |
 | `sched.json`, `sched-1.0.1.json` | `bench/harness/harness.py --suite sched` for the final build and contenders, and for 1.0.1 |
 | `builds.txt` | sha256 of each `_core.pyd` measured |
+| `followup-runs.jsonl.gz`, `ab-followup.json` | The follow-up A/B (the pass's final build against the build that stops duplicating the socket behind `get_extra_info("socket")` and trims the WebSocket receive path), every run and the aggregated rows; each run carries `build` (`pass` or `follow-up`) |
 
 Rows come from four sessions on one machine with the same configuration:
 the contender comparison (every third-party server, and cadeloop 1.0.1),
@@ -20,6 +21,13 @@ uvicorn on cadeloop with the final build. cadeloop 1.0.1 ran in every
 session as a control; its plaintext throughput was 73.7 K, 74.3 K, 74.8 K
 and 73.4 K req/s (median of three each), so the sessions are comparable.
 The scheduling runs and the timer runs used the final build.
+
+The follow-up A/B is a fifth session on the same machine: cadeloop's own
+server on both builds in five rotated reps (WebSocket workloads and three
+HTTP guards), then uvicorn on cadeloop, one build per server process,
+alternated three times each. The tables and charts above do not use it;
+[docs/benchmarks-windows.md](../../../docs/benchmarks-windows.md#follow-up-ab-socket-handle-and-websocket-receive-path)
+does.
 
 Recreate the tables and charts:
 
