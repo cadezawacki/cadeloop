@@ -912,10 +912,18 @@ def _finalize_loop(loop, budget: float) -> None:
     budget = max(budget, 0.25)  # even at grace=0, one pass to run cleanup that does not await
     try:
         tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
-        if tasks:
+        # The eager engine runs a request without an asyncio Task (R-056),
+        # so all_tasks() never lists it: a handler still awaiting here was
+        # never cancelled, its cleanup never ran, and close() then dropped
+        # it mid-await. Its driver is cancelled with the tasks.
+        drivers = loop._core.http_request_drivers()
+        if tasks or drivers:
             for task in tasks:
                 task.cancel()
-            loop.run_until_complete(asyncio.wait(tasks, timeout=budget))
+            for driver in drivers:
+                driver.cancel()
+            finished = [_when_finished(loop, driver) for driver in drivers]
+            loop.run_until_complete(asyncio.wait(tasks + finished, timeout=budget))
             for task in tasks:
                 if task.done() and not task.cancelled() and task.exception() is not None:
                     loop.call_exception_handler(
@@ -925,7 +933,7 @@ def _finalize_loop(loop, budget: float) -> None:
                             "task": task,
                         }
                     )
-            pending = sum(not t.done() for t in tasks)
+            pending = sum(not t.done() for t in tasks) + sum(not d.done() for d in drivers)
             if pending:
                 logger.warning("cadeloop: %d task(s) still running after cancellation", pending)
         loop.run_until_complete(loop.shutdown_asyncgens())
@@ -934,6 +942,19 @@ def _finalize_loop(loop, budget: float) -> None:
         # A forced exit stopped the loop under us, or the executor would
         # not finish in time: close anyway.
         logger.debug("cadeloop: loop finalization cut short: %r", exc)
+
+
+def _when_finished(loop, driver):
+    """A future resolved when an eager request driver finishes: the driver
+    is not an asyncio Future, so asyncio.wait() cannot take it as is."""
+    fut = loop.create_future()
+
+    def finished(_driver):
+        if not fut.done():
+            fut.set_result(None)
+
+    driver.add_done_callback(finished)
+    return fut
 
 
 def _start_stats_endpoint(loop, port: int, worker_id):

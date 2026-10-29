@@ -3364,6 +3364,21 @@ impl AppTask {
                             let wake = slf.getattr(intern!(py, "_wake"))?;
                             y.call_method1(intern!(py, "add_done_callback"), (wake,))?;
                             slf.borrow_mut().waiting_on = Some(yielded.clone_ref(py));
+                            // A cancel() that arrived while this step ran
+                            // could only latch must_cancel (nothing was
+                            // awaited yet). Task.__step applies it to the
+                            // future just awaited; left latched, it waited
+                            // for that future to finish by itself -- for
+                            // ever, for one that never does.
+                            if slf.borrow().must_cancel {
+                                let cancelled: bool = y
+                                    .call_method0(intern!(py, "cancel"))
+                                    .and_then(|v| v.extract())
+                                    .unwrap_or(false);
+                                if cancelled {
+                                    slf.borrow_mut().must_cancel = false;
+                                }
+                            }
                             return Ok(StepOutcome::Suspended);
                         }
                         _ => {
@@ -3397,8 +3412,19 @@ impl AppTask {
             on_coro_finished(py, core, tid)?;
         }
         drop_driver(py, core, tid)?;
-        // Pump pipelined requests that queued while this one ran (R-085).
-        pump_requests(py, core_bound, tid)
+        // Pump pipelined requests that queued while this one ran (R-085)
+        // -- from the event phase, not from here. This runs inside
+        // `_wake`, in a copy of the finished request's own context, and
+        // AppTask::spawn copies whatever context is current: pumping here
+        // started the next request with every contextvar the previous one
+        // had set (a user, a tenant, a DB session). The event phase runs
+        // in the loop's own context, as the first request on a
+        // connection always has.
+        core.with_net(|net, _| {
+            if net.http_conn_mut(tid).is_some_and(|c| !c.active && !c.pending.is_empty()) {
+                net.events.push(net::NetEvent::HttpPump { tid });
+            }
+        })
     }
 }
 
@@ -3417,7 +3443,12 @@ impl HttpTaskDone {
         let cancelled: bool =
             task.call_method0(intern!(py, "cancelled")).and_then(|v| v.extract()).unwrap_or(false);
         if cancelled {
-            app_failure(py, core, self.tid, PyRuntimeError::new_err("ASGI application task cancelled"))?;
+            // As a CancelledError, which app_failure treats as the request
+            // being abandoned -- exactly what the eager driver reports. A
+            // RuntimeError here logged every cancelled request (each one
+            // still in flight at a graceful shutdown's deadline, say) as
+            // an exception in the application.
+            app_failure(py, core, self.tid, cancelled_error(py))?;
         } else {
             let exc = task.call_method0(intern!(py, "exception"))?;
             if exc.is_none() {

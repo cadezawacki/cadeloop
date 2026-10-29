@@ -2922,3 +2922,149 @@ def test_a_parked_parse_error_still_sees_the_client_leave(loop):
     loop.run_until_complete(main())
     loop._core.listener_close(lid)
     assert seen == ["http.disconnect"], seen
+
+
+def test_a_cancel_requested_while_the_handler_runs_cancels_its_next_await(loop):
+    """A cancel() that reaches the eager driver while the handler is
+    running can only be latched -- nothing is awaited yet. asyncio's Task
+    applies it to the next future awaited; the driver waited for that
+    future to finish by itself instead (for ever, for one that never
+    does)."""
+    seen = []
+
+    async def app(scope, receive, send):
+        await receive()
+        lp = asyncio.get_running_loop()
+        never = asyncio.Event()
+        lp.call_later(2, never.set)  # the latch only fired when this did
+        t0 = lp.time()
+        asyncio.current_task().cancel()
+        try:
+            await never.wait()
+            seen.append("not cancelled")
+        except asyncio.CancelledError:
+            seen.append(lp.time() - t0)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    loop._core.listener_close(lid)
+    assert len(seen) == 1 and seen[0] != "not cancelled" and seen[0] < 1.0, seen
+
+
+def test_contextvar_isolation_pipelined_requests(loop):
+    """A request pipelined behind one that suspended started with every
+    contextvar that one had set: the eager driver pumped it from inside
+    the finished request's own wakeup, and copied its context from there."""
+    import contextvars
+
+    cv = contextvars.ContextVar("cadeloop_test_cv3", default=None)
+
+    async def cv_app(scope, receive, send):
+        await receive()
+        seen_before = cv.get()
+        cv.set(scope["path"])
+        await asyncio.sleep(0)
+        body = json.dumps({"seen_before": seen_before}).encode()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, cv_app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        out = [await asyncio.wait_for(_read_one_response(reader), 5) for _ in range(2)]
+        writer.close()
+        return out
+
+    first, second = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert json.loads(_body(first)) == {"seen_before": None}
+    assert json.loads(_body(second)) == {"seen_before": None}, _body(second)
+
+
+def test_a_cancelled_non_eager_request_is_not_an_application_error(loop):
+    """With eager_tasks off, a request task that was cancelled -- one still
+    in flight when a graceful shutdown's deadline passes, say -- was
+    reported as "Exception in ASGI application: RuntimeError: ASGI
+    application task cancelled". A cancellation is how a request is
+    abandoned, as the eager driver already treats it."""
+    reports = []
+    loop.set_exception_handler(lambda _loop, ctx: reports.append(ctx.get("message")))
+    tasks = []
+
+    async def app(scope, receive, send):
+        await receive()
+        tasks.append(asyncio.current_task())
+        await asyncio.sleep(3600)
+
+    lid, port = listen(loop, app, eager=False)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        for _ in range(500):
+            if tasks:
+                break
+            await asyncio.sleep(0.01)
+        tasks[0].cancel()
+        data = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        return data
+
+    data = loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert data.startswith(b"HTTP/1.1 500"), data[:40]
+    assert not [r for r in reports if "Exception in ASGI application" in str(r)], reports
+
+
+def test_close_cancels_what_is_parked_on_a_connection(loop):
+    """loop.close() tore native connections down and dropped what was
+    parked on them pending: receive()/send() waiters were never resolved,
+    and an eager handler's coroutine was never finalized -- it and the
+    future it awaited kept each other alive in a cycle the collector
+    cannot see. Both are cancelled first now."""
+    import gc
+    import weakref
+
+    refs, ran, waiters, holders = {}, [], [], []
+    parked = asyncio.Event()
+
+    async def app(scope, receive, send):
+        await receive()
+
+        async def listener():
+            waiter = receive()  # parks: the body was already delivered
+            waiters.append(waiter)
+            await waiter
+
+        holders.append(asyncio.ensure_future(listener()))
+        await asyncio.sleep(0)  # the listener parks
+        refs["coro"] = weakref.ref(asyncio.current_task().get_coro())
+        parked.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            ran.append("finally")
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(parked.wait(), 5)
+        return writer
+
+    writer = loop.run_until_complete(main())
+    loop.set_exception_handler(lambda _loop, _ctx: None)
+    loop._core.listener_close(lid)
+    loop.close()
+    gc.collect()
+    writer.close()
+    assert waiters and waiters[0].cancelled(), waiters
+    assert ran == ["finally"] and refs["coro"]() is None, (ran, refs["coro"]())

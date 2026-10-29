@@ -801,6 +801,20 @@ impl CoreLoop {
         if self.state.is_claimed() {
             return Err(PyRuntimeError::new_err("Cannot close a running event loop"));
         }
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Cancel what is still parked on a native HTTP connection before the
+        // teardown below drops it pending (net::http_parked). Done while the
+        // loop is open, so each one's callbacks are queued as usual -- and
+        // released below, unrun, with the rest of the pending work. That is
+        // what lets a parked handler's coroutine be finalized: dropped as
+        // it was, it and the future it awaited kept each other alive.
+        let parked = self.state.with(|st| net::http_parked(py, &st.net))?;
+        for p in &parked {
+            let _ = p.call_method0(py, intern!(py, "cancel"));
+        }
+        drop(parked);
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -1396,6 +1410,14 @@ impl CoreLoop {
         let busy = self.with_net(|net, reactor| net::http_begin_shutdown(py, net, reactor.backend_mut()))?;
         self.drain_graveyards(py)?;
         Ok(busy)
+    }
+
+    /// Graceful shutdown, last phase (R-092): the eager request drivers
+    /// still in flight, which the facade cancels along with the tasks the
+    /// application left running (`asyncio.all_tasks()` does not list them).
+    /// Each has `cancel()`, `done()` and `add_done_callback()`.
+    fn http_request_drivers(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.with_net(|net, _| net::http_request_drivers(py, net))
     }
 
     /// R-060 latency mode: when set, HTTP response bytes go on the wire

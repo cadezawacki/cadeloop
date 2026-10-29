@@ -1887,6 +1887,47 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
     busy
 }
 
+/// Graceful shutdown, last phase: the eager request drivers (AppTasks)
+/// still in flight, for the caller to cancel with the tasks the
+/// application left running. They are not asyncio Tasks, so the
+/// `asyncio.all_tasks()` sweep that does that never saw them: a handler
+/// still awaiting at the deadline was never cancelled, and its cleanup
+/// never ran. In-cell; clones only.
+pub(crate) fn http_request_drivers(py: Python<'_>, net: &NetState) -> Vec<Py<PyAny>> {
+    net.transports
+        .values()
+        .filter_map(|e| match &e.proto {
+            ProtoKind::Http(conn) => conn.driver.as_ref().map(|d| d.clone_ref(py).into_any()),
+            ProtoKind::Py(_) => None,
+        })
+        .collect()
+}
+
+/// Everything still parked on a native HTTP connection -- its eager
+/// driver, its receive()/send() waiters, and waiters already taken into
+/// events that will now never be dispatched -- for `CoreLoop::close` to
+/// cancel before the teardown drops it. Dropped pending, a driver and the
+/// future it awaited kept each other alive through a cycle the collector
+/// cannot see (AppTask is opaque to it), so the handler's coroutine was
+/// never finalized. In-cell; clones only.
+pub(crate) fn http_parked(py: Python<'_>, net: &NetState) -> Vec<Py<PyAny>> {
+    let mut parked = http_request_drivers(py, net);
+    for e in net.transports.values() {
+        if let ProtoKind::Http(conn) = &e.proto {
+            parked.extend(conn.recv_waiters.iter().chain(&conn.drain_waiters).map(|f| f.clone_ref(py)));
+        }
+    }
+    for ev in &net.events {
+        if let NetEvent::HttpDisconnect { fut, .. }
+        | NetEvent::HttpDrained { fut }
+        | NetEvent::WsWake { fut, .. } = ev
+        {
+            parked.push(fut.clone_ref(py));
+        }
+    }
+    parked
+}
+
 /// Mark a native HTTP connection to close once its write queue drains
 /// (`connection: close`, parse errors, app failures). In-cell.
 pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
