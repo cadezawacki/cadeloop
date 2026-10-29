@@ -52,6 +52,79 @@ impl SizeClass {
     pub fn slots_per_region(self) -> usize {
         REGION_SIZE / self.size()
     }
+
+    /// The class for a connection's next receive buffer, after a read
+    /// returned `bytes` into one of this class. A full buffer grows it a
+    /// class (more may be waiting). Only a read far below the current size
+    /// shrinks it, and never one that `follows_full` -- the previous read
+    /// filled its buffer, so this one is the tail of a larger message: a
+    /// 16.5 KB request filled 16 KiB, grew the buffer, then shrank it to
+    /// 4 KiB on its 100-byte tail, and every request took three reads.
+    /// An idle connection still settles on the smallest.
+    pub fn after_read(self, bytes: usize, follows_full: bool) -> SizeClass {
+        if bytes >= self.size() {
+            return match self {
+                SizeClass::S4K => SizeClass::S16K,
+                _ => SizeClass::S64K,
+            };
+        }
+        if follows_full {
+            return self;
+        }
+        if bytes <= 1024 {
+            return SizeClass::S4K;
+        }
+        if self == SizeClass::S64K && bytes <= 4096 {
+            return SizeClass::S16K;
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod after_read_tests {
+    use super::SizeClass::{self, S16K, S4K, S64K};
+
+    #[test]
+    fn full_reads_grow_one_class_at_a_time() {
+        assert_eq!(S4K.after_read(4096, false), S16K);
+        assert_eq!(S16K.after_read(16384, true), S64K);
+        assert_eq!(S64K.after_read(65536, true), S64K);
+    }
+
+    #[test]
+    fn small_reads_settle_on_the_smallest_and_tails_do_not_flap() {
+        assert_eq!(S64K.after_read(300, false), S4K, "an idle keep-alive request");
+        assert_eq!(S64K.after_read(3000, false), S16K);
+        assert_eq!(S64K.after_read(20_000, false), S64K, "a bulk stream's short read keeps 64K");
+        assert_eq!(S16K.after_read(5000, false), S16K);
+        assert_eq!(S4K.after_read(2000, false), S4K);
+        let mut c = SizeClass::S4K;
+        for _ in 0..3 {
+            c = c.after_read(c.size(), true);
+        }
+        assert_eq!(c, S64K, "a bulk transfer reaches 64 KiB reads after two full ones");
+    }
+
+    #[test]
+    fn a_messages_tail_does_not_shrink_the_buffer_it_grew() {
+        // A 16.5 KB request per round trip: one read per request once
+        // settled, not a grow/shrink cycle of three.
+        let (mut c, mut full, mut reads) = (S4K, false, 0);
+        for _ in 0..10 {
+            let mut left = 16_500usize;
+            while left > 0 {
+                let got = left.min(c.size());
+                left -= got;
+                reads += 1;
+                let filled = got >= c.size();
+                c = c.after_read(got, full);
+                full = filled;
+            }
+        }
+        assert_eq!(c, S64K);
+        assert!(reads <= 10 + 3, "{reads} reads for 10 requests");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,6 +157,15 @@ struct Region {
     /// Filled by the RIO backend after RIORegisterBuffer (opaque here).
     pub rio_buffer_id: Option<u64>,
     large_pages: bool,
+}
+
+impl Region {
+    /// May its free slots be paged out? Not once RIO has registered it
+    /// (the kernel holds its pages), nor large pages (not decommittable
+    /// piecewise).
+    fn pageable(&self) -> bool {
+        self.rio_buffer_id.is_none() && !self.large_pages
+    }
 }
 
 // Thread-affine by contract (loop thread only); pointers make this !Send by
@@ -184,13 +266,19 @@ impl Drop for Region {
 /// or faults anything back in; 256 64 KiB slots is 16 MiB.
 pub const RESIDENT_FREE_SLOTS: usize = 256;
 
-/// Whether `page_out` actually returns memory on this platform. Windows
-/// keeps every page: RIO registers whole regions with the kernel, and its
-/// discard primitives cannot be exercised on this platform's test hosts.
-const PAGES_OUT: bool = cfg!(target_os = "linux");
+/// Whether `page_out` actually returns memory on this platform.
+///
+/// On Windows a region is committed whole, so a slot is private memory
+/// (commit charge) whether or not it is in use, and a pool that never
+/// decommitted held its peak for good: 5,000 idle connections closing left
+/// 256 MiB committed. Regions RIO has registered with the kernel, and
+/// large-page regions (which cannot be decommitted piecewise), keep every
+/// page (`Region::pageable`).
+const PAGES_OUT: bool = cfg!(any(target_os = "linux", windows));
 
-/// Hand a free slot's pages back to the OS; they read as zero when next
-/// touched. Returns whether it did.
+/// Hand a free slot's pages back to the OS. On Linux they read as zero
+/// when next touched; on Windows they are decommitted and `page_in` must
+/// recommit them before the slot is used again. Returns whether it did.
 fn page_out(ptr: *mut u8, len: usize) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -199,10 +287,34 @@ fn page_out(ptr: *mut u8, len: usize) -> bool {
         // handed out again.
         unsafe { libc::madvise(ptr.cast(), len, libc::MADV_DONTNEED) == 0 }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_DECOMMIT};
+        // SAFETY: a whole free slot (page-aligned: slots are 4 KiB
+        // multiples in a 64 KiB-aligned region) that nothing references
+        // until `acquire` hands it out again, recommitting it first.
+        unsafe { VirtualFree(ptr.cast(), len, MEM_DECOMMIT) != 0 }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (ptr, len);
         false
+    }
+}
+
+/// Make a paged-out slot usable again (Windows: recommit it; elsewhere its
+/// pages fault back in on their own).
+fn page_in(ptr: *mut u8, len: usize) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        let p = unsafe { VirtualAlloc(ptr.cast(), len, MEM_COMMIT, PAGE_READWRITE) };
+        // The same failure Region::alloc treats as fatal: no commit left.
+        assert!(!p.is_null(), "VirtualAlloc(MEM_COMMIT, {len}) of a buffer slot failed");
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (ptr, len);
     }
 }
 
@@ -266,6 +378,10 @@ impl ClassPool {
         self.refcounts.get(i).is_some_and(|&rc| rc > 0) && self.generations.get(i) == Some(&id.generation)
     }
 
+    fn pageable(&self, index: u32) -> bool {
+        self.regions[index as usize / self.class.slots_per_region()].pageable()
+    }
+
     fn slot_ptr(&self, index: u32) -> *mut u8 {
         let per = self.class.slots_per_region();
         let region = &self.regions[index as usize / per];
@@ -321,7 +437,9 @@ impl BufferPool {
         }
         let index = pool.freelist.pop_back().expect("freelist refilled by grow");
         debug_assert_eq!(pool.refcounts[index as usize], 0, "acquired slot has live refs");
-        if !std::mem::take(&mut pool.paged_out[index as usize]) {
+        if std::mem::take(&mut pool.paged_out[index as usize]) {
+            page_in(pool.slot_ptr(index), class.size());
+        } else {
             pool.resident_free -= 1;
         }
         pool.refcounts[index as usize] = 1;
@@ -370,7 +488,11 @@ impl BufferPool {
         // Recycled: every id handed out for this slot is now stale.
         pool.generations[id.index as usize] = pool.generations[id.index as usize].wrapping_add(1);
         pool.in_use -= 1;
-        if PAGES_OUT && pool.resident_free >= RESIDENT_FREE_SLOTS && page_out(pool.slot_ptr(id.index), size) {
+        if PAGES_OUT
+            && pool.resident_free >= RESIDENT_FREE_SLOTS
+            && pool.pageable(id.index)
+            && page_out(pool.slot_ptr(id.index), size)
+        {
             pool.paged_out[id.index as usize] = true;
             pool.freelist.push_front(id.index);
         } else {
@@ -403,6 +525,23 @@ impl BufferPool {
     /// Buffers currently held (for `loop.stats()`, R-103).
     pub fn in_use(&self) -> usize {
         self.classes.iter().map(|c| c.in_use).sum()
+    }
+
+    /// Bytes of the buffers currently held.
+    pub fn bytes_in_use(&self) -> usize {
+        self.classes.iter().map(|c| c.in_use * c.class.size()).sum()
+    }
+
+    /// Bytes the pool keeps from the OS: its regions, less the free slots
+    /// paged out (see `PAGES_OUT`). On Windows, its commit charge.
+    pub fn bytes_held(&self) -> usize {
+        self.classes
+            .iter()
+            .map(|c| {
+                (c.regions.len() * REGION_SIZE)
+                    .saturating_sub((c.freelist.len() - c.resident_free) * c.class.size())
+            })
+            .sum()
     }
 
     /// `retain`/`release` calls refused because the `SlotId` was stale or
@@ -501,6 +640,39 @@ mod tests {
         let paged_out = c.freelist.iter().filter(|&&i| c.paged_out[i as usize]).count();
         assert_eq!(c.resident_free + paged_out, c.freelist.len());
         assert!(c.freelist.iter().all(|&i| c.refcounts[i as usize] == 0));
+    }
+
+    /// Windows: slots released past the warm set are decommitted -- the
+    /// pool's commit charge falls -- and a decommitted slot handed out
+    /// again is recommitted before use (a write to it would fault if not).
+    #[cfg(windows)]
+    #[test]
+    fn released_slots_are_decommitted_and_recommitted_on_reuse() {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+        let state = |ptr: *mut u8| {
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            unsafe { VirtualQuery(ptr.cast(), &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+            m.State
+        };
+        let mut p = BufferPool::new();
+        let n = RESIDENT_FREE_SLOTS * 2;
+        let ids: Vec<SlotId> = (0..n).map(|_| p.acquire(SizeClass::S16K)).collect();
+        let held = p.bytes_held();
+        let ptrs: Vec<*mut u8> = ids.iter().map(|&id| p.slot_ptr(id)).collect();
+        for &id in &ids {
+            p.release(id);
+        }
+        assert_eq!(held - p.bytes_held(), RESIDENT_FREE_SLOTS * SizeClass::S16K.size(), "past the warm set");
+        let decommitted = ptrs.iter().filter(|&&q| state(q) != MEM_COMMIT).count();
+        assert_eq!(decommitted, RESIDENT_FREE_SLOTS);
+        let again: Vec<SlotId> = (0..n).map(|_| p.acquire(SizeClass::S16K)).collect();
+        for &id in &again {
+            unsafe { std::ptr::write_bytes(p.slot_ptr(id), 0xAB, SizeClass::S16K.size()) };
+        }
+        assert_eq!(p.bytes_held(), held);
+        for id in again {
+            p.release(id);
+        }
     }
 
     #[test]

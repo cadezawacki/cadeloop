@@ -80,6 +80,9 @@ pub struct Stats {
     /// possible completion source (has_io_interest() == false).
     pub polls_elided: u64,
     pub polls: u64,
+    /// Parks bounded by a timer's deadline that used the backend's precise
+    /// wait (IOCP: the high-resolution park timer).
+    pub precise_parks: u64,
 }
 
 pub struct Reactor<T> {
@@ -111,6 +114,9 @@ pub struct Reactor<T> {
     /// Timers that expired this tick, in deadline order, until the binding
     /// layer takes them behind the ready batch (`take_expired`).
     expired: VecDeque<T>,
+    /// The last `poll_timeout` ends at a timer's deadline (not the idle
+    /// clamp): the park should end on time (`IoBackend::poll_precise`).
+    deadline_bound: bool,
 }
 
 impl<T: TimerPayload> Reactor<T> {
@@ -133,6 +139,7 @@ impl<T: TimerPayload> Reactor<T> {
             ready_snapshot: 0,
             spare: VecDeque::with_capacity(INITIAL_BATCH_CAPACITY),
             expired: VecDeque::new(),
+            deadline_bound: false,
         })
     }
 
@@ -330,6 +337,7 @@ impl<T: TimerPayload> Reactor<T> {
     /// R-030: 0 when ready callbacks or expired timers are pending; else
     /// time to the next timer deadline; clamped to [0, 100ms].
     pub fn poll_timeout(&mut self) -> Duration {
+        self.deadline_bound = false;
         if !self.ready.is_empty() || !self.expired.is_empty() {
             return Duration::ZERO;
         }
@@ -339,7 +347,11 @@ impl<T: TimerPayload> Reactor<T> {
                 if d <= now {
                     Duration::ZERO
                 } else {
-                    Duration::from_nanos(d - now).min(MAX_PARK)
+                    let left = Duration::from_nanos(d - now);
+                    // Past the clamp, the park is an idle one: the timer is
+                    // met by a later park that does end at its deadline.
+                    self.deadline_bound = left <= MAX_PARK;
+                    left.min(MAX_PARK)
                 }
             }
             None => MAX_PARK,
@@ -387,6 +399,7 @@ impl<T: TimerPayload> Reactor<T> {
             return Ok(());
         }
         self.stats.polls += 1;
+        let mut timeout = timeout;
         if self.cfg.spin_us > 0 {
             let spin_budget = Duration::from_micros(self.cfg.spin_us).min(timeout);
             let spin_start = std::time::Instant::now();
@@ -397,8 +410,15 @@ impl<T: TimerPayload> Reactor<T> {
                 }
                 std::hint::spin_loop();
             }
+            // The spin was part of the wait: a park that ends on time must
+            // not add it again.
+            timeout = timeout.saturating_sub(spin_start.elapsed());
         }
-        self.backend.poll(&mut self.completions, Some(timeout))?;
+        let precise = self.deadline_bound && self.backend.precise_parks();
+        if precise {
+            self.stats.precise_parks += 1;
+        }
+        self.backend.poll_precise(&mut self.completions, Some(timeout), self.deadline_bound)?;
         self.last_poll_ns = self.clock.now_uncached();
         Ok(())
     }

@@ -25,9 +25,10 @@ work unmodified.
 For an even faster performance boost, skip the Python HTTP stack entirely.
 `cadeloop.serve()` parses HTTP, builds the ASGI scope, and serializes responses
 **in Rust**. Your `async def app(scope, receive, send)` is the only Python left
-on the request path — which is why it serves **3.8× a tuned uvicorn**
-(httptools + uvloop), **2.4× granian**, and **15.2× uvicorn + h11 on stdlib
-asyncio**.
+on the request path — which is why, on Windows, it serves **4.3× uvicorn on
+winloop** and **7.2× uvicorn on stdlib asyncio** at a quarter or less of their
+CPU per request, and on Linux **3.8× a tuned uvicorn** (httptools + uvloop) and
+**2.4× granian** ([benchmarks](#benchmarks)).
 
 ---
 
@@ -36,6 +37,8 @@ asyncio**.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Benchmarks](#benchmarks)
+  - [Windows 11 (IOCP)](#windows-11-iocp)
+  - [Linux (epoll dev backend)](#linux-epoll-dev-backend)
 - [Usage guide](#usage-guide)
   - [1. As a drop-in event loop](#1-as-a-drop-in-event-loop)
   - [2. As an ASGI server](#2-as-an-asgi-server-cadeloopserve)
@@ -128,15 +131,295 @@ if __name__ == "__main__":
 
 ## Benchmarks
 
+Two platforms, measured separately. **Windows** is the production target
+(IOCP backend); **Linux** runs the `epoll` development backend. Both are
+loopback runs with the load generator on the same machine: they compare
+servers under identical conditions, they are not capacity numbers.
+
+Methodology, harnesses, raw data and the measurement traps we hit along the
+way: [docs/benchmarks.md](docs/benchmarks.md) and
+[bench/windows/](bench/windows/README.md). Every Windows number below, with
+all columns: [docs/benchmarks-windows.md](docs/benchmarks-windows.md).
+
+### Windows 11 (IOCP)
+
+Windows 11 Home 10.0.26200, Intel Core Ultra 7 265K (20 cores, 32 GB),
+CPython 3.11.9; the host's VPN client and ad blocker (both filter network
+traffic) stopped for every run, and its antivirus protection paused for the
+comparison session. Load comes from
+[`bench/loadgen`](bench/loadgen/), a native Go generator that validates
+every response. Every server runs the same ASGI app
+([`bench/windows/app.py`](bench/windows/app.py)) as one worker; each cell
+is three runs, each against a fresh server, with the order of servers
+rotated; the median run is shown, and percentiles come from all three runs'
+merged latency histograms. **No cell below had a failed request.**
+
+#### HTTP / ASGI
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-dark.svg">
+  <img alt="Windows HTTP requests per second by workload: cadeloop serve() leads every workload, 1.6 to 4.8 times uvicorn on winloop" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http.svg">
+</picture>
+
+Requests per second, 64 keep-alive connections unless noted:
+
+<table>
+<thead><tr><th>workload</th><th align="right">cadeloop <code>serve()</code></th><th align="right">uvicorn + cadeloop</th><th align="right">uvicorn + winloop</th><th align="right">uvicorn + asyncio</th><th align="right">hypercorn</th></tr></thead>
+<tbody>
+<tr><td>plaintext</td><td align="right" style="background-color: #00f0d11a"><b>78.0 K</b></td><td align="right">18.4 K</td><td align="right">18.0 K</td><td align="right">10.8 K</td><td align="right">7.6 K</td></tr>
+<tr><td>plaintext, 1 connection</td><td align="right" style="background-color: #00f0d11a"><b>47.2 K</b></td><td align="right">13.1 K</td><td align="right">10.9 K</td><td align="right">7.7 K</td><td align="right">5.8 K</td></tr>
+<tr><td>JSON</td><td align="right" style="background-color: #00f0d11a"><b>57.8 K</b></td><td align="right">16.0 K</td><td align="right">15.9 K</td><td align="right">10.0 K</td><td align="right">7.0 K</td></tr>
+<tr><td>64 KiB body</td><td align="right" style="background-color: #00f0d11a"><b>41.2 K</b></td><td align="right">14.5 K</td><td align="right">14.9 K</td><td align="right">8.9 K</td><td align="right">6.4 K</td></tr>
+<tr><td>1 MiB stream (16 conns)</td><td align="right" style="background-color: #00f0d11a"><b>3.3 K</b></td><td align="right">2.0 K</td><td align="right">2.0 K</td><td align="right">1.1 K</td><td align="right">858</td></tr>
+<tr><td>16 KiB upload</td><td align="right" style="background-color: #00f0d11a"><b>61.1 K</b></td><td align="right">13.0 K</td><td align="right">12.8 K</td><td align="right">9.1 K</td><td align="right">6.2 K</td></tr>
+<tr><td>1 ms await</td><td align="right" style="background-color: #00f0d11a"><b>31.6 K</b></td><td align="right">17.4 K</td><td align="right">10.9 K</td><td align="right">10.1 K</td><td align="right">7.0 K</td></tr>
+<tr><td>conn per request (16)</td><td align="right" style="background-color: #00f0d11a"><b>24.1 K</b></td><td align="right">8.6 K</td><td align="right">9.2 K</td><td align="right">4.7 K</td><td align="right">2.9 K</td></tr>
+<tr><td>pipelined ×16</td><td align="right" style="background-color: #00f0d11a"><b>553 K</b></td><td align="right">17.5 K</td><td align="right">17.6 K</td><td align="right">13.2 K</td><td align="right">7.7 K</td></tr>
+</tbody>
+</table>
+
+uvicorn runs its h11 parser (httptools is not installed here) with
+wsproto; hypercorn runs on stdlib asyncio. The `1 ms await` app awaits
+`asyncio.sleep(0.001)` before answering; `conn per request` opens a new
+connection for every request; `pipelined ×16` writes 16 requests per round
+trip, which strips out per-round-trip kernel costs and shows the engine
+itself.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-cpu-dark.svg">
+  <img alt="Server CPU per request: cadeloop 12.8 us on plaintext vs 55 us for uvicorn on winloop and 92 us on stdlib asyncio" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-cpu.svg">
+</picture>
+
+Plaintext, 64 connections, in detail — server CPU is user + kernel time of
+the server's whole process tree per successful request:
+
+<table>
+<thead><tr><th>server</th><th align="right">req/s</th><th align="right">p50</th><th align="right">p99</th><th align="right">p99.9</th><th align="right">CPU / request</th><th align="right">peak memory</th><th align="right">threads</th></tr></thead>
+<tbody>
+<tr><td><b>cadeloop</b> <code>serve()</code></td><td align="right" style="background-color: #00f0d11a"><b>78.0 K</b></td><td align="right" style="background-color: #00f0d11a"><b>819 µs</b></td><td align="right" style="background-color: #00f0d11a"><b>991 µs</b></td><td align="right" style="background-color: #00f0d11a"><b>1.75 ms</b></td><td align="right" style="background-color: #00f0d11a"><b>12.8 µs</b></td><td align="right" style="background-color: #00f0d11a"><b>33 MiB</b></td><td align="right">5</td></tr>
+<tr><td>cadeloop 1.0.1</td><td align="right">73.7 K</td><td align="right">860 µs</td><td align="right">1.06 ms</td><td align="right">1.57 ms</td><td align="right">13.5 µs</td><td align="right">35 MiB</td><td align="right">5</td></tr>
+<tr><td>uvicorn + cadeloop</td><td align="right">18.4 K</td><td align="right">3.38 ms</td><td align="right">5.05 ms</td><td align="right">5.77 ms</td><td align="right">54.1 µs</td><td align="right">37 MiB</td><td align="right">5</td></tr>
+<tr><td>uvicorn + winloop</td><td align="right">18.0 K</td><td align="right">3.44 ms</td><td align="right">6.95 ms</td><td align="right">7.73 ms</td><td align="right">55.3 µs</td><td align="right">61 MiB</td><td align="right">12</td></tr>
+<tr><td>uvicorn + asyncio</td><td align="right">10.8 K</td><td align="right">5.83 ms</td><td align="right">7.01 ms</td><td align="right">10.09 ms</td><td align="right">92.2 µs</td><td align="right">29 MiB</td><td align="right">5</td></tr>
+<tr><td>hypercorn</td><td align="right">7.6 K</td><td align="right">8.39 ms</td><td align="right">9.96 ms</td><td align="right">13.11 ms</td><td align="right">131.5 µs</td><td align="right">28 MiB</td><td align="right">5</td></tr>
+</tbody>
+</table>
+
+Most of cadeloop's 12.8 µs per request is the Windows kernel: 1.6 µs is
+user time (parsing, the ASGI call, serialization), the rest is the receive
+and send on the socket. Pipelined, where one receive carries 16 requests,
+the same engine serves 553 K req/s at 1.8 µs each.
+
+#### Memory
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-idle-mem-dark.svg">
+  <img alt="Private memory per idle keep-alive connection at 1000 and 5000 connections" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-idle-mem.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-idle-total-dark.svg">
+  <img alt="Total server private memory while holding 1000 and 5000 idle connections" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-idle-total.svg">
+</picture>
+
+Idle keep-alive connections (each made one request, then held open), private
+bytes of the server's process tree:
+
+<table>
+<thead><tr><th>server</th><th align="right">at rest</th><th align="right">holding 5,000</th><th align="right">per connection</th><th align="right">after they close</th><th align="right">handles / conn</th></tr></thead>
+<tbody>
+<tr><td><b>cadeloop</b> <code>serve()</code></td><td align="right">30 MiB</td><td align="right" style="background-color: #00f0d11a"><b>68 MiB</b></td><td align="right" style="background-color: #00f0d11a"><b>6.6 KiB</b></td><td align="right" style="background-color: #00f0d11a"><b>42 MiB</b></td><td align="right">1</td></tr>
+<tr><td>cadeloop 1.0.1</td><td align="right">31 MiB</td><td align="right">365 MiB</td><td align="right">54.6 KiB</td><td align="right">355 MiB</td><td align="right">1</td></tr>
+<tr><td>uvicorn + cadeloop</td><td align="right">36 MiB</td><td align="right">106 MiB</td><td align="right">11.2 KiB</td><td align="right">67 MiB</td><td align="right">1*</td></tr>
+<tr><td>uvicorn + winloop</td><td align="right">61 MiB</td><td align="right">98 MiB</td><td align="right">6.4 KiB</td><td align="right">79 MiB</td><td align="right">1</td></tr>
+<tr><td>uvicorn + asyncio</td><td align="right">25 MiB</td><td align="right">376 MiB</td><td align="right">57.9 KiB</td><td align="right">376 MiB</td><td align="right">1</td></tr>
+<tr><td>hypercorn</td><td align="right">23 MiB</td><td align="right">408 MiB</td><td align="right">63.0 KiB</td><td align="right">408 MiB</td><td align="right">1</td></tr>
+</tbody>
+</table>
+
+\* 2 in this run: cadeloop duplicated the socket that uvicorn asks every
+connection for. It now wraps the connection's own handle. Re-measured
+against this build in a later session: 1.00 handle per connection at
+1,000 and 5,000, and 11.7–12.1 KiB of private memory per connection at
+5,000 against this build's 11.2–11.3 KiB in the same session
+([follow-up A/B](docs/benchmarks-windows.md#follow-up-ab-socket-handle-and-websocket-receive-path)).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-mem-dark.svg">
+  <img alt="Server private memory at rest and at its peak under each HTTP load" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-mem.svg">
+</picture>
+
+Under load, cadeloop peaks between 33 and 42 MiB of private memory across
+the workloads (31 MiB at rest). uvicorn on stdlib asyncio ranges 29–40 MiB,
+hypercorn 28–50 MiB (its peak is connection churn), uvicorn on cadeloop
+37–45 MiB, and uvicorn on winloop holds 61 MiB from the start (12 threads).
+In each rep the workloads run in sequence against one server process, so a
+peak also reflects whatever the process kept from the workloads before it.
+
+#### WebSocket
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-ws-dark.svg">
+  <img alt="WebSocket echo messages per second" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-ws.svg">
+</picture>
+
+Echo of each message back to the client; messages per second, with p99
+round-trip latency:
+
+<table>
+<thead><tr><th>workload</th><th align="right">cadeloop</th><th align="right">uvicorn + winloop</th><th align="right">uvicorn + asyncio</th><th align="right">hypercorn</th></tr></thead>
+<tbody>
+<tr><td>64 B, 1 connection</td><td align="right" style="background-color: #00f0d11a"><b>48.3 K <sub>45 µs</sub></b></td><td align="right">22.8 K <sub>133 µs</sub></td><td align="right">17.7 K <sub>137 µs</sub></td><td align="right">15.5 K <sub>160 µs</sub></td></tr>
+<tr><td>64 B, 64 connections</td><td align="right" style="background-color: #00f0d11a"><b>77.8 K <sub>999 µs</sub></b></td><td align="right">43.3 K <sub>3.93 ms</sub></td><td align="right">31.3 K <sub>4.52 ms</sub></td><td align="right">26.3 K <sub>3.18 ms</sub></td></tr>
+<tr><td>16 KiB, 16 connections</td><td align="right" style="background-color: #00f0d11a"><b>47.6 K <sub>463 µs</sub></b></td><td align="right">21.0 K <sub>2.52 ms</sub></td><td align="right">18.5 K <sub>3.24 ms</sub></td><td align="right">15.4 K <sub>1.46 ms</sub></td></tr>
+<tr><td>1 KiB stream, 32 in flight ×16</td><td align="right" style="background-color: #00f0d11a"><b>407 K <sub>1.67 ms</sub></b></td><td align="right">92.1 K <sub>17.56 ms</sub></td><td align="right">66.4 K <sub>19.14 ms</sub></td><td align="right">56.7 K <sub>12.06 ms</sub></td></tr>
+</tbody>
+</table>
+
+#### TLS
+
+<table>
+<thead><tr><th>workload</th><th align="right">cadeloop</th><th align="right">uvicorn + winloop</th><th align="right">uvicorn + asyncio</th></tr></thead>
+<tbody>
+<tr><td>plaintext, 64 keep-alive conns</td><td align="right" style="background-color: #00f0d11a"><b>62.6 K <sub>1.39 ms</sub></b></td><td align="right">15.7 K <sub>7.93 ms</sub></td><td align="right">9.2 K <sub>8.32 ms</sub></td></tr>
+<tr><td>new connection per request (16)</td><td align="right" style="background-color: #00f0d11a"><b>3.6 K <sub>2.85 ms</sub></b></td><td align="right">2.3 K <sub>4.59 ms</sub></td><td align="right">1.5 K <sub>3.05 ms</sub></td></tr>
+</tbody>
+</table>
+
+TLS 1.3 through Python's `ssl` module in every server; `new connection per
+request` includes the full handshake.
+
+#### Timers and wakeups
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-timers-dark.svg">
+  <img alt="asyncio.sleep overshoot: cadeloop 0.55 ms past a 1 ms deadline, asyncio, winloop and cadeloop 1.0.1 about 14.4 ms" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-timers.svg">
+</picture>
+
+How late `asyncio.sleep(d)` returns on an otherwise idle loop (median /
+p99), and how long a `call_soon_threadsafe()` from another thread takes to
+run on a parked loop:
+
+<table>
+<thead><tr><th></th><th align="right">sleep(1 ms)</th><th align="right">sleep(5 ms)</th><th align="right">sleep(10 ms)</th><th align="right">cross-thread wakeup</th></tr></thead>
+<tbody>
+<tr><td><b>cadeloop</b></td><td align="right" style="background-color: #00f0d11a"><b>+0.55 / 0.88 ms</b></td><td align="right" style="background-color: #00f0d11a"><b>+0.40 / 0.63 ms</b></td><td align="right" style="background-color: #00f0d11a"><b>+0.31 / 0.82 ms</b></td><td align="right">16 / 117 µs</td></tr>
+<tr><td>cadeloop 1.0.1</td><td align="right">+14.41 / 15.50 ms</td><td align="right">+10.60 / 15.97 ms</td><td align="right">+5.66 / 15.52 ms</td><td align="right">16 / 91 µs</td></tr>
+<tr><td>winloop</td><td align="right">+14.49 / 15.41 ms</td><td align="right">+10.73 / 15.17 ms</td><td align="right">+6.00 / 12.47 ms</td><td align="right">19 / 66 µs</td></tr>
+<tr><td>asyncio</td><td align="right">+14.33 / 15.51 ms</td><td align="right">+10.82 / 15.22 ms</td><td align="right">+5.88 / 11.31 ms</td><td align="right">68 / 162 µs</td></tr>
+</tbody>
+</table>
+
+A Windows wait with a millisecond timeout ends on the next system clock
+interrupt, 15.6 ms apart by default, so every loop that parks that way turns
+a 1 ms sleep into ~15 ms — which is also why the `1 ms await` HTTP workload
+above is the one where the stdlib and winloop rows fall furthest behind.
+cadeloop ends a timer-bound wait on a high-resolution waitable timer
+instead; its remaining ~0.5 ms is the platform's own floor (CPython 3.11's
+`time.sleep(0.001)` overshoots by the same amount on this machine). Under
+load, when no loop parks, all of them are on time. winloop fires sub-ms
+timers early (0.5 ms sleeps return at once), and on a busy loop stdlib
+asyncio fires timers up to its 15.6 ms clock resolution early.
+
+#### TCP echo — the loop alone
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-echo-dark.svg">
+  <img alt="TCP echo messages per second on cadeloop, winloop, rsloop and asyncio" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-echo.svg">
+</picture>
+
+The same `asyncio.Protocol` echo server on every loop; messages per second
+(p99):
+
+<table>
+<thead><tr><th>workload</th><th align="right">cadeloop</th><th align="right">winloop</th><th align="right">rsloop</th><th align="right">asyncio</th></tr></thead>
+<tbody>
+<tr><td>1 KiB, 1 connection</td><td align="right" style="background-color: #00f0d11a"><b>51.8 K <sub>41 µs</sub></b></td><td align="right">40.4 K <sub>54 µs</sub></td><td align="right">40.4 K <sub>48 µs</sub></td><td align="right">31.5 K <sub>79 µs</sub></td></tr>
+<tr><td>1 KiB, 64 connections</td><td align="right">84.4 K <sub>909 µs</sub></td><td align="right">80.1 K <sub>1.56 ms</sub></td><td align="right" style="background-color: #00f0d11a"><b>87.7 K <sub>958 µs</sub></b></td><td align="right">53.6 K <sub>1.54 ms</sub></td></tr>
+<tr><td>1 KiB, 16 in flight ×64</td><td align="right">346 K <sub>3.44 ms</sub></td><td align="right">375 K <sub>5.18 ms</sub></td><td align="right" style="background-color: #00f0d11a"><b>457 K <sub>2.49 ms</sub></b></td><td align="right">287 K <sub>4.46 ms</sub></td></tr>
+<tr><td>64 KiB, 8 connections</td><td align="right">29.8 K <sub>614 µs</sub></td><td align="right">26.8 K <sub>745 µs</sub></td><td align="right" style="background-color: #00f0d11a"><b>43.7 K <sub>324 µs</sub></b></td><td align="right">31.4 K <sub>459 µs</sub></td></tr>
+</tbody>
+</table>
+
+rsloop runs its socket I/O on worker threads: it uses 1.5–2 cores (26
+threads) where the others use one, and more CPU per message than cadeloop
+(4.4 vs 2.9 µs with 16 in flight). With one connection, cadeloop spins for
+up to 20 µs before parking (`spin_us`), which is why it answers fastest and
+also why it shows a full core busy at that load.
+
+#### Overload and recovery
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-overload-dark.svg">
+  <img alt="p99 latency per second through 10 seconds at 150 percent of each server's capacity: every server keeps serving and recovers once the backlog drains" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-overload.svg">
+</picture>
+
+Open-loop load at 50% of each server's own measured capacity, then 150% for
+10 s, then 50% again, from 256 connections; latency is measured from when
+each request was due, so the backlog shows. Every server kept serving at
+capacity through the overload without errors or collapse, and recovered
+once the backlog drained; cadeloop's capacity here is 77.9 K req/s against
+18.4 K for uvicorn on cadeloop, 18.1 K on winloop and 10.9 K on asyncio.
+
+#### Scheduling microbenchmarks
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-sched-dark.svg">
+  <img alt="Windows scheduling microbenchmarks as a share of the fastest loop per benchmark" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-sched.svg">
+</picture>
+
+Median of 5 runs after 3 warmups, a fresh process per run; millions of operations per second ("hung": rsloop 0.1.30 does not finish the timer benchmarks, killed at 12 s):
+
+<table>
+<thead><tr><th>benchmark</th><th align="right">cadeloop</th><th align="right">winloop</th><th align="right">rsloop</th><th align="right">asyncio</th></tr></thead>
+<tbody>
+<tr><td><code>task_fib</code></td><td align="right">0.194</td><td align="right">0.186</td><td align="right" style="background-color: #00f0d11a"><b>0.196</b></td><td align="right">0.125</td></tr>
+<tr><td><code>call_soon_chain</code></td><td align="right" style="background-color: #00f0d11a"><b>11.027</b></td><td align="right">2.347</td><td align="right">9.785</td><td align="right">0.906</td></tr>
+<tr><td><code>call_soon_burst</code></td><td align="right" style="background-color: #00f0d11a"><b>12.652</b></td><td align="right">1.596</td><td align="right">hung</td><td align="right">1.170</td></tr>
+<tr><td><code>timer_schedule_cancel</code></td><td align="right" style="background-color: #00f0d11a"><b>6.732</b></td><td align="right">0.744</td><td align="right">hung</td><td align="right">0.910</td></tr>
+<tr><td><code>timer_fire</code></td><td align="right" style="background-color: #00f0d11a"><b>4.619</b></td><td align="right">2.016</td><td align="right">hung</td><td align="right">0.530</td></tr>
+<tr><td><code>sleep0_chain</code></td><td align="right" style="background-color: #00f0d11a"><b>3.635</b></td><td align="right">1.555</td><td align="right">3.265</td><td align="right">0.758</td></tr>
+<tr><td><code>task_spawn</code></td><td align="right">0.565</td><td align="right">0.497</td><td align="right" style="background-color: #00f0d11a"><b>0.567</b></td><td align="right">0.381</td></tr>
+<tr><td><code>threadsafe_throughput</code></td><td align="right" style="background-color: #00f0d11a"><b>8.066</b></td><td align="right">2.570</td><td align="right">4.581</td><td align="right">0.069</td></tr>
+<tr><td><code>future_chain</code></td><td align="right">2.725</td><td align="right">0.945</td><td align="right" style="background-color: #00f0d11a"><b>2.820</b></td><td align="right">0.405</td></tr>
+<tr><td><code>gather_fanin</code></td><td align="right" style="background-color: #00f0d11a"><b>0.613</b></td><td align="right">0.519</td><td align="right">0.572</td><td align="right">0.334</td></tr>
+<tr><td><code>queue_pingpong</code></td><td align="right" style="background-color: #00f0d11a"><b>1.871</b></td><td align="right">1.765</td><td align="right">1.853</td><td align="right">1.759</td></tr>
+<tr><td><code>queue_pingpong_native</code></td><td align="right" style="background-color: #00f0d11a"><b>6.055</b></td><td align="right">5.369</td><td align="right">5.927</td><td align="right">4.977</td></tr>
+</tbody>
+</table>
+
+#### What this release changed on Windows
+
+cadeloop 1.0.1 against the current build, same machine, same session,
+three rotated runs each:
+
+<table>
+<thead><tr><th>workload</th><th align="right">1.0.1</th><th align="right">now</th><th align="right">change</th></tr></thead>
+<tbody>
+<tr><td>HTTP plaintext, 64 conns</td><td align="right">74.8 K</td><td align="right">78.0 K</td><td align="right">+4.3%</td></tr>
+<tr><td>HTTP JSON</td><td align="right">56.1 K</td><td align="right">57.8 K</td><td align="right">+2.9%</td></tr>
+<tr><td>HTTP 64 KiB body</td><td align="right">39.1 K</td><td align="right">41.2 K</td><td align="right">+5.5%</td></tr>
+<tr><td>HTTP 1 MiB stream</td><td align="right">3.1 K</td><td align="right">3.3 K</td><td align="right">+5.1%</td></tr>
+<tr><td>HTTP 16 KiB upload</td><td align="right">61.3 K</td><td align="right">61.1 K</td><td align="right">-0.4%</td></tr>
+<tr><td>WebSocket 64 B, 64 conns</td><td align="right">74.2 K</td><td align="right">77.8 K</td><td align="right">+4.9%</td></tr>
+<tr><td>TCP echo 1 KiB, 64 conns</td><td align="right">80.5 K</td><td align="right">84.4 K</td><td align="right">+4.8%</td></tr>
+<tr><td>HTTP with a 1 ms await</td><td align="right">4.5 K</td><td align="right">31.6 K</td><td align="right">7.0×</td></tr>
+<tr><td>memory per idle connection (5,000)</td><td align="right">54.6 KiB</td><td align="right">6.6 KiB</td><td align="right">-88%</td></tr>
+<tr><td>memory kept after 5,000 close</td><td align="right">+324 MiB</td><td align="right">+12 MiB</td><td></td></tr>
+<tr><td><code>asyncio.sleep(0.001)</code> overshoot</td><td align="right">14.4 ms</td><td align="right">0.55 ms</td><td align="right">26× sooner</td></tr>
+</tbody>
+</table>
+
+The fixes behind these, and the correctness fixes that came with them, are
+listed in the [engineering record](docs/README.md).
+
+### Linux (epoll dev backend)
+
 Linux 6.18.44, 4 vCPU Intel Xeon @ 2.10 GHz, CPython 3.11.17. Loopback,
-single box, load generator sharing the cores — relative comparison, not
-capacity numbers. Linux runs the `epoll` dev backend; the Windows/IOCP
-numbers are in [docs/README.md](docs/README.md).
+single box, load generator sharing the cores. Linux runs the `epoll`
+development backend, not the Windows/IOCP production target.
 
-Methodology, raw commands, and known measurement pitfalls:
-[docs/benchmarks.md](docs/benchmarks.md).
-
-### HTTP / ASGI
+#### HTTP / ASGI
 
 `wrk -t2 -c64`, 3s warmup + 3×10s measured, median. Single worker, plaintext
 `Hello, World!` ASGI app. No contender returned a non-2xx response or a socket
@@ -168,7 +451,7 @@ the other loops. Holding the loop fixed at cadeloop, `serve()` is 9.9×
 uvicorn+h11. The comparable stacks — those that also moved parsing out of
 Python — are granian (2.4×) and uvicorn+httptools+uvloop (3.8×).
 
-### Scheduling — recursive async `fib(21)`
+#### Scheduling — recursive async `fib(21)`
 
 The composite workload: `fib(k)` spawns its two recursive calls as concurrent
 tasks, so one call expands into 35,421 coroutine calls across a deep, irregular
@@ -198,7 +481,7 @@ Every native loop lands in a 1.4–1.6× band over stdlib, and the four sit with
 workload. Most of the time here goes to CPython's coroutine machinery, which no
 loop replaces, so the single-operation gaps below mostly wash out.
 
-### Scheduling microbenchmarks
+#### Scheduling microbenchmarks
 
 Single-operation isolation, 3 warmup + 5 measured runs per pass, fresh process
 per run; three passes, so each figure is the median of 15 runs. Millions of
@@ -738,6 +1021,7 @@ literal `none` — without it, those states would be unreachable from the shell.
 | `CADELOOP_BACKEND` | `Loop()` | Default backend when the `backend` argument is `None`. Lets a whole test or benchmark run target one backend. |
 | `CADELOOP_ALLOW_EXPERIMENTAL_RIO` | `Config` | Required to set `backend="rio"` through `Config`/`serve()`. `Loop(backend="rio")` stays reachable without it, for RIO diagnosis. |
 | `PYTHONASYNCIODEBUG` | `Loop()` | Enables asyncio debug mode, as with the stdlib loop. `-X dev` does the same. |
+| `CADELOOP_COARSE_TIMERS` | `Loop()` (Windows) | Parks with a timer pending end on the system clock tick (15.6 ms by default), as they did before high-resolution parks. For A/B measurement and diagnosis only. |
 
 ---
 
@@ -761,9 +1045,11 @@ print(loop.stats())
 | `timers_fired` | Timers that fired. |
 | `xthread_items` | Callbacks and timers other threads handed over while the loop was parked in its poll. Calls made while the loop is reachable -- including every `call_soon_threadsafe` from its own thread -- go straight to the ready queue and are not counted. |
 | `spin_hits` | Times the spin window found work without a blocking wait. |
+| `precise_parks` | Waits bounded by a timer's deadline that ended on a high-resolution timer (Windows IOCP) rather than the system clock tick. |
 | `ready_len`, `timers_len` | Current ready-queue and timer-heap depth. |
 | `connections`, `listeners` | Live counts. |
 | `buffers_in_use` | Buffer slots currently held by kernel ops or exported memoryviews. |
+| `buffer_bytes_in_use`, `buffer_bytes_held` | Bytes those slots occupy, and bytes the buffer pool keeps from the OS in all (on Windows, its commit charge). Free slots beyond a warm set of 256 per size class are handed back, so the second falls again after a burst. |
 | `bytes_received`, `bytes_sent` | Cumulative byte counters. |
 | `connections_accepted` | Cumulative accepts. |
 | `accept_starved` | Times a listener's accept pool ran dry — raise `accept_pool` if this climbs. |

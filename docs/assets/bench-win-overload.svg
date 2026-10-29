@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" width="760" height="360" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<rect width="760" height="360" fill="#fcfcfb" rx="8"/>
+<rect x="179.9" y="92" width="231.7" height="224" fill="#e1e0d9" opacity="0.6"/>
+<text x="295.7" y="106" font-size="11" text-anchor="middle" fill="#898781">150% of capacity offered</text>
+<text x="24" y="34" font-size="16" font-weight="600" fill="#0b0b0b">p99 latency through overload and recovery (Windows 11)</text>
+<text x="24" y="54" font-size="12" fill="#52514e">open loop, 256 connections: 50% of each server's own capacity for 5 s, 150% for 10 s, 50% for 15 s</text>
+<rect x="24" y="66" width="12" height="12" rx="3" fill="#13968e"/>
+<text x="41" y="76" font-size="12" fill="#52514e">cadeloop</text>
+<rect x="111.8" y="66" width="12" height="12" rx="3" fill="#eda100"/>
+<text x="128.8" y="76" font-size="12" fill="#52514e">uvicorn+cadeloop</text>
+<rect x="252.39999999999998" y="66" width="12" height="12" rx="3" fill="#008300"/>
+<text x="269.4" y="76" font-size="12" fill="#52514e">uvicorn+winloop</text>
+<rect x="386.4" y="66" width="12" height="12" rx="3" fill="#6250d6"/>
+<text x="403.4" y="76" font-size="12" fill="#52514e">uvicorn+asyncio</text>
+<line x1="64" y1="316.0" x2="736" y2="316.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56" y="320.0" font-size="11" text-anchor="end" fill="#898781">1 ms</text>
+<line x1="64" y1="260.0" x2="736" y2="260.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56" y="264.0" font-size="11" text-anchor="end" fill="#898781">10 ms</text>
+<line x1="64" y1="204.0" x2="736" y2="204.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56" y="208.0" font-size="11" text-anchor="end" fill="#898781">100 ms</text>
+<line x1="64" y1="148.0" x2="736" y2="148.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56" y="152.0" font-size="11" text-anchor="end" fill="#898781">1 s</text>
+<line x1="64" y1="92.0" x2="736" y2="92.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56" y="96.0" font-size="11" text-anchor="end" fill="#898781">10 s</text>
+<text x="64.0" y="334" font-size="11" text-anchor="middle" fill="#898781">0s</text>
+<text x="179.9" y="334" font-size="11" text-anchor="middle" fill="#898781">5s</text>
+<text x="295.7" y="334" font-size="11" text-anchor="middle" fill="#898781">10s</text>
+<text x="411.6" y="334" font-size="11" text-anchor="middle" fill="#898781">15s</text>
+<text x="527.4" y="334" font-size="11" text-anchor="middle" fill="#898781">20s</text>
+<text x="643.3" y="334" font-size="11" text-anchor="middle" fill="#898781">25s</text>
+<path d="M64.0,278.6 L87.2,305.5 L110.3,308.8 L133.5,304.2 L156.7,304.5 L179.9,171.7 L203.0,154.8 L226.2,145.2 L249.4,138.2 L272.6,132.4 L295.7,127.6 L318.9,124.0 L342.1,120.9 L365.2,118.1 L388.4,115.6 L411.6,113.3 L434.8,111.1 L457.9,109.4 L481.1,107.7 L504.3,105.9 L527.4,104.5 L550.6,104.8 L573.8,109.0 L597.0,114.1 L620.1,120.3 L643.3,128.3 L666.5,141.1 L689.7,169.4 L712.8,293.8 L736.0,293.8" fill="none" stroke="#13968e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M64.0,290.5 L87.2,290.8 L110.3,290.2 L133.5,290.0 L156.7,290.5 L179.9,173.4 L203.0,156.2 L226.2,146.3 L249.4,139.1 L272.6,133.8 L295.7,129.0 L318.9,125.6 L342.1,122.2 L365.2,119.3 L388.4,116.7 L411.6,114.3 L434.8,112.2 L457.9,110.4 L481.1,108.4 L504.3,106.8 L527.4,105.7 L550.6,107.1 L573.8,111.4 L597.0,116.9 L620.1,124.0 L643.3,133.8 L666.5,150.2 L689.7,228.7 L712.8,263.2 L736.0,263.5" fill="none" stroke="#eda100" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M64.0,290.2 L87.2,290.5 L110.3,287.9 L133.5,288.6 L156.7,290.8 L179.9,172.2 L203.0,155.4 L226.2,145.5 L249.4,138.2 L272.6,132.9 L295.7,128.3 L318.9,124.3 L342.1,121.1 L365.2,118.3 L388.4,115.8 L411.6,113.5 L434.8,111.1 L457.9,109.4 L481.1,107.4 L504.3,105.7 L527.4,104.3 L550.6,104.0 L573.8,107.4 L597.0,111.8 L620.1,116.9 L643.3,123.7 L666.5,132.9 L689.7,147.8 L712.8,193.6 L736.0,258.8" fill="none" stroke="#008300" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M64.0,258.5 L87.2,287.4 L110.3,292.3 L133.5,285.9 L156.7,286.9 L179.9,172.2 L203.0,155.4 L226.2,145.9 L249.4,138.8 L272.6,133.3 L295.7,128.7 L318.9,125.2 L342.1,121.9 L365.2,119.0 L388.4,116.7 L411.6,114.3 L434.8,112.2 L457.9,110.0 L481.1,108.4 L504.3,106.8 L527.4,105.7 L550.6,106.8 L573.8,111.1 L597.0,116.7 L620.1,122.5 L643.3,131.4 L666.5,144.4 L689.7,176.1 L712.8,252.9 L736.0,251.8" fill="none" stroke="#6250d6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

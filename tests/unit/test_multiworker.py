@@ -414,3 +414,24 @@ def test_the_restart_rule_is_one_rule_for_both_supervisors():
     assert n(4, became_ready=True, uptime=srv._STABLE_SECS + 1) == 1
     # Served but died quickly, repeatedly: still a loop.
     assert n(2, became_ready=True, uptime=0.5) == 3
+
+
+def test_a_venv_worker_is_spawned_as_its_base_interpreter(monkeypatch):
+    """A Windows venv's python.exe is a launcher that runs the base
+    interpreter as a child. Spawned through it, the worker's pid named the
+    launcher, so every connection shared to that pid was duplicated into
+    the launcher: the worker could adopt none of them. The base
+    interpreter is started directly instead, told its venv as
+    multiprocessing does (bpo-35797)."""
+    from cadeloop import server
+
+    monkeypatch.setattr(server, "_WIN", True)
+    monkeypatch.setattr(server.sys, "executable", r"C:\venv\Scripts\python.exe")
+    monkeypatch.setattr(server.sys, "_base_executable", r"C:\Python311\python.exe", raising=False)
+    cmd, env = server._worker_command()
+    assert cmd == [r"C:\Python311\python.exe", "-m", "cadeloop._winworker"]
+    assert env["__PYVENV_LAUNCHER__"] == r"C:\venv\Scripts\python.exe"
+    # Outside a venv the interpreter is its own base: nothing changes.
+    monkeypatch.setattr(server.sys, "_base_executable", r"C:\venv\Scripts\python.exe", raising=False)
+    cmd, env = server._worker_command()
+    assert cmd[0] == r"C:\venv\Scripts\python.exe" and env is None

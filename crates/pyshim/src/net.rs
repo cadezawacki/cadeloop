@@ -52,6 +52,17 @@ use crate::http::HttpConn;
 /// R-035: cork flush threshold.
 const CORK_FLUSH_BYTES: usize = 64 * 1024;
 
+/// How long a closing HTTP connection keeps reading (and discarding) what
+/// its peer still sends after our FIN (see `TransportEntry::lingering`).
+const LINGER_NS: u64 = 5_000_000_000;
+
+/// What a live transport reports when its I/O is aborted under it
+/// (ConnectionAbortedError): WSAECONNABORTED / ECONNABORTED.
+#[cfg(windows)]
+const WSAECONNABORTED: u32 = 10053;
+#[cfg(not(windows))]
+const WSAECONNABORTED: u32 = 103;
+
 /// Writes at most this big are copied onto the end of the last queued
 /// buffer instead of queuing a buffer of their own (see `coalesce_tail`).
 ///
@@ -85,8 +96,17 @@ fn coalesce_tail(entry: &mut TransportEntry, data: &[u8]) -> bool {
         _ => false,
     }
 }
-/// Recv slot class: 64 KiB reads.
-const RECV_CLASS: SizeClass = SizeClass::S64K;
+
+/// A stream transport's first receive buffer. Later ones follow what the
+/// reads actually return (`SizeClass::after_read`).
+///
+/// A posted receive owns its buffer until data arrives, so an idle
+/// connection holds one for as long as it is idle. At a fixed 64 KiB that
+/// was 64 KiB of committed memory per idle keep-alive connection -- most
+/// of what such a connection cost -- for requests that fit in one 4 KiB
+/// read. A read that fills its buffer moves the next one up a class, so
+/// bulk transfers reach 64 KiB reads after two; small reads move it back.
+const RECV_CLASS_FIRST: SizeClass = SizeClass::S4K;
 
 /// The OS's message for `code` -- what `os.strerror()` (or, on Windows,
 /// a socket.error) says -- without the " (os error N)" suffix that Rust's
@@ -258,6 +278,10 @@ pub(crate) struct TransportEntry {
     /// user-visible object ever references them).
     pub pyobj: Option<Py<Transport>>,
     recv_slot: Option<SlotId>,
+    /// The class the next receive buffer is acquired in (`SizeClass::after_read`).
+    recv_class: SizeClass,
+    /// The last read filled its buffer (`SizeClass::after_read`).
+    recv_last_full: bool,
     recv_op: Option<OpId>,
     send_op: Option<OpId>,
     /// How many buffers at the front of `wq` the send in flight points the
@@ -275,6 +299,13 @@ pub(crate) struct TransportEntry {
     conn_lost: bool,
     eof_wanted: bool,
     eof_sent: bool,
+    /// An HTTP connection the engine is closing while its peer may still
+    /// be sending (`http_close_after_write`): its receive stays posted and
+    /// what arrives is discarded, so the close is not a reset.
+    lingering: bool,
+    /// When the lingering ends regardless (0 until the response is out
+    /// and the FIN sent); enforced by `http_sweep`.
+    linger_until_ns: u64,
     flush_scheduled: bool,
     pub peername: Option<Py<PyAny>>,
     pub sockname: Option<Py<PyAny>>,
@@ -287,15 +318,13 @@ pub(crate) struct TransportEntry {
     /// `paused_recv` (asyncio sees no EOF before resume_reading re-adds
     /// its reader), and delivered after it.
     paused_eof: bool,
-    /// The duplicate behind `get_extra_info("socket")` of a transport
+    /// The socket object behind `get_extra_info("socket")` of a transport
     /// that has no socket object of its own (see `Transport::trsock`),
-    /// built on first ask. Closed, not merely dropped, at teardown -- see
-    /// `graveyard_sockets`.
+    /// built on first ask: a `socket.socket` over the engine's own handle
+    /// that does not own it. `release_socket` detaches it before closing
+    /// the handle, so nothing it does afterwards -- its finalizer's
+    /// close() above all -- can reach a socket that reuses the number.
     pub extra_sock: Option<Py<PyAny>>,
-    /// That duplicate's descriptor, listed in `fd_users` too: it is the
-    /// number `get_extra_info("socket").fileno()` reports, so it is the
-    /// one an add_reader() on "the transport's fd" names.
-    extra_fd: Option<RawSocket>,
     /// The caller's own socket object, for a transport built from one
     /// (`sock=`). It owns the descriptor, as in asyncio: teardown closes
     /// it (through Python, once connection_lost has run) instead of
@@ -656,8 +685,15 @@ impl NetState {
     /// returned `&mut HttpConn` before touching other NetState fields.
     /// How many live connections are native HTTP ones (as opposed to the
     /// Python-protocol transports an application opens for itself).
+    /// Live HTTP connections -- not counting those whose response and FIN
+    /// are out and that only wait for the peer to finish (`lingering`): a
+    /// graceful drain has nothing left to wait for on them, and waited out
+    /// its whole grace for a peer that never closed.
     pub(crate) fn http_conn_count(&self) -> usize {
-        self.transports.values().filter(|e| matches!(e.proto, ProtoKind::Http(_))).count()
+        self.transports
+            .values()
+            .filter(|e| matches!(e.proto, ProtoKind::Http(_)) && !(e.lingering && e.linger_until_ns != 0))
+            .count()
     }
 
     pub(crate) fn http_conn_mut(&mut self, tid: u64) -> Option<&mut HttpConn> {
@@ -768,6 +804,15 @@ pub(crate) enum NetEvent {
         tid: u64,
         data: Vec<u8>,
     },
+    /// A protocol transport's receive could not be re-posted (the peer
+    /// reset it, typically): torn down when dispatched, so the data and
+    /// EOF events queued ahead of it -- bytes the kernel already handed
+    /// over -- reach the protocol first, as the stdlib proactor delivers
+    /// a read's data before raising the next read's error.
+    RecvFailed {
+        tid: u64,
+        os_error: u32,
+    },
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
     BufData {
@@ -831,7 +876,7 @@ pub(crate) enum NetEvent {
 }
 
 /// A socket object a dead transport still holds (the caller's own, or the
-/// duplicate behind `get_extra_info("socket")`), closed -- not merely
+/// detached one behind `get_extra_info("socket")`), closed -- not merely
 /// dropped -- whenever it is let go: after connection_lost normally, but
 /// also when that never runs because the loop closed first, so a
 /// transport's close stays final either way. Dropped attached, outside
@@ -864,7 +909,7 @@ pub(crate) struct ConnLost {
     transport: Option<Py<Transport>>,
     protocol: Py<PyAny>,
     /// Closed after connection_lost: the caller's socket object, or the
-    /// duplicate behind `get_extra_info("socket")`.
+    /// (already detached) one behind `get_extra_info("socket")`.
     close_after: CloseOnDrop,
     server: Option<Py<PyAny>>,
 }
@@ -991,6 +1036,19 @@ fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_
         let _ = netsys::shutdown_send(entry.socket);
     }
     if entry.closing {
+        if entry.lingering {
+            if entry.linger_until_ns == 0 {
+                // The response is all out: FIN behind it, then read what
+                // the peer still sends until its EOF or the deadline.
+                if !entry.eof_sent {
+                    entry.eof_sent = true;
+                    let _ = netsys::shutdown_send(entry.socket);
+                }
+                entry.linger_until_ns = net.now_ns.saturating_add(LINGER_NS).max(1);
+                post_recv(py, net, backend, tid);
+            }
+            return;
+        }
         let immediate = drained && net.inline_close != Some(tid);
         teardown_lost(py, net, backend, tid, LostReason::Clean, immediate);
     }
@@ -1135,9 +1193,6 @@ fn teardown_lost(
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
-    if let Some(fd) = entry.extra_fd.take() {
-        forget_fd(net, fd, tid);
-    }
     if let Some(slot) = entry.recv_slot.take() {
         // The transport's own reference. The posted op holds a second one
         // (R-073) that only the reap releases.
@@ -1215,6 +1270,13 @@ fn forget_fd(net: &mut NetState, fd: RawSocket, id: u64) {
 /// (`retire_sockets`, or after connection_lost), never under it.
 fn release_socket(backend: Backend<'_>, entry: &TransportEntry) {
     backend.detach_socket(entry.socket);
+    if let Some(sock) = &entry.extra_sock {
+        // Let go of the handle before it is closed (see `extra_sock`).
+        // The C base class's detach(): socket.socket overrides it in
+        // Python, and no Python code runs in-cell; this one only clears
+        // the object's descriptor.
+        Python::attach(|py| detach_socket_object(py, sock));
+    }
     if entry.owner.is_none() {
         netsys::close(entry.socket);
     }
@@ -1246,9 +1308,6 @@ pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err:
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
-    if let Some(fd) = entry.extra_fd.take() {
-        forget_fd(net, fd, tid);
-    }
     if let Some(slot) = entry.recv_slot.take() {
         net.buffers.release(slot);
     }
@@ -1859,7 +1918,17 @@ pub(crate) fn http_sweep(
     let mut expire_head: Vec<u64> = Vec::new();
     let mut expire_idle: Vec<u64> = Vec::new();
     let mut expire_dead: Vec<u64> = Vec::new();
+    let mut expire_linger: Vec<u64> = Vec::new();
     for (&tid, entry) in net.transports.iter_mut() {
+        if entry.lingering
+            && !entry.conn_lost
+            && entry.linger_until_ns != 0
+            && now_ns >= entry.linger_until_ns
+        {
+            // A peer that never finished sending after our FIN.
+            expire_linger.push(tid);
+            continue;
+        }
         if entry.conn_lost || entry.closing {
             continue;
         }
@@ -1938,6 +2007,9 @@ pub(crate) fn http_sweep(
     // the cycle collector, so dropping `conn.driver` alone would not, the
     // awaited future's `_wake` still references it -- and gives the app its
     // `finally`/cancel-scope cleanup.
+    for &tid in &expire_linger {
+        teardown_with(py, net, backend, tid, None);
+    }
     let mut cancel_drivers: Vec<Py<PyAny>> = Vec::new();
     for &tid in &expire_dead {
         if let Some(conn) = net.http_conn_mut(tid) {
@@ -2159,7 +2231,22 @@ pub(crate) fn http_close_after_write(py: Python<'_>, net: &mut NetState, backend
         return;
     }
     entry.closing = true;
-    if let Some(op) = entry.recv_op.take() {
+    // Closing a socket with unread input makes the close a reset, and a
+    // reset can cost the peer the very response it was closed after:
+    // Windows discards what a connection had received but not yet read
+    // when its RST arrives. A client still uploading when it is answered
+    // early (a 413 at headers-complete, a 400) got ECONNRESET instead of
+    // the answer. So unless the peer has finished sending, the response
+    // goes out, then our FIN, and the connection reads and discards
+    // until the peer's EOF -- bounded by LINGER_NS, which `http_sweep`
+    // enforces, so only where a sweep runs (a head or idle timeout set).
+    let linger = match &entry.proto {
+        ProtoKind::Http(c) => !c.disconnected && (c.idle_timeout_ns > 0 || c.head_timeout_ns > 0),
+        ProtoKind::Py(_) => false,
+    };
+    if linger {
+        entry.lingering = true;
+    } else if let Some(op) = entry.recv_op.take() {
         // Mapping stays; the completion is discarded by the closing check.
         let _ = backend.cancel(op);
     }
@@ -2183,22 +2270,27 @@ fn ensure_buffers_registered(net: &mut NetState, backend: Backend<'_>) {
 /// Post the next recv on a transport. In-cell.
 fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
-    if entry.recv_op.is_some() || entry.reading_paused || entry.closing || entry.conn_lost {
+    if entry.recv_op.is_some()
+        || entry.reading_paused
+        || (entry.closing && !entry.lingering)
+        || entry.conn_lost
+    {
         return;
     }
     // Engine-level backpressure is checked HERE rather than at each call
     // site: the TLS path reposts from its own branch, so a flag consulted
     // only by the plaintext caller left HTTPS connections pipelining
-    // without any bound at all (R-085/R-087).
+    // without any bound at all (R-085/R-087). A lingering read discards
+    // what it gets, so no budget applies to it.
     if let ProtoKind::Http(conn) = &entry.proto {
-        if conn.pipeline_paused || conn.ws.as_ref().is_some_and(|w| w.inbox_paused) {
+        if !entry.lingering && (conn.pipeline_paused || conn.ws.as_ref().is_some_and(|w| w.inbox_paused)) {
             return;
         }
     }
     let slot = match entry.recv_slot {
         Some(s) => s,
         None => {
-            let s = net.buffers.acquire(RECV_CLASS);
+            let s = net.buffers.acquire(entry.recv_class);
             ensure_buffers_registered(net, backend);
             net.transports.get_mut(&tid).unwrap().recv_slot = Some(s);
             s
@@ -2217,6 +2309,14 @@ fn post_recv(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64)
             net.buffers.retain(slot);
             net.transports.get_mut(&tid).unwrap().recv_op = Some(op);
             net.ops.insert(op, OpTarget::Recv { tid, slot });
+        }
+        // A failure here usually follows a completion whose bytes are still
+        // queued for dispatch (the peer sent, then reset). Tearing down now
+        // removed the transport those events route to, and the protocol
+        // never saw data the kernel had already delivered.
+        Err(e) if matches!(net.transports.get(&tid).map(|e| &e.proto), Some(ProtoKind::Py(_))) => {
+            let os_error = e.raw_os_error().unwrap_or(5) as u32;
+            net.events.push(NetEvent::RecvFailed { tid, os_error });
         }
         Err(e) => teardown_err(py, net, backend, tid, e),
     }
@@ -2582,14 +2682,33 @@ fn on_recv_done(
     if entry.recv_op == Some(op) {
         entry.recv_op = None;
     }
+    if entry.lingering && !entry.conn_lost {
+        // A closing connection draining its peer's input (see
+        // `TransportEntry::lingering`): bytes are discarded unread.
+        if os_error != 0 {
+            teardown_with(py, net, backend, tid, None);
+        } else if bytes == 0 {
+            // The peer is done: close as soon as the response is out
+            // (at once, if it already is).
+            entry.lingering = false;
+            maybe_finish_shutdown(py, net, backend, tid, true);
+        } else {
+            post_recv(py, net, backend, tid);
+        }
+        return;
+    }
     if entry.conn_lost || entry.closing {
         return; // inbound data after close(): discarded by design
     }
     if os_error != 0 {
-        if is_cancelled_error(os_error) {
-            return; // pause_reading()/close() cancelled it
-        }
-        teardown_with(py, net, backend, tid, Some(os_error));
+        // Every receive this layer cancels belongs to a transport that is
+        // closing or gone (both returned above). An abort reaching a live
+        // one means its socket was closed under it -- the socket object
+        // behind a `sock=` transport closed directly, say -- and ignoring
+        // it left the transport neither reading nor lost, for good. The
+        // stdlib proactor reports it as ConnectionAbortedError.
+        let code = if is_cancelled_error(os_error) { WSAECONNABORTED } else { os_error };
+        teardown_with(py, net, backend, tid, Some(code));
         return;
     }
     if bytes == 0 {
@@ -2673,10 +2792,13 @@ fn on_recv_done(
                 // R-059: ciphertext — record processing needs _ssl (phase 2).
                 net.events.push(NetEvent::TlsData { tid, data: data.to_vec() });
             } else if conn.ws.is_some() {
-                // R-087: WS mode — bytes go to the frame parser, not llhttp.
-                // Copied out first: ws_ingest needs &mut NetState.
-                let owned = data.to_vec();
-                crate::http::ws_ingest(py, net, backend, tid, &owned);
+                // R-087: WS mode — bytes go to the frame parser, not llhttp,
+                // straight from the receive slot: ws_ingest reads them only
+                // inside the parser's push (or into the pre-accept buffer),
+                // before anything it does can post a receive into this slot
+                // again or tear the connection down and release it. (They
+                // were copied out first, a heap copy of every read.)
+                crate::http::ws_ingest(py, net, backend, tid, data);
             } else if conn.deferred_error.is_none() {
                 // In-cell parse (R-080): llhttp over the recv slot; the
                 // parser copies what it keeps, so the slot re-posts below.
@@ -2707,7 +2829,7 @@ fn on_recv_done(
                         if outcome.pump {
                             net.events.push(NetEvent::HttpPump { tid });
                         }
-                        if outcome.owes_continue {
+                        if outcome.owes_continue && crate::http::continue_now_or_later(conn) {
                             continue_owed = true;
                         }
                     }
@@ -2746,6 +2868,20 @@ fn on_recv_done(
     }
     if paused_now {
         net.stats_pipeline_pauses += 1;
+    }
+    // Size the next read by this one (see RECV_CLASS_FIRST). The slot
+    // still has this op's reference, released after we return, so letting
+    // go of the transport's here frees it then -- unless a receive was
+    // already re-posted into it (a WebSocket ingest resuming reads), which
+    // keeps it until that one completes.
+    if let Some(entry) = net.transports.get_mut(&tid) {
+        let next = slot.class.after_read(bytes as usize, entry.recv_last_full);
+        entry.recv_last_full = bytes as usize >= slot.class.size();
+        entry.recv_class = next;
+        if next != slot.class && entry.recv_slot == Some(slot) && entry.recv_op.is_none() {
+            entry.recv_slot = None;
+            net.buffers.release(slot);
+        }
     }
     if pipeline_pause {
         return; // budget spent; http_resume_reading re-posts
@@ -2854,8 +2990,13 @@ fn on_send_done(
     if entry.conn_lost {
         return;
     }
-    if os_error != 0 && !is_cancelled_error(os_error) {
-        teardown_with(py, net, backend, tid, Some(os_error));
+    if os_error != 0 {
+        // Only teardown cancels a send, and that marks the transport lost
+        // first; an abort on a live one means its socket was closed under
+        // it. Treated as a 0-byte success, the queue was re-posted to a
+        // handle value Windows may already have given to another socket.
+        let code = if is_cancelled_error(os_error) { WSAECONNABORTED } else { os_error };
+        teardown_with(py, net, backend, tid, Some(code));
         return;
     }
     net.stats_bytes_tx += bytes as u64;
@@ -3117,6 +3258,15 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
             NetEvent::HeldData { tid, data } => {
                 let route = core.with_net(|net, _| route_inbound(py, net, tid, data.as_ptr(), data.len()))?;
                 deliver_inbound(py, core, tid, route, None, data.as_ptr(), data.len())?;
+            }
+            NetEvent::RecvFailed { tid, os_error } => {
+                // A no-op if the callbacks that took its data aborted it;
+                // one still draining a close() is torn down now, its peer
+                // having reset.
+                core.with_net(|net, reactor| {
+                    teardown_with(py, net, reactor.backend_mut(), tid, Some(os_error))
+                })?;
+                core.drain_graveyards(py)?;
             }
             NetEvent::BufData { tid, slot, len } => {
                 // The slot is the event's until released below, so its
@@ -3725,6 +3875,8 @@ pub(crate) fn wire_stream(
                 proto: ProtoKind::Py(proto),
                 pyobj: Some(transport.clone_ref(py)),
                 recv_slot: None,
+                recv_class: RECV_CLASS_FIRST,
+                recv_last_full: false,
                 recv_op: None,
                 send_op: None,
                 inflight: 0,
@@ -3738,11 +3890,12 @@ pub(crate) fn wire_stream(
                 conn_lost: false,
                 eof_wanted: false,
                 eof_sent: false,
+                lingering: false,
+                linger_until_ns: 0,
                 flush_scheduled: false,
                 paused_recv: None,
                 paused_eof: false,
                 extra_sock: None,
-                extra_fd: None,
                 owner,
                 server,
                 // Kept on the Transport itself (they outlive the entry);
@@ -3814,6 +3967,8 @@ pub(crate) fn wire_http(
                 proto: ProtoKind::Http(Box::new(conn)),
                 pyobj: None,
                 recv_slot: None,
+                recv_class: RECV_CLASS_FIRST,
+                recv_last_full: false,
                 recv_op: None,
                 send_op: None,
                 inflight: 0,
@@ -3827,11 +3982,12 @@ pub(crate) fn wire_http(
                 conn_lost: false,
                 eof_wanted: false,
                 eof_sent: false,
+                lingering: false,
+                linger_until_ns: 0,
                 flush_scheduled: false,
                 paused_recv: None,
                 paused_eof: false,
                 extra_sock: None,
-                extra_fd: None,
                 owner: None,
                 server: None,
                 peername: peer,
@@ -3940,12 +4096,13 @@ impl Transport {
     /// or set one such as keepalive. A transport built from the caller's
     /// socket (`sock=`) wraps that very object, as asyncio does.
     ///
-    /// Otherwise the engine owns the only descriptor, so the wrapper holds
-    /// a `dup()` rather than a second owner of the engine's: two owners of
-    /// one descriptor means a double close, and by the second one the OS
-    /// may have handed that number to an unrelated connection (ADR-25's
-    /// hazard, reached from the other side). The duplicate is closed at
-    /// teardown (`ConnLost`), which keeps the transport's close final.
+    /// Otherwise the engine owns the only descriptor, and the wrapper
+    /// holds a socket object over it that never owns it: two owners of one
+    /// descriptor means a double close, and by the second one the OS may
+    /// have handed that number to an unrelated connection (ADR-25's
+    /// hazard, reached from the other side). It is detached before the
+    /// engine closes the handle (`release_socket`), which keeps the
+    /// transport's close final: `fileno()` reads -1 from then on.
     fn transport_socket(&self, py: Python<'_>, core: &CoreLoop) -> PyResult<Option<Py<PyAny>>> {
         if let Some(ts) = self.trsock.get(py) {
             return Ok(Some(ts.clone_ref(py)));
@@ -3958,26 +4115,23 @@ impl Transport {
         let sock = match owner {
             Some(owner) => owner,
             None => {
-                let dup = build_transport_socket(py, raw)?;
-                let dup_fd: u64 = dup.call_method0(py, intern!(py, "fileno"))?.extract(py)?;
+                let sock = build_transport_socket(py, raw)?;
+                // Its fileno() is the transport's own descriptor, already in
+                // `fd_users`, so add_reader() refuses it as asyncio does.
                 let kept = core.with_net(|net, _| match net.transports.get_mut(&self.tid) {
-                    Some(e) if e.extra_sock.is_none() => {
-                        e.extra_sock = Some(dup.clone_ref(py));
-                        // Open as long as the entry is (the TransportSocket
-                        // wrapper has no close()), so the number cannot be
-                        // reused while it stands for this transport.
-                        e.extra_fd = Some(dup_fd as RawSocket);
-                        net.fd_users.insert(dup_fd as RawSocket, FdUser::Stream(self.tid));
+                    Some(e) if e.extra_sock.is_none() && e.socket == raw => {
+                        e.extra_sock = Some(sock.clone_ref(py));
                         true
                     }
                     _ => false,
                 })?;
                 if !kept {
-                    // Torn down meanwhile: nothing would ever close it.
-                    let _ = dup.call_method0(py, intern!(py, "close"));
+                    // Torn down meanwhile, its handle closed or about to be:
+                    // this object must not own it.
+                    detach_socket_object(py, &sock);
                     return Ok(None);
                 }
-                dup
+                sock
             }
         };
         let ts = transport_socket(py, sock)?;
@@ -4089,16 +4243,35 @@ fn check_write_type(data: &Bound<'_, PyAny>) -> PyResult<()> {
     )))
 }
 
-/// A plain `socket.socket` over a duplicate of `raw`: the object the
-/// engine closes at teardown. Callers see it only through a
-/// `TransportSocket` (see `Transport::transport_socket`).
+/// `_socket.socket.detach`, looked up once (see `detach_socket_object`).
+static SOCKET_DETACH: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Make a `socket.socket` built by `build_transport_socket` let go of its
+/// handle without closing it. The C base class's method, called directly:
+/// it runs no Python code, so it is safe in-cell.
+fn detach_socket_object(py: Python<'_>, sock: &Py<PyAny>) {
+    let detach = SOCKET_DETACH.get_or_try_init(py, || {
+        py.import("_socket")?.getattr("socket")?.getattr("detach").map(Bound::unbind)
+    });
+    if let Ok(detach) = detach {
+        let _ = detach.call1(py, (sock.clone_ref(py),));
+    }
+}
+
+/// A plain `socket.socket` over the engine's own handle `raw`, which it
+/// must never close: `release_socket` detaches it first. Callers see it
+/// only through a `TransportSocket` (see `Transport::transport_socket`),
+/// which has no close() or detach() to offer them.
+///
+/// This used to wrap a `socket.dup()` -- on Windows a
+/// WSADuplicateSocket, a second handle and a second owner of the
+/// connection -- and uvicorn asks for this object on every connection
+/// just to read its addresses: one extra handle per connection, held for
+/// the connection's life, and the duplication's cost on every accept.
 fn build_transport_socket(py: Python<'_>, raw: RawSocket) -> PyResult<Py<PyAny>> {
     let socket_mod = py.import("socket")?;
-    // socket.dup(), not os.dup(): on Windows a SOCKET is not a file
-    // descriptor and only this one does the right thing.
-    let dup = socket_mod.call_method1(intern!(py, "dup"), (raw as u64,))?;
     let kwargs = PyDict::new(py);
-    kwargs.set_item(intern!(py, "fileno"), dup)?;
+    kwargs.set_item(intern!(py, "fileno"), raw as u64)?;
     Ok(socket_mod.getattr(intern!(py, "socket"))?.call((), Some(&kwargs))?.unbind())
 }
 

@@ -80,8 +80,14 @@ pub(crate) struct HttpConn {
     pub(crate) keep_alive: bool,
     pub(crate) resp: RespPhase,
     pub(crate) resp_head: Vec<u8>,
+    /// A pipelined head expects `100 Continue` while earlier requests are
+    /// still unanswered: owed once every response ahead of it is complete
+    /// (`continue_now_or_later`).
+    pub(crate) continue_deferred: bool,
     /// http.response.start carried a content-length header.
     pub(crate) resp_started_with_length: bool,
+    /// ... and a `connection` header of the application's own.
+    pub(crate) resp_app_connection: bool,
     /// Its parsed value, enforced across every body message.
     pub(crate) resp_declared_length: Option<u64>,
     /// Body bytes handed to the wire so far for the active response.
@@ -316,7 +322,9 @@ impl HttpConn {
             keep_alive: true,
             resp: RespPhase::Idle,
             resp_head: Vec::new(),
+            continue_deferred: false,
             resp_started_with_length: false,
+            resp_app_connection: false,
             resp_declared_length: None,
             resp_body_sent: 0,
             raw_stream: false,
@@ -419,6 +427,10 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
         conn.pending_bytes += req.queued_size();
         conn.pending.push_back(req);
     }
+    if conn.continue_deferred && !conn.parser.expecting_body() {
+        // Its body came without the interim response: none is owed now.
+        conn.continue_deferred = false;
+    }
     let mut oversize_ws_trailing = false;
     if let Some(offset) = fed? {
         // Upgrade head complete (R-087): bytes past it are NOT HTTP —
@@ -456,6 +468,23 @@ pub(crate) fn conn_feed(conn: &mut HttpConn, data: &[u8]) -> Result<FeedOutcome,
 /// continue timeout before sending -- a fixed stall on every upload for
 /// the clients that use it, and an indefinite one for the strict ones.
 pub(crate) const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Whether a head that expects `100 Continue` may have it now. The
+/// interim response shares the connection's one ordered byte stream, so
+/// written while an earlier request was still being answered it landed
+/// inside that response -- in the middle of a streamed body, corrupting
+/// its chunked framing or shifting a content-length one -- or ahead of
+/// it, where the client takes it for the earlier request's interim
+/// response. Such a head's 100 is deferred until everything ahead of it
+/// is answered (`finish_request`), not skipped: a strict client never
+/// sends the body without it.
+pub(crate) fn continue_now_or_later(conn: &mut HttpConn) -> bool {
+    if !conn.active && conn.pending.is_empty() {
+        return true;
+    }
+    conn.continue_deferred = true;
+    false
+}
 
 /// R-086, shared by the plaintext and TLS ingest paths: answer a parse
 /// error in its pipeline position. An idle connection is answered (and
@@ -856,6 +885,20 @@ pub(crate) fn completed(py: Python<'_>) -> &Py<CompletedAwaitable> {
     COMPLETED.get_or_init(py, || Py::new(py, CompletedAwaitable {}).unwrap())
 }
 
+/// Finish an awaitable with `value`: StopIteration carrying it, raised as
+/// (StopIteration, value) rather than as an exception instance. That is
+/// the form the awaiting frame reads the result straight out of (CPython
+/// 3.11's `_PyGen_FetchStopIterationValue`), so no exception object or
+/// args tuple is built -- which a normalized StopIteration cost every
+/// receive(). A tuple value would be read as the exception's args, so
+/// one of those goes wrapped, normalized on the way out as before.
+fn stop_iteration(py: Python<'_>, value: Py<PyAny>) -> PyErr {
+    if value.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
+        return pyo3::exceptions::PyStopIteration::new_err((value,));
+    }
+    PyErr::from_type(py.get_type::<pyo3::exceptions::PyStopIteration>(), value)
+}
+
 /// One-shot "already done -> value" awaitable (receive() results).
 #[pyclass(module = "cadeloop._core")]
 pub struct ValueAwaitable {
@@ -897,9 +940,7 @@ impl ValueAwaitable {
             (None, Some(t)) => t.msg.into_message(py)?,
             (None, None) => return Err(PyRuntimeError::new_err("awaitable already consumed")),
         };
-        Err(PyErr::from_value(
-            pyo3::exceptions::PyStopIteration::new_err((value,)).value(py).clone().into_any(),
-        ))
+        Err(stop_iteration(py, value))
     }
 }
 
@@ -1094,12 +1135,13 @@ impl HttpReceive {
             R::Body(b) => taken(TakenMsg::Body(b)),
             R::Wait(pyloop) => park_recv_waiter(py, core, self.tid, &pyloop, false),
             R::WsWait(pyloop) => {
-                let fut = park_recv_waiter(py, core, self.tid, &pyloop, true)?;
+                let (fut, pending) = park_recv_waiter_pending(py, core, self.tid, &pyloop, true)?;
                 let recv = WsRecv {
                     core: self.core.clone_ref(py),
                     tid: self.tid,
                     epoch: self.epoch,
                     fut: Some(fut),
+                    parked_pending: pending,
                 };
                 Ok(Py::new(py, recv)?.into_any())
             }
@@ -1117,7 +1159,33 @@ fn park_recv_waiter(
     pyloop: &Py<PyAny>,
     ws: bool,
 ) -> PyResult<Py<PyAny>> {
+    park_recv_waiter_pending(py, core, tid, pyloop, ws).map(|(fut, _)| fut)
+}
+
+/// `park_recv_waiter`, also saying whether the waiter is still pending
+/// (false: the connection was gone, and it is already resolved).
+fn park_recv_waiter_pending(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    pyloop: &Py<PyAny>,
+    ws: bool,
+) -> PyResult<(Py<PyAny>, bool)> {
     let fut = pyloop.bind(py).call_method0(intern!(py, "create_future"))?;
+    // The receive loop's case -- nothing parked yet -- in one entry: no
+    // queue to take out, filter and put back.
+    let store = fut.clone().unbind();
+    let first = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+        Some(conn) if conn.recv_waiters.is_empty() => {
+            conn.recv_waiters.push_back(store);
+            None
+        }
+        _ => Some(store),
+    })?;
+    if first.is_none() {
+        return Ok((fut.unbind(), true));
+    }
+    drop(first);
     // Prune waiters a cancelled receive() left behind BEFORE parking the
     // new one: the heartbeat pattern (wait_for(receive(), t) in a loop)
     // cancels one future per poll, and retaining them grew the queue
@@ -1146,11 +1214,12 @@ fn park_recv_waiter(
         }
         None => Some(store),
     })?;
-    if unstored.is_some() {
+    let pending = unstored.is_none();
+    if !pending {
         let msg = if ws { ws_gone_message(py, core, tid)? } else { gone_message(py, core, tid)? };
         let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
     }
-    Ok(fut.unbind())
+    Ok((fut.unbind(), pending))
 }
 
 /// A WsWake for a receive() waiter still pending (R-087): resolve it with
@@ -1213,6 +1282,11 @@ pub struct WsRecv {
     epoch: u64,
     /// The parked waiter; `None` once the message has been handed over.
     fut: Option<Py<PyAny>>,
+    /// The waiter was parked unresolved and has not been looked at since:
+    /// the first resume yields it without asking done(). Only a wake can
+    /// resolve it, and a wake is a later loop callback; awaited late, a
+    /// done future yielded to the task just resumes it a tick later.
+    parked_pending: bool,
 }
 
 #[pymethods]
@@ -1259,7 +1333,11 @@ impl WsRecv {
                 return Err(PyRuntimeError::new_err("cannot reuse already awaited receive()"));
             };
             let f = fut.bind(py);
-            let done: bool = f.call_method0(intern!(py, "done"))?.extract()?;
+            let done: bool = if std::mem::take(&mut self.parked_pending) {
+                false
+            } else {
+                f.call_method0(intern!(py, "done"))?.extract()?
+            };
             if !done {
                 // Future.__await__: yield it to the task, which resumes
                 // this once it is resolved.
@@ -1283,15 +1361,15 @@ impl WsRecv {
             match took {
                 Took::Value(v) => {
                     self.fut = None;
-                    return Err(PyErr::from_value(
-                        pyo3::exceptions::PyStopIteration::new_err((v,)).value(py).clone().into_any(),
-                    ));
+                    return Err(stop_iteration(py, v));
                 }
                 // Woken, and the message went to another receive() first:
                 // wait again.
                 Took::Wait(pyloop) => {
                     let core = self.core.bind(py).get();
-                    self.fut = Some(park_recv_waiter(py, core, self.tid, &pyloop, true)?);
+                    let (fut, pending) = park_recv_waiter_pending(py, core, self.tid, &pyloop, true)?;
+                    self.fut = Some(fut);
+                    self.parked_pending = pending;
                 }
             }
         }
@@ -1721,6 +1799,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         };
         let mut declared_length: Option<u64> = None;
         let mut saw_close = false;
+        let mut saw_connection = false;
         if let Some(headers) = message.get_item(intern!(py, "headers"))? {
             for item in headers.try_iter()? {
                 let pair = item?;
@@ -1779,10 +1858,11 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // and the body bytes are not chunk-framed either way.
                     continue;
                 }
-                if name.eq_ignore_ascii_case(b"connection")
-                    && value.to_ascii_lowercase().windows(5).any(|w| w == b"close")
-                {
-                    saw_close = true;
+                if name.eq_ignore_ascii_case(b"connection") {
+                    saw_connection = true;
+                    if value.to_ascii_lowercase().windows(5).any(|w| w == b"close") {
+                        saw_close = true;
+                    }
                 }
                 if name.eq_ignore_ascii_case(b"date") || name.eq_ignore_ascii_case(b"server") {
                     continue; // ours (R-084)
@@ -1814,6 +1894,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             if saw_close {
                 conn.keep_alive = false;
             }
+            conn.resp_app_connection = saw_connection;
             conn.resp = RespPhase::Started;
             conn.log_status = status;
             Ok(())
@@ -1827,9 +1908,21 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             Some(v) => v.is_truthy()?,
             None => false,
         };
-        let body: Vec<u8> = match message.get_item(intern!(py, "body"))? {
-            Some(v) if !v.is_none() => v.extract()?,
-            _ => Vec::new(),
+        // Borrowed from the bytes object (the GIL is held for as long as
+        // `body_obj` lives): its one copy is onto the wire buffer below.
+        // Extracting it into a Vec first copied every body twice -- a full
+        // extra memcpy per 16 KiB chunk of a streamed response.
+        let body_obj = message.get_item(intern!(py, "body"))?;
+        let owned: Vec<u8>;
+        let body: &[u8] = match &body_obj {
+            Some(v) if !v.is_none() => match v.cast::<pyo3::types::PyBytes>() {
+                Ok(b) => b.as_bytes(),
+                Err(_) => {
+                    owned = v.extract()?;
+                    &owned
+                }
+            },
+            _ => &[],
         };
         core.with_net(|net, reactor| {
             let backend = reactor.backend_mut();
@@ -1843,6 +1936,8 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                 RespPhase::Started => {
                     // First body chunk decides the framing (R-084).
                     let mut out = std::mem::take(&mut conn.resp_head);
+                    // Framing headers and the chunk-size line need < 64.
+                    out.reserve(body.len() + 64);
                     let saw_length = conn.resp_started_with_length;
                     // A bodyless status must not carry body bytes AND must
                     // not carry framing headers: a client reading a 204/304
@@ -1868,9 +1963,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                             out.extend_from_slice(framed.to_string().as_bytes());
                             out.extend_from_slice(b"\r\n");
                         }
+                        announce_keep_alive_10(conn, &mut out);
                         out.extend_from_slice(b"\r\n");
                         if !head_req {
-                            out.extend_from_slice(&body);
+                            out.extend_from_slice(body);
                         }
                         conn.resp_body_sent = if head_req { 0 } else { body.len() as u64 };
                         if let Some(e) = length_mismatch(conn, !more) {
@@ -1886,15 +1982,16 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         // Raw streaming: caller-framed (their CL), a HEAD
                         // response (no body bytes at all), or HTTP/1.0
                         // (close-delimited — chunked needs 1.1).
-                        out.extend_from_slice(b"\r\n");
-                        if !head_req {
-                            out.extend_from_slice(&body);
-                        }
                         if minor == 0 && !saw_length && !head_req {
                             // Close-delimited only when the body length is
                             // genuinely implicit; HEAD and bodyless statuses
                             // are self-framing, so the connection survives.
                             conn.keep_alive = false;
+                        }
+                        announce_keep_alive_10(conn, &mut out);
+                        out.extend_from_slice(b"\r\n");
+                        if !head_req {
+                            out.extend_from_slice(body);
                         }
                         conn.resp_body_sent = body.len() as u64;
                         if let Some(e) = length_mismatch(conn, false) {
@@ -1905,7 +2002,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     } else {
                         out.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
                         if !body.is_empty() {
-                            push_chunk(&mut out, &body);
+                            push_chunk(&mut out, body);
                         }
                         conn.raw_stream = false;
                         conn.resp_body_sent = body.len() as u64;
@@ -1928,9 +2025,9 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     if head_req {
                         // body bytes suppressed
                     } else if raw {
-                        out.extend_from_slice(&body);
+                        out.extend_from_slice(body);
                     } else if !body.is_empty() {
-                        push_chunk(&mut out, &body);
+                        push_chunk(&mut out, body);
                     }
                     conn.resp_body_sent = conn.resp_body_sent.saturating_add(body.len() as u64);
                     if let Some(e) = length_mismatch(conn, !more) {
@@ -2050,6 +2147,18 @@ fn is_forbidden_trailer(name: &[u8]) -> bool {
             | b"content-range"
             | b"trailer"
     )
+}
+
+/// An HTTP/1.0 connection persists only if the response says so (RFC 7230
+/// 6.3, appendix A.1.2). A 1.0 client that asked for keep-alive was kept
+/// open without being told: one that then read to EOF waited out the idle
+/// timeout for a response it already had. Called with the head's framing
+/// settled, so a close-delimited body (keep_alive already cleared) is
+/// never announced as persistent.
+fn announce_keep_alive_10(conn: &HttpConn, out: &mut Vec<u8>) {
+    if conn.active_minor == 0 && conn.keep_alive && !conn.resp_app_connection {
+        out.extend_from_slice(b"connection: keep-alive\r\n");
+    }
 }
 
 /// Enforce a declared `content-length` (R-084). Getting this wrong is not
@@ -2324,7 +2433,7 @@ pub(crate) fn tls_ingest(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64, da
                     if outcome.pause_reading {
                         conn.pipeline_paused = true;
                     }
-                    if outcome.owes_continue {
+                    if outcome.owes_continue && continue_now_or_later(conn) {
                         // Staged as plaintext like any other response
                         // byte; the TlsFlush below encrypts it.
                         net::http_enqueue(py, net, backend, tid, CONTINUE_RESPONSE.to_vec());
@@ -2959,6 +3068,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                 conn.resp = RespPhase::Idle;
                 conn.resp_head = Vec::new();
                 conn.resp_started_with_length = false;
+                conn.resp_app_connection = false;
                 conn.resp_declared_length = None;
                 conn.resp_body_sent = 0;
                 conn.raw_stream = false;
@@ -3439,6 +3549,18 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
             net::http_enqueue(py, net, backend, tid, resp);
             net::http_close_after_write(py, net, backend, tid);
         } else {
+            // Every response ahead of a deferred 100 Continue is complete
+            // once nothing else is queued: it goes out now, behind them.
+            let owed = net.http_conn_mut(tid).is_some_and(|c| {
+                let now = c.continue_deferred && c.pending.is_empty() && c.parser.expecting_body();
+                if c.pending.is_empty() {
+                    c.continue_deferred = false;
+                }
+                now
+            });
+            if owed {
+                net::http_enqueue(py, net, backend, tid, CONTINUE_RESPONSE.to_vec());
+            }
             // R-085: a request just left the pipeline queue, so the budget
             // that suppressed reading may have freed up.
             net::http_resume_reading(py, net, backend, tid);
@@ -3745,10 +3867,27 @@ impl AppTask {
     }
 }
 
+/// `_asyncio.Future` and `_asyncio.Task`, the C types (see `future_loop`).
+static C_FUTURE_TYPES: PyOnceLock<(Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
+
 /// The loop a future is attached to, mirroring `asyncio.futures._get_loop`:
 /// `get_loop()` when it exists, else the `_loop` attribute. `None` when
 /// neither is available -- an awaitable too exotic to judge, left alone.
 fn future_loop<'py>(py: Python<'py>, fut: &Bound<'py, PyAny>) -> Option<Bound<'py, PyAny>> {
+    // asyncio's C Future and Task -- exactly those types, so no override
+    // of get_loop() is skipped -- answer by their `_loop`, which is what
+    // their get_loop() returns: a slot read, where get_loop() was a
+    // bound-method allocation and a call on every suspension.
+    let c_types = C_FUTURE_TYPES.get_or_try_init(py, || -> PyResult<_> {
+        let m = py.import("_asyncio")?;
+        Ok((m.getattr("Future")?.unbind(), m.getattr("Task")?.unbind()))
+    });
+    if let Ok((future, task)) = c_types {
+        let ty = fut.get_type();
+        if ty.is(future.bind(py)) || ty.is(task.bind(py)) {
+            return fut.getattr(intern!(py, "_loop")).ok();
+        }
+    }
     if let Ok(get_loop) = fut.getattr(intern!(py, "get_loop")) {
         return get_loop.call0().ok();
     }

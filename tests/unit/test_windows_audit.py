@@ -524,3 +524,172 @@ def test_a_subprocess_outliving_its_loop_does_not_raise_in_the_waiter(monkeypatc
         if t.name == "cadeloop-subprocess-wait":
             t.join(10)
     assert not errors, errors
+
+
+# --------------------------------------------------------------------- #
+# Windows pass 3: bytes ahead of a reset, aborts under a live transport, #
+# timer-bound parks                                                      #
+# --------------------------------------------------------------------- #
+
+
+@windows_only
+def test_bytes_received_before_a_reset_reach_the_protocol(loop):
+    """The peer's bytes completed the pending receive, then the peer reset
+    before the loop got to that completion. Re-posting the receive fails at
+    once (WSAECONNRESET), and the transport was torn down right there -- so
+    the event already queued for those bytes found no transport and was
+    dropped: the protocol saw nothing of data the kernel had delivered. The
+    stdlib proactor delivers the bytes, then ConnectionResetError."""
+    import struct
+
+    async def main():
+        conns = asyncio.Queue()
+
+        class P(asyncio.Protocol):
+            def __init__(self):
+                self.got = 0
+                self.lost = loop.create_future()
+
+            def connection_made(self, transport):
+                conns.put_nowait(self)
+                # Block the loop once its receive is posted: the bytes and
+                # the reset both land while it is busy.
+                loop.call_soon(time.sleep, 0.15)
+
+            def data_received(self, data):
+                self.got += len(data)
+
+            def connection_lost(self, exc):
+                self.lost.set_result(exc)
+
+        server = await loop.create_server(P, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        def client():
+            c = socket.create_connection(("127.0.0.1", port))
+            time.sleep(0.03)
+            c.sendall(b"x" * 1000)
+            time.sleep(0.03)
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))
+            c.close()
+
+        results = []
+        for _ in range(5):
+            sender = loop.run_in_executor(None, client)
+            proto = await conns.get()
+            await sender
+            exc = await asyncio.wait_for(proto.lost, 5)
+            results.append((proto.got, type(exc)))
+        server.close()
+        await server.wait_closed()
+        return results
+
+    results = loop.run_until_complete(main())
+    assert all(got == 1000 for got, _ in results), results
+    assert all(exc is ConnectionResetError for _, exc in results), results
+
+
+@windows_only
+def test_a_socket_closed_under_its_transport_loses_the_connection(loop):
+    """Closing the socket object a `sock=` transport runs on fails the
+    transport with ConnectionAbortedError, as asyncio does. On Windows 11
+    the pending receive completes with WSAECONNABORTED here, not
+    ERROR_OPERATION_ABORTED; an operation aborted under a live transport
+    by any other means is now treated the same way rather than taken for
+    one of our own cancellations (which left the transport neither
+    reading nor lost)."""
+
+    async def main():
+        listener = socket.create_server(("127.0.0.1", 0))
+        sock = socket.create_connection(listener.getsockname())
+        peer, _ = listener.accept()
+        lost = loop.create_future()
+
+        class P(asyncio.Protocol):
+            def connection_lost(self, exc):
+                if not lost.done():
+                    lost.set_result(exc)
+
+        await loop.create_connection(P, sock=sock)
+        await asyncio.sleep(0.05)  # the receive is posted
+        sock.close()
+        try:
+            return await asyncio.wait_for(lost, 3)
+        finally:
+            peer.close()
+            listener.close()
+
+    exc = loop.run_until_complete(main())
+    assert isinstance(exc, ConnectionAbortedError), exc
+
+
+@windows_only
+@pytest.mark.skipif(bool(os.environ.get("CADELOOP_COARSE_TIMERS")), reason="precise parks disabled")
+def test_a_short_timer_ends_its_park_on_time(loop):
+    """A GetQueuedCompletionStatusEx timeout is whole milliseconds and ends
+    on the next system clock interrupt, 15.6 ms apart by default: a 2 ms
+    sleep took ~14 ms on an otherwise idle loop (stdlib asyncio and winloop
+    alike). Parks bounded by a timer now end on a high-resolution timer."""
+
+    async def main():
+        over = []
+        for _ in range(15):
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.002)
+            over.append(time.perf_counter() - t0 - 0.002)
+        return sorted(over)
+
+    over = loop.run_until_complete(main())
+    assert over[0] > -1e-4, f"a timer fired early: {over}"
+    assert over[len(over) // 2] < 0.006, f"median overshoot {over[len(over) // 2] * 1e3:.2f} ms"
+    assert loop.stats()["precise_parks"] >= 15
+
+
+@windows_only
+def test_the_extra_info_socket_is_no_second_handle(loop):
+    """get_extra_info("socket") on a transport the loop made its own socket
+    for wrapped a socket.dup() -- on Windows a WSADuplicateSocket, a second
+    handle to the connection held for its life. uvicorn asks for it on
+    every connection, so each one cost two handles. It now wraps the
+    transport's own handle without owning it: no new handle, and the
+    transport's close still both ends the connection and leaves the
+    object reading fileno() -1."""
+
+    n = 32
+
+    async def main():
+        transports = []
+
+        class P(asyncio.Protocol):
+            def connection_made(self, transport):
+                transports.append(transport)
+
+        server = await loop.create_server(P, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()[:2]
+        clients = [socket.create_connection(addr) for _ in range(n)]
+        try:
+            while len(transports) < n:
+                await asyncio.sleep(0.01)
+            before = _process_handle_count()
+            socks = [t.get_extra_info("socket") for t in transports]
+            added = _process_handle_count() - before
+            assert added < n // 4, f"{added} handles for {n} sockets"
+            assert all(s.fileno() != -1 for s in socks)
+            # The number add_reader() refuses is the transport's own.
+            with pytest.raises(RuntimeError, match="is used by transport"):
+                loop.add_reader(socks[0].fileno(), lambda: None)
+            for t in transports:
+                t.close()
+            await asyncio.sleep(0.05)
+            assert all(s.fileno() == -1 for s in socks)
+            # Closed for real: the peer sees its EOF.
+            for c in clients:
+                c.settimeout(3)
+                assert c.recv(1) == b""
+        finally:
+            for c in clients:
+                c.close()
+            server.close()
+            await server.wait_closed()
+
+    loop.run_until_complete(main())

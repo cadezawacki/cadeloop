@@ -1,0 +1,47 @@
+{
+ "started": "2026-10-29T09:49:58",
+ "argv": [
+  "C:\\Users\\zawac\\Desktop\\cadeloop\\.claude\\worktrees\\baseline\\bench\\windows\\run_suite.py",
+  "--suite",
+  "http,echo,ws,tls,idle",
+  "--pkg",
+  "baseline=C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\artifacts\\baseline",
+  "--pkg",
+  "candidate=C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\artifacts\\cand2",
+  "--reps",
+  "3",
+  "--duration",
+  "5",
+  "--warmup",
+  "1.5",
+  "--loadgen",
+  "C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\artifacts\\loadgen.exe",
+  "--out",
+  "C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\results\\window1",
+  "--cert",
+  "C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\tls\\cert.pem",
+  "C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\tls\\key.pem",
+  "--idle-counts",
+  "1000,5000"
+ ],
+ "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+ "executable": "C:\\Users\\zawac\\Desktop\\cadeloop\\.venv\\Scripts\\python.exe",
+ "platform": "Windows-10-10.0.26200-SP0",
+ "machine": "AMD64",
+ "cpu_count": 20,
+ "pkgs": {
+  "baseline": {
+   "path": "C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\artifacts\\baseline",
+   "identity": null
+  },
+  "candidate": {
+   "path": "C:\\Users\\zawac\\AppData\\Local\\Temp\\claude\\C--Users-zawac-Desktop-cadeloop\\59982420-8fa7-4289-81d6-cd0ba803ccc7\\scratchpad\\artifacts\\cand2",
+   "identity": "rev=5285fdc dirty=True sha256=da735aceda98ec899944ee62a764147127f56b35c68cca09d4f73b49266084c3\n M crates/core/src/backend/iocp.rs\n M crates/core/src/backend/mod.rs\n M crates/core/src/reactor.rs\n M crates/pyshim/src/coreloop.rs\n M crates/pyshim/src/net.rs\n"
+  }
+ },
+ "merged_from": {
+  "window1": "contenders + cadeloop 1.0.1",
+  "window3": "final build",
+  "window2": "cand3 for the rest"
+ }
+}

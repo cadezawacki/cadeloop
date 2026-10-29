@@ -234,6 +234,25 @@ pub trait IoBackend {
     /// Called with the GIL released (R-021).
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize>;
 
+    /// `poll`, told whether `timeout` is a deadline that should end the
+    /// wait on time (a timer is due then) rather than an idle clamp.
+    /// Backends whose waits are already precise, or that cannot do
+    /// better, keep the default.
+    fn poll_precise(
+        &mut self,
+        out: &mut Vec<Completion>,
+        timeout: Option<Duration>,
+        precise: bool,
+    ) -> io::Result<usize> {
+        let _ = precise;
+        self.poll(out, timeout)
+    }
+
+    /// Whether `poll_precise` ends deadline-bound parks on time.
+    fn precise_parks(&self) -> bool {
+        false
+    }
+
     /// Non-blocking poll used by the spin phase of spin-then-park (R-060).
     fn try_poll(&mut self, out: &mut Vec<Completion>) -> io::Result<usize> {
         self.poll(out, Some(Duration::ZERO))

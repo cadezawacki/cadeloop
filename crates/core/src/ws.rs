@@ -158,10 +158,10 @@ pub enum WsEvent {
 /// drain protocol events. Limits: `max_message` bounds the ASSEMBLED
 /// message (1009 beyond it).
 pub struct WsRx {
+    /// The unparsed tail of earlier pushes: a frame not yet complete.
     buf: Vec<u8>,
-    /// Bytes of `buf` already parsed into events. Compacted away once per
-    /// `push`, not per frame (see `push`).
-    pos: usize,
+    /// Bytes the last `parse_one` consumed.
+    consumed: usize,
     frag_op: Option<u8>,
     frag: Vec<u8>,
     pub max_message: usize,
@@ -172,18 +172,50 @@ pub struct WsRx {
 
 impl WsRx {
     pub fn new(max_message: usize) -> Self {
-        WsRx { buf: Vec::new(), pos: 0, frag_op: None, frag: Vec::new(), max_message, ended: false }
+        WsRx { buf: Vec::new(), consumed: 0, frag_op: None, frag: Vec::new(), max_message, ended: false }
     }
 
     pub fn push(&mut self, data: &[u8], out: &mut Vec<WsEvent>) {
         if self.ended {
             return;
         }
-        self.buf.extend_from_slice(data);
+        if self.buf.is_empty() {
+            // Nothing carried over -- the usual case, one or more whole
+            // frames per read: parse straight out of `data` and keep only
+            // an incomplete tail. Copying every read into `buf` first cost
+            // a copy per read, and held `buf` at the largest read's size
+            // for the connection's life.
+            let used = self.parse_all(data, out);
+            if !self.ended && used < data.len() {
+                self.buf.extend_from_slice(&data[used..]);
+            }
+            return;
+        }
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.extend_from_slice(data);
+        let used = self.parse_all(&buf, out);
+        if !self.ended {
+            // Drop what this push parsed, ONCE: `parse_all` walks a cursor
+            // instead of draining per frame -- draining per frame was
+            // O(remaining) each, i.e. O(n^2) for a buffer full of small
+            // frames. A single 64 KiB recv of ~10,900 empty frames cost
+            // ~115 ms of in-cell parse CPU (vs ~0.36 ms fed one frame at a
+            // time), stalling the whole worker; the cursor makes it linear.
+            buf.drain(..used);
+            self.buf = buf;
+        }
+    }
+
+    /// Parse every complete frame at the front of `b` into `out`; returns
+    /// how many bytes that consumed. A Close, or a protocol failure, ends
+    /// the stream: nothing after it is parsed, and `ended` is set.
+    fn parse_all(&mut self, b: &[u8], out: &mut Vec<WsEvent>) -> usize {
+        let mut pos = 0;
         loop {
-            match self.parse_one() {
-                ParseOne::NeedMore => break,
+            match self.parse_one(&b[pos..]) {
+                ParseOne::NeedMore => return pos,
                 ParseOne::Event(ev) => {
+                    pos += self.consumed;
                     // A Close ends the stream as a failure does. A peer may
                     // send nothing after its Close (RFC 6455 5.5.1), and the
                     // application has been told websocket.disconnect, the
@@ -197,28 +229,18 @@ impl WsRx {
                         self.ended = true;
                         // Nothing more will be parsed; drop the buffer.
                         self.buf = Vec::new();
-                        self.pos = 0;
-                        return;
+                        return pos;
                     }
                 }
-                ParseOne::Continue => {}
+                ParseOne::Continue => pos += self.consumed,
             }
-        }
-        // Compact ONCE per push: drop the prefix consumed this call so
-        // `buf` holds only the unparsed tail. `parse_one` advances a cursor
-        // instead of draining per frame -- draining per frame was
-        // O(remaining) each, i.e. O(n^2) for a buffer full of small frames.
-        // A single 64 KiB recv of ~10,900 empty frames cost ~115 ms of
-        // in-cell parse CPU (vs ~0.36 ms fed one frame at a time), stalling
-        // the whole worker; the cursor makes it linear.
-        if self.pos != 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
         }
     }
 
-    fn parse_one(&mut self) -> ParseOne {
-        let b = &self.buf[self.pos..];
+    /// One frame from the front of `b`. A frame parsed into an event or a
+    /// fragment sets `consumed` to its length; a failure does not need it
+    /// (the stream ends there).
+    fn parse_one(&mut self, b: &[u8]) -> ParseOne {
         if b.len() < 2 {
             return ParseOne::NeedMore;
         }
@@ -278,7 +300,7 @@ impl WsRx {
         for (i, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[i & 3];
         }
-        self.pos += off + len;
+        self.consumed = off + len;
 
         match opcode {
             OP_PING => ParseOne::Event(WsEvent::Ping(payload)),
@@ -414,9 +436,48 @@ mod tests {
         for (i, ev) in out.iter().enumerate() {
             assert_eq!(*ev, WsEvent::Binary(vec![(i & 0xff) as u8]));
         }
-        // Fully consumed: no bytes retained, cursor reset.
+        // Fully consumed: no bytes retained.
         assert!(rx.buf.is_empty());
-        assert_eq!(rx.pos, 0);
+    }
+
+    #[test]
+    fn any_split_of_a_stream_yields_the_same_events() {
+        // Whole frames, a fragmented message with a ping between its
+        // fragments, and a larger frame: parsed straight from one push,
+        // from a carried tail after a split at every byte boundary, and
+        // byte by byte -- every route must agree.
+        let mut stream = Vec::new();
+        stream.extend(client_frame(OP_TEXT, b"hello", true));
+        stream.extend(client_frame(OP_BINARY, &[1, 2, 3], false));
+        stream.extend(client_frame(OP_PING, b"p", true));
+        stream.extend(client_frame(OP_CONT, &[4, 5], true));
+        stream.extend(client_frame(OP_BINARY, &[7u8; 300], true));
+        let mut rx = WsRx::new(1 << 20);
+        let mut whole = Vec::new();
+        rx.push(&stream, &mut whole);
+        assert_eq!(
+            whole,
+            vec![
+                WsEvent::Text("hello".into()),
+                WsEvent::Ping(b"p".to_vec()),
+                WsEvent::Binary(vec![1, 2, 3, 4, 5]),
+                WsEvent::Binary(vec![7u8; 300]),
+            ]
+        );
+        for cut in 0..=stream.len() {
+            let mut rx = WsRx::new(1 << 20);
+            let mut out = Vec::new();
+            rx.push(&stream[..cut], &mut out);
+            rx.push(&stream[cut..], &mut out);
+            assert_eq!(out, whole, "split at byte {cut}");
+            assert!(rx.buf.is_empty());
+        }
+        let mut rx = WsRx::new(1 << 20);
+        let mut out = Vec::new();
+        for b in &stream {
+            rx.push(std::slice::from_ref(b), &mut out);
+        }
+        assert_eq!(out, whole);
     }
 
     #[test]

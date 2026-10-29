@@ -5,7 +5,8 @@ holds the methodology, the raw commands, and the measurement mistakes worth
 knowing about — including two that silently flattened an earlier draft of
 the README table into a near-tie.
 
-The Windows/IOCP benchmark history is separate, in
+The Windows methodology is [below](#windows); its harness and full notes are in
+[bench/windows/](../bench/windows/README.md). Older Windows/IOCP runs are kept in
 [docs/README.md](README.md#benchmarks-windows-11-loopback).
 
 Charts are generated from the same JSON the tables quote:
@@ -162,3 +163,64 @@ current throughput.
   contenders that scale better with cores are penalised equally.
 - One workload (plaintext `Hello, World!`). Large bodies, TLS, and
   WebSockets are not represented in these numbers.
+
+## Windows
+
+The Windows numbers in the README come from a separate, native harness:
+[`bench/windows/`](../bench/windows/README.md) drives each server with
+[`bench/loadgen`](../bench/loadgen/), a Go load generator built for this
+because a Python client is GIL-bound (trap 1) and `wrk` does not run on
+Windows. It speaks HTTP/1.1 (keep-alive, pipelined, open-loop, and one
+connection per request), TCP echo and WebSocket, validates every response,
+and keeps each run's full latency histogram.
+
+### Trap 3 — Go's clock on Windows
+
+Go's monotonic clock on Windows reads the kernel's interrupt time, which
+advances only at the timer interrupt. The first validation run of the load
+generator reported echo round trips of exactly 0 or ~0.5 ms; they were
+~100 µs. Every latency it records is now a QueryPerformanceCounter delta,
+cross-checked against an independent Python client on the same server.
+
+### Trap 4 — the host's network filters set the ceiling
+
+With AdGuard's and a VPN client's WFP filtering drivers active, loopback TCP
+on the test machine saturated at ~14 K round trips/s *system-wide*: one
+server or two independent servers loaded at once, the total was the same,
+and stdlib asyncio, winloop and cadeloop all measured ~14.3 K msg/s on 64
+echo connections. Single-connection RTT was ~100 µs. With those products,
+Dropbox and Bitdefender's protection paused, the same Go echo server
+reached 201 K msg/s and cadeloop's single-connection RTT was 21 µs. A
+benchmark that cannot separate servers is measuring the host; check by
+loading two servers at once.
+
+### Trap 5 — a venv's python.exe is not the server
+
+On Windows a venv's `python.exe` is a launcher that starts the real
+interpreter as a child. Reading CPU or memory off the `Popen` handle
+measures the launcher. The runner sums everything over the server's
+process tree (and spawn-model workers are grandchildren).
+
+### Windows environment and method
+
+| | |
+|---|---|
+| OS | Windows 11 Home 10.0.26200, x64, hypervisor present (HVCI on) |
+| CPU | Intel Core Ultra 7 265K, 20 cores, 32 GB |
+| Python | CPython 3.11.9 (64-bit, MSC v.1938) |
+| Rust | 1.96.0, `x86_64-pc-windows-msvc`, release profile (fat LTO, `codegen-units=1`, `panic=abort`), mimalloc |
+| Contenders | uvicorn 0.52.2 (h11, wsproto), hypercorn 0.18.0, winloop 0.6.3, rsloop 0.1.30, stdlib asyncio (proactor) |
+| Load | loadgen (Go 1.25.6), same machine, loopback |
+| Host state | AdGuard, ProtonVPN and Dropbox stopped in every session; Bitdefender protection disabled for the contender session. cadeloop 1.0.1 ran in each session as a control: 73.7 K, 74.3 K, 74.8 K and 73.4 K req/s plaintext |
+
+Each contender serves the same ASGI app (`bench/windows/app.py`) from a
+fresh process per rep; three reps with the contender order rotated; 1.5 s
+warmup, 5 s measured. Throughput is the median rep. Percentiles come from
+the merged histogram of all reps' observations. "Server CPU / request" is
+user + kernel time of the server's process tree over the measured window
+divided by successful requests -- the number least affected by the client
+sharing the machine.
+
+Results: summarised in the [README](../README.md#windows-11-iocp), every
+table in full in [benchmarks-windows.md](benchmarks-windows.md), raw data in
+[bench/baselines/windows-2026-10/](../bench/baselines/windows-2026-10/).
