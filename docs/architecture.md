@@ -27,6 +27,10 @@ tick:
    (0 if ready work exists; else min(next deadline, 100ms) — R-030).
 2. **GIL released** (the only release point): backend poll —
    spin-then-park (R-060), then `GetQueuedCompletionStatusEx` batch 256.
+   A park that ends at a timer's deadline also arms a high-resolution
+   waitable timer whose expiry reaches the port as a wait completion
+   packet, so it ends on time instead of on the next 15.6 ms clock
+   interrupt (`precise_parks` in `loop.stats()`).
 3. **GIL re-acquired once per batch** (not per event): translate
    completions -- readiness watches the poll reported join this tick's
    batch -- then dispatch every callback that was ready when the tick

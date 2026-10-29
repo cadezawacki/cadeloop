@@ -90,6 +90,8 @@ pub(crate) const KEY_RIO: usize = 3;
 /// The quarantine's drain sentinel (`Quarantine::sentinel_wanted`); its
 /// generation rides in the byte count.
 const KEY_DRAIN: usize = 4;
+/// The high-resolution park timer's expiry (`HiResTimer`).
+const KEY_TIMER: usize = 5;
 
 /// R-030: dequeue batch size.
 pub(crate) const POLL_BATCH: usize = 256;
@@ -337,6 +339,171 @@ struct AfdHelper {
     base: SOCKET,
 }
 
+// ---- high-resolution parks --------------------------------------------
+//
+// A GetQueuedCompletionStatusEx timeout is whole milliseconds, and the
+// kernel ends the wait on the next system clock interrupt after it:
+// every 15.6 ms unless some process has raised the timer resolution. A
+// 1 ms `asyncio.sleep` measured 15.5 ms here, a 5 ms one 15.6 ms --
+// exactly what stdlib asyncio and winloop do too. A high-resolution
+// waitable timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, Windows 10 1803+)
+// expires on time without changing the system timer resolution, and a
+// wait completion packet associated with it delivers that expiry to the
+// port as an ordinary dequeue: the park ends when the timer does, with
+// no extra thread and no timeBeginPeriod. This is the mechanism the
+// Windows thread pool uses for its waits, and Go's runtime parks on since
+// 1.23.
+//
+// NtCreate/Associate/CancelWaitCompletionPacket are ntdll exports outside
+// the documented Win32 surface, so they are resolved at run time; if any
+// is missing, or the timer cannot be created, parks stay coarse exactly
+// as before.
+
+type NtCreateWaitCompletionPacketFn = unsafe extern "system" fn(*mut HANDLE, u32, *const c_void) -> i32;
+type NtAssociateWaitCompletionPacketFn = unsafe extern "system" fn(
+    HANDLE,
+    HANDLE,
+    HANDLE,
+    *const c_void,
+    *const c_void,
+    i32,
+    usize,
+    *mut u8,
+) -> i32;
+type NtCancelWaitCompletionPacketFn = unsafe extern "system" fn(HANDLE, u8) -> i32;
+
+struct WaitPacketFns {
+    create: NtCreateWaitCompletionPacketFn,
+    associate: NtAssociateWaitCompletionPacketFn,
+    cancel: NtCancelWaitCompletionPacketFn,
+}
+
+fn wait_packet_fns() -> Option<&'static WaitPacketFns> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    static FNS: OnceLock<Option<WaitPacketFns>> = OnceLock::new();
+    FNS.get_or_init(|| unsafe {
+        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+        let ntdll = GetModuleHandleW(name.as_ptr());
+        if ntdll.is_null() {
+            return None;
+        }
+        let create = GetProcAddress(ntdll, c"NtCreateWaitCompletionPacket".as_ptr().cast())?;
+        let associate = GetProcAddress(ntdll, c"NtAssociateWaitCompletionPacket".as_ptr().cast())?;
+        let cancel = GetProcAddress(ntdll, c"NtCancelWaitCompletionPacket".as_ptr().cast())?;
+        Some(WaitPacketFns {
+            create: std::mem::transmute::<unsafe extern "system" fn() -> isize, NtCreateWaitCompletionPacketFn>(create),
+            associate: std::mem::transmute::<unsafe extern "system" fn() -> isize, NtAssociateWaitCompletionPacketFn>(associate),
+            cancel: std::mem::transmute::<unsafe extern "system" fn() -> isize, NtCancelWaitCompletionPacketFn>(cancel),
+        })
+    })
+    .as_ref()
+}
+
+/// A high-resolution waitable timer whose expiry is queued to the port as a
+/// `KEY_TIMER` packet (see the section comment above).
+struct HiResTimer {
+    timer: HANDLE,
+    packet: HANDLE,
+    fns: &'static WaitPacketFns,
+    /// The packet is associated with the timer and has not been dequeued:
+    /// it must be cancelled before it can be associated again.
+    armed: bool,
+}
+
+impl HiResTimer {
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::System::Threading::{
+            CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+        };
+        if std::env::var_os("CADELOOP_COARSE_TIMERS").is_some() {
+            return None;
+        }
+        let fns = wait_packet_fns()?;
+        let timer = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        if timer.is_null() {
+            return None; // pre-1803: no high-resolution timers
+        }
+        let mut packet: HANDLE = std::ptr::null_mut();
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        if unsafe { (fns.create)(&mut packet, GENERIC_ALL, std::ptr::null()) } < 0 || packet.is_null() {
+            unsafe { CloseHandle(timer) };
+            return None;
+        }
+        Some(HiResTimer { timer, packet, fns, armed: false })
+    }
+
+    /// Arrange a `KEY_TIMER` packet on `port` once `after` has elapsed.
+    /// `Some(true)`: the timer had already expired (do not block);
+    /// `Some(false)`: armed; `None`: not this time -- park coarsely.
+    fn arm(&mut self, port: HANDLE, after: Duration) -> Option<bool> {
+        use windows_sys::Win32::System::Threading::SetWaitableTimer;
+        if self.armed {
+            // An earlier park ended on I/O before its timer. Cancelling with
+            // RemoveSignaledPacket also takes back a packet already queued,
+            // so no stale wake survives the re-arm. STATUS_PENDING means the
+            // expiry is being queued right now: the packet is still in use,
+            // and its dequeue clears `armed`. Any other answer leaves the
+            // packet free or not: the association below says which.
+            if unsafe { (self.fns.cancel)(self.packet, 1) } == STATUS_PENDING {
+                return None;
+            }
+            self.armed = false;
+        }
+        // Relative due time in 100 ns units, rounded up: never early.
+        let ticks = after.as_nanos().div_ceil(100).clamp(1, i64::MAX as u128) as i64;
+        let due = -ticks;
+        if unsafe { SetWaitableTimer(self.timer, &due, 0, None, std::ptr::null(), 0) } == 0 {
+            return None;
+        }
+        let mut signaled: u8 = 0;
+        let st = unsafe {
+            (self.fns.associate)(
+                self.packet,
+                port,
+                self.timer,
+                KEY_TIMER as *const c_void,
+                std::ptr::null(),
+                0,
+                0,
+                &mut signaled,
+            )
+        };
+        if st < 0 {
+            return None;
+        }
+        // Whether a packet is still queued when the timer had already
+        // expired is not documented; cancelling before the next
+        // association covers both answers (and is what Go's runtime does
+        // on every arm).
+        self.armed = true;
+        if signaled != 0 {
+            // Expired between SetWaitableTimer and the association: the
+            // wait is already over.
+            return Some(true);
+        }
+        Some(false)
+    }
+}
+
+impl Drop for HiResTimer {
+    fn drop(&mut self) {
+        unsafe {
+            if self.armed {
+                (self.fns.cancel)(self.packet, 1);
+            }
+            CloseHandle(self.packet);
+            CloseHandle(self.timer);
+        }
+    }
+}
+
 struct PortHandle(HANDLE);
 // SAFETY: an IOCP handle is thread-safe by OS contract (PQCS/GQCS are the
 // documented cross-thread mechanism).
@@ -417,6 +584,8 @@ pub struct IocpBackend {
     /// queued for an op already retired inline (see `quarantine`). Dropped
     /// rather than misattributed; never expected to be non-zero.
     pub dropped_completions: u64,
+    /// Precise park deadlines (`HiResTimer`); None where unavailable.
+    hires: Option<HiResTimer>,
 }
 
 // SAFETY: thread-affine by loop contract; raw handles are moved with it.
@@ -539,6 +708,7 @@ impl IocpBackend {
             associated: FxHashSet::default(),
             foreign_completions: 0,
             dropped_completions: 0,
+            hires: HiResTimer::new(),
         })
     }
 
@@ -945,6 +1115,14 @@ impl IocpBackend {
             out.push(Completion::Wakeup);
             return;
         }
+        if entry.lpCompletionKey == KEY_TIMER {
+            // The park deadline passed: the dequeue itself was the point.
+            // The association is spent, so the next arm needs no cancel.
+            if let Some(h) = self.hires.as_mut() {
+                h.armed = false;
+            }
+            return;
+        }
         if entry.lpCompletionKey == KEY_DRAIN {
             // Every packet queued before the sentinel has now been seen,
             // in this batch or an earlier one (the port is FIFO).
@@ -1121,6 +1299,8 @@ impl Drop for IocpBackend {
         // when its cancellation completes, and a readiness poll of a socket
         // that outlives the loop would complete whenever data arrived. Reap
         // all of it before the slab goes.
+        // The park timer goes first, while the port it delivers to is open.
+        self.hires = None;
         let left = self.quiesce(DROP_DRAIN_BUDGET);
         // Accepted connections the transport layer never collected, and
         // sockets parked for reuse: ours alone, so close them.
@@ -1732,6 +1912,15 @@ impl IoBackend for IocpBackend {
     }
 
     fn poll(&mut self, out: &mut Vec<Completion>, timeout: Option<Duration>) -> io::Result<usize> {
+        self.poll_precise(out, timeout, false)
+    }
+
+    fn poll_precise(
+        &mut self,
+        out: &mut Vec<Completion>,
+        timeout: Option<Duration>,
+        precise: bool,
+    ) -> io::Result<usize> {
         let before = out.len();
         self.rearm_watches();
         // R-031: inline completions first — they were never queued.
@@ -1740,8 +1929,19 @@ impl IoBackend for IocpBackend {
         }
         let timeout_ms: u32 = match timeout {
             _ if out.len() > before => 0, // work already available
-            Some(t) => crate::backend::wait_millis(t).min(u32::MAX as u128 - 1) as u32,
-            None => 0,
+            Some(t) if !t.is_zero() => {
+                let port = self.port.0;
+                match self.hires.as_mut().filter(|_| precise).and_then(|h| h.arm(port, t)) {
+                    // Expired while arming: reap, do not block.
+                    Some(true) => 0,
+                    // The KEY_TIMER packet ends the wait on time; the coarse
+                    // timeout behind it is only a backstop, set past the
+                    // deadline so it never ends the park first.
+                    Some(false) => (t.as_millis() + 2).min(u32::MAX as u128 - 1) as u32,
+                    None => crate::backend::wait_millis(t).min(u32::MAX as u128 - 1) as u32,
+                }
+            }
+            _ => 0,
         };
         let mark = self.quarantine.mark();
         let mut n: u32 = 0;
@@ -1773,6 +1973,10 @@ impl IoBackend for IocpBackend {
 
     fn wakeup_handle(&self) -> Arc<dyn Wakeup> {
         Arc::new(IocpWakeup { port: self.port.clone(), posts: AtomicU64::new(0) })
+    }
+
+    fn precise_parks(&self) -> bool {
+        self.hires.is_some()
     }
 
     fn name(&self) -> &'static str {
@@ -2148,6 +2352,55 @@ mod tests {
         assert!(b.has_io_interest(), "a queued re-arm is interest");
         b.poll(&mut Vec::new(), Some(Duration::ZERO)).unwrap();
         assert!(b.has_io_interest(), "another socket's poll is interest");
+    }
+
+    /// A park bounded by a timer ends at its deadline, not on the next
+    /// system clock interrupt (15.6 ms apart by default).
+    #[test]
+    fn a_deadline_bound_park_ends_on_time() {
+        let mut b = IocpBackend::new().unwrap();
+        if b.hires.is_none() {
+            eprintln!("no high-resolution timer on this Windows; nothing to prove");
+            return;
+        }
+        let mut took = Vec::new();
+        for _ in 0..10 {
+            let mut out = Vec::new();
+            let t0 = Instant::now();
+            b.poll_precise(&mut out, Some(Duration::from_millis(2)), true).unwrap();
+            took.push(t0.elapsed());
+            assert!(out.is_empty(), "the timer's packet is not a completion: {out:?}");
+        }
+        took.sort();
+        assert!(took[0] >= Duration::from_micros(1900), "a park ended early: {took:?}");
+        assert!(took[5] < Duration::from_millis(6), "parks still end on the clock tick: {took:?}");
+    }
+
+    /// A park that ends on something else leaves its timer armed. Re-arming
+    /// must take back that timer's packet even once it is queued, or it
+    /// ends a later park at once.
+    #[test]
+    fn an_interrupted_precise_park_leaves_no_stale_wake() {
+        let mut b = IocpBackend::new().unwrap();
+        if b.hires.is_none() {
+            return;
+        }
+        b.wakeup_handle().wake();
+        let mut out = Vec::new();
+        b.poll_precise(&mut out, Some(Duration::from_millis(30)), true).unwrap();
+        assert!(matches!(out.as_slice(), [Completion::Wakeup]), "{out:?}");
+        assert!(b.hires.as_ref().unwrap().armed, "the woken park's timer is still armed");
+        std::thread::sleep(Duration::from_millis(45)); // it expires: its packet is queued
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        b.poll_precise(&mut out, Some(Duration::from_millis(10)), true).unwrap();
+        let took = t0.elapsed();
+        assert!(out.is_empty(), "{out:?}");
+        assert!(took >= Duration::from_millis(9), "a stale timer packet ended the park after {took:?}");
+        // Dropped armed: the timer and packet go before the port.
+        b.wakeup_handle().wake();
+        b.poll_precise(&mut Vec::new(), Some(Duration::from_millis(50)), true).unwrap();
+        drop(b);
     }
 
     /// W11: a bind failure is the real error; ignoring it surfaced as
