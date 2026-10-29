@@ -1035,3 +1035,43 @@ def test_a_send_on_a_socket_closing_under_the_app_raises_oserror(loop):
     writer.close()
     assert isinstance(errors.get("/shutdown"), OSError), errors
     assert isinstance(errors.get("/own-close"), RuntimeError), errors
+
+
+def test_a_receive_cancelled_before_it_runs_loses_no_message(loop):
+    """receive() takes its message when called, not when awaited. A task
+    wrapping it that was cancelled before its first step (an aborted task
+    group; wait_for(receive(), 0) on 3.11) dropped the awaitable, and the
+    message with it: the next receive() never saw it."""
+    got = []
+    queued = asyncio.Event()
+
+    async def app(scope, receive, send):
+        assert (await receive())["type"] == "websocket.connect"
+        await send({"type": "websocket.accept"})
+        await queued.wait()  # "hello" is waiting in the inbox now
+        t = asyncio.ensure_future(receive())
+        t.cancel()  # before it ever ran
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        got.append(await asyncio.wait_for(receive(), 2))
+        await send({"type": "websocket.close"})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        writer.write(client_frame(0x1, b"hello") + client_frame(0x9, b"ping"))
+        await writer.drain()
+        # The pong is answered after "hello" was read: it is queued.
+        _fin, op, _payload = await asyncio.wait_for(read_server_frame(reader), 5)
+        assert op == 0xA, op
+        queued.set()
+        await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+    assert got == [{"type": "websocket.receive", "text": "hello"}], got

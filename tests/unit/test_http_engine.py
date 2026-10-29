@@ -2924,6 +2924,32 @@ def test_a_parked_parse_error_still_sees_the_client_leave(loop):
     assert seen == ["http.disconnect"], seen
 
 
+def test_a_receive_cancelled_before_it_runs_loses_no_body(loop):
+    """receive() takes the request body when called, not when awaited, so
+    a task wrapping it that was cancelled before its first step --
+    wait_for(receive(), 0) on 3.11, an aborted task group -- lost the
+    body: the next receive() parked for a disconnect instead."""
+    got = []
+
+    async def app(scope, receive, send):
+        t = asyncio.ensure_future(receive())
+        t.cancel()  # before it ever ran
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        got.append(await asyncio.wait_for(receive(), 2))
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app)
+    loop.run_until_complete(
+        _request(port, b"POST / HTTP/1.1\r\nHost: h\r\ncontent-length: 5\r\n\r\nhello")
+    )
+    loop._core.listener_close(lid)
+    assert got == [{"type": "http.request", "body": b"hello", "more_body": False}], got
+
+
 def test_a_cancel_requested_while_the_handler_runs_cancels_its_next_await(loop):
     """A cancel() that reaches the eager driver while the handler is
     running can only be latched -- nothing is awaited yet. asyncio's Task
