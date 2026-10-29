@@ -1865,6 +1865,10 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
         if let Some(conn) = net.http_conn_mut(tid) {
             if let Some(wsc) = conn.ws.as_mut() {
                 wsc.closing = true;
+                // What outlives the connection (a receive() after its
+                // teardown, a waiter whose wake was still queued) reports
+                // the code this end closed with, not 1006.
+                wsc.close_code = Some(1012);
                 let m = crate::http::WsMsg::Disconnect(1012);
                 wsc.inbox_bytes += m.charge();
                 wsc.inbox.push_back(m);
@@ -1882,6 +1886,47 @@ pub(crate) fn http_begin_shutdown(py: Python<'_>, net: &mut NetState, backend: B
         teardown_with(py, net, backend, tid, None);
     }
     busy
+}
+
+/// Graceful shutdown, last phase: the eager request drivers (AppTasks)
+/// still in flight, for the caller to cancel with the tasks the
+/// application left running. They are not asyncio Tasks, so the
+/// `asyncio.all_tasks()` sweep that does that never saw them: a handler
+/// still awaiting at the deadline was never cancelled, and its cleanup
+/// never ran. In-cell; clones only.
+pub(crate) fn http_request_drivers(py: Python<'_>, net: &NetState) -> Vec<Py<PyAny>> {
+    net.transports
+        .values()
+        .filter_map(|e| match &e.proto {
+            ProtoKind::Http(conn) => conn.driver.as_ref().map(|d| d.clone_ref(py).into_any()),
+            ProtoKind::Py(_) => None,
+        })
+        .collect()
+}
+
+/// Everything still parked on a native HTTP connection -- its eager
+/// driver, its receive()/send() waiters, and waiters already taken into
+/// events that will now never be dispatched -- for `CoreLoop::close` to
+/// cancel before the teardown drops it. Dropped pending, a driver and the
+/// future it awaited kept each other alive through a cycle the collector
+/// cannot see (AppTask is opaque to it), so the handler's coroutine was
+/// never finalized. In-cell; clones only.
+pub(crate) fn http_parked(py: Python<'_>, net: &NetState) -> Vec<Py<PyAny>> {
+    let mut parked = http_request_drivers(py, net);
+    for e in net.transports.values() {
+        if let ProtoKind::Http(conn) = &e.proto {
+            parked.extend(conn.recv_waiters.iter().chain(&conn.drain_waiters).map(|f| f.clone_ref(py)));
+        }
+    }
+    for ev in &net.events {
+        if let NetEvent::HttpDisconnect { fut, .. }
+        | NetEvent::HttpDrained { fut }
+        | NetEvent::WsWake { fut, .. } = ev
+        {
+            parked.push(fut.clone_ref(py));
+        }
+    }
+    parked
 }
 
 /// Mark a native HTTP connection to close once its write queue drains
@@ -2433,9 +2478,16 @@ fn on_recv_done(
                 // Copied out first: ws_ingest needs &mut NetState.
                 let owned = data.to_vec();
                 crate::http::ws_ingest(py, net, backend, tid, &owned);
-            } else {
+            } else if conn.deferred_error.is_none() {
                 // In-cell parse (R-080): llhttp over the recv slot; the
                 // parser copies what it keeps, so the slot re-posts below.
+                // (Once a parse error is parked behind requests still being
+                // answered, the parser is dead: what arrives is discarded
+                // unread, but the recv still re-posts -- reading is the
+                // only way to see the peer leave. Stopped, a long-poll
+                // handler parked in receive() for exactly that was never
+                // told, and the sweep, seeing a request still active, held
+                // the connection for good.)
                 match crate::http::conn_feed(conn, data) {
                     Ok(outcome) => {
                         // Oversized pre-dispatch WS buffer (see conn_feed):
@@ -2481,7 +2533,9 @@ fn on_recv_done(
         if crate::http::conn_parse_failed(py, net, backend, tid, err) {
             net.events.push(NetEvent::HttpPump { tid });
         }
-        return; // no recv re-post: the parser is dead
+        // The parser is dead. An idle connection was answered at once and
+        // is closing, so post_recv declines it; one whose 400 is parked
+        // keeps reading, discarding what arrives (above).
     }
     if continue_owed {
         // Before the body, not after: the client is holding it back until
@@ -3084,13 +3138,30 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                         let _ = fut.call_method1(intern!(py, "set_result"), (d,));
                     }
                     (false, None) => {
-                        // Spurious wake: park the waiter again.
+                        // Spurious wake: park the waiter again -- while there
+                        // is still something to wait for. The wake took this
+                        // waiter out of recv_waiters, so a teardown between
+                        // queueing it and now (an app callback that ran
+                        // first, during a graceful shutdown say) could not
+                        // release it, and parking it on the gone connection
+                        // dropped it unresolved: receive() pending for good,
+                        // and its task, which asyncio holds only weakly,
+                        // destroyed by the collector while pending. Past EOF
+                        // no message can arrive either.
                         let stored = fut.clone().unbind();
-                        core.with_net(|net, _| {
-                            if let Some(c) = net.http_conn_mut(tid) {
+                        let unparked = core.with_net(move |net, _| match net.http_conn_mut(tid) {
+                            Some(c) if !c.disconnected => {
                                 c.recv_waiters.push_back(stored);
+                                None
                             }
+                            // Handed back so the reference drops out of the
+                            // cell (ADR-5).
+                            _ => Some(stored),
                         })?;
+                        if unparked.is_some() {
+                            let msg = crate::http::ws_gone_message(py, core, tid)?;
+                            let _ = fut.call_method1(intern!(py, "set_result"), (msg,));
+                        }
                     }
                     (true, Some(m)) => {
                         // Waiter was cancelled: keep the event for the next
