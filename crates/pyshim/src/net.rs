@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -979,6 +979,9 @@ fn teardown_lost(
         return;
     }
     entry.conn_lost = true;
+    if let Some(t) = &entry.pyobj {
+        t.get().mark_lost();
+    }
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
@@ -1073,6 +1076,9 @@ fn retire_sockets(net: &mut NetState, entry: &mut TransportEntry) {
 pub(crate) fn teardown(net: &mut NetState, backend: Backend<'_>, tid: u64, _err: Option<u32>) {
     let Some(mut entry) = net.transports.remove(&tid) else { return };
     entry.conn_lost = true;
+    if let Some(t) = &entry.pyobj {
+        t.get().mark_lost();
+    }
     cancel_transport_ops(net, backend, &mut entry);
     release_socket(backend, &entry);
     forget_fd(net, entry.socket, tid);
@@ -2212,6 +2218,28 @@ fn post_accepts_inner(net: &mut NetState, backend: Backend<'_>, lid: u64, report
     }
 }
 
+/// Drop the cancelled watches `translate` found on `socket`: the backend
+/// stops watching those sides and the handles go to the graveyard, to be
+/// released outside the cell. In-cell.
+fn unwatch_cancelled(net: &mut NetState, backend: Backend<'_>, socket: RawSocket, r: bool, w: bool) {
+    let old_r = if r { net.readers.remove(&socket) } else { None };
+    let old_w = if w { net.writers.remove(&socket) } else { None };
+    let (keep_r, keep_w) = (net.readers.contains_key(&socket), net.writers.contains_key(&socket));
+    if backend.set_watch(socket, keep_r, keep_w).is_err() {
+        // Still watched: keep the tables agreeing with the backend, as
+        // remove_reader() does, and try again on the next event.
+        if let Some(h) = old_r {
+            net.readers.insert(socket, h);
+        }
+        if let Some(h) = old_w {
+            net.writers.insert(socket, h);
+        }
+        return;
+    }
+    net.graveyard_handles.extend(old_r);
+    net.graveyard_handles.extend(old_w);
+}
+
 /// Translate one poll's completions into phase-2 events. In-cell.
 pub(crate) fn translate(
     py: Python<'_>,
@@ -2223,13 +2251,25 @@ pub(crate) fn translate(
         match c {
             Completion::Wakeup => {}
             Completion::Ready { socket, readable, writable } => {
-                if readable {
+                // A watch whose Handle was cancelled -- Handle.cancel() on
+                // what loop._add_reader()/_add_writer() return -- is dropped
+                // the first time its fd fires, as asyncio's _process_events
+                // drops it. Left in place it was queued (and skipped) on
+                // every event, and an fd that stayed ready kept the loop
+                // spinning instead of parking.
+                let cancelled = |h: Option<&Py<Handle>>| h.is_some_and(|h| h.get().is_cancelled());
+                let drop_r = readable && cancelled(net.readers.get(&socket));
+                let drop_w = writable && cancelled(net.writers.get(&socket));
+                if drop_r || drop_w {
+                    unwatch_cancelled(net, backend, socket, drop_r, drop_w);
+                }
+                if readable && !drop_r {
                     if let Some(h) = net.readers.get(&socket) {
                         let h = h.clone_ref(py);
                         net.ready_scratch.push(h);
                     }
                 }
-                if writable {
+                if writable && !drop_w {
                     if let Some(h) = net.writers.get(&socket) {
                         let h = h.clone_ref(py);
                         net.ready_scratch.push(h);
@@ -2568,6 +2608,9 @@ fn on_send_done(
     // Pop consumed buffers into the graveyard (Py refs drop out-of-cell).
     let mut consumed = bytes as usize;
     entry.queued_bytes -= consumed.min(entry.queued_bytes);
+    if let Some(t) = &entry.pyobj {
+        t.get().queued.store(entry.queued_bytes, Ordering::Relaxed);
+    }
     while consumed > 0 {
         let Some(front) = entry.wq.front_mut() else { break };
         let rem = front.remaining();
@@ -3603,6 +3646,14 @@ pub struct Transport {
     /// loop.sendfile() owns the socket: write() raises, as asyncio's does
     /// while its sendfile's empty-waiter is set.
     sendfile: AtomicBool,
+    /// The entry's `closing || conn_lost` and `queued_bytes`, mirrored
+    /// wherever those change. `is_closing()` and `get_write_buffer_size()`
+    /// answer from them when the state is out of reach -- another thread
+    /// asking while the loop is parked in its poll, which the state cell
+    /// refuses (gil_boundary) -- as asyncio answers both with an attribute
+    /// read from any thread.
+    closing: AtomicBool,
+    queued: AtomicUsize,
 }
 
 /// `asyncio.trsock.TransportSocket`, looked up once.
@@ -3635,7 +3686,16 @@ impl Transport {
             losing: Mutex::new(None),
             eof: AtomicBool::new(false),
             sendfile: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
         }
+    }
+
+    /// The connection is gone: what `is_closing()` and
+    /// `get_write_buffer_size()` answer from now on (see `closing`).
+    pub(crate) fn mark_lost(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        self.queued.store(0, Ordering::Relaxed);
     }
 
     fn core_ref<'a>(&'a self, py: Python<'a>) -> &'a CoreLoop {
@@ -3906,6 +3966,9 @@ impl Transport {
                 }
             }
             pause = maybe_pause(py, net, reactor.backend_mut(), tid);
+            if let Some(e) = net.transports.get(&tid) {
+                self.queued.store(e.queued_bytes, Ordering::Relaxed);
+            }
             dirty |= !net.graveyard_bufs.is_empty() || !net.graveyard_entries.is_empty();
         })?;
         if dirty {
@@ -3940,8 +4003,19 @@ impl Transport {
     }
 
     /// loop.sendfile()'s claim on the socket (see `Transport::sendfile`).
-    fn _set_sendfile_active(&self, active: bool) {
-        self.sendfile.store(active, Ordering::Relaxed);
+    ///
+    /// Exclusive, as asyncio's: a second transfer while one is running is
+    /// refused. Overlapping transfers interleaved their chunks on the wire
+    /// and parked on the descriptor's one writer watch, where the second
+    /// displaced the first -- which then waited for good -- and whichever
+    /// finished first dropped the claim for both.
+    fn _set_sendfile_active(&self, active: bool) -> PyResult<()> {
+        if !active {
+            self.sendfile.store(false, Ordering::Relaxed);
+        } else if self.sendfile.swap(true, Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("sendfile is already in progress on this transport"));
+        }
+        Ok(())
     }
 
     /// asyncio.constants._SendfileMode.TRY_NATIVE: loop.sendfile() may use
@@ -3979,7 +4053,8 @@ impl Transport {
 
     fn get_write_buffer_size(&self, py: Python<'_>) -> PyResult<usize> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| net.transports.get(&self.tid).map_or(0, |e| e.queued_bytes))
+        let exact = core.try_with_net(|net, _| net.transports.get(&self.tid).map_or(0, |e| e.queued_bytes));
+        Ok(exact.unwrap_or_else(|| self.queued.load(Ordering::Relaxed)))
     }
 
     fn get_write_buffer_limits(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
@@ -4107,6 +4182,7 @@ impl Transport {
                 return;
             }
             entry.closing = true;
+            self.closing.store(true, Ordering::Relaxed);
             if let Some(op) = entry.recv_op.take() {
                 // Keep the mapping (see pause_reading): the completion is
                 // routed and discarded by the closing/conn_lost checks.
@@ -4174,7 +4250,9 @@ impl Transport {
 
     fn is_closing(&self, py: Python<'_>) -> PyResult<bool> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| net.transports.get(&self.tid).is_none_or(|e| e.closing || e.conn_lost))
+        let exact = core
+            .try_with_net(|net, _| net.transports.get(&self.tid).is_none_or(|e| e.closing || e.conn_lost));
+        Ok(exact.unwrap_or_else(|| self.closing.load(Ordering::Relaxed)))
     }
 
     // ---- protocol / introspection ---------------------------------------

@@ -202,6 +202,17 @@ impl CoreLoop {
         self.state.with(|st| f(&mut st.net, &mut st.reactor))
     }
 
+    /// [`CoreLoop::with_net`] for read-only accessors that have an answer
+    /// of their own when the state is out of reach -- another thread while
+    /// the loop is parked in its poll, or a re-entered borrow
+    /// (gil_boundary): None there, `f` not run, instead of a RuntimeError.
+    pub(crate) fn try_with_net<R>(
+        &self,
+        f: impl FnOnce(&mut NetState, &mut Reactor<HandleRef>) -> R,
+    ) -> Option<R> {
+        self.state.try_with(|st| f(&mut st.net, &mut st.reactor)).ok()
+    }
+
     pub(crate) fn water_marks(&self) -> (usize, usize) {
         (self.high_water, self.low_water)
     }
