@@ -2223,6 +2223,28 @@ fn post_accepts_inner(net: &mut NetState, backend: Backend<'_>, lid: u64, report
     }
 }
 
+/// Drop the cancelled watches `translate` found on `socket`: the backend
+/// stops watching those sides and the handles go to the graveyard, to be
+/// released outside the cell. In-cell.
+fn unwatch_cancelled(net: &mut NetState, backend: Backend<'_>, socket: RawSocket, r: bool, w: bool) {
+    let old_r = if r { net.readers.remove(&socket) } else { None };
+    let old_w = if w { net.writers.remove(&socket) } else { None };
+    let (keep_r, keep_w) = (net.readers.contains_key(&socket), net.writers.contains_key(&socket));
+    if backend.set_watch(socket, keep_r, keep_w).is_err() {
+        // Still watched: keep the tables agreeing with the backend, as
+        // remove_reader() does, and try again on the next event.
+        if let Some(h) = old_r {
+            net.readers.insert(socket, h);
+        }
+        if let Some(h) = old_w {
+            net.writers.insert(socket, h);
+        }
+        return;
+    }
+    net.graveyard_handles.extend(old_r);
+    net.graveyard_handles.extend(old_w);
+}
+
 /// Translate one poll's completions into phase-2 events. In-cell.
 pub(crate) fn translate(
     py: Python<'_>,
@@ -2234,13 +2256,25 @@ pub(crate) fn translate(
         match c {
             Completion::Wakeup => {}
             Completion::Ready { socket, readable, writable } => {
-                if readable {
+                // A watch whose Handle was cancelled -- Handle.cancel() on
+                // what loop._add_reader()/_add_writer() return -- is dropped
+                // the first time its fd fires, as asyncio's _process_events
+                // drops it. Left in place it was queued (and skipped) on
+                // every event, and an fd that stayed ready kept the loop
+                // spinning instead of parking.
+                let cancelled = |h: Option<&Py<Handle>>| h.is_some_and(|h| h.get().is_cancelled());
+                let drop_r = readable && cancelled(net.readers.get(&socket));
+                let drop_w = writable && cancelled(net.writers.get(&socket));
+                if drop_r || drop_w {
+                    unwatch_cancelled(net, backend, socket, drop_r, drop_w);
+                }
+                if readable && !drop_r {
                     if let Some(h) = net.readers.get(&socket) {
                         let h = h.clone_ref(py);
                         net.ready_scratch.push(h);
                     }
                 }
-                if writable {
+                if writable && !drop_w {
                     if let Some(h) = net.writers.get(&socket) {
                         let h = h.clone_ref(py);
                         net.ready_scratch.push(h);

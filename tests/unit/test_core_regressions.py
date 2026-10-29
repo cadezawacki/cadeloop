@@ -615,6 +615,35 @@ def test_removed_and_replaced_watch_handles_are_cancelled(loop):
         b.close()
 
 
+def test_watch_cancelled_through_its_handle_is_dropped_on_its_next_event(loop):
+    """loop._add_reader()/_add_writer() return the watch's Handle, as
+    asyncio's do. A watch cancelled through that Handle stayed registered:
+    every readiness event queued it again only for dispatch to skip it,
+    and an fd that stayed ready kept the loop spinning instead of parking.
+    asyncio's _process_events drops a cancelled watch on its next event."""
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    try:
+        calls = []
+
+        async def main():
+            loop._add_reader(a.fileno(), calls.append, "read").cancel()
+            loop._add_writer(b.fileno(), calls.append, "write").cancel()  # writable at once
+            b.send(b"x")  # `a` stays readable: nobody reads it
+            before = loop.stats()["ticks"]
+            await asyncio.sleep(0.05)
+            return loop.stats()["ticks"] - before
+
+        ticks = loop.run_until_complete(main())
+        assert calls == []
+        assert loop.remove_reader(a.fileno()) is False
+        assert loop.remove_writer(b.fileno()) is False
+        assert ticks < 50, f"the loop spun: {ticks} iterations in 50 ms"
+    finally:
+        a.close()
+        b.close()
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="epoll fd semantics")
 def test_fd_closed_before_remove_reader_can_be_watched_again(loop):
     """epoll forgets a registration when its file is closed. remove_reader
