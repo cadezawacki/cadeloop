@@ -2165,3 +2165,95 @@ def test_sendfile_falls_back_when_os_sendfile_cannot_read_the_file(cade_loop):
         await server.wait_closed()
 
     loop.run_until_complete(main())
+
+
+# ---- callback contexts ---------------------------------------------------- #
+# cadeloop keeps no copy of an empty context in the queue: a callback
+# scheduled from one runs in an empty context of its own at dispatch. These
+# pin down that nothing about it is observable.
+
+_CTX_VAR = __import__("contextvars").ContextVar("_CTX_VAR", default="unset")
+
+
+def test_a_callbacks_context_changes_stay_its_own(loop):
+    """Every callback runs in its own copy of the scheduler's context: a
+    set() in one is invisible to the next, whether the scheduling context
+    was empty or not, and a value set before scheduling is visible."""
+    import contextvars
+
+    out = []
+
+    def setter():
+        out.append(_CTX_VAR.get())
+        _CTX_VAR.set("set-by-callback")
+
+    loop.call_soon(setter)
+    loop.call_soon(lambda: out.append(_CTX_VAR.get()))
+    loop.call_later(0, setter)
+    loop.call_later(0, lambda: out.append(_CTX_VAR.get()))
+    ctx = contextvars.copy_context()
+    ctx.run(_CTX_VAR.set, "scheduler")
+    ctx.run(loop.call_soon, setter)
+    ctx.run(loop.call_soon, lambda: out.append(_CTX_VAR.get()))
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    assert out == ["unset", "unset", "scheduler", "scheduler", "unset", "unset"]
+
+
+def test_call_soon_inside_a_callback_copies_that_callbacks_context(loop):
+    out = []
+
+    def parent():
+        _CTX_VAR.set("parent")
+        loop.call_soon(lambda: out.append(_CTX_VAR.get()))
+
+    loop.call_soon(parent)
+    loop.call_soon(lambda: out.append(_CTX_VAR.get()))
+    loop.call_later(0.05, loop.stop)
+    loop.run_forever()
+    assert sorted(out) == ["parent", "unset"]
+
+
+def test_a_reader_keeps_one_context_across_invocations(loop):
+    """asyncio runs every callback of one watch in the context its handle
+    copied once, so a value a reader sets is still there next time."""
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    seen = []
+
+    def on_read():
+        a.recv(16)
+        seen.append(_CTX_VAR.get())
+        _CTX_VAR.set(f"set-{len(seen)}")
+        if len(seen) == 1:
+            b.send(b"y")
+        else:
+            loop.remove_reader(a)
+            loop.stop()
+
+    try:
+        loop.add_reader(a, on_read)
+        b.send(b"x")
+        loop.call_later(5, loop.stop)
+        loop.run_forever()
+    finally:
+        a.close()
+        b.close()
+    assert seen == ["unset", "set-1"]
+
+
+def test_call_soon_threadsafe_carries_the_producer_threads_context(loop):
+    out = []
+
+    def producer(value):
+        if value is not None:
+            _CTX_VAR.set(value)
+        loop.call_soon_threadsafe(lambda: out.append(_CTX_VAR.get()))
+
+    for value in (None, "thread"):
+        t = __import__("threading").Thread(target=producer, args=(value,))
+        t.start()
+        t.join()
+    loop.call_later(0.05, loop.stop)
+    loop.run_forever()
+    assert out == ["unset", "thread"]

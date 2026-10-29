@@ -1,6 +1,7 @@
 //! `cadeloop._core` — the PyO3 extension module (L2 bindings).
 
 mod coreloop;
+mod ctxsnap;
 mod fastqueue;
 mod gil_boundary;
 mod handles;
@@ -18,6 +19,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    ctxsnap::init(m.py())?;
     m.add_class::<coreloop::CoreLoop>()?;
     m.add_class::<handles::Handle>()?;
     m.add_class::<handles::TimerHandle>()?;

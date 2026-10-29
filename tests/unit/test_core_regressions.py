@@ -833,3 +833,42 @@ def test_ready_callbacks_run_before_this_iterations_io_callbacks(loop):
     finally:
         ta.close()
         tb.close()
+
+
+@pytest.mark.parametrize("non_empty", [False, True], ids=["empty-context", "non-empty-context"])
+def test_scheduling_without_a_context_allocates_nothing_the_gc_tracks(loop, non_empty):
+    """A callback scheduled without an explicit context used to keep a copy
+    of the current one alive in the queue: a GC-tracked object per pending
+    callback, which set off a young collection every ~700 calls and fed the
+    full ones -- for a 200k-callback burst, over half the time. Callbacks
+    scheduled while the current variables are unchanged now share one
+    snapshot of them (ctxsnap), and each still runs in a context of its own
+    at dispatch (see the parity tests' callback-context section)."""
+
+    import contextvars
+
+    var = contextvars.ContextVar("request_id")
+
+    def cb():
+        pass
+
+    def schedule():
+        if non_empty:
+            var.set("r-1")
+        for _ in range(5000):
+            loop.call_soon(cb)
+            loop.call_later(60, cb).cancel()
+
+    gc.collect()
+    gc.disable()
+    try:
+        before = gc.get_count()[0]
+        # A fresh context, so "empty" is: the test process's own may not be
+        # (anything that called decimal.getcontext() set a variable in it).
+        contextvars.Context().run(schedule)
+        grown = gc.get_count()[0] - before
+    finally:
+        gc.enable()
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    assert grown < 50, f"{grown} GC-tracked allocations for 10000 scheduling calls"

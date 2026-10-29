@@ -38,6 +38,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::{PyTraverseError, PyVisit};
 
+use crate::ctxsnap::Scratch;
+
 /// A callback's positional arguments, stored inline.
 ///
 /// Zero, one and two arguments cover the scheduling the loop does on its
@@ -219,6 +221,11 @@ pub struct Handle {
     persistent: bool,
     /// Created in debug mode: keep a repr when references are released.
     debug: bool,
+    /// `context` is a shared snapshot (`ctxsnap`): the callback runs in a
+    /// scratch context with its variables, never in the snapshot itself.
+    /// Set for callbacks scheduled without an explicit context; an explicit
+    /// one is entered as given, as asyncio does.
+    snapshot: bool,
 }
 
 impl Handle {
@@ -226,7 +233,7 @@ impl Handle {
         py: Python<'_>,
         callback: Py<PyAny>,
         args: CallArgs,
-        context: Py<PyAny>,
+        (context, snapshot): (Py<PyAny>, bool),
         debug: bool,
         source_tb: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
@@ -236,13 +243,27 @@ impl Handle {
             scheduled: AtomicBool::new(false),
             persistent: false,
             debug,
+            snapshot,
         })
     }
 
     /// A readiness-watch handle (see `persistent`).
-    pub(crate) fn persistent(mut self) -> Self {
+    ///
+    /// A watch gets a context of its own even when it was scheduled with a
+    /// shared snapshot: asyncio runs every readiness callback of one watch
+    /// in the same context, so a variable a reader sets is still there on
+    /// its next call -- which a scratch context per dispatch would lose.
+    pub(crate) fn persistent(mut self, py: Python<'_>) -> PyResult<Self> {
         self.persistent = true;
-        self
+        if self.snapshot {
+            let r = self.refs.0.get_mut();
+            if let Some(snap) = r.context.as_ref() {
+                // SAFETY: a snapshot handle's context is a live Context.
+                r.context = Some(unsafe { crate::ctxsnap::own_copy(py, snap.as_ptr())? });
+            }
+            self.snapshot = false;
+        }
+        Ok(self)
     }
 
     /// Returns true when this call newly cancelled the handle.
@@ -299,13 +320,14 @@ impl Handle {
     /// behalf of the loop that owns it (see `CoreLoop::__traverse__`).
     ///
     /// The callback and arguments only. The context is left out on
-    /// purpose: each pending handle has its own copy (GC-tracked, so a
-    /// distinct object per handle and a cache miss per visit), which made
-    /// full collections of an idle loop with many callbacks queued twice as
-    /// expensive -- and a reference cycle that runs through a context
-    /// snapshot, rather than through the callback or an argument, is
-    /// vanishingly rare. Under-reporting can only delay a collection,
-    /// never free anything early.
+    /// purpose: visiting a per-handle copy (what every handle held before
+    /// snapshots were shared, and what explicit-context handles still
+    /// hold) made full collections of an idle loop with many callbacks
+    /// queued twice as expensive -- and a reference cycle that runs
+    /// through a context, rather than through the callback or an argument,
+    /// is vanishingly rare. (The loop reports its cached shared snapshot
+    /// itself.) Under-reporting can only delay a collection, never free
+    /// anything early.
     pub(crate) fn visit_refs(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         // SAFETY: traversal runs with the GIL held and cannot overlap a
         // `GilCell::with` (whose closures never reach Python, so never
@@ -597,7 +619,7 @@ fn fatal_or_failed(py: Python<'_>, err: PyErr) -> PyResult<DispatchOutcome> {
 /// Fatal exceptions (KeyboardInterrupt / SystemExit) propagate as `Err` to
 /// unwind `run_forever`, matching asyncio's `Handle._run` contract.
 #[inline]
-pub fn run_handle(py: Python<'_>, handle: &Handle) -> PyResult<DispatchOutcome> {
+pub fn run_handle(py: Python<'_>, handle: &Handle, scratch: &mut Scratch) -> PyResult<DispatchOutcome> {
     if handle.is_cancelled() {
         return Ok(DispatchOutcome::Done);
     }
@@ -626,6 +648,28 @@ pub fn run_handle(py: Python<'_>, handle: &Handle) -> PyResult<DispatchOutcome> 
         // handle dispatched twice): nothing left to run.
         return Ok(DispatchOutcome::Done);
     }
+    // A snapshot is never entered itself: the callback runs in a scratch
+    // context with its variables (ctxsnap).
+    let fresh = handle.snapshot;
+    let ctx = if fresh {
+        unsafe {
+            let acquired = scratch.acquire(py, ctx);
+            ffi::Py_DECREF(ctx); // the snapshot reference taken above
+            match acquired {
+                Ok(c) => c,
+                Err(e) => {
+                    for p in [cb, a0, a1, many] {
+                        if !p.is_null() {
+                            ffi::Py_DECREF(p);
+                        }
+                    }
+                    return fatal_or_failed(py, e);
+                }
+            }
+        }
+    } else {
+        ctx
+    };
 
     let result = unsafe {
         let res = if ffi::PyContext_Enter(ctx) != 0 {
@@ -669,10 +713,15 @@ pub fn run_handle(py: Python<'_>, handle: &Handle) -> PyResult<DispatchOutcome> 
                 Ok(())
             }
         };
-        for p in [cb, ctx, a0, a1, many] {
+        for p in [cb, a0, a1, many] {
             if !p.is_null() {
                 ffi::Py_DECREF(p);
             }
+        }
+        if fresh {
+            drop(scratch.give_back(py, ctx));
+        } else {
+            ffi::Py_DECREF(ctx);
         }
         res
     };

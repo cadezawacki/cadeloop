@@ -21,13 +21,14 @@
 //! }
 //! ```
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::{self, BackendKind, Completion, IoBackend, Wakeup};
-use crate::ready::{CrossThreadQueue, ReadyQueue};
+use crate::ready::{CrossThreadQueue, ReadyQueue, INITIAL_BATCH_CAPACITY};
 use crate::time::{Clock, Ticks};
 use crate::timer::{TimerHeap, TimerPayload};
 
@@ -102,6 +103,9 @@ pub struct Reactor<T> {
     /// Ready-queue length snapshot at tick start: callbacks scheduled during
     /// dispatch never run in the same tick (asyncio `_run_once` semantics).
     ready_snapshot: usize,
+    /// The dispatch buffer `take_batch` trades with the ready queue, lent
+    /// to the binding layer for the length of a run (`take_spare`).
+    spare: VecDeque<T>,
 }
 
 impl<T: TimerPayload> Reactor<T> {
@@ -122,6 +126,7 @@ impl<T: TimerPayload> Reactor<T> {
             batch_left: 0,
             last_poll_ns: 0,
             ready_snapshot: 0,
+            spare: VecDeque::with_capacity(INITIAL_BATCH_CAPACITY),
         })
     }
 
@@ -403,6 +408,53 @@ impl<T: TimerPayload> Reactor<T> {
     pub fn drain_completions(&mut self, out: &mut Vec<Completion>) {
         out.extend_from_slice(&self.completions);
         self.completions.clear();
+    }
+
+    /// Lend the spare dispatch buffer to a run (see `take_batch`).
+    ///
+    /// The ready queue and this buffer trade places every tick. Keeping the
+    /// one a run ends with, instead of dropping it with the run, is what
+    /// lets both stop allocating once they reach the workload's largest
+    /// batch: a fresh buffer per run regrew to that size every time, from
+    /// freshly faulted memory -- 12% of a 50k-callback burst's time.
+    pub fn take_spare(&mut self) -> VecDeque<T> {
+        std::mem::take(&mut self.spare)
+    }
+
+    /// Take back the buffer `take_spare` lent, which must be empty: the
+    /// larger of it and whatever is held now is kept.
+    pub fn put_spare(&mut self, buf: VecDeque<T>) {
+        debug_assert!(buf.is_empty());
+        if buf.is_empty() && buf.capacity() >= self.spare.capacity() {
+            self.spare = buf;
+        }
+    }
+
+    /// Move the whole current dispatch batch into `out`, which must be
+    /// empty: what `pop_ready_batched` hands out one token at a time, in
+    /// O(1).
+    ///
+    /// The batch is the queue's snapshot, so the queue's buffer itself is
+    /// swapped out, and `out`'s -- empty, capacity intact -- takes its
+    /// place for whatever the batch schedules. The two buffers alternate
+    /// tick by tick and stop allocating once they reach the workload's
+    /// largest batch. Copying token by token instead grew a second buffer
+    /// to the snapshot's size: a 200k-callback burst or a
+    /// call_soon_threadsafe flood paid a reallocation series and the page
+    /// faults of fresh memory for it on top of touching every token twice.
+    pub fn take_batch(&mut self, out: &mut VecDeque<T>) {
+        let n = std::mem::take(&mut self.batch_left);
+        if n == 0 {
+            return;
+        }
+        self.ready.swap_with(out);
+        // Anything queued behind the snapshot belongs to the next tick:
+        // back to the queue front, in order.
+        while out.len() > n {
+            let Some(token) = out.pop_back() else { break };
+            self.ready.push_front(token);
+        }
+        self.stats.callbacks_dispatched += out.len() as u64;
     }
 
     /// Pop the next token of the current dispatch batch (R-054: never more
