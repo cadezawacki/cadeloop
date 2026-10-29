@@ -618,7 +618,7 @@ fn fatal_or_failed(py: Python<'_>, err: PyErr) -> PyResult<DispatchOutcome> {
 ///
 /// Fatal exceptions (KeyboardInterrupt / SystemExit) propagate as `Err` to
 /// unwind `run_forever`, matching asyncio's `Handle._run` contract.
-#[inline]
+#[inline(always)]
 pub fn run_handle(py: Python<'_>, handle: &Handle, scratch: &mut Scratch) -> PyResult<DispatchOutcome> {
     if handle.is_cancelled() {
         return Ok(DispatchOutcome::Done);
@@ -719,7 +719,7 @@ pub fn run_handle(py: Python<'_>, handle: &Handle, scratch: &mut Scratch) -> PyR
             }
         }
         if fresh {
-            drop(scratch.give_back(py, ctx));
+            scratch.give_back(py, ctx);
         } else {
             ffi::Py_DECREF(ctx);
         }

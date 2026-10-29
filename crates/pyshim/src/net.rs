@@ -2819,12 +2819,15 @@ fn route_eof(py: Python<'_>, net: &mut NetState, tid: u64) -> Option<(Py<PyAny>,
     Some((p.eof_received.clone_ref(py), entry.pyobj.as_ref()?.clone_ref(py)))
 }
 
+/// Dispatch `events` in order, leaving the Vec empty (its buffer is the
+/// tick's to reuse). A fatal error puts what is left back at the front of
+/// the queue.
 pub(crate) fn dispatch_events(
     py: Python<'_>,
     slf: &Bound<'_, CoreLoop>,
-    events: Vec<NetEvent>,
+    events: &mut Vec<NetEvent>,
 ) -> PyResult<()> {
-    let mut events = events.into_iter();
+    let mut events = events.drain(..);
     while let Some(event) = events.next() {
         if let Err(e) = dispatch_one_event(py, slf, event) {
             let rest: Vec<NetEvent> = events.collect();

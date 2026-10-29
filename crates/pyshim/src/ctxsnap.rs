@@ -288,6 +288,12 @@ impl SnapCache {
     /// The context a callback scheduled without one keeps, and whether it
     /// is a snapshot (run in a scratch copy) rather than a context of its
     /// own (run in directly, as asyncio does with its copy).
+    ///
+    /// Out of line: the busiest scheduling path -- a task's step, a
+    /// future's callbacks -- passes its context explicitly and never gets
+    /// here, and inlined into `make_handle` this grew that path past what
+    /// stays in the instruction cache.
+    #[inline(never)]
     pub(crate) fn capture(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, bool)> {
         unsafe {
             if tstate_ok() {
@@ -399,7 +405,10 @@ impl Scratch {
                 if !layout_ok() || self.vars == want {
                     return Ok(ctx.into_ptr());
                 }
-                drop(ctx);
+                // A context, so freeing it runs no code; dropped with a
+                // plain decref, as dispatch drops everything it holds (a
+                // `Py` drop's is-the-thread-attached probe is a TLS lookup).
+                ffi::Py_DECREF(ctx.into_ptr());
             }
             let ctx = ffi::PyContext_Copy(snap);
             if ctx.is_null() {
@@ -411,21 +420,23 @@ impl Scratch {
     }
 
     /// Take back what `acquire` handed out, after the callback ran in it:
-    /// kept for the next callback when that is unobservable, else returned
-    /// for the caller to drop (outside anything it must not re-enter).
+    /// kept for the next callback when that is unobservable, else released
+    /// (with a plain decref, as dispatch releases everything it holds).
     ///
     /// # Safety
-    /// `ctx` must be the owned reference `acquire` returned.
-    pub(crate) unsafe fn give_back(&mut self, py: Python<'_>, ctx: *mut ffi::PyObject) -> Option<Py<PyAny>> {
+    /// `ctx` must be the owned reference `acquire` returned, and the GIL
+    /// held.
+    pub(crate) unsafe fn give_back(&mut self, py: Python<'_>, ctx: *mut ffi::PyObject) {
         unsafe {
             let unchanged = ffi::Py_REFCNT(ctx) == 1
                 && if layout_ok() { vars_of(ctx) == self.vars } else { is_empty(ctx) };
-            let owned = Bound::from_owned_ptr(py, ctx).unbind();
             if unchanged {
-                self.ctx = Some(owned);
-                None
+                self.ctx = Some(Bound::from_owned_ptr(py, ctx).unbind());
             } else {
-                Some(owned)
+                // Freeing a context can free variable values, and that can
+                // run any code -- harmless here: the scratch slot is empty
+                // (acquire took it), so nothing re-entered can see it.
+                ffi::Py_DECREF(ctx);
             }
         }
     }
