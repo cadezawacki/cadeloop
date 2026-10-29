@@ -33,5 +33,10 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 proptest = "1"
 
+# tests/buffer_residency.rs runs under the extension's own allocator
+# (R-070): what a slab region costs depends on who allocates it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

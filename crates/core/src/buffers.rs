@@ -3,8 +3,9 @@
 //! Size classes {4 KiB, 16 KiB, 64 KiB}. Each slab is one 2 MiB region
 //! (`VirtualAlloc` on Windows, attempting large pages via
 //! `MEM_LARGE_PAGES` when `SeLockMemoryPrivilege` is held, with silent
-//! fallback; `alloc_zeroed` elsewhere for dev/test builds), carved into
-//! fixed-size slots with a per-class freelist.
+//! fallback; an anonymous `mmap` on Linux; `alloc_zeroed` elsewhere for
+//! dev/test builds), carved into fixed-size slots with a per-class
+//! freelist.
 //!
 //! The pool is thread-affine — only the loop thread touches it — so slot
 //! refcounts are plain `u32`s, no atomics, no locks (R-071).
@@ -113,7 +114,37 @@ impl Region {
             assert!(!ptr.is_null(), "VirtualAlloc({REGION_SIZE}) failed");
             Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            // Straight from the kernel, not the global allocator. Under
+            // mimalloc (the extension's allocator, R-070) `alloc_zeroed` of
+            // a 2 MiB region came back fully resident, so every connection's
+            // 64 KiB receive slot cost 64 KiB of RSS even when no request
+            // ever filled more than a page of it: 3000 idle keep-alive
+            // connections held ~190 MB. An anonymous mapping is zero-filled
+            // and faulted in page by page as recvs actually write.
+            //
+            // Transparent huge pages stay off for these regions: with THP
+            // "always", a recent kernel aligns a 2 MiB anonymous mapping to
+            // a huge-page boundary and the first byte received would fault
+            // in the whole region again.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    REGION_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(ptr != libc::MAP_FAILED, "mmap({REGION_SIZE}) failed");
+            // Advisory: a kernel without THP refuses it, and then there are
+            // no huge pages to avoid.
+            unsafe { libc::madvise(ptr, REGION_SIZE, libc::MADV_NOHUGEPAGE) };
+            Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let layout = std::alloc::Layout::from_size_align(REGION_SIZE, 4096).unwrap();
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -130,7 +161,11 @@ impl Drop for Region {
             use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
             VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::munmap(self.ptr.cast(), REGION_SIZE);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         unsafe {
             let layout = std::alloc::Layout::from_size_align(REGION_SIZE, 4096).unwrap();
             std::alloc::dealloc(self.ptr, layout);
@@ -138,14 +173,54 @@ impl Drop for Region {
     }
 }
 
+/// Free slots per class that keep their pages when released. Past this,
+/// a released slot's pages go back to the OS (Linux; see `page_out`).
+///
+/// Regions are never freed, so without a bound the pool held its peak:
+/// after 3000 connections that each received 200 KB had all closed, the
+/// 190 MB their receive slots had touched stayed resident for good. The
+/// most recently freed slots are handed out first, so a steady
+/// connection churn below this many free slots never pages anything out
+/// or faults anything back in; 256 64 KiB slots is 16 MiB.
+pub const RESIDENT_FREE_SLOTS: usize = 256;
+
+/// Whether `page_out` actually returns memory on this platform. Windows
+/// keeps every page: RIO registers whole regions with the kernel, and its
+/// discard primitives cannot be exercised on this platform's test hosts.
+const PAGES_OUT: bool = cfg!(target_os = "linux");
+
+/// Hand a free slot's pages back to the OS; they read as zero when next
+/// touched. Returns whether it did.
+fn page_out(ptr: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a whole free slot inside one of our private anonymous
+        // mappings; nothing references it (refcount zero) until it is
+        // handed out again.
+        unsafe { libc::madvise(ptr.cast(), len, libc::MADV_DONTNEED) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ptr, len);
+        false
+    }
+}
+
 struct ClassPool {
     class: SizeClass,
     regions: Vec<Region>,
-    freelist: Vec<u32>,
+    /// Free slots. Resident ones are pushed at the back and handed out
+    /// first; paged-out ones (`paged_out`) wait at the front.
+    freelist: std::collections::VecDeque<u32>,
     /// Refcount per allocated slot index; 0 == free.
     refcounts: Vec<u32>,
     /// Parallel to `refcounts`; see `SlotId::generation`.
     generations: Vec<u32>,
+    /// Parallel to `refcounts`: a free slot with no resident pages (never
+    /// touched since its region was mapped, or paged out on release).
+    paged_out: Vec<bool>,
+    /// Free slots that are not `paged_out`, against RESIDENT_FREE_SLOTS.
+    resident_free: usize,
     /// `retain`/`release` calls refused because the id was stale or out of
     /// range. Always zero in a correct run.
     stale_rejections: u64,
@@ -157,9 +232,11 @@ impl ClassPool {
         ClassPool {
             class,
             regions: Vec::new(),
-            freelist: Vec::new(),
+            freelist: std::collections::VecDeque::new(),
             refcounts: Vec::new(),
             generations: Vec::new(),
+            paged_out: Vec::new(),
+            resident_free: 0,
             stale_rejections: 0,
             in_use: 0,
         }
@@ -172,8 +249,12 @@ impl ClassPool {
         let n = self.class.slots_per_region() as u32;
         self.refcounts.resize(self.refcounts.len() + n as usize, 0);
         self.generations.resize(self.generations.len() + n as usize, 0);
+        // Fresh mappings have no resident pages yet.
+        self.paged_out.resize(self.paged_out.len() + n as usize, true);
+        // Only ever grown empty; pushed in reverse so low indices are
+        // handed out first.
         for i in (0..n).rev() {
-            self.freelist.push(base + i);
+            self.freelist.push_back(base + i);
         }
     }
 
@@ -238,8 +319,11 @@ impl BufferPool {
         if pool.freelist.is_empty() {
             pool.grow();
         }
-        let index = pool.freelist.pop().expect("freelist refilled by grow");
+        let index = pool.freelist.pop_back().expect("freelist refilled by grow");
         debug_assert_eq!(pool.refcounts[index as usize], 0, "acquired slot has live refs");
+        if !std::mem::take(&mut pool.paged_out[index as usize]) {
+            pool.resident_free -= 1;
+        }
         pool.refcounts[index as usize] = 1;
         pool.in_use += 1;
         SlotId { class, index, generation: pool.generations[index as usize] }
@@ -286,7 +370,13 @@ impl BufferPool {
         // Recycled: every id handed out for this slot is now stale.
         pool.generations[id.index as usize] = pool.generations[id.index as usize].wrapping_add(1);
         pool.in_use -= 1;
-        pool.freelist.push(id.index);
+        if PAGES_OUT && pool.resident_free >= RESIDENT_FREE_SLOTS && page_out(pool.slot_ptr(id.index), size) {
+            pool.paged_out[id.index as usize] = true;
+            pool.freelist.push_front(id.index);
+        } else {
+            pool.resident_free += 1;
+            pool.freelist.push_back(id.index);
+        }
         true
     }
 
@@ -403,6 +493,42 @@ mod tests {
         let b = p.acquire(SizeClass::S4K);
         assert_eq!(b.index, a.index, "LIFO freelist should recycle the slot");
         p.release(b);
+    }
+
+    /// Every free slot is either counted resident or marked paged out.
+    fn assert_free_accounting(p: &BufferPool, class: SizeClass) {
+        let c = p.class(class);
+        let paged_out = c.freelist.iter().filter(|&&i| c.paged_out[i as usize]).count();
+        assert_eq!(c.resident_free + paged_out, c.freelist.len());
+        assert!(c.freelist.iter().all(|&i| c.refcounts[i as usize] == 0));
+    }
+
+    #[test]
+    fn release_past_the_resident_budget_pages_out_and_keeps_the_warm_set_first() {
+        let mut p = BufferPool::new();
+        let n = RESIDENT_FREE_SLOTS * 2 + 7;
+        let ids: Vec<SlotId> = (0..n).map(|_| p.acquire(SizeClass::S64K)).collect();
+        for &id in &ids {
+            assert!(p.release(id));
+        }
+        assert_free_accounting(&p, SizeClass::S64K);
+        let resident_expected = if PAGES_OUT { RESIDENT_FREE_SLOTS } else { n };
+        assert_eq!(p.class(SizeClass::S64K).resident_free, resident_expected);
+        // Reacquired, the resident slots come first: the last ones freed
+        // within the budget, most recent first.
+        let warm = p.acquire(SizeClass::S64K);
+        assert_eq!(warm.index, ids[RESIDENT_FREE_SLOTS - 1].index);
+        assert_free_accounting(&p, SizeClass::S64K);
+        // Every slot is still usable, and ids still go stale on recycle.
+        let again: Vec<SlotId> = (0..n - 1).map(|_| p.acquire(SizeClass::S64K)).collect();
+        assert_free_accounting(&p, SizeClass::S64K);
+        assert_eq!(p.in_use(), n);
+        assert!(!p.release(ids[0]), "a stale id still resolves");
+        for id in again.into_iter().chain([warm]) {
+            assert!(p.release(id));
+        }
+        assert_free_accounting(&p, SizeClass::S64K);
+        assert_eq!(p.in_use(), 0);
     }
 
     #[test]
