@@ -1571,6 +1571,60 @@ def test_pipelined_burst_behind_a_slow_request_is_bounded(loop):
     loop._core.listener_close(lid)
 
 
+def test_a_pipelining_client_does_not_starve_other_connections(loop):
+    """R-085 fairness: one 64 KiB read carries ~2400 minimal pipelined
+    requests, and the pump served all of them back to back in one pass --
+    every other connection's requests waited behind the whole burst. It
+    now yields after a quantum, so a request arriving on another
+    connection is served within a few quanta, while the burst itself is
+    still answered completely and in order."""
+    order = []
+
+    async def app(scope, receive, send):
+        order.append(scope["path"])
+        await send(
+            {"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]}
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    lid, port = listen(loop, app)
+    n = 4000
+
+    def read_responses(sock, count):
+        buf = b""
+        while buf.count(b"HTTP/1.1 200 ") < count:
+            chunk = sock.recv(1 << 16)
+            assert chunk, "connection closed before every response arrived"
+            buf += chunk
+        return buf
+
+    def client():
+        a = socket.create_connection(("127.0.0.1", port))
+        b = socket.create_connection(("127.0.0.1", port))
+        try:
+            for s in (a, b):
+                s.settimeout(20)
+            # Both connections live on the server before the burst starts.
+            b.sendall(b"GET /warm HTTP/1.1\r\nHost: h\r\n\r\n")
+            read_responses(b, 1)
+            a.sendall(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n" * n)
+            b.sendall(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+            read_responses(b, 1)
+            read_responses(a, n)
+        finally:
+            a.close()
+            b.close()
+
+    loop.run_until_complete(loop.run_in_executor(None, client))
+    loop._core.listener_close(lid)
+    assert order.count("/a") == n, "the burst was not answered in full"
+    behind = order.index("/b") - 1
+    # Served back to back, /b waited for the whole first read of the burst
+    # (~700 requests on a fresh loopback connection, up to ~2400 per
+    # 64 KiB); with the quantum it is a few quanta at most.
+    assert behind < 256, f"/b was served only after {behind} of the other client's requests"
+
+
 def test_oversized_body_is_rejected_by_default(loop):
     """R-086: the engine buffers a whole request body before dispatching,
     so an unlimited default let any unauthenticated client turn one

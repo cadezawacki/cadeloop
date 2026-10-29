@@ -2659,12 +2659,36 @@ fn is_ws_key(k: &[u8]) -> bool {
         && k[..22].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
-/// Phase 2: start queued requests until the queue is empty or one
-/// suspends. ITERATIVE — a pipelined burst of N sync requests runs in one
+/// Pipelined requests one connection runs per pump before yielding to
+/// everyone else (R-085).
+///
+/// One 64 KiB read can carry ~2400 minimal pipelined requests, and the pump
+/// used to run all of them back to back: every other connection's requests,
+/// I/O and timers waited behind one client's burst -- ~6 ms per read here,
+/// and a probe's p99 latency went from 0.9 ms to 7.7 ms under four
+/// pipelining clients. Past the quantum the pump re-queues itself as an
+/// event and the rest run on later passes, after what other connections
+/// have queued meanwhile. uvicorn yields after every request; 16 keeps the
+/// yield's own cost negligible next to the requests it separates.
+const PUMP_QUANTUM: usize = 16;
+
+/// Phase 2: start queued requests until the queue is empty, one suspends,
+/// or `PUMP_QUANTUM` have run. ITERATIVE — a pipelined burst runs in a
 /// loop, not N nested stacks (AppTask::step never pumps).
 pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64) -> PyResult<()> {
     let core = slf.get();
+    let mut ran = 0usize;
     loop {
+        if ran == PUMP_QUANTUM {
+            // Yield: the rest of the pipeline goes behind whatever is queued
+            // now, as a pump of its own.
+            return core.with_net(|net, _| {
+                if net.http_conn_mut(tid).is_some_and(|c| !c.active && !c.pending.is_empty()) {
+                    net.events.push(net::NetEvent::HttpPump { tid });
+                }
+            });
+        }
+        ran += 1;
         // Pop the next request only when no request is active.
         let next = core.with_net(|net, reactor| {
             let logging = net.access_sink.is_some();
