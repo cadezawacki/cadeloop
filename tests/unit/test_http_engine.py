@@ -3130,6 +3130,33 @@ def test_what_the_apps_synchronous_call_sets_stays_with_its_request(loop, eager)
     assert user.get() is None, "set in the context the loop runs in"
 
 
+@pytest.mark.parametrize("eager", [True, False])
+def test_a_handler_raising_systemexit_still_answers_its_request(loop, eager):
+    """SystemExit (or KeyboardInterrupt) from a handler stops the loop, as
+    from any asyncio Task -- but it left before its request was answered,
+    with the driver never marked finished: the client got nothing until
+    the shutdown's deadline closed the connection, and the shutdown
+    reported a task still running. The request is now answered (500)
+    first. On the non-eager path the Task already raised it out of the
+    loop; its done callback no longer raises it a second time, which cut
+    short the shutdown the first one started."""
+
+    async def app(scope, receive, send):
+        await receive()
+        await asyncio.sleep(0.01)
+        sys.exit(3)
+
+    lid, port = listen(loop, app, eager=eager)
+    client = loop.create_task(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    with pytest.raises(SystemExit):
+        loop.run_until_complete(client)
+    # The loop runs on, as serve()'s shutdown drain does.
+    resp = loop.run_until_complete(client)
+    loop._core.listener_close(lid)
+    assert resp.startswith(b"HTTP/1.1 500"), resp
+    assert all(d.done() for d in loop._core.http_request_drivers())
+
+
 def test_contextvar_isolation_pipelined_requests(loop):
     """A request pipelined behind one that suspended started with every
     contextvar that one had set: the eager driver pumped it from inside

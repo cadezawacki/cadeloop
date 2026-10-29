@@ -3260,7 +3260,13 @@ fn on_coro_finished(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> Py
 /// App raised (R-086): 500 if the response never started, teardown if it
 /// died mid-response. Client disconnects are not reported as app errors.
 pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64, err: PyErr) -> PyResult<()> {
-    if err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py) {
+    if is_process_exit(py, &err) {
+        // SystemExit and KeyboardInterrupt ask the process to stop rather
+        // than fail the request: they go on out of the loop, as from an
+        // asyncio Task -- once the request is answered like any failed
+        // one. Raised before that, they left its client with no answer
+        // until the shutdown's deadline closed the connection under it.
+        fail_request(py, core, tid, epoch)?;
         return Err(err);
     }
     // CancelledError is not an application error: it is how a request is
@@ -3274,6 +3280,16 @@ pub(crate) fn app_failure(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64,
     if !disconnect {
         core.report_net_error(py, "Exception in ASGI application", err.into_value(py).into_any())?;
     }
+    fail_request(py, core, tid, epoch)
+}
+
+fn is_process_exit(py: Python<'_>, err: &PyErr) -> bool {
+    err.is_instance_of::<PyKeyboardInterrupt>(py) || err.is_instance_of::<PySystemExit>(py)
+}
+
+/// What a request whose coroutine raised gets (R-086): 500 if its response
+/// never started, a hard close if it died mid-response; a WebSocket, 1011.
+fn fail_request(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> PyResult<()> {
     // A request already released (it failed in its background work) or
     // superseded: its connection has moved on to another request, which
     // this must neither answer for nor tear down.
@@ -3823,7 +3839,12 @@ impl AppTask {
         if let Err(e) = task_hook(py, &LEAVE_TASK, "_leave_task").and_then(|f| f.call1(py, (&pyloop, slf))) {
             e.write_unraisable(py, None);
         }
-        if matches!(out, Ok(StepOutcome::Finished) | Ok(StepOutcome::Failed)) {
+        let finished = match &out {
+            Ok(o) => matches!(o, StepOutcome::Finished | StepOutcome::Failed),
+            // A process-exit exception the coroutine raised (step_body).
+            Err(_) => slf.borrow().finished,
+        };
+        if finished {
             slf.borrow_mut().finished = true;
             AppTask::fire_done_callbacks(slf, py)?;
         }
@@ -3970,7 +3991,15 @@ impl AppTask {
                     }
                 }
                 Err(e) => {
-                    app_failure(py, core, tid, epoch, e)?;
+                    if let Err(fatal) = app_failure(py, core, tid, epoch, e) {
+                        // SystemExit or KeyboardInterrupt, going on out of
+                        // the loop: the coroutine that raised it is
+                        // finished all the same (`step` fires its done
+                        // callbacks), and no longer the connection's.
+                        slf.borrow_mut().finished = true;
+                        drop_driver(py, core, tid, slf.as_ptr())?;
+                        return Err(fatal);
+                    }
                     return Ok(StepOutcome::Failed);
                 }
             }
@@ -4064,7 +4093,15 @@ impl HttpTaskDone {
             if exc.is_none() {
                 on_coro_finished(py, core, self.tid, self.epoch)?;
             } else {
-                app_failure(py, core, self.tid, self.epoch, PyErr::from_value(exc))?;
+                let err = PyErr::from_value(exc);
+                if is_process_exit(py, &err) {
+                    // The Task raised it out of the loop itself already;
+                    // raised again from here it would cut the shutdown
+                    // that it started short.
+                    fail_request(py, core, self.tid, self.epoch)?;
+                } else {
+                    app_failure(py, core, self.tid, self.epoch, err)?;
+                }
             }
         }
         pump_requests(py, core_bound, self.tid)
