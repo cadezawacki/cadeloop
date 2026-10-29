@@ -21,7 +21,9 @@ methodology: [benchmarks.md](benchmarks.md).*
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | ASGI | Concurrent `send()` calls parked on write backpressure displaced one another's drain future: every frame was written but only the last sender resumed, and the rest stayed pending until the app's timeout or were destroyed by the GC as pending tasks; waiters now queue and all resolve on drain or teardown | `` |
+> | Net | Transport events were bound before the iteration's callbacks ran: data and EOF reached a protocol after `close()`/`abort()` or while paused, datagrams arrived after a datagram transport's close, `resume_writing` followed `abort()`, and bytes meant for the protocol `set_protocol()` installed (a `start_tls` ClientHello) went to the old one; events are now routed at dispatch (ADR-32) | `` |
+> | Loop | An iteration ran its due timers before the I/O its poll reported, so an idle timeout due as a request arrived won the race: uvicorn's keep-alive timeout closed the connection and lost the request; timers now run after the iteration's I/O, as in asyncio (ADR-32) | `` |
+> | ASGI | Concurrent `send()` calls parked on write backpressure displaced one another's drain future: every frame was written but only the last sender resumed, and the rest stayed pending until the app's timeout or were destroyed by the GC as pending tasks; waiters now queue and all resolve on drain or teardown | `981dafc` |
 > | CI | The PGO wheel build baked a git-bash POSIX path into the instrumented binary, so Windows wrote the profiles elsewhere and the merge found nothing | `79bab8f` |
 > | TLS | A peer that connected and never sent a ClientHello was never torn down: each sweep staged another unencryptable 408 while the socket and receive slot stayed held | `7069869` |
 > | Loop | `sendfile` held a raw fd across suspensions: a transport closed mid-transfer could aim `os.sendfile` at whatever connection reused the number, or park forever on a dead watcher | `7069869` |

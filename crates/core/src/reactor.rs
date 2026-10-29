@@ -15,9 +15,11 @@
 //!     let t = reactor.poll_timeout();
 //!     reactor.poll(t)                   // GIL RELEASED (R-021)
 //!     reactor.finish_poll()             // GIL held: xthread drain, timers
-//!     while let Some(tok) = reactor.pop_ready_batched() {
-//!         dispatch(tok)                 // GIL held, one re-acquire per batch
-//!     }
+//!     reactor.take_batch(&mut batch);   // the ready snapshot, I/O watches included
+//!     let timers = reactor.take_expired(&mut batch);
+//!     dispatch(batch)                   // GIL held: the snapshot, then the
+//!                                       // tick's transport events, then the
+//!                                       // `timers` expired timers at its tail
 //! }
 //! ```
 
@@ -106,6 +108,9 @@ pub struct Reactor<T> {
     /// The dispatch buffer `take_batch` trades with the ready queue, lent
     /// to the binding layer for the length of a run (`take_spare`).
     spare: VecDeque<T>,
+    /// Timers that expired this tick, in deadline order, until the binding
+    /// layer takes them behind the ready batch (`take_expired`).
+    expired: VecDeque<T>,
 }
 
 impl<T: TimerPayload> Reactor<T> {
@@ -127,6 +132,7 @@ impl<T: TimerPayload> Reactor<T> {
             last_poll_ns: 0,
             ready_snapshot: 0,
             spare: VecDeque::with_capacity(INITIAL_BATCH_CAPACITY),
+            expired: VecDeque::new(),
         })
     }
 
@@ -170,6 +176,13 @@ impl<T: TimerPayload> Reactor<T> {
         self.stats.callbacks_dispatched = self.stats.callbacks_dispatched.saturating_sub(1);
     }
 
+    /// Undo a `take_expired` for a timer an unwind left undispatched: back
+    /// to the FRONT of the expired timers, ahead of any that expire later.
+    /// Feed tokens in REVERSE order.
+    pub fn unpop_expired(&mut self, token: T) {
+        self.expired.push_front(token);
+    }
+
     /// Schedule `token` to become ready at `deadline`. Cancellation is read
     /// off the payload itself ([`TimerPayload::is_cancelled`]).
     #[inline]
@@ -208,14 +221,14 @@ impl<T: TimerPayload> Reactor<T> {
 
     // ---- tick ------------------------------------------------------------
 
-    /// Start-of-tick bookkeeping (GIL held): refresh clock, absorb timer
-    /// cancellations, drain the cross-thread queue, fire expired timers.
     /// R-052: mark/clear the signal-wakeup fd on the backend so poll
     /// elision does not count it as I/O interest.
     pub fn set_wake_only(&mut self, fd: Option<crate::backend::RawSocket>) {
         self.backend.set_wake_only(fd);
     }
 
+    /// Start-of-tick bookkeeping (GIL held): refresh clock, absorb timer
+    /// cancellations, drain the cross-thread queue, collect expired timers.
     pub fn prepare_tick(&mut self) {
         self.stats.ticks += 1;
         self.clock.invalidate();
@@ -275,6 +288,9 @@ impl<T: TimerPayload> Reactor<T> {
         self.stats.xthread_items += n as u64;
     }
 
+    /// Move the timers due now out of the heap, behind any collected
+    /// earlier this tick. They are dispatched after the tick's ready batch
+    /// AND its I/O callbacks (`take_expired`).
     #[inline]
     fn fire_expired_timers(&mut self) {
         // Cheap reject before the pop loop: the top entry is a lower bound
@@ -286,15 +302,35 @@ impl<T: TimerPayload> Reactor<T> {
             return;
         }
         while let Some(token) = self.timers.pop_expired(now) {
-            self.ready.push(token);
+            self.expired.push_back(token);
             self.stats.timers_fired += 1;
         }
     }
 
-    /// R-030: 0 when ready callbacks are pending; else time to the next
-    /// timer deadline; clamped to [0, 100ms].
+    /// Append this tick's expired timers to `out` -- the dispatch batch,
+    /// once `take_batch` has filled it -- and return how many: the binding
+    /// layer runs them after the batch's other callbacks and after the
+    /// tick's transport events.
+    ///
+    /// That is asyncio's `_run_once` order: the previous iteration's
+    /// callbacks, then the I/O callbacks `_process_events` appends, then
+    /// the timers that are due. Firing timers first, as this did, handed a
+    /// race to the timer whenever both were ready in one tick: uvicorn's
+    /// keep-alive timeout closed a connection whose next request had
+    /// already arrived, where asyncio (and uvloop) deliver the request and
+    /// its `data_received` cancels the timer.
+    pub fn take_expired(&mut self, out: &mut VecDeque<T>) -> usize {
+        let n = self.expired.len();
+        if n > 0 {
+            out.extend(self.expired.drain(..));
+        }
+        n
+    }
+
+    /// R-030: 0 when ready callbacks or expired timers are pending; else
+    /// time to the next timer deadline; clamped to [0, 100ms].
     pub fn poll_timeout(&mut self) -> Duration {
-        if !self.ready.is_empty() {
+        if !self.ready.is_empty() || !self.expired.is_empty() {
             return Duration::ZERO;
         }
         match self.timers.next_deadline() {
@@ -472,14 +508,16 @@ impl<T: TimerPayload> Reactor<T> {
         token
     }
 
+    /// Callbacks ready to run: the ready queue and the expired timers.
     pub fn ready_len(&self) -> usize {
-        self.ready.len()
+        self.ready.len() + self.expired.len()
     }
 
-    /// Every token the reactor holds in its ready queue and timer heap.
-    /// (Cross-thread items in flight are not reachable without draining.)
+    /// Every token the reactor holds in its ready queue, expired timers
+    /// and timer heap. (Cross-thread items in flight are not reachable
+    /// without draining.)
     pub fn pending_iter(&self) -> impl Iterator<Item = &T> {
-        self.ready.iter().chain(self.timers.iter())
+        self.ready.iter().chain(self.expired.iter()).chain(self.timers.iter())
     }
 
     pub fn timers_len(&self) -> usize {
@@ -497,6 +535,7 @@ impl<T: TimerPayload> Reactor<T> {
         while let Some(t) = self.ready.pop() {
             out.push(t);
         }
+        out.extend(self.expired.drain(..));
         let mut scratch = ReadyQueue::new();
         let timers = &mut self.timers;
         self.xthread.drain_into(&mut scratch, |deadline, token| timers.schedule(deadline, token));
@@ -535,7 +574,52 @@ mod tests {
         while let Some(tok) = r.pop_ready_batched() {
             out.push(tok.value);
         }
+        let mut timers = VecDeque::new();
+        r.take_expired(&mut timers);
+        out.extend(timers.into_iter().map(|t| t.value));
         out
+    }
+
+    #[test]
+    fn expired_timers_run_after_this_ticks_io_callbacks() {
+        // asyncio's _run_once order: the previous iteration's callbacks,
+        // then the I/O callbacks this poll reported, then due timers.
+        let mut r = reactor();
+        let now = r.now_fresh();
+        r.schedule_timer(now, tok(3));
+        r.push_ready(tok(1));
+        r.prepare_tick();
+        assert_eq!(r.poll_timeout(), Duration::ZERO, "an expired timer is ready work");
+        r.poll(Duration::ZERO).unwrap();
+        r.finish_poll_after(false);
+        r.push_ready(tok(2)); // a readiness watch the poll reported
+        r.absorb_into_batch();
+        let mut batch = VecDeque::new();
+        r.take_batch(&mut batch);
+        let timers = r.take_expired(&mut batch);
+        assert_eq!(timers, 1);
+        assert_eq!(batch.into_iter().map(|t| t.value).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(r.ready_len(), 0);
+    }
+
+    #[test]
+    fn unpopped_expired_timers_keep_their_place() {
+        let mut r = reactor();
+        let now = r.now_fresh();
+        r.schedule_timer(now, tok(1));
+        r.schedule_timer(now, tok(2));
+        r.prepare_tick();
+        let mut batch = VecDeque::new();
+        r.take_batch(&mut batch);
+        assert_eq!(r.take_expired(&mut batch), 2);
+        // An unwind before either ran: both go back, in order, and a
+        // timer expiring later queues behind them.
+        for t in batch.drain(..).rev() {
+            r.unpop_expired(t);
+        }
+        r.schedule_timer(now, tok(3));
+        assert_eq!(r.ready_len(), 2);
+        assert_eq!(run_tick(&mut r), vec![1, 2, 3]);
     }
 
     #[test]

@@ -12,11 +12,14 @@
 //! ```text
 //! 1. flush corked writes queued by last tick's ready callbacks
 //!    prepare_tick; poll (GIL released, R-021)
-//! 2. translate completions -> NetEvents (in-cell, no Python execution)
-//! 3. dispatch NetEvents (protocol callbacks; GIL, out-of-cell)
-//! 4. flush writes those callbacks corked (R-035 tick-end flush)
-//! 5. dispatch NetEvents produced by the flush (teardowns)
-//! 6. dispatch ready-callback batch (<=128, R-054)
+//! 2. translate completions -> NetEvents, readiness watches -> the ready
+//!    queue (in-cell, no Python execution)
+//! 3. dispatch the ready batch (R-054): last tick's callbacks, then the
+//!    readiness watches this poll reported
+//! 4. dispatch NetEvents (protocol callbacks; GIL, out-of-cell), then
+//!    the timers due -- asyncio's _run_once order
+//! 5. flush writes those callbacks corked (R-035 tick-end flush)
+//! 6. dispatch NetEvents produced by the flush (teardowns)
 //! ```
 
 use std::collections::VecDeque;
@@ -402,8 +405,8 @@ impl CoreLoop {
     ) -> PyResult<()> {
         let stopping = self.stopping.load(Ordering::Acquire);
         debug_assert!(batch.is_empty());
-        type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Option<Graveyards>, bool);
-        let (poll_result, parked, events, graveyard, special): TickOut = self.state.with(|st| {
+        type TickOut = (std::io::Result<()>, bool, Vec<NetEvent>, Option<Graveyards>, bool, usize);
+        let (poll_result, parked, events, graveyard, special, timers): TickOut = self.state.with(|st| {
             // Phase 1: flush corked writes from last tick's callbacks.
             if !st.net.flush_list.is_empty() {
                 let list = std::mem::take(&mut st.net.flush_list);
@@ -437,7 +440,7 @@ impl CoreLoop {
                 (py.detach(move || reactor.poll(timeout)), true)
             };
             if poll_result.is_err() {
-                return (poll_result, parked, Vec::new(), None, false);
+                return (poll_result, parked, Vec::new(), None, false, 0);
             }
             // Phase 2: translate completions (no Python execution).
             st.reactor.finish_poll_after(parked);
@@ -472,18 +475,20 @@ impl CoreLoop {
             }
             let events = std::mem::take(&mut st.net.events);
             // The dispatch batch, in the SAME cell entry: every callback
-            // ready when the tick began, plus this tick's timers and
-            // readiness watches (batch_left was snapshotted for exactly
-            // those). It runs BEFORE the transport events below, as
-            // asyncio's _run_once appends an iteration's I/O callbacks
-            // behind the callbacks already in `_ready`.
+            // ready when the tick began, plus this tick's readiness watches
+            // (batch_left was snapshotted for exactly those), and at its
+            // tail the timers due now. asyncio's _run_once appends an
+            // iteration's I/O callbacks behind the callbacks already in
+            // `_ready`, and the due timers behind those: so the batch runs
+            // first, then the transport events, then the timers.
             st.reactor.take_batch(batch);
+            let timers = st.reactor.take_expired(batch);
             let graveyard = if st.net.has_graveyards() || st.reactor.has_graveyard() {
                 Some(take_graveyards(st))
             } else {
                 None
             };
-            (Ok(()), parked, events, graveyard, st.net.has_special_graveyards())
+            (Ok(()), parked, events, graveyard, st.net.has_special_graveyards(), timers)
         })?;
         drop(graveyard);
         poll_result?;
@@ -503,13 +508,7 @@ impl CoreLoop {
             let interrupted = unsafe { ffi::PyErr_CheckSignals() != 0 };
             if interrupted {
                 let err = PyErr::fetch(py);
-                if !batch.is_empty() {
-                    self.state.with(|st| {
-                        for token in batch.drain(..).rev() {
-                            st.reactor.unpop_ready(token);
-                        }
-                    })?;
-                }
+                self.hand_back(batch, timers)?;
                 // The transport events too: dropped here, they took their
                 // payloads and teardowns with them -- and a caller that
                 // runs the loop again after a KeyboardInterrupt (asyncio.run
@@ -521,12 +520,61 @@ impl CoreLoop {
         }
 
         // Phase 3: ready-callback batch (R-054). A fatal error
-        // (KeyboardInterrupt/SystemExit from a callback) returns the
-        // undispatched tail to the queue front -- and this tick's transport
-        // events, which have not run yet, to theirs -- so nothing is lost
-        // and FIFO order holds across the unwind.
+        // (KeyboardInterrupt/SystemExit from a callback) hands the
+        // undispatched rest back -- callbacks to the ready queue, timers to
+        // theirs -- and this tick's transport events, which have not run
+        // yet, to theirs, so nothing is lost and FIFO order holds across
+        // the unwind.
+        if let Err(err) = self.run_handles(py, batch, batch.len() - timers, scratch) {
+            self.hand_back(batch, timers)?;
+            self.requeue_events(events)?;
+            return Err(err);
+        }
+
+        // Phase 4: the protocol callbacks of this tick's transport events,
+        // then (4b) the timers due, then -- when events fired -- flush the
+        // writes this tick corked (same tick, R-035) and dispatch the
+        // teardowns that flush produced. Anything they schedule runs next
+        // tick, as in asyncio.
+        let had_events = !events.is_empty();
+        if had_events {
+            if let Err(err) = net::dispatch_events(py, slf, events) {
+                self.hand_back(batch, timers)?;
+                return Err(err);
+            }
+        }
+        if timers > 0 {
+            if let Err(err) = self.run_handles(py, batch, timers, scratch) {
+                self.hand_back(batch, batch.len())?;
+                return Err(err);
+            }
+        }
+        // Let the shared context snapshot go once nothing pending uses it.
+        self.snaps.trim(py);
+        if had_events {
+            let events = self.flush_corked(py)?;
+            self.drain_graveyards(py)?;
+            if !events.is_empty() {
+                net::dispatch_events(py, slf, events)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispatch the first `n` handles of `batch`, releasing each as it goes.
+    /// A fatal error stops it with the rest still in `batch`, for the
+    /// caller to hand back (`hand_back`).
+    #[inline]
+    fn run_handles(
+        &self,
+        py: Python<'_>,
+        batch: &mut VecDeque<HandleRef>,
+        n: usize,
+        scratch: &mut Scratch,
+    ) -> PyResult<()> {
         let debug = self.debug.load(Ordering::Relaxed);
-        while let Some(token) = batch.pop_front() {
+        for _ in 0..n {
+            let Some(token) = batch.pop_front() else { break };
             let started = debug.then(std::time::Instant::now);
             let fatal = match run_handle(py, token.get(), scratch) {
                 Ok(DispatchOutcome::Done) => None,
@@ -538,17 +586,8 @@ impl CoreLoop {
                 Err(e) => Some(e),
             };
             if let Some(err) = fatal {
-                // This callback ran (and raised); everything still in the
-                // batch goes back to the queue front, in order.
-                if !batch.is_empty() {
-                    self.state.with(|st| {
-                        for t in batch.drain(..).rev() {
-                            st.reactor.unpop_ready(t);
-                        }
-                    })?;
-                }
+                // This callback ran (and raised).
                 release_token(py, token);
-                self.requeue_events(events)?;
                 return Err(err);
             }
             if let Some(started) = started {
@@ -576,22 +615,26 @@ impl CoreLoop {
             // above: the slow-callback report formats the callback.)
             release_token(py, token);
         }
-        // Let the shared context snapshot go once nothing pending uses it.
-        self.snaps.trim(py);
-
-        // Phases 4-6 only exist when transport events fired: dispatch the
-        // protocol callbacks, flush the writes this tick corked (same tick,
-        // R-035), then dispatch the teardowns that flush produced. Anything
-        // they schedule runs next tick, as in asyncio.
-        if !events.is_empty() {
-            net::dispatch_events(py, slf, events)?;
-            let events = self.flush_corked(py)?;
-            self.drain_graveyards(py)?;
-            if !events.is_empty() {
-                net::dispatch_events(py, slf, events)?;
-            }
-        }
         Ok(())
+    }
+
+    /// Hand back what an unwind left in `batch` undispatched: the expired
+    /// timers at its tail (`timers` of them) to the front of theirs, the
+    /// rest to the ready queue's front, so the next tick runs both in
+    /// their original order.
+    fn hand_back(&self, batch: &mut VecDeque<HandleRef>, timers: usize) -> PyResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.state.with(|st| {
+            let split = batch.len() - timers.min(batch.len());
+            for t in batch.drain(split..).rev() {
+                st.reactor.unpop_expired(t);
+            }
+            for t in batch.drain(..).rev() {
+                st.reactor.unpop_ready(t);
+            }
+        })
     }
 
     /// Put transport events this tick took but did not dispatch back at
@@ -1267,7 +1310,7 @@ impl CoreLoop {
     ) -> PyResult<()> {
         self.check_closed()?;
         let addr = addr.filter(|a| !a.is_none()).map(parse_addr_tuple).transpose()?;
-        self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))?
+        self.with_net(|net, reactor| net::udp_sendto(net, reactor.backend_mut(), did, data, addr))?
             .map_err(net::io_error)?;
         self.drain_graveyards(py)
     }

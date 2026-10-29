@@ -236,6 +236,10 @@ pub(crate) struct TransportEntry {
     /// memory, and handing it another read defeats exactly that.
     /// Delivered by `resume_reading`.
     paused_recv: Option<Vec<u8>>,
+    /// The peer's EOF arrived while `reading_paused` was set: held like
+    /// `paused_recv` (asyncio sees no EOF before resume_reading re-adds
+    /// its reader), and delivered after it.
+    paused_eof: bool,
     /// The duplicate behind `get_extra_info("socket")` of a transport
     /// that has no socket object of its own (see `Transport::trsock`),
     /// built on first ask. Closed, not merely dropped, at teardown -- see
@@ -562,22 +566,28 @@ impl NetState {
 /// Phase-2 events: dispatched with the GIL, outside the state cell.
 pub(crate) enum NetEvent {
     /// Plain-protocol data: payload prebuilt, slot already re-posted.
+    ///
+    /// This and the other inbound events below name their transport, not
+    /// the callback to call: where the bytes go is decided when the event
+    /// is dispatched (`route_inbound`), since a callback that runs between
+    /// the poll and then -- in this tick's ready batch, or an earlier
+    /// event's -- may close the transport, pause its reading or swap its
+    /// protocol, and asyncio, which removes or re-reads the reader at
+    /// those moments, delivers nothing to a closed or paused transport and
+    /// everything to the current protocol.
     Data {
-        /// Needed so a failing callback can close the connection it
-        /// arrived on -- see the dispatch site.
         tid: u64,
-        data_received: Py<PyAny>,
         payload: Py<PyAny>,
     },
     /// R-058: one received datagram (payload prebuilt, recv re-posted).
     DgramData {
-        datagram_received: Py<PyAny>,
+        did: u64,
         payload: Py<PyAny>,
         addr: Option<netsys::Addr>,
     },
     /// R-058: per-packet error surfaced to protocol.error_received.
     DgramError {
-        error_received: Py<PyAny>,
+        did: u64,
         err: u32,
     },
     /// R-058: datagram endpoint torn down. `close_after`: its socket
@@ -611,26 +621,21 @@ pub(crate) enum NetEvent {
     TlsFlush {
         tid: u64,
     },
-    /// BufferedProtocol data: copy out of the retained slot in phase 2
-    /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
-    /// Buffered-protocol delivery from an owned copy: the held bytes a
-    /// paused transport accumulated, which have no slot of their own.
-    BufDataOwned {
+    /// The bytes a paused transport held (`paused_recv`), delivered by
+    /// `resume_reading`: an owned copy, with no pool slot of its own.
+    HeldData {
         tid: u64,
-        get_buffer: Py<PyAny>,
-        buffer_updated: Py<PyAny>,
         data: Vec<u8>,
     },
+    /// BufferedProtocol data: copy out of the retained slot in phase 2
+    /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
     BufData {
         tid: u64,
-        get_buffer: Py<PyAny>,
-        buffer_updated: Py<PyAny>,
         slot: SlotId,
         len: usize,
     },
     Eof {
-        eof_received: Py<PyAny>,
-        transport: Py<Transport>,
+        tid: u64,
     },
     ConnLost(Box<ConnLost>),
     /// `resume_writing`, then -- if that left the queue empty -- the
@@ -1402,19 +1407,17 @@ fn on_dgram_recv_done(
     }
     if os_error == 0 {
         let slot = entry.recv_slot.expect("recv op had a slot");
-        let datagram_received = entry.datagram_received.clone_ref(py);
         let ptr = net.buffers.slot_ptr(slot);
         let payload = unsafe {
             let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
             Bound::from_owned_ptr(py, obj).unbind()
         };
-        net.events.push(NetEvent::DgramData { datagram_received, payload, addr });
+        net.events.push(NetEvent::DgramData { did, payload, addr });
     } else if !is_cancelled_error(os_error) {
         // Per-packet errors (e.g. ECONNREFUSED surfaced by a connected
         // socket after an ICMP unreachable): report and KEEP receiving —
         // asyncio semantics.
-        let error_received = entry.error_received.clone_ref(py);
-        net.events.push(NetEvent::DgramError { error_received, err: os_error });
+        net.events.push(NetEvent::DgramError { did, err: os_error });
     } else {
         return; // cancelled: teardown owns the endpoint
     }
@@ -1442,8 +1445,7 @@ fn on_dgram_send_done(
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
     entry.send_op = None;
     if os_error != 0 && !is_cancelled_error(os_error) {
-        let error_received = entry.error_received.clone_ref(py);
-        net.events.push(NetEvent::DgramError { error_received, err: os_error });
+        net.events.push(NetEvent::DgramError { did, err: os_error });
     }
     dgram_pump_send(py, net, backend, did);
 }
@@ -1467,7 +1469,7 @@ fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did
         // Mirrors the charge on the way in; the two must move together or
         // the cap drifts.
         entry.queued_bytes = entry.queued_bytes.saturating_sub(data.len() + DGRAM_PER_PACKET);
-        dgram_send_now(py, net, backend, did, &data, addr.as_ref());
+        dgram_send_now(net, backend, did, &data, addr.as_ref());
     }
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
     if entry.closing && !entry.conn_lost && entry.send_op.is_none() {
@@ -1476,7 +1478,6 @@ fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did
 }
 
 fn dgram_send_now(
-    py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
     did: u64,
@@ -1494,11 +1495,7 @@ fn dgram_send_now(
             // Synchronous refusal: per-packet error, endpoint stays up.
             // The caller keeps draining -- no completion is coming for
             // this packet, so it must not be treated as "in flight".
-            if let Some(entry) = net.datagrams.get_mut(&did) {
-                let error_received = entry.error_received.clone_ref(py);
-                net.events
-                    .push(NetEvent::DgramError { error_received, err: e.raw_os_error().unwrap_or(0) as u32 });
-            }
+            net.events.push(NetEvent::DgramError { did, err: e.raw_os_error().unwrap_or(0) as u32 });
         }
     }
 }
@@ -1506,7 +1503,6 @@ fn dgram_send_now(
 /// asyncio DatagramTransport.sendto: fire-and-forget; sends serialize
 /// through one in-flight op with a queue behind it.
 pub(crate) fn udp_sendto(
-    py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
     did: u64,
@@ -1529,15 +1525,14 @@ pub(crate) fn udp_sendto(
             // Deterministic overflow policy: drop and report. Growing
             // without bound is the alternative, and a producer that can
             // outrun the socket would take the process down with it.
-            let error_received = entry.error_received.clone_ref(py);
-            net.events.push(NetEvent::DgramError { error_received, err: ENOBUFS });
+            net.events.push(NetEvent::DgramError { did, err: ENOBUFS });
             return Ok(());
         }
         entry.queued_bytes += data.len() + DGRAM_PER_PACKET;
         entry.send_queue.push_back((data.to_vec(), addr));
         return Ok(());
     }
-    dgram_send_now(py, net, backend, did, data, addr.as_ref());
+    dgram_send_now(net, backend, did, data, addr.as_ref());
     Ok(())
 }
 
@@ -2316,17 +2311,15 @@ fn on_recv_done(
     if bytes == 0 {
         // Peer EOF. Recv is NOT re-posted.
         let (http_idle, waiters) = match &mut entry.proto {
-            ProtoKind::Py(p) => {
-                // Phase 2 decides close-vs-keep from eof_received().
-                let ev = NetEvent::Eof {
-                    eof_received: p.eof_received.clone_ref(py),
-                    transport: entry
-                        .pyobj
-                        .as_ref()
-                        .expect("py protocol entries always carry a Transport")
-                        .clone_ref(py),
-                };
-                net.events.push(ev);
+            ProtoKind::Py(_) => {
+                if entry.reading_paused {
+                    // Held, as data completing while paused is: delivered
+                    // by resume_reading, after anything held before it.
+                    entry.paused_eof = true;
+                } else {
+                    // Phase 2 decides close-vs-keep from eof_received().
+                    net.events.push(NetEvent::Eof { tid });
+                }
                 return;
             }
             ProtoKind::Http(conn) => {
@@ -2371,31 +2364,22 @@ fn on_recv_done(
     }
     match &mut entry.proto {
         ProtoKind::Py(p) => {
-            if let Some(data_received) = &p.data_received {
+            if p.data_received.is_some() {
                 // Plain Protocol: materialize bytes now (non-GC-tracked
                 // allocation, safe in-cell) and re-post into the SAME slot
                 // immediately so the kernel refills while Python processes.
-                let data_received = data_received.clone_ref(py);
                 let ptr = net.buffers.slot_ptr(slot);
                 let payload = unsafe {
                     let obj = ffi::PyBytes_FromStringAndSize(ptr.cast(), bytes as ffi::Py_ssize_t);
                     Bound::from_owned_ptr(py, obj).unbind()
                 };
-                net.events.push(NetEvent::Data { tid, data_received, payload });
+                net.events.push(NetEvent::Data { tid, payload });
             } else {
                 // BufferedProtocol: the transport's slot reference transfers
                 // to the phase-2 event (released there after the copy); a
                 // fresh slot is acquired for the next read.
-                let get_buffer = p.get_buffer.as_ref().unwrap().clone_ref(py);
-                let buffer_updated = p.buffer_updated.as_ref().unwrap().clone_ref(py);
                 entry.recv_slot = None; // ref now owned by the BufData event
-                net.events.push(NetEvent::BufData {
-                    tid,
-                    get_buffer,
-                    buffer_updated,
-                    slot,
-                    len: bytes as usize,
-                });
+                net.events.push(NetEvent::BufData { tid, slot, len: bytes as usize });
             }
         }
         ProtoKind::Http(conn) => {
@@ -2476,31 +2460,25 @@ fn on_recv_done(
     post_recv(py, net, backend, tid);
 }
 
-/// Deliver bytes a paused transport held, if any. In-cell; the actual
-/// protocol call happens in phase 2 like every other receive.
-fn flush_paused_recv(py: Python<'_>, net: &mut NetState, tid: u64) {
-    let Some(entry) = net.transports.get_mut(&tid) else { return };
-    if entry.conn_lost || entry.closing {
+/// Deliver the bytes and EOF a paused transport held, if any, in that
+/// order; returns whether the EOF was among them (nothing is left to read
+/// then). In-cell; the actual protocol calls happen in phase 2 like every
+/// other receive.
+fn flush_paused_recv(net: &mut NetState, tid: u64) -> bool {
+    let Some(entry) = net.transports.get_mut(&tid) else { return false };
+    if entry.conn_lost || entry.closing || !matches!(entry.proto, ProtoKind::Py(_)) {
         entry.paused_recv = None;
-        return;
+        entry.paused_eof = false;
+        return false;
     }
-    let Some(data) = entry.paused_recv.take() else { return };
-    let ProtoKind::Py(p) = &entry.proto else { return };
-    if let Some(data_received) = &p.data_received {
-        let payload = unsafe {
-            let obj = ffi::PyBytes_FromStringAndSize(data.as_ptr().cast(), data.len() as ffi::Py_ssize_t);
-            Bound::from_owned_ptr(py, obj).unbind()
-        };
-        let data_received = data_received.clone_ref(py);
-        net.events.push(NetEvent::Data { tid, data_received, payload });
-    } else if let (Some(get_buffer), Some(buffer_updated)) = (&p.get_buffer, &p.buffer_updated) {
-        net.events.push(NetEvent::BufDataOwned {
-            tid,
-            get_buffer: get_buffer.clone_ref(py),
-            buffer_updated: buffer_updated.clone_ref(py),
-            data,
-        });
+    let eof = std::mem::take(&mut entry.paused_eof);
+    if let Some(data) = entry.paused_recv.take() {
+        net.events.push(NetEvent::HeldData { tid, data });
     }
+    if eof {
+        net.events.push(NetEvent::Eof { tid });
+    }
+    eof
 }
 
 /// Stop reading on a transport for engine-level backpressure (R-085/
@@ -2525,8 +2503,9 @@ pub(crate) fn resume_reading_after_backpressure(
         }
         e.reading_paused = false;
     }
-    flush_paused_recv(py, net, tid);
-    post_recv(py, net, backend, tid);
+    if !flush_paused_recv(net, tid) {
+        post_recv(py, net, backend, tid);
+    }
 }
 
 /// Queued write bytes and the high-water mark for a transport (R-084).
@@ -2707,6 +2686,96 @@ fn on_accept_done(net: &mut NetState, backend: Backend<'_>, lid: u64, op: OpId, 
 /// FRONT of the pending-event queue (ahead of anything pushed while this
 /// batch ran), so the next tick dispatches it in the original order --
 /// the same unwind contract the ready-callback batch keeps.
+/// Where a stream transport's inbound bytes go, decided when their event
+/// is dispatched (see `NetEvent::Data`).
+enum Inbound {
+    /// Closed, aborted or gone: asyncio stopped reading at that moment.
+    Discard,
+    /// Paused: added to the bytes `resume_reading` delivers.
+    Held,
+    /// The current protocol's `data_received`.
+    Plain(Py<PyAny>),
+    /// The current protocol's `get_buffer` and `buffer_updated`.
+    Buffered(Py<PyAny>, Py<PyAny>),
+}
+
+/// Route `len` bytes at `src` that arrived on `tid` (in-cell; copies them
+/// only to hold them).
+fn route_inbound(py: Python<'_>, net: &mut NetState, tid: u64, src: *const u8, len: usize) -> Inbound {
+    let Some(entry) = net.transports.get_mut(&tid) else { return Inbound::Discard };
+    if entry.conn_lost || entry.closing {
+        return Inbound::Discard;
+    }
+    let ProtoKind::Py(p) = &entry.proto else { return Inbound::Discard };
+    if entry.reading_paused {
+        // SAFETY: the caller's event owns the bytes for this call.
+        let data = unsafe { std::slice::from_raw_parts(src, len) };
+        match &mut entry.paused_recv {
+            Some(held) => held.extend_from_slice(data),
+            None => entry.paused_recv = Some(data.to_vec()),
+        }
+        return Inbound::Held;
+    }
+    match (&p.data_received, &p.get_buffer, &p.buffer_updated) {
+        (Some(data_received), _, _) => Inbound::Plain(data_received.clone_ref(py)),
+        (None, Some(get_buffer), Some(buffer_updated)) => {
+            Inbound::Buffered(get_buffer.clone_ref(py), buffer_updated.clone_ref(py))
+        }
+        _ => Inbound::Discard,
+    }
+}
+
+/// Hand routed bytes to the protocol: `payload` when they are already a
+/// bytes object, else a new one for a plain protocol (held bytes, or a
+/// buffered protocol's slot after set_protocol swapped in a plain one).
+/// A failing callback is fatal to the transport, as in asyncio.
+fn deliver_inbound(
+    py: Python<'_>,
+    core: &CoreLoop,
+    tid: u64,
+    route: Inbound,
+    payload: Option<&Py<PyAny>>,
+    src: *const u8,
+    len: usize,
+) -> PyResult<()> {
+    match route {
+        Inbound::Discard | Inbound::Held => Ok(()),
+        Inbound::Plain(data_received) => {
+            let res = match payload {
+                Some(payload) => data_received.call1(py, (payload,)),
+                None => {
+                    // SAFETY: the caller's event owns the bytes for this call.
+                    let data = unsafe { std::slice::from_raw_parts(src, len) };
+                    data_received.call1(py, (pyo3::types::PyBytes::new(py, data),))
+                }
+            };
+            fatal_protocol_error(py, core, tid, res, DATA_RECEIVED_FAILED)
+        }
+        Inbound::Buffered(get_buffer, buffer_updated) => {
+            match copy_into_app_buffer(py, &get_buffer, &buffer_updated, src, len) {
+                Ok(()) => Ok(()),
+                Err((message, e)) => fatal_protocol_error::<()>(py, core, tid, Err(e), message),
+            }
+        }
+    }
+}
+
+/// The current protocol's `eof_received` and the transport, when the peer's
+/// EOF is to be delivered now: not after close() or abort(), and while
+/// reading is paused it is held instead (see `paused_eof`).
+fn route_eof(py: Python<'_>, net: &mut NetState, tid: u64) -> Option<(Py<PyAny>, Py<Transport>)> {
+    let entry = net.transports.get_mut(&tid)?;
+    if entry.conn_lost || entry.closing {
+        return None;
+    }
+    let ProtoKind::Py(p) = &entry.proto else { return None };
+    if entry.reading_paused {
+        entry.paused_eof = true;
+        return None;
+    }
+    Some((p.eof_received.clone_ref(py), entry.pyobj.as_ref()?.clone_ref(py)))
+}
+
 pub(crate) fn dispatch_events(
     py: Python<'_>,
     slf: &Bound<'_, CoreLoop>,
@@ -2733,43 +2802,56 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
     let core = slf.get();
     {
         match event {
-            NetEvent::Data { tid, data_received, payload } => {
-                let res = data_received.call1(py, (payload,));
-                if res.is_err() {
-                    fatal_protocol_error(py, core, tid, res, DATA_RECEIVED_FAILED)?;
-                }
+            NetEvent::Data { tid, payload } => {
+                // SAFETY: the event owns `payload`, a bytes object, until
+                // the end of this arm.
+                let (src, len) = unsafe {
+                    (
+                        ffi::PyBytes_AsString(payload.as_ptr()).cast::<u8>(),
+                        ffi::PyBytes_Size(payload.as_ptr()) as usize,
+                    )
+                };
+                let route = core.with_net(|net, _| route_inbound(py, net, tid, src, len))?;
+                deliver_inbound(py, core, tid, route, Some(&payload), src, len)?;
             }
-            NetEvent::BufDataOwned { tid, get_buffer, buffer_updated, data } => {
-                let res = copy_into_app_buffer(py, &get_buffer, &buffer_updated, data.as_ptr(), data.len());
-                if let Err((message, e)) = res {
-                    fatal_protocol_error::<()>(py, core, tid, Err(e), message)?;
-                }
+            NetEvent::HeldData { tid, data } => {
+                let route = core.with_net(|net, _| route_inbound(py, net, tid, data.as_ptr(), data.len()))?;
+                deliver_inbound(py, core, tid, route, None, data.as_ptr(), data.len())?;
             }
-            NetEvent::BufData { tid, get_buffer, buffer_updated, slot, len } => {
-                let res = fill_app_buffer(py, core, &get_buffer, &buffer_updated, slot, len);
+            NetEvent::BufData { tid, slot, len } => {
+                // The slot is the event's until released below, so its
+                // memory stays put across the protocol calls.
+                let (route, src) = core.with_net(|net, _| {
+                    let src = net.buffers.slot_ptr(slot).cast_const();
+                    (route_inbound(py, net, tid, src, len), src)
+                })?;
+                let res = deliver_inbound(py, core, tid, route, None, src, len);
                 core.with_net(|net, _| {
                     net.buffers.release(slot);
                 })?;
-                if let Err((message, e)) = res {
-                    fatal_protocol_error::<()>(py, core, tid, Err(e), message)?;
-                }
+                res?;
             }
-            NetEvent::Eof { eof_received, transport } => match eof_received.call0(py) {
-                Ok(keep_open) => {
-                    if !keep_open.is_truthy(py).unwrap_or(false) {
-                        transport.bind(py).get().close(py)?;
+            NetEvent::Eof { tid } => {
+                let route = core.with_net(|net, _| route_eof(py, net, tid))?;
+                if let Some((eof_received, transport)) = route {
+                    match eof_received.call0(py) {
+                        Ok(keep_open) => {
+                            if !keep_open.is_truthy(py).unwrap_or(false) {
+                                transport.bind(py).get().close(py)?;
+                            }
+                        }
+                        Err(e) => {
+                            // Fatal, as it is in the stdlib. The receive side
+                            // has reached EOF and will never be posted again,
+                            // so a transport left open here is half-open
+                            // forever unless the application happens to close
+                            // it -- and it has just told us it cannot handle
+                            // the event.
+                            fatal_protocol_error::<()>(py, core, tid, Err(e), EOF_RECEIVED_FAILED)?;
+                        }
                     }
                 }
-                Err(e) => {
-                    // Fatal, as it is in the stdlib. The receive side has
-                    // reached EOF and will never be posted again, so a
-                    // transport left open here is half-open forever unless
-                    // the application happens to close it -- and it has
-                    // just told us it cannot handle the event.
-                    let tid = transport.get().tid;
-                    fatal_protocol_error::<()>(py, core, tid, Err(e), EOF_RECEIVED_FAILED)?;
-                }
-            },
+            }
             NetEvent::ConnLost(lost) => {
                 if lost.immediate {
                     let res = call_connection_lost(py, *lost);
@@ -2778,13 +2860,29 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                     schedule_lost(py, core, Lost::Stream(lost))?;
                 }
             }
-            NetEvent::DgramData { datagram_received, payload, addr } => {
-                let addr_obj = any_addr_tuple(py, addr).unwrap_or_else(|| py.None());
-                core.guard_protocol_call(py, datagram_received.call1(py, (payload, addr_obj)))?;
+            NetEvent::DgramData { did, payload, addr } => {
+                // Not after close() or abort(): asyncio removed the reader.
+                let datagram_received = core.with_net(|net, _| {
+                    net.datagrams
+                        .get(&did)
+                        .filter(|e| !e.closing && !e.conn_lost)
+                        .map(|e| e.datagram_received.clone_ref(py))
+                })?;
+                if let Some(datagram_received) = datagram_received {
+                    let addr_obj = any_addr_tuple(py, addr).unwrap_or_else(|| py.None());
+                    core.guard_protocol_call(py, datagram_received.call1(py, (payload, addr_obj)))?;
+                }
             }
-            NetEvent::DgramError { error_received, err } => {
-                let exc_obj = os_err(py, err);
-                core.guard_protocol_call(py, error_received.call1(py, (exc_obj,)))?;
+            NetEvent::DgramError { did, err } => {
+                // A closing endpoint still reports errors of the sends it
+                // drains, as asyncio's does; an aborted one reports nothing.
+                let error_received = core.with_net(|net, _| {
+                    net.datagrams.get(&did).filter(|e| !e.conn_lost).map(|e| e.error_received.clone_ref(py))
+                })?;
+                if let Some(error_received) = error_received {
+                    let exc_obj = os_err(py, err);
+                    core.guard_protocol_call(py, error_received.call1(py, (exc_obj,)))?;
+                }
             }
             NetEvent::DgramLost { connection_lost, err, close_after, immediate } => {
                 let lost = Lost::Datagram { connection_lost, err, close_after };
@@ -2796,8 +2894,21 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 }
             }
             NetEvent::ResumeWriting { tid, resume_writing } => {
-                let res =
-                    report_flow_control_error(py, core, tid, resume_writing.call0(py), RESUME_WRITING_FAILED);
+                // Owed to the protocol that was paused: not after abort(),
+                // and not to a protocol set_protocol() installed since,
+                // which starts unpaused. (A closing transport still gets
+                // it while its output drains, as in asyncio.)
+                let owed = core.with_net(|net, _| match net.transports.get(&tid) {
+                    Some(e) if !e.conn_lost => {
+                        matches!(&e.proto, ProtoKind::Py(p) if p.resume_writing.is(&resume_writing))
+                    }
+                    _ => false,
+                })?;
+                let res = if owed {
+                    report_flow_control_error(py, core, tid, resume_writing.call0(py), RESUME_WRITING_FAILED)
+                } else {
+                    Ok(())
+                };
                 core.with_net(|net, reactor| finish_after_resume(py, net, reactor.backend_mut(), tid))?;
                 core.drain_graveyards(py)?;
                 res?;
@@ -3158,19 +3269,6 @@ impl LostCall {
 /// be handled here in the poll-dispatch path at all).
 pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
 
-/// BufferedProtocol receive: get_buffer -> memcpy -> buffer_updated.
-fn fill_app_buffer(
-    py: Python<'_>,
-    core: &CoreLoop,
-    get_buffer: &Py<PyAny>,
-    buffer_updated: &Py<PyAny>,
-    slot: SlotId,
-    len: usize,
-) -> Result<(), (&'static str, PyErr)> {
-    let src = core.with_net(|net, _| net.buffers.slot_ptr(slot)).map_err(|e| (GET_BUFFER_FAILED, e))?;
-    copy_into_app_buffer(py, get_buffer, buffer_updated, src, len)
-}
-
 /// The copy loop itself, over any source. Split out so held bytes (which
 /// have no pool slot) reach the protocol by exactly the same path as a
 /// fresh read.
@@ -3382,6 +3480,7 @@ pub(crate) fn wire_stream(
                 eof_sent: false,
                 flush_scheduled: false,
                 paused_recv: None,
+                paused_eof: false,
                 extra_sock: None,
                 extra_fd: None,
                 owner,
@@ -3463,6 +3562,7 @@ pub(crate) fn wire_http(
                 eof_sent: false,
                 flush_scheduled: false,
                 paused_recv: None,
+                paused_eof: false,
                 extra_sock: None,
                 extra_fd: None,
                 owner: None,
@@ -3972,9 +4072,10 @@ impl Transport {
                     entry.reading_paused = false;
                     // Anything that completed while paused goes out first,
                     // ahead of whatever the fresh recv brings, or the
-                    // stream would be reordered.
-                    flush_paused_recv(py, net, tid);
-                    let still_idle = net.transports.get(&tid).is_some_and(|e| e.recv_op.is_none());
+                    // stream would be reordered. After a held EOF there is
+                    // nothing more to read.
+                    let eof = flush_paused_recv(net, tid);
+                    let still_idle = !eof && net.transports.get(&tid).is_some_and(|e| e.recv_op.is_none());
                     if still_idle {
                         post_recv(py, net, reactor.backend_mut(), tid);
                     }
