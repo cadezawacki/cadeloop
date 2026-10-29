@@ -17,6 +17,21 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Windows pass (on `claude/windows-perf-pass`; reproduced and verified natively on Windows 11 26200, CPython 3.11.9)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | IOCP | A park bounded by a timer ended on the next 15.6 ms clock interrupt (a GetQueuedCompletionStatusEx timeout is whole milliseconds, rounded to the tick): `asyncio.sleep(0.001)` took 15.5 ms, and a server whose requests await a 1 ms timer served 4.6 K req/s instead of 31.6 K. Timer-bound parks now end on a high-resolution waitable timer delivered to the port as a wait completion packet (0.5 ms overshoot, the platform's floor; `CADELOOP_COARSE_TIMERS=1` restores the old wait) | |
+> | Net | Bytes the kernel had already handed to a receive were dropped when the next receive could not be posted (the peer sent, then reset): the teardown ran before the data event was dispatched, so the protocol never saw them (0/40 delivered in a deterministic repro; stdlib 40/40). The failure is now delivered after the data | |
+> | Net | Hardening, not reproduced: an `ERROR_OPERATION_ABORTED` receive or send on a live transport was taken for our own cancellation (the receive side would stop without `connection_lost`; the send side re-posted). Every internal cancel marks the transport closing or lost first, and closing the socket under a transport completes its I/O with WSAECONNABORTED on Windows 11, which was already handled -- so only a foreign `CancelIoEx` could reach this. Both now fail the transport with ConnectionAbortedError, as the stdlib proactor does | |
+> | HTTP | A pipelined `Expect: 100-continue` head got its interim response as soon as it was parsed -- inside an earlier request's streamed response, breaking its chunked framing. It now follows every response ahead of it, and is omitted once the body has arrived anyway (RFC 7231 5.1.1) | |
+> | HTTP | HTTP/1.0 `Connection: keep-alive` was honoured but never announced, so a 1.0 client reading to EOF waited out the idle timeout | |
+> | HTTP | The engine closed a connection with the peer's upload still arriving, which makes the close a reset -- and Windows discards a connection's received-but-unread data when the RST lands: a client answered 413 at headers-complete while still sending got ECONNRESET instead of the 413. The response is now followed by a FIN and the peer's input drained (discarded) until its EOF, bounded at 5 s by the timeout sweep | |
+> | Perf | `http.response.body` copied every body twice (extracted into a Vec, then onto the wire buffer); it is now borrowed from the `bytes` object, and the head buffer is sized once | |
+> | Perf | Every connection kept a 64 KiB receive buffer posted while idle -- committed memory on Windows, where buffer regions are committed whole: 54.6 KiB of private memory per idle keep-alive connection at 5,000 connections. Receive buffers now start at 4 KiB and grow a size class whenever a read fills one (a short read right after a full one is a message's tail and does not shrink it back): 6.6 KiB per connection, and +3-6% on most HTTP, WebSocket and echo workloads, consistent with the smaller working set | |
+> | Perf | The buffer pool never returned memory on Windows (page-out was Linux-only): 5,000 idle connections closing left +324 MiB committed for good. Free slots beyond a warm set of 256 per size class are now decommitted, and recommitted when handed out again (RIO-registered and large-page regions excepted): +12 MiB | |
+> | Server | `serve(workers=N)` from a virtualenv on Windows served nothing: the venv's `python.exe` is a launcher, so each connection was `socket.share()`d into the launcher's process instead of the worker's ("could not adopt a connection: the handle is invalid"), leaking a socket handle in the launcher per connection. Workers are now started as the base interpreter with `__PYVENV_LAUNCHER__`, as multiprocessing does (bpo-35797) | |
+>
 > **Fixed and on `claude/pipelined-parse-error-desync-k6y3tp` (continues `claude/new-session-bq3hp6`)**
 >
 > | Area | Fix | Commit |
@@ -476,106 +491,21 @@ import in this container and is excluded.)
 
 ## Benchmarks (Windows 11, loopback)
 
-> **Scope.** Same R-130 methodology, on the production target: Windows 11
-> (build 26200) on an Intel Core Ultra 7 265K (20 cores), CPython 3.11.9,
-> client and server sharing the box over loopback — relative comparison,
-> not the spec's two-machine acceptance numbers (R-131). Contenders:
-> stdlib asyncio (proactor), winloop 0.2 (uvloop's Windows port), rsloop,
-> and cadeloop on its IOCP backend. Raw JSON lives in
-> [`bench/baselines/`](../bench/baselines/) (`windows-*.json`); the whole
-> suite is collected by `tools\windows\validate.ps1`.
+Current Windows numbers -- HTTP, WebSocket, TLS, TCP echo, timers,
+scheduling, memory per connection, overload and recovery, with charts --
+are in the [top-level README](../README.md#windows-11-iocp), measured with
+the native harness in [`bench/windows/`](../bench/windows/README.md);
+methodology in [benchmarks.md](benchmarks.md#windows). The summary data
+behind them is in [`bench/baselines/windows-2026-10/`](../bench/baselines/windows-2026-10/).
 
-### Scheduling core
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-win-sched-dark.svg">
-  <img alt="Windows scheduling speedup vs stdlib asyncio: cadeloop ahead of asyncio on all ten benchmarks and ahead of winloop on ten; rsloop leads the call_soon chain but fails three timer benches" src="assets/bench-win-sched.svg">
-</picture>
-
-Median throughput, millions of ops/second:
-
-| benchmark | cadeloop | asyncio | winloop | rsloop |
-|---|---|---|---|---|
-| call_soon_chain | 6.20 | 0.82 | 2.18 | **9.27** |
-| call_soon_burst | **4.88** | 1.10 | 1.45 | failed¹ |
-| timer_schedule_cancel | **3.56** | 0.86 | 0.63 | failed¹ |
-| timer_fire | **3.08** | 0.51 | 1.94 | failed¹ |
-| sleep0_chain | 2.94 | 0.72 | 1.49 | **3.11** |
-| task_spawn | 0.51 | 0.38 | 0.45 | **0.53** |
-| threadsafe_throughput | **5.09** | 0.04 | 2.18 | 4.44 |
-| future_chain | 2.06 | 0.38 | 0.91 | **2.78** |
-| gather_fanin | 0.50 | 0.32 | 0.48 | **0.53** |
-| queue_pingpong | 1.71 | 1.71 | 1.70 | **1.76** |
-
-- **vs stdlib asyncio: faster on 10/10 (1.0x–141x). vs winloop: faster
-  on 10/10 (1.01x–5.6x)**, with the timer benches (5.6x) and cross-thread
-  wakeups (2.3x; proactor's own threadsafe path collapses to 36K ops/s)
-  the standouts.
-- rsloop is the strongest scheduling rival here, as on Linux: of the
-  seven benches it finishes it wins six — four by ≤6%, future_chain by
-  35%, and call_soon_chain by 49% (a per-call contextvars-capture
-  shortcut we decline for drop-in semantics, ADR-22, plus a handle
-  allocation gap that is a measured optimization target). ¹And exactly as
-  on Linux, rsloop 0.1.30 hangs reproducibly on the three timer-centric
-  benches — recorded as failed; the harness watchdog kills a run at 12s.
-  cadeloop wins everything involving timers or threads outright.
-
-### TCP echo — per-message loop overhead
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-win-echo-dark.svg">
-  <img alt="Windows single-connection TCP echo: cadeloop 26.8K msgs/s at 107us p99 vs winloop 20.5K at 143us and asyncio 17.6K at 161us" src="assets/bench-win-echo.svg">
-</picture>
-
-Single connection, 1 KiB ping-pong:
-
-| loop | msgs/s | p50 RTT | p99 RTT |
-|---|---|---|---|
-| **cadeloop** | **26.8K** | **30.0 µs** | 107.3 µs |
-| rsloop | 23.9K | 36.1 µs | **103.9 µs** |
-| winloop | 20.5K | 40.9 µs | 142.7 µs |
-| asyncio | 17.6K | 54.3 µs | 160.7 µs |
-
-64 connections, 1 KiB messages:
-
-| loop | msgs/s | p50 | p99 |
-|---|---|---|---|
-| rsloop | **43.0K** | **1.42 ms** | 2.45 ms |
-| **cadeloop** | 41.2K | 1.52 ms | **2.13 ms** |
-| winloop | 34.1K | 1.80 ms | 3.59 ms |
-| asyncio | 30.7K | 1.96 ms | 3.44 ms |
-
-**1.31x winloop single-stream at 27% lower p50; 1.21x at 64
-connections with the best p99 in the field.** Unlike rloop, rsloop
-ships working transports on Windows and is honest competition: 12%
-behind on single-stream RTT, 4% ahead on 64-connection throughput
-(inside the shared-box noise band — the two-machine run decides that
-one), with cadeloop holding the tail latency.
-
-### HTTP/1.1 — the native engine on its production platform
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-win-http-dark.svg">
-  <img alt="Windows HTTP plaintext RPS: cadeloop-native 34.7K req/s at 2.7ms p99 vs the uvicorn pack at ~7.7-7.9K and hypercorn 5.6K" src="assets/bench-win-http.svg">
-</picture>
-
-Plaintext "Hello, World!" ASGI, 64 keep-alive connections:
-
-| contender | req/s | p50 | p99 |
-|---|---|---|---|
-| **cadeloop native** (`cadeloop.serve`) | **34.7K** | **1.75 ms** | **2.65 ms** |
-| uvicorn + asyncio | 7.87K | 8.03 ms | 10.2 ms |
-| uvicorn + winloop | 7.85K | 8.03 ms | 10.0 ms |
-| uvicorn + cadeloop | 7.81K | 8.07 ms | 10.8 ms |
-| uvicorn + rsloop | 7.74K | 8.22 ms | 9.8 ms |
-| hypercorn + asyncio | 5.59K | 11.4 ms | 15.1 ms |
-
-**4.4x uvicorn+winloop's throughput at 4.6x lower p50** — the spec's
-≥2.0x-uvicorn-winloop target (R-002) cleared with headroom on the
-production platform (loopback preview; the acceptance measurement is a
-two-machine run, R-131). The uvicorn pack sits within ±2% of each other
-— h11's Python-side parsing flattens any loop's advantage, which is the
-native engine's reason to exist.
+The figures that stood here until October 2026 (cadeloop-native 34.7 K
+req/s, 64-connection echo 41.2 K msg/s, single-connection echo 30 µs p50)
+came from the Python load generator that [benchmarks.md](benchmarks.md#trap-1--the-load-generator-was-the-bottleneck)
+shows to be GIL-bound, and are superseded. On the same machine, the native
+generator measured cadeloop-native at 73.7 K req/s for the then-current
+1.0.1 build -- but only with the host's network-filtering software paused:
+with AdGuard's and a VPN client's WFP drivers active, loopback TCP capped
+*every* server at ~14 K round trips/s (trap 4 in benchmarks.md).
 
 ### RIO status on this machine
 
