@@ -271,6 +271,72 @@ def test_write_backpressure_pause_resume(loop):
     loop.run_until_complete(main())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="IOCP completes a send whole; partial progress is the epoll backend's"
+)
+def test_write_then_drain_both_ways_does_not_deadlock(loop):
+    """Both ends write, wait out their own pause, and only then read --
+    the shape of drain()-before-read code on each side of a connection.
+    asyncio counts as buffered only what the kernel refused, so with a
+    write just past what the socket buffers take neither side pauses.
+    The epoll backend kept a partly written gather parked until every
+    byte was out and counted all of it as buffered meanwhile: both sides
+    paused, each waiting for the other to read."""
+
+    class Side(asyncio.Protocol):
+        def __init__(self, want):
+            self.want = want
+            self.got = 0
+            self.writable = loop.create_future()
+            self.writable.set_result(None)
+            self.done = loop.create_future()
+
+        def connection_made(self, transport):
+            transport.pause_reading()  # read only once our write is through
+
+        def pause_writing(self):
+            self.writable = loop.create_future()
+
+        def resume_writing(self):
+            if not self.writable.done():
+                self.writable.set_result(None)
+
+        def data_received(self, data):
+            self.got += len(data)
+            if self.got >= self.want and not self.done.done():
+                self.done.set_result(None)
+
+    def kernel_takes():
+        # What the kernel accepts of one large send on such a pair.
+        probe, peer = socket.socketpair()
+        probe.setblocking(False)
+        try:
+            return probe.send(b"x" * (8 << 20))
+        finally:
+            probe.close()
+            peer.close()
+
+    async def run(transport, side, size):
+        transport.write(b"y" * size)
+        assert transport.get_write_buffer_size() < size, "bytes the kernel took still count as buffered"
+        await side.writable  # drain()
+        transport.resume_reading()
+        await side.done
+
+    async def main():
+        size = kernel_takes() + 32 * 1024  # 32 KiB left over: under the 64 KiB high-water mark
+        a, b = socket.socketpair()
+        ta, pa = await loop.create_connection(lambda: Side(size), sock=a)
+        tb, pb = await loop.create_connection(lambda: Side(size), sock=b)
+        try:
+            await asyncio.wait_for(asyncio.gather(run(ta, pa, size), run(tb, pb, size)), 5)
+        finally:
+            ta.abort()
+            tb.abort()
+
+    loop.run_until_complete(main())
+
+
 def test_abort_delivers_connection_lost(loop):
     async def main():
         done = loop.create_future()
