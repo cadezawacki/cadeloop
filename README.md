@@ -355,7 +355,7 @@ three runs' merged histograms. No run had a failed request.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http-dark.svg">
-  <img alt="Windows HTTP requests per second by workload: cadeloop serve() leads every workload, 1.6 to 4.8 times uvicorn on winloop" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http.svg">
+  <img alt="Windows HTTP requests per second by workload: cadeloop serve() leads every workload, 2.6 to 4.8 times uvicorn on winloop" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-win-http.svg">
 </picture>
 
 <!-- table:bench-win-table-http -->
@@ -512,7 +512,8 @@ here was 77.9 K requests per second, against 18.4 K for uvicorn on cadeloop,
 <!-- /table -->
 
 Each benchmark times one kind of loop operation in isolation, in a fresh
-process per run. rsloop 0.1.30 did not finish the timer benchmarks and was
+process per run. rsloop 0.1.30 never finished three of them
+(`call_soon_burst`, `timer_schedule_cancel` and `timer_fire`) and was
 stopped after 12 s.
 
 ### Linux (epoll)
