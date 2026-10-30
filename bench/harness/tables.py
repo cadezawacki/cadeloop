@@ -1,9 +1,10 @@
-"""Comparison tables as light/dark SVG pairs, the best cell highlighted.
+"""Comparison tables as light/dark SVG pairs, the top three marked.
 
 GitHub and PyPI strip `style` and `bgcolor` from README HTML, so a text
 table cannot carry a cell fill on either. These tables are images instead,
-drawn in the same ink as the charts (charts.py), with the best value of
-each row (or column) bold on a light teal fill.
+drawn in the same ink as the charts (charts.py), with the three best values
+of each row (or column) on gold, silver and bronze badges. Each badge also
+carries its place as a number, so the ranking never rests on color alone.
 
 A table spec is plain data, so the same JSON drives the README image and
 can be checked by eye:
@@ -12,12 +13,13 @@ can be checked by eye:
       "title": "...", "subtitle": "...",
       "columns": ["workload", "cadeloop", "uvicorn + uvloop", ...],
       "rows": [
-        {"label": "plaintext", "cells": [{"text": "78.0 K", "sub": "819 µs", "best": true}, ...]},
+        {"label": "plaintext", "cells": [{"text": "78.0 K", "sub": "819 µs", "rank": 1}, ...]},
         ...
       ],
       "notes": ["optional footnote lines"]
     }
 
+`rank` (1, 2 or 3) puts a cell on its medal; mark_ranks() sets it.
 `label_code: true` on a row sets its label in monospace (benchmark names).
 
   python bench/harness/tables.py SPEC.json [SPEC.json ...] --outdir docs/assets
@@ -35,12 +37,31 @@ from charts import FONT, INK
 
 MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
 
-# The highlight: a light teal fill with dark ink in both themes, so the
-# best cell reads the same on GitHub's light and dark pages.
-BEST = {
-    "light": {"fill": "#c9efe8", "stroke": "#8fd8cb", "text": "#03332d", "sub": "#24665c"},
-    "dark": {"fill": "#a5e6da", "stroke": "#c6f2ea", "text": "#02261f", "sub": "#1d5a50"},
+# Medal badges for 1st, 2nd and 3rd: muted gold, silver and bronze tints,
+# each with a stronger disc that carries the place number. Chosen in OKLCH;
+# the three discs stay apart (OKLab ΔE ≥ 15) for normal vision and under
+# simulated protan/deutan vision, and every text clears 5:1 on its fill.
+# The pale fills alone are close by design; the numbered disc is the cue.
+MEDALS = {
+    "light": {
+        1: {"fill": "#fbf0cf", "stroke": "#e3cfa1", "disc": "#eab53b", "digit": "#311d03",
+            "text": "#3f2903", "sub": "#72552b"},
+        2: {"fill": "#eceff2", "stroke": "#c7cbd0", "disc": "#afb5bc", "digit": "#171b1f",
+            "text": "#25292e", "sub": "#575b60"},
+        3: {"fill": "#fce7d6", "stroke": "#e0bca2", "disc": "#c6764d", "digit": "#2a140c",
+            "text": "#4f2611", "sub": "#834e36"},
+    },
+    "dark": {
+        1: {"fill": "#3a2f16", "stroke": "#6c582d", "disc": "#ecbd4a", "digit": "#2f1e02",
+            "text": "#f6e7bb", "sub": "#cdbd92"},
+        2: {"fill": "#2c2e31", "stroke": "#54595e", "disc": "#b2b8bf", "digit": "#171b1f",
+            "text": "#e5e8ec", "sub": "#bbbec1"},
+        3: {"fill": "#3a2619", "stroke": "#6f4c34", "disc": "#d2865b", "digit": "#2a140c",
+            "text": "#f7d7c2", "sub": "#d5b39d"},
+    },
 }
+PLACES = {1: "1st", 2: "2nd", 3: "3rd"}
+DISC_R, DISC_GAP = 6.5, 5  # the numbered disc at a badge's left, and the space after it
 
 TITLE_PX, SUB_PX, HEAD_PX, CELL_PX, NOTE_PX, SMALL_PX = 16, 12, 12, 13, 11, 11
 ROW_H, HEAD_H, PAD_X, CELL_PAD = 30, 30, 24, 14
@@ -67,15 +88,18 @@ def esc(s: str) -> str:
 
 
 def cell_width(cell: dict) -> float:
+    """The cell's text, and on a badge the numbered disc beside it."""
     w = text_width(cell.get("text", ""), CELL_PX, bold=True)
     if cell.get("sub"):
         w += 5 + text_width(cell["sub"], SMALL_PX)
+    if cell.get("rank"):
+        w += 2 * DISC_R + DISC_GAP
     return w
 
 
 def render(spec: dict, mode: str) -> str:
     ink = INK[mode]
-    best = BEST[mode]
+    medals = MEDALS[mode]
     cols = spec["columns"]
     rows = spec["rows"]
     ncol = len(cols)
@@ -139,12 +163,19 @@ def render(spec: dict, mode: str) -> str:
             right = x + w - CELL_PAD
             text = cell.get("text", "")
             sub = cell.get("sub")
-            if cell.get("best"):
+            rank = cell.get("rank")
+            if rank:
+                m = medals[rank]
                 cw = cell_width(cell) + 16
-                out.append(f'<rect x="{right - cw + 8:.1f}" y="{y + 4:.1f}" width="{cw:.1f}" '
-                           f'height="{ROW_H - 8}" '
-                           f'rx="6" fill="{best["fill"]}" stroke="{best["stroke"]}" stroke-width="1"/>')
-                main_fill, sub_fill, main_weight = best["text"], best["sub"], ' font-weight="700"'
+                left = right - cw + 8
+                out.append(f'<rect x="{left:.1f}" y="{y + 4:.1f}" width="{cw:.1f}" height="{ROW_H - 8}" '
+                           f'rx="6" fill="{m["fill"]}" stroke="{m["stroke"]}" stroke-width="1"/>')
+                cx, cy = left + 6 + DISC_R, y + ROW_H / 2
+                out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{DISC_R}" fill="{m["disc"]}"/>')
+                out.append(f'<text x="{cx:.1f}" y="{cy + 3.4:.1f}" font-size="9.5" font-weight="700" '
+                           f'text-anchor="middle" fill="{m["digit"]}">{rank}</text>')
+                main_fill, sub_fill = m["text"], m["sub"]
+                main_weight = ' font-weight="700"' if rank == 1 else ' font-weight="600"'
             else:
                 main_fill, sub_fill, main_weight = ink["primary"], ink["muted"], ""
             if sub:
@@ -174,7 +205,8 @@ def render(spec: dict, mode: str) -> str:
 
 
 def alt_text(spec: dict) -> str:
-    """The table as one line of text, for the image's alt attribute."""
+    """The table as text, for the image's alt attribute: one sentence per
+    row, cells separated by semicolons, places spelled out."""
     cols = spec["columns"][1:]
     rows = []
     for r in spec["rows"]:
@@ -183,11 +215,11 @@ def alt_text(spec: dict) -> str:
             v = c.get("text", "")
             if c.get("sub"):
                 v += f" ({c['sub']})"
-            if c.get("best"):
-                v += " best"
+            if c.get("rank"):
+                v += f", {PLACES[c['rank']]}"
             cells.append(f"{name} {v}")
-        rows.append(f"{r['label']}: " + ", ".join(cells))
-    return f"{spec.get('title', '')}. " + "; ".join(rows) + "."
+        rows.append(f"{r['label']}: " + "; ".join(cells))
+    return f"{spec.get('title', '')}. " + ". ".join(rows) + "."
 
 
 def write(spec: dict, path_base: str) -> None:
@@ -197,39 +229,38 @@ def write(spec: dict, path_base: str) -> None:
             f.write(render(spec, mode))
 
 
-def mark_best(rows: list[dict], higher_is_better: bool | list[bool], values: list[list[float | None]],
-              axis: str = "row") -> None:
-    """Set `best` on the winning cell of every row (axis="row") or every
-    column (axis="col"). `values` parallels the cells; None never wins.
-    Ties all win, unless most of the row or column ties: then nothing is
-    marked. `higher_is_better` may be one flag, or one per row/column."""
-    if axis == "row":
-        for ri, r in enumerate(rows):
-            vals = values[ri]
-            hib = higher_is_better[ri] if isinstance(higher_is_better, list) else higher_is_better
-            present = [v for v in vals if v is not None]
-            if len(set(present)) < 2:
-                continue  # nothing to pick between
-            target = max(present) if hib else min(present)
-            if present.count(target) * 2 > len(present):
-                continue  # most of them tie: no one stands out
-            for ci, v in enumerate(vals):
-                if v is not None and v == target:
-                    r["cells"][ci]["best"] = True
-    else:
-        ncol = len(values[0])
-        for ci in range(ncol):
-            col = [values[ri][ci] for ri in range(len(rows))]
-            hib = higher_is_better[ci] if isinstance(higher_is_better, list) else higher_is_better
-            present = [v for v in col if v is not None]
-            if len(set(present)) < 2:
-                continue  # nothing to pick between
-            target = max(present) if hib else min(present)
-            if present.count(target) * 2 > len(present):
-                continue  # most of them tie: no one stands out
-            for ri, v in enumerate(col):
-                if v is not None and v == target:
-                    rows[ri]["cells"][ci]["best"] = True
+def mark_ranks(rows: list[dict], higher_is_better: bool | None | list[bool | None],
+               values: list[list[float | None]], axis: str = "row") -> None:
+    """Set `rank` 1, 2 or 3 on the three best cells of every row (axis="row")
+    or every column (axis="col"). `values` parallels the cells; a None value
+    is never ranked. `higher_is_better` is one flag, or one per row/column,
+    and None there leaves that row/column unranked.
+
+    Places work as medals do: equal values share a place and the next place
+    is skipped (two firsts, then a third). The last place never gets a
+    badge, so a row of two or three marks only its leaders, and when most
+    of a row or column ties for first, nothing in it is marked."""
+    lines = range(len(rows)) if axis == "row" else range(len(values[0]))
+    for i in lines:
+        hib = higher_is_better[i] if isinstance(higher_is_better, list) else higher_is_better
+        if hib is None:
+            continue
+        if axis == "row":
+            cells, vals = rows[i]["cells"], values[i]
+        else:
+            cells, vals = [r["cells"][i] for r in rows], [v[i] for v in values]
+        present = [v for v in vals if v is not None]
+        if len(set(present)) < 2:
+            continue  # nothing to pick between
+        best, worst = (max(present), min(present)) if hib else (min(present), max(present))
+        if present.count(best) * 2 > len(present):
+            continue  # most of them tie: no one stands out
+        for cell, v in zip(cells, vals, strict=True):
+            if v is None or v == worst:
+                continue
+            place = 1 + sum(1 for o in present if (o > v if hib else o < v))
+            if place <= 3:
+                cell["rank"] = place
 
 
 RAW = "https://raw.githubusercontent.com/cadezawacki/cadeloop/main/"

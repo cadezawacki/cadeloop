@@ -17,13 +17,15 @@
     "cells": [
      {
       "text": "78.0 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "18.4 K"
+      "text": "18.4 K",
+      "rank": 2
      },
      {
-      "text": "18.0 K"
+      "text": "18.0 K",
+      "rank": 3
      },
      {
       "text": "10.8 K"
@@ -39,13 +41,15 @@
     "cells": [
      {
       "text": "47.2 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "13.1 K"
+      "text": "13.1 K",
+      "rank": 2
      },
      {
-      "text": "10.9 K"
+      "text": "10.9 K",
+      "rank": 3
      },
      {
       "text": "7.7 K"
@@ -61,13 +65,15 @@
     "cells": [
      {
       "text": "57.8 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "16.0 K"
+      "text": "16.0 K",
+      "rank": 2
      },
      {
-      "text": "15.9 K"
+      "text": "15.9 K",
+      "rank": 3
      },
      {
       "text": "10.0 K"
@@ -83,13 +89,15 @@
     "cells": [
      {
       "text": "41.2 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "14.5 K"
+      "text": "14.5 K",
+      "rank": 3
      },
      {
-      "text": "14.9 K"
+      "text": "14.9 K",
+      "rank": 2
      },
      {
       "text": "8.9 K"
@@ -105,13 +113,15 @@
     "cells": [
      {
       "text": "3.3 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "2.0 K"
+      "text": "2.0 K",
+      "rank": 2
      },
      {
-      "text": "2.0 K"
+      "text": "2.0 K",
+      "rank": 2
      },
      {
       "text": "1.1 K"
@@ -127,13 +137,15 @@
     "cells": [
      {
       "text": "61.1 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "13.0 K"
+      "text": "13.0 K",
+      "rank": 2
      },
      {
-      "text": "12.8 K"
+      "text": "12.8 K",
+      "rank": 3
      },
      {
       "text": "9.1 K"
@@ -149,13 +161,15 @@
     "cells": [
      {
       "text": "31.6 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "17.4 K"
+      "text": "17.4 K",
+      "rank": 2
      },
      {
-      "text": "10.9 K"
+      "text": "10.9 K",
+      "rank": 3
      },
      {
       "text": "10.1 K"
@@ -171,13 +185,15 @@
     "cells": [
      {
       "text": "24.1 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "8.6 K"
+      "text": "8.6 K",
+      "rank": 3
      },
      {
-      "text": "9.2 K"
+      "text": "9.2 K",
+      "rank": 2
      },
      {
       "text": "4.7 K"
@@ -193,13 +209,15 @@
     "cells": [
      {
       "text": "553 K",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "17.5 K"
+      "text": "17.5 K",
+      "rank": 3
      },
      {
-      "text": "17.6 K"
+      "text": "17.6 K",
+      "rank": 2
      },
      {
       "text": "13.2 K"
@@ -231,26 +249,27 @@
     "cells": [
      {
       "text": "78.0 K",
-      "best": true
+      "rank": 1
      },
      {
       "text": "819 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "991 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "1.75 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "12.8 µs",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "33 MiB"
+      "text": "33 MiB",
+      "rank": 3
      },
      {
       "text": "5"
@@ -262,19 +281,24 @@
     "label_code": false,
     "cells": [
      {
-      "text": "18.4 K"
+      "text": "18.4 K",
+      "rank": 2
      },
      {
-      "text": "3.38 ms"
+      "text": "3.38 ms",
+      "rank": 2
      },
      {
-      "text": "5.05 ms"
+      "text": "5.05 ms",
+      "rank": 2
      },
      {
-      "text": "5.77 ms"
+      "text": "5.77 ms",
+      "rank": 2
      },
      {
-      "text": "54.1 µs"
+      "text": "54.1 µs",
+      "rank": 2
      },
      {
       "text": "37 MiB"
@@ -289,19 +313,24 @@
     "label_code": false,
     "cells": [
      {
-      "text": "18.0 K"
+      "text": "18.0 K",
+      "rank": 3
      },
      {
-      "text": "3.44 ms"
+      "text": "3.44 ms",
+      "rank": 3
      },
      {
-      "text": "6.95 ms"
+      "text": "6.95 ms",
+      "rank": 3
      },
      {
-      "text": "7.73 ms"
+      "text": "7.73 ms",
+      "rank": 3
      },
      {
-      "text": "55.3 µs"
+      "text": "55.3 µs",
+      "rank": 3
      },
      {
       "text": "61 MiB"
@@ -331,7 +360,8 @@
       "text": "92.2 µs"
      },
      {
-      "text": "29 MiB"
+      "text": "29 MiB",
+      "rank": 2
      },
      {
       "text": "5"
@@ -359,7 +389,7 @@
      },
      {
       "text": "28 MiB",
-      "best": true
+      "rank": 1
      },
      {
       "text": "5"
@@ -385,18 +415,20 @@
     "label_code": false,
     "cells": [
      {
-      "text": "30 MiB"
+      "text": "30 MiB",
+      "rank": 3
      },
      {
       "text": "68 MiB",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "6.6 KiB"
+      "text": "6.6 KiB",
+      "rank": 2
      },
      {
       "text": "42 MiB",
-      "best": true
+      "rank": 1
      },
      {
       "text": "1"
@@ -411,13 +443,16 @@
       "text": "36 MiB"
      },
      {
-      "text": "106 MiB"
+      "text": "106 MiB",
+      "rank": 3
      },
      {
-      "text": "11.2 KiB"
+      "text": "11.2 KiB",
+      "rank": 3
      },
      {
-      "text": "67 MiB"
+      "text": "67 MiB",
+      "rank": 2
      },
      {
       "text": "1"
@@ -432,14 +467,16 @@
       "text": "61 MiB"
      },
      {
-      "text": "98 MiB"
+      "text": "98 MiB",
+      "rank": 2
      },
      {
       "text": "6.4 KiB",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "79 MiB"
+      "text": "79 MiB",
+      "rank": 3
      },
      {
       "text": "1"
@@ -451,7 +488,8 @@
     "label_code": false,
     "cells": [
      {
-      "text": "25 MiB"
+      "text": "25 MiB",
+      "rank": 2
      },
      {
       "text": "376 MiB"
@@ -473,7 +511,7 @@
     "cells": [
      {
       "text": "23 MiB",
-      "best": true
+      "rank": 1
      },
      {
       "text": "408 MiB"
@@ -509,15 +547,17 @@
      {
       "text": "48.3 K",
       "sub": "45 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "22.8 K",
-      "sub": "133 µs"
+      "sub": "133 µs",
+      "rank": 2
      },
      {
       "text": "17.7 K",
-      "sub": "137 µs"
+      "sub": "137 µs",
+      "rank": 3
      },
      {
       "text": "15.5 K",
@@ -532,15 +572,17 @@
      {
       "text": "77.8 K",
       "sub": "999 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "43.3 K",
-      "sub": "3.93 ms"
+      "sub": "3.93 ms",
+      "rank": 2
      },
      {
       "text": "31.3 K",
-      "sub": "4.52 ms"
+      "sub": "4.52 ms",
+      "rank": 3
      },
      {
       "text": "26.3 K",
@@ -555,15 +597,17 @@
      {
       "text": "47.6 K",
       "sub": "463 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "21.0 K",
-      "sub": "2.52 ms"
+      "sub": "2.52 ms",
+      "rank": 2
      },
      {
       "text": "18.5 K",
-      "sub": "3.24 ms"
+      "sub": "3.24 ms",
+      "rank": 3
      },
      {
       "text": "15.4 K",
@@ -578,15 +622,17 @@
      {
       "text": "407 K",
       "sub": "1.67 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "92.1 K",
-      "sub": "17.56 ms"
+      "sub": "17.56 ms",
+      "rank": 2
      },
      {
       "text": "66.4 K",
-      "sub": "19.14 ms"
+      "sub": "19.14 ms",
+      "rank": 3
      },
      {
       "text": "56.7 K",
@@ -613,11 +659,12 @@
      {
       "text": "62.6 K",
       "sub": "1.39 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "15.7 K",
-      "sub": "7.93 ms"
+      "sub": "7.93 ms",
+      "rank": 2
      },
      {
       "text": "9.2 K",
@@ -632,11 +679,12 @@
      {
       "text": "3.6 K",
       "sub": "2.85 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "2.3 K",
-      "sub": "4.59 ms"
+      "sub": "4.59 ms",
+      "rank": 2
      },
      {
       "text": "1.5 K",
@@ -663,19 +711,19 @@
     "cells": [
      {
       "text": "+0.55 / 0.88 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "+0.40 / 0.63 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "+0.31 / 0.82 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "16 / 117 µs",
-      "best": true
+      "rank": 1
      }
     ]
    },
@@ -687,13 +735,15 @@
       "text": "+14.49 / 15.41 ms"
      },
      {
-      "text": "+10.73 / 15.17 ms"
+      "text": "+10.73 / 15.17 ms",
+      "rank": 2
      },
      {
       "text": "+6.00 / 12.47 ms"
      },
      {
-      "text": "19 / 66 µs"
+      "text": "19 / 66 µs",
+      "rank": 2
      }
     ]
    },
@@ -702,13 +752,15 @@
     "label_code": false,
     "cells": [
      {
-      "text": "+14.33 / 15.51 ms"
+      "text": "+14.33 / 15.51 ms",
+      "rank": 2
      },
      {
       "text": "+10.82 / 15.22 ms"
      },
      {
-      "text": "+5.88 / 11.31 ms"
+      "text": "+5.88 / 11.31 ms",
+      "rank": 2
      },
      {
       "text": "68 / 162 µs"
@@ -717,7 +769,7 @@
    }
   ],
   "notes": [
-   "Highlighted: the lowest median in each column."
+   "Places go by the median in each column."
   ]
  },
  "bench-win-table-echo": {
@@ -738,15 +790,17 @@
      {
       "text": "51.8 K",
       "sub": "41 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "40.4 K",
-      "sub": "54 µs"
+      "sub": "54 µs",
+      "rank": 2
      },
      {
       "text": "40.4 K",
-      "sub": "48 µs"
+      "sub": "48 µs",
+      "rank": 2
      },
      {
       "text": "31.5 K",
@@ -760,16 +814,18 @@
     "cells": [
      {
       "text": "84.4 K",
-      "sub": "909 µs"
+      "sub": "909 µs",
+      "rank": 2
      },
      {
       "text": "80.1 K",
-      "sub": "1.56 ms"
+      "sub": "1.56 ms",
+      "rank": 3
      },
      {
       "text": "87.7 K",
       "sub": "958 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "53.6 K",
@@ -783,16 +839,18 @@
     "cells": [
      {
       "text": "346 K",
-      "sub": "3.44 ms"
+      "sub": "3.44 ms",
+      "rank": 3
      },
      {
       "text": "375 K",
-      "sub": "5.18 ms"
+      "sub": "5.18 ms",
+      "rank": 2
      },
      {
       "text": "457 K",
       "sub": "2.49 ms",
-      "best": true
+      "rank": 1
      },
      {
       "text": "287 K",
@@ -806,7 +864,8 @@
     "cells": [
      {
       "text": "29.8 K",
-      "sub": "614 µs"
+      "sub": "614 µs",
+      "rank": 3
      },
      {
       "text": "26.8 K",
@@ -815,11 +874,12 @@
      {
       "text": "43.7 K",
       "sub": "324 µs",
-      "best": true
+      "rank": 1
      },
      {
       "text": "31.4 K",
-      "sub": "459 µs"
+      "sub": "459 µs",
+      "rank": 2
      }
     ]
    }
@@ -841,14 +901,16 @@
     "label_code": true,
     "cells": [
      {
-      "text": "0.194"
+      "text": "0.194",
+      "rank": 2
      },
      {
-      "text": "0.186"
+      "text": "0.186",
+      "rank": 3
      },
      {
       "text": "0.196",
-      "best": true
+      "rank": 1
      },
      {
       "text": "0.125"
@@ -861,13 +923,15 @@
     "cells": [
      {
       "text": "11.027",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "2.347"
+      "text": "2.347",
+      "rank": 3
      },
      {
-      "text": "9.785"
+      "text": "9.785",
+      "rank": 2
      },
      {
       "text": "0.906"
@@ -880,10 +944,11 @@
     "cells": [
      {
       "text": "12.652",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "1.596"
+      "text": "1.596",
+      "rank": 2
      },
      {
       "text": "hung"
@@ -899,7 +964,7 @@
     "cells": [
      {
       "text": "6.732",
-      "best": true
+      "rank": 1
      },
      {
       "text": "0.744"
@@ -908,7 +973,8 @@
       "text": "hung"
      },
      {
-      "text": "0.910"
+      "text": "0.910",
+      "rank": 2
      }
     ]
    },
@@ -918,10 +984,11 @@
     "cells": [
      {
       "text": "4.619",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "2.016"
+      "text": "2.016",
+      "rank": 2
      },
      {
       "text": "hung"
@@ -937,13 +1004,15 @@
     "cells": [
      {
       "text": "3.635",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "1.555"
+      "text": "1.555",
+      "rank": 3
      },
      {
-      "text": "3.265"
+      "text": "3.265",
+      "rank": 2
      },
      {
       "text": "0.758"
@@ -955,14 +1024,16 @@
     "label_code": true,
     "cells": [
      {
-      "text": "0.565"
+      "text": "0.565",
+      "rank": 2
      },
      {
-      "text": "0.497"
+      "text": "0.497",
+      "rank": 3
      },
      {
       "text": "0.567",
-      "best": true
+      "rank": 1
      },
      {
       "text": "0.381"
@@ -975,13 +1046,15 @@
     "cells": [
      {
       "text": "8.066",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "2.570"
+      "text": "2.570",
+      "rank": 3
      },
      {
-      "text": "4.581"
+      "text": "4.581",
+      "rank": 2
      },
      {
       "text": "0.069"
@@ -993,14 +1066,16 @@
     "label_code": true,
     "cells": [
      {
-      "text": "2.725"
+      "text": "2.725",
+      "rank": 2
      },
      {
-      "text": "0.945"
+      "text": "0.945",
+      "rank": 3
      },
      {
       "text": "2.820",
-      "best": true
+      "rank": 1
      },
      {
       "text": "0.405"
@@ -1013,13 +1088,15 @@
     "cells": [
      {
       "text": "0.613",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "0.519"
+      "text": "0.519",
+      "rank": 3
      },
      {
-      "text": "0.572"
+      "text": "0.572",
+      "rank": 2
      },
      {
       "text": "0.334"
@@ -1032,13 +1109,15 @@
     "cells": [
      {
       "text": "1.871",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "1.765"
+      "text": "1.765",
+      "rank": 3
      },
      {
-      "text": "1.853"
+      "text": "1.853",
+      "rank": 2
      },
      {
       "text": "1.759"
@@ -1051,13 +1130,15 @@
     "cells": [
      {
       "text": "6.055",
-      "best": true
+      "rank": 1
      },
      {
-      "text": "5.369"
+      "text": "5.369",
+      "rank": 3
      },
      {
-      "text": "5.927"
+      "text": "5.927",
+      "rank": 2
      },
      {
       "text": "4.977"

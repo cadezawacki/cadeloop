@@ -397,8 +397,9 @@ def kfmt(v):
 
 
 def readme_specs(rows, idle, timers, sched, P):
-    """README table specs (bench/harness/tables.py), best cells marked."""
-    from tables import mark_best
+    """README table specs (bench/harness/tables.py), the top three of each
+    row or column ranked."""
+    from tables import mark_ranks
 
     idx = {(r["suite"], r["workload"], r["server"]): r for r in rows}
     plat, tag = P["name"], P["tag"]
@@ -424,7 +425,7 @@ def readme_specs(rows, idle, timers, sched, P):
                 vs.append(shown(cell["text"]) if ok(r) else None)
             body.append({"label": label, "cells": cells})
             vals.append(vs)
-        mark_best(body, True, vals, axis="row")
+        mark_ranks(body, True, vals, axis="row")
         return {"columns": ["workload"] + [tname(c, as_server) for c in cons], "rows": body}
 
     specs[f"bench-{tag}-table-http"] = {
@@ -445,7 +446,7 @@ def readme_specs(rows, idle, timers, sched, P):
         "subtitle": "the same asyncio.Protocol on every loop · messages per second, p99 in small type",
         **by_workload("echo", ECHO_LABELS, P["echo"], True, False)}
 
-    # Plaintext in detail: one row per server, best per column.
+    # Plaintext in detail: one row per server, ranked per column.
     body, vals = [], []
     for srv in P["http"]:
         r = idx.get(("http", "plaintext-c64", srv))
@@ -457,7 +458,8 @@ def readme_specs(rows, idle, timers, sched, P):
             {"text": us(r["p999_us"])}, {"text": f"{cpu:.1f} µs" if cpu is not None else "–"},
             {"text": f"{peak:.0f} MiB" if peak else "–"}, {"text": str(r["server_peak_threads"] or "–")}]})
         vals.append([shown(c["text"]) for c in body[-1]["cells"]])
-    mark_best(body, [True, False, False, False, False, False, False], vals, axis="col")
+    # Threads describe a design rather than score one: never ranked.
+    mark_ranks(body, [True, False, False, False, False, False, None], vals, axis="col")
     specs[f"bench-{tag}-table-plaintext"] = {
         "title": f"Plaintext HTTP in detail · {plat}",
         "subtitle": "64 connections · CPU is user + kernel time of the server's processes per request",
@@ -489,7 +491,7 @@ def readme_specs(rows, idle, timers, sched, P):
             # Descriptors per connection is a sanity check (about 1 means
             # each connection was held), not a score: never ranked.
             vals.append([shown(c["text"]) for c in body[-1]["cells"][:4]] + [None])
-        mark_best(body, False, vals, axis="col")
+        mark_ranks(body, False, vals, axis="col")
         specs[f"bench-{tag}-table-idle"] = {
             "title": f"Idle keep-alive connections · {plat}",
             "subtitle": f"each of {top:,} connections made one request and was held open · "
@@ -513,13 +515,13 @@ def readme_specs(rows, idle, timers, sched, P):
             vs.append(shown(cells[-1]["text"]))
             body.append({"label": tname(srv, False), "cells": cells})
             vals.append(vs)
-        mark_best(body, False, vals, axis="col")
+        mark_ranks(body, False, vals, axis="col")
         specs[f"bench-{tag}-table-timers"] = {
             "title": f"Timers and wake-ups · {plat}",
             "subtitle": "how late asyncio.sleep(d) returns on an idle loop (median / p99) · "
                         "call_soon_threadsafe() into a sleeping loop",
             "columns": ["loop", "sleep(1 ms)", "sleep(5 ms)", "sleep(10 ms)", "cross-thread wake-up"],
-            "rows": body, "notes": ["Highlighted: the lowest median in each column."]}
+            "rows": body, "notes": ["Places go by the median in each column."]}
 
     if sched:
         body, vals = [], []
@@ -531,7 +533,7 @@ def readme_specs(rows, idle, timers, sched, P):
                 vs.append(shown(cells[-1]["text"]))
             body.append({"label": bench, "label_code": True, "cells": cells})
             vals.append(vs)
-        mark_best(body, True, vals, axis="row")
+        mark_ranks(body, True, vals, axis="row")
         nruns = max(len((x or {}).get("runs", [])) for res in sched.values() for x in res.values())
         specs[f"bench-{tag}-table-sched"] = {
             "title": f"Scheduling microbenchmarks · {plat}",

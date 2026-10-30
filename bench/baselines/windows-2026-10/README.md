@@ -11,7 +11,7 @@ Machine, software and method: [docs/benchmarks.md](../../../docs/benchmarks.md#w
 | `ab-cand3-vs-1.0.1.json` | the same for the build before the receive-size tail rule (`/sleep`, churn, pipelined and TLS rows come from it) |
 | `timers.json` | `bench/suite/latency.py`: sleep overshoot and cross-thread wakeup latency |
 | `sched.json`, `sched-1.0.1.json` | `bench/harness/harness.py --suite sched` for the final build and contenders, and for 1.0.1 |
-| `readme-tables.json` | The README's Windows tables as published (from `summary.json` and the A/B files), drawn by `bench/harness/tables.py`; the best cell of each row or column is marked |
+| `readme-tables.json` | The README's Windows tables as published (from `summary.json` and the A/B files), drawn by `bench/harness/tables.py`, with the top three of each row or column ranked |
 | `builds.txt` | sha256 of each `_core.pyd` measured |
 | `followup-runs.jsonl.gz`, `ab-followup.json` | The follow-up A/B (the pass's final build against the build that stops duplicating the socket behind `get_extra_info("socket")` and trims the WebSocket receive path), every run and the aggregated rows; each run carries `build` (`pass` or `follow-up`) |
 
