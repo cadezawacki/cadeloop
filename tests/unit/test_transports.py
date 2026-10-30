@@ -430,10 +430,20 @@ def test_transport_state_reads_from_another_thread(loop):
     async def main():
         a, peer = socket.socketpair()
         t, _ = await loop.create_connection(asyncio.Protocol, sock=a)
-        t.write(b"x" * (8 << 20))  # the peer never reads: most of it stays queued
-        await asyncio.sleep(0.01)
-        queued = t.get_write_buffer_size()
-        assert queued > 0
+        # The peer never reads, so once the OS stops taking data the rest
+        # stays queued -- but how much it takes first is the OS's call:
+        # Linux holds back part of 8 MiB, Windows loopback took all of it.
+        chunk = b"x" * (8 << 20)
+        for _ in range(8):
+            t.write(chunk)
+            await asyncio.sleep(0.05)
+            assert not t.is_closing(), "the transport closed while writing"
+            queued = t.get_write_buffer_size()
+            await asyncio.sleep(0.05)
+            if queued and t.get_write_buffer_size() == queued:
+                break  # stalled: nothing more leaves the queue
+        else:
+            raise AssertionError(f"the OS took all {8 * len(chunk)} bytes written")
         seen = []
 
         def probe():

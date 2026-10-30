@@ -1579,17 +1579,27 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
     connection is served within a few quanta, while the burst itself is
     still answered completely and in order.
 
-    /b is sent once the server is serving the burst, from a thread of its
-    own: how much of the burst the kernel buffers depends on how much the
-    server reads ahead of its pipeline budget, and a client that sent /b
-    only after the whole burst had been written measured that instead."""
+    /b is sent once the server is serving the burst: how much of the burst
+    the kernel buffers depends on how much the server reads ahead of its
+    pipeline budget, and a client that sent /b only after the whole burst
+    had been written measured that instead. It is sent by the app, on the
+    server's own thread, as the first /a starts, so the count begins when
+    /b's bytes are in the server's socket. Sent from a client thread after
+    it saw the first /a, the count also took in however long that thread
+    then waited for the GIL and a CPU before its send ran: 700 to 900 more
+    /a on a two-core Windows runner, with the server as fair as ever."""
     import threading
-    import time
 
     order = []
+    trigger = {}  # the client's /b connection, until the first /a sends on it
+    sent_at = []
 
     async def app(scope, receive, send):
         order.append(scope["path"])
+        b = trigger.pop("b", None) if scope["path"] == "/a" else None
+        if b is not None:
+            sent_at.append(len(order))
+            b.sendall(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
         await send(
             {"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]}
         )
@@ -1606,8 +1616,6 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
             buf += chunk
         return buf
 
-    served_before_b = []
-
     def client():
         a = socket.create_connection(("127.0.0.1", port))
         b = socket.create_connection(("127.0.0.1", port))
@@ -1617,13 +1625,9 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
             # Both connections live on the server before the burst starts.
             b.sendall(b"GET /warm HTTP/1.1\r\nHost: h\r\n\r\n")
             read_responses(b, 1)
+            trigger["b"] = b
             burst = threading.Thread(target=a.sendall, args=(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n" * n,))
             burst.start()
-            deadline = time.monotonic() + 10
-            while order.count("/a") < 1 and time.monotonic() < deadline:
-                time.sleep(0.0005)
-            served_before_b.append(order.count("/a"))
-            b.sendall(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
             read_responses(b, 1)
             read_responses(a, n)
             burst.join()
@@ -1634,10 +1638,11 @@ def test_a_pipelining_client_does_not_starve_other_connections(loop):
     loop.run_until_complete(loop.run_in_executor(None, client))
     loop._core.listener_close(lid)
     assert order.count("/a") == n, "the burst was not answered in full"
-    behind = order.index("/b") - 1 - served_before_b[0]
+    behind = order.index("/b") - sent_at[0]
     # Served back to back, /b waited for the whole first read of the burst
     # (~700 requests on a fresh loopback connection, up to ~2400 per
-    # 64 KiB); with the quantum it is a few quanta at most.
+    # 64 KiB); with the quantum it is a few quanta at most, plus what the
+    # server runs before its next kernel poll (one every 250 µs when busy).
     assert behind < 256, f"/b was served only after {behind} more of the other client's requests"
 
 def test_oversized_body_is_rejected_by_default(loop):

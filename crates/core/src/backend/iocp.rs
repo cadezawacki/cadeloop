@@ -92,6 +92,10 @@ pub(crate) const KEY_RIO: usize = 3;
 const KEY_DRAIN: usize = 4;
 /// The high-resolution park timer's expiry (`HiResTimer`).
 const KEY_TIMER: usize = 5;
+/// How far past a precise park's deadline its coarse backstop timeout
+/// lies: more than one default clock tick (15.6 ms), the most a coarse wait
+/// can expire early, so the timer's packet always ends the park first.
+const BACKSTOP_MS: u128 = 20;
 
 /// R-030: dequeue batch size.
 pub(crate) const POLL_BATCH: usize = 256;
@@ -1935,9 +1939,12 @@ impl IoBackend for IocpBackend {
                     // Expired while arming: reap, do not block.
                     Some(true) => 0,
                     // The KEY_TIMER packet ends the wait on time; the coarse
-                    // timeout behind it is only a backstop, set past the
-                    // deadline so it never ends the park first.
-                    Some(false) => (t.as_millis() + 2).min(u32::MAX as u128 - 1) as u32,
+                    // timeout behind it is only a backstop, and must never
+                    // end the park first. A coarse wait counts from the last
+                    // clock tick, so it can expire up to a whole tick
+                    // (15.6 ms by default) early: 2 ms past a 2 ms deadline,
+                    // a park begun late in a tick ended after 99 µs.
+                    Some(false) => (t.as_millis() + BACKSTOP_MS).min(u32::MAX as u128 - 1) as u32,
                     None => crate::backend::wait_millis(t).min(u32::MAX as u128 - 1) as u32,
                 }
             }
