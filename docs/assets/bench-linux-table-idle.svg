@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 762 356" width="762" height="356" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>Idle keep-alive connections · Linux</title>
+<rect width="762" height="356" fill="#fcfcfb" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">Idle keep-alive connections · Linux</text>
+<text x="24" y="62" font-size="12" fill="#52514e">each of 5,000 connections made one request and was held open · unique memory (USS) of the server</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">server</text>
+<text x="238.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">at rest</text>
+<text x="353.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">holding 5,000</text>
+<text x="482.8" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">per connection</text>
+<text x="622.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">after they close</text>
+<text x="723.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">fds / conn</text>
+<line x1="24" y1="106.0" x2="737.6" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#0b0b0b">cadeloop serve()</text>
+<text x="238.1" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">23 MiB</text>
+<text x="353.6" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">64 MiB</text>
+<text x="482.8" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.2 KiB</text>
+<rect x="570.4" y="110.0" width="60.5" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="622.9" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">33 MiB</text>
+<text x="723.6" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">1</text>
+<line x1="24" y1="136.0" x2="737.6" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">granian</text>
+<text x="238.1" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">–</text>
+<text x="353.6" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">–</text>
+<text x="482.8" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">–</text>
+<text x="622.9" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">–</text>
+<text x="723.6" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">–</text>
+<line x1="24" y1="166.0" x2="737.6" y2="166.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#0b0b0b">uvicorn[standard]</text>
+<text x="238.1" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">24 MiB</text>
+<text x="353.6" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">61 MiB</text>
+<text x="482.8" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">6.2 KiB</text>
+<text x="622.9" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">48 MiB</text>
+<text x="723.6" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">1</text>
+<line x1="24" y1="196.0" x2="737.6" y2="196.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#0b0b0b">uvicorn + cadeloop</text>
+<text x="238.1" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">28 MiB</text>
+<text x="353.6" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">99 MiB</text>
+<text x="482.8" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">11.7 KiB</text>
+<text x="622.9" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">70 MiB</text>
+<text x="723.6" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">1</text>
+<line x1="24" y1="226.0" x2="737.6" y2="226.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="245.5" font-size="13" fill="#0b0b0b">uvicorn + uvloop</text>
+<text x="238.1" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">23 MiB</text>
+<text x="353.6" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">57 MiB</text>
+<text x="482.8" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.6 KiB</text>
+<text x="622.9" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">45 MiB</text>
+<text x="723.6" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">1</text>
+<line x1="24" y1="256.0" x2="737.6" y2="256.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="275.5" font-size="13" fill="#0b0b0b">uvicorn + asyncio</text>
+<rect x="185.6" y="260.0" width="60.5" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="238.1" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">20 MiB</text>
+<rect x="301.1" y="260.0" width="60.5" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="353.6" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">54 MiB</text>
+<rect x="428.7" y="260.0" width="62.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="482.8" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">5.5 KiB</text>
+<text x="622.9" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">53 MiB</text>
+<text x="723.6" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">1</text>
+<line x1="24" y1="286.0" x2="737.6" y2="286.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="305.5" font-size="13" fill="#0b0b0b">hypercorn</text>
+<rect x="185.6" y="290.0" width="60.5" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="238.1" y="305.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">20 MiB</text>
+<text x="353.6" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">88 MiB</text>
+<text x="482.8" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">11.2 KiB</text>
+<text x="622.9" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">88 MiB</text>
+<text x="723.6" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.94</text>
+<text x="24" y="338.0" font-size="11" fill="#898781">granian accepted about 648 of the 5,000 connections with its default settings (256 timed out), so it has no comparable figure here.</text>
+</svg>

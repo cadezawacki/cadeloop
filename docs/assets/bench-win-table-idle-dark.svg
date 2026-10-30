@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 746 278" width="746" height="278" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>Idle keep-alive connections · Windows 11</title>
+<rect width="746" height="278" fill="#0B0D11" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#ffffff">Idle keep-alive connections · Windows 11</text>
+<text x="24" y="62" font-size="12" fill="#c9d1d9">each connection made one request and was held open · private bytes of the server</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#c9d1d9">server</text>
+<text x="230.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">at rest</text>
+<text x="337.4" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">holding 5,000</text>
+<text x="458.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">per connection</text>
+<text x="590.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">after they close</text>
+<text x="708.4" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">handles / conn</text>
+<line x1="24" y1="106.0" x2="722.4" y2="106.0" stroke="#232830" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#ffffff">cadeloop serve()</text>
+<text x="230.1" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">30 MiB</text>
+<rect x="284.9" y="110.0" width="60.5" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="337.4" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">68 MiB</text>
+<text x="458.6" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">6.6 KiB</text>
+<rect x="538.1" y="110.0" width="60.5" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="590.6" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">42 MiB</text>
+<text x="708.4" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="136.0" x2="722.4" y2="136.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#ffffff">uvicorn + cadeloop</text>
+<text x="230.1" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">36 MiB</text>
+<text x="337.4" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">106 MiB</text>
+<text x="458.6" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">11.2 KiB</text>
+<text x="590.6" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">67 MiB</text>
+<text x="708.4" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="166.0" x2="722.4" y2="166.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#ffffff">uvicorn + winloop</text>
+<text x="230.1" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">61 MiB</text>
+<text x="337.4" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">98 MiB</text>
+<rect x="404.5" y="170.0" width="62.0" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="458.6" y="185.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">6.4 KiB</text>
+<text x="590.6" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">79 MiB</text>
+<text x="708.4" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="196.0" x2="722.4" y2="196.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#ffffff">uvicorn + asyncio</text>
+<text x="230.1" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">25 MiB</text>
+<text x="337.4" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">376 MiB</text>
+<text x="458.6" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">57.9 KiB</text>
+<text x="590.6" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">376 MiB</text>
+<text x="708.4" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="226.0" x2="722.4" y2="226.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="245.5" font-size="13" fill="#ffffff">hypercorn</text>
+<rect x="177.6" y="230.0" width="60.5" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="230.1" y="245.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">23 MiB</text>
+<text x="337.4" y="245.5" font-size="13" text-anchor="end" fill="#ffffff">408 MiB</text>
+<text x="458.6" y="245.5" font-size="13" text-anchor="end" fill="#ffffff">63.0 KiB</text>
+<text x="590.6" y="245.5" font-size="13" text-anchor="end" fill="#ffffff">408 MiB</text>
+<text x="708.4" y="245.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+</svg>

@@ -1,7 +1,11 @@
-"""Windows benchmark runner: native load (bench/loadgen) against real servers.
+"""Benchmark runner: native load (bench/loadgen) against real servers.
 
-  python bench/windows/run_suite.py --suite http,echo,ws,tls,idle \
+  python bench/suite/run_suite.py --suite http,echo,ws,tls,idle \
       --pkg baseline=PATH --pkg candidate=PATH --reps 3 --out DIR
+
+Runs on Windows and Linux. The contenders follow the platform: winloop on
+Windows is uvloop on Linux, and Linux adds granian and uvicorn's standard
+stack (httptools + websockets on uvloop), which do not run on Windows.
 
 Each (contender, rep) gets a FRESH server process. A server is used only
 once a real request through it succeeds (no startup sleeps). While the
@@ -28,7 +32,14 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
-import winproc  # noqa: E402
+if os.name == "nt":
+    import winproc as procstat  # noqa: E402
+else:
+    import linproc as procstat  # noqa: E402
+
+WINDOWS = os.name == "nt"
+# The compiled third-party loop that uvicorn is usually paired with.
+ALT_LOOP = "winloop" if WINDOWS else "uvloop"
 
 PY = sys.executable
 SERVERS = os.path.join(HERE, "servers.py")
@@ -74,11 +85,24 @@ def http_contenders(pkgs):
     cand = pkgs.get("candidate", any_pkg)
     out += [
         ("uvicorn+asyncio", ["--impl", "uvicorn", "--loop", "asyncio"], any_pkg),
-        ("uvicorn+winloop", ["--impl", "uvicorn", "--loop", "winloop"], any_pkg),
+        (f"uvicorn+{ALT_LOOP}", ["--impl", "uvicorn", "--loop", ALT_LOOP], any_pkg),
         ("uvicorn+cadeloop", ["--impl", "uvicorn", "--loop", "cadeloop"], cand),
         ("hypercorn+asyncio", ["--impl", "hypercorn", "--loop", "asyncio"], any_pkg),
     ]
+    out += linux_extras(any_pkg)
     return only(out)
+
+
+def linux_extras(pkg):
+    """Servers that only run on Linux: uvicorn as `uvicorn[standard]`
+    installs it (httptools and websockets on uvloop), and granian."""
+    if WINDOWS:
+        return []
+    return [
+        ("uvicorn[standard]", ["--impl", "uvicorn", "--loop", "uvloop", "--http", "httptools",
+                               "--ws", "websockets"], pkg),
+        ("granian", ["--impl", "granian"], pkg),
+    ]
 
 
 HTTP_WORKLOADS = [
@@ -110,7 +134,7 @@ class Server:
         self.cmd = cmd
         self.log = open(os.path.join(OUT, f"server-{label.replace('[', '_').replace(']', '')}-{self.port}.log"), "w")
         self.proc = subprocess.Popen(cmd, env=env, cwd=HERE, stdout=self.log, stderr=subprocess.STDOUT)
-        self.sampler = winproc.TreeSampler(self.proc.pid)
+        self.sampler = procstat.TreeSampler(self.proc.pid)
         self.probe = probe
         self.tls = bool(tls)
 
@@ -155,7 +179,7 @@ class Server:
     def stop(self):
         code = self.proc.poll()
         if code is None:
-            winproc.kill_tree(self.proc.pid)
+            procstat.kill_tree(self.proc.pid)
             try:
                 self.proc.wait(10)
             except subprocess.TimeoutExpired:
@@ -168,6 +192,8 @@ class Server:
 # ---- one measured run ------------------------------------------------------
 
 LOADGEN = None
+# Extra loadgen flags for every run (--loadgen-procs).
+LOADGEN_ARGS: list[str] = []
 OUT = None
 
 
@@ -183,15 +209,15 @@ def run_load(server: Server, args, duration, warmup, extra_meta):
                 pass
             stop.wait(0.5)
 
-    tcp0 = winproc.tcp_stats()
+    tcp0 = procstat.tcp_stats()
     th = threading.Thread(target=sample, daemon=True)
-    cmd = [LOADGEN, "-port", str(server.port), "-d", str(duration), "-warmup", str(warmup), *args]
+    cmd = [LOADGEN, "-port", str(server.port), "-d", str(duration), "-warmup", str(warmup), *LOADGEN_ARGS, *args]
     t0 = time.perf_counter()
     th.start()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + warmup + 60)
     stop.set()
     th.join()
-    tcp1 = winproc.tcp_stats()
+    tcp1 = procstat.tcp_stats()
     res = None
     if "RESULT " in proc.stdout:
         res = json.loads(proc.stdout.split("RESULT ", 1)[1])
@@ -281,7 +307,8 @@ def suite_tls(pkgs, reps, dur, warm, cert):
     cand = pkgs.get("candidate", next(iter(pkgs.values())))
     cons = [(f"cadeloop[{n}]", ["--impl", "cadeloop"], p) for n, p in pkgs.items()]
     cons += [("uvicorn+asyncio", ["--impl", "uvicorn", "--loop", "asyncio"], cand),
-             ("uvicorn+winloop", ["--impl", "uvicorn", "--loop", "winloop"], cand)]
+             (f"uvicorn+{ALT_LOOP}", ["--impl", "uvicorn", "--loop", ALT_LOOP], cand)]
+    cons += linux_extras(cand)
     cons = only(cons)
     wl = [("tls-plaintext-c64", ["-path", "/", "-c", "64", "-tls", "-expect-len", "13"]),
           ("tls-churn-c16", ["-path", "/", "-c", "16", "-tls", "-churn", "-expect-len", "13"])]
@@ -299,8 +326,9 @@ def suite_ws(pkgs, reps, dur, warm):
     cand = pkgs.get("candidate", next(iter(pkgs.values())))
     cons = [(f"cadeloop[{n}]", ["--impl", "cadeloop"], p) for n, p in pkgs.items()]
     cons += [("uvicorn+asyncio", ["--impl", "uvicorn", "--loop", "asyncio"], cand),
-             ("uvicorn+winloop", ["--impl", "uvicorn", "--loop", "winloop"], cand),
+             (f"uvicorn+{ALT_LOOP}", ["--impl", "uvicorn", "--loop", ALT_LOOP], cand),
              ("hypercorn+asyncio", ["--impl", "hypercorn", "--loop", "asyncio"], cand)]
+    cons += linux_extras(cand)
     cons = only(cons)
     wl = [("ws-64b-c1", ["-c", "1", "-size", "64"]),
           ("ws-64b-c64", ["-c", "64", "-size", "64"]),
@@ -319,7 +347,8 @@ def suite_ws(pkgs, reps, dur, warm):
 def suite_echo(pkgs, reps, dur, warm):
     cons = [(f"cadeloop[{n}]", ["--loop", "cadeloop"], p) for n, p in pkgs.items()]
     anyp = next(iter(pkgs.values()))
-    cons += [(f"{l}", ["--loop", l], anyp) for l in ("asyncio", "winloop", "rsloop")]
+    loops = ("asyncio", "winloop", "rsloop") if WINDOWS else ("asyncio", "uvloop", "rloop", "rsloop")
+    cons += [(f"{l}", ["--loop", l], anyp) for l in loops]
     cons = only(cons)
     wl = [("echo-1k-c1", ["-c", "1", "-size", "1024"]),
           ("echo-1k-c64", ["-c", "64", "-size", "1024"]),
@@ -345,7 +374,8 @@ def suite_idle(pkgs, counts):
             for n in counts:
                 before = s.sampler.sample()
                 p = subprocess.Popen([LOADGEN, "-mode", "hold", "-port", str(s.port), "-c", str(n), "-d", "6",
-                                      "-hold-request", "-timeout", "20"], stdout=subprocess.PIPE, text=True)
+                                      "-hold-request", "-timeout", "20", *LOADGEN_ARGS],
+                                     stdout=subprocess.PIPE, text=True)
                 line = p.stdout.readline().strip()  # HOLDING n
                 time.sleep(2)
                 held = s.sampler.sample()
@@ -389,6 +419,20 @@ def suite_overload(pkgs, contenders, conns=256):
         with_server(label, args, pkg, "http", "http", None, body)
 
 
+def contender_versions() -> dict:
+    """Installed versions of every third-party server and loop measured."""
+    from importlib import metadata
+
+    out = {}
+    for dist in ("uvicorn", "h11", "httptools", "wsproto", "websockets", "hypercorn", "granian",
+                 "uvloop", "winloop", "rloop", "rsloop"):
+        try:
+            out[dist] = metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            pass
+    return out
+
+
 def main():
     global LOADGEN, OUT
     ap = argparse.ArgumentParser()
@@ -405,9 +449,14 @@ def main():
     ap.add_argument("--overload-contenders", default="")
     ap.add_argument("--cadeloop-only", action="store_true", help="skip third-party contenders")
     ap.add_argument("--only", default="", help="comma-separated contender labels to run")
+    ap.add_argument("--loadgen-procs", type=int, default=0,
+                    help="cap the load generator's OS threads (GOMAXPROCS); 0 leaves Go's default. "
+                         "On a small machine this keeps it from taking the server's cores.")
     a = ap.parse_args()
     global CADELOOP_ONLY
     LOADGEN = a.loadgen
+    if a.loadgen_procs:
+        LOADGEN_ARGS.extend(["-procs", str(a.loadgen_procs)])
     OUT = a.out
     CADELOOP_ONLY = a.cadeloop_only
     ONLY.update(x for x in a.only.split(",") if x)
@@ -420,6 +469,7 @@ def main():
         ident = os.path.join(os.path.dirname(p.rstrip("\\/")), n, "IDENTITY.txt")
         ident = os.path.join(p, "IDENTITY.txt")
         meta["pkgs"][n] = {"path": p, "identity": open(ident).read() if os.path.exists(ident) else None}
+    meta["versions"] = contender_versions()
     with open(os.path.join(OUT, "meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
     wl = [w for w in a.workloads.split(",") if w]

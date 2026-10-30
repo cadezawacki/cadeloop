@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 380" width="900" height="380" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Closed-loop and open-loop load</title>
+<rect width="900" height="380" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">Closed-loop and open-loop load</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">If the load generator waits for each answer before sending the next, a server stall also stalls the measurement.</text>
+<rect x="330.0" y="86.0" width="280.0" height="100.0" rx="4" fill="#fde1e3" opacity="0.8"/>
+<text x="470.0" y="100.0" font-size="10.5" fill="#cf222e" text-anchor="middle">server stalls for 1 s</text>
+<rect x="330.0" y="216.0" width="280.0" height="100.0" rx="4" fill="#fde1e3" opacity="0.8"/>
+<text x="470.0" y="230.0" font-size="10.5" fill="#cf222e" text-anchor="middle">server stalls for 1 s</text>
+<text x="24.0" y="112.0" font-size="12.5" fill="#1f2328" font-weight="600">closed loop</text>
+<text x="24.0" y="130.0" font-size="11" fill="#4b535d">send, wait for the reply,</text>
+<text x="24.0" y="144.0" font-size="11" fill="#4b535d">then send the next</text>
+<rect x="190.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="197.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="204.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="211.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="218.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="225.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="232.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="239.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="246.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="253.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="260.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="267.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="274.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="281.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="288.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="295.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="302.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="309.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="316.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="323.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="330.0" y="150.0" width="280.0" height="22.0" rx="3" fill="#c4620c"/>
+<text x="470.0" y="166.0" font-size="11" fill="#fcfcfb" font-weight="600" text-anchor="middle">one request, 1000 ms</text>
+<rect x="610.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="617.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="624.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="631.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="638.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="645.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="652.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="659.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="666.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="673.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="680.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="687.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="694.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="701.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="708.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="715.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="722.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="729.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="736.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="743.0" y="150.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<line x1="190.0" y1="186.0" x2="750.0" y2="186.0" stroke="#c8ced6" stroke-width="1.2"/>
+<text x="190.0" y="201.0" font-size="10" fill="#7d8590" text-anchor="middle">0 ms</text>
+<text x="330.0" y="201.0" font-size="10" fill="#7d8590" text-anchor="middle">500 ms</text>
+<text x="470.0" y="201.0" font-size="10" fill="#7d8590" text-anchor="middle">1000 ms</text>
+<text x="610.0" y="201.0" font-size="10" fill="#7d8590" text-anchor="middle">1500 ms</text>
+<text x="750.0" y="201.0" font-size="10" fill="#7d8590" text-anchor="middle">2000 ms</text>
+<text x="760.0" y="166.0" font-size="11.5" fill="#c4620c" font-weight="600">1 slow result</text>
+<text x="24.0" y="242.0" font-size="12.5" fill="#1f2328" font-weight="600">open loop</text>
+<text x="24.0" y="260.0" font-size="11" fill="#4b535d">send on a fixed schedule,</text>
+<text x="24.0" y="274.0" font-size="11" fill="#4b535d">answer or not</text>
+<rect x="190.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="197.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="204.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="211.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="218.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="225.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="232.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="239.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="246.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="253.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="260.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="267.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="274.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="281.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="288.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="295.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="302.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="309.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="316.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="323.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="330.0" y="252.0" width="3.0" height="32.0" rx="1" fill="#c4620c"/>
+<rect x="337.0" y="252.8" width="3.0" height="31.2" rx="1" fill="#c4620c"/>
+<rect x="344.0" y="253.5" width="3.0" height="30.5" rx="1" fill="#c4620c"/>
+<rect x="351.0" y="254.2" width="3.0" height="29.8" rx="1" fill="#c4620c"/>
+<rect x="358.0" y="255.0" width="3.0" height="29.0" rx="1" fill="#c4620c"/>
+<rect x="365.0" y="255.8" width="3.0" height="28.2" rx="1" fill="#c4620c"/>
+<rect x="372.0" y="256.5" width="3.0" height="27.5" rx="1" fill="#c4620c"/>
+<rect x="379.0" y="257.2" width="3.0" height="26.8" rx="1" fill="#c4620c"/>
+<rect x="386.0" y="258.0" width="3.0" height="26.0" rx="1" fill="#c4620c"/>
+<rect x="393.0" y="258.8" width="3.0" height="25.2" rx="1" fill="#c4620c"/>
+<rect x="400.0" y="259.5" width="3.0" height="24.5" rx="1" fill="#c4620c"/>
+<rect x="407.0" y="260.2" width="3.0" height="23.8" rx="1" fill="#c4620c"/>
+<rect x="414.0" y="261.0" width="3.0" height="23.0" rx="1" fill="#c4620c"/>
+<rect x="421.0" y="261.8" width="3.0" height="22.2" rx="1" fill="#c4620c"/>
+<rect x="428.0" y="262.5" width="3.0" height="21.5" rx="1" fill="#c4620c"/>
+<rect x="435.0" y="263.2" width="3.0" height="20.8" rx="1" fill="#c4620c"/>
+<rect x="442.0" y="264.0" width="3.0" height="20.0" rx="1" fill="#c4620c"/>
+<rect x="449.0" y="264.8" width="3.0" height="19.2" rx="1" fill="#c4620c"/>
+<rect x="456.0" y="265.5" width="3.0" height="18.5" rx="1" fill="#c4620c"/>
+<rect x="463.0" y="266.2" width="3.0" height="17.8" rx="1" fill="#c4620c"/>
+<rect x="470.0" y="267.0" width="3.0" height="17.0" rx="1" fill="#c4620c"/>
+<rect x="477.0" y="267.8" width="3.0" height="16.2" rx="1" fill="#c4620c"/>
+<rect x="484.0" y="268.5" width="3.0" height="15.5" rx="1" fill="#c4620c"/>
+<rect x="491.0" y="269.2" width="3.0" height="14.8" rx="1" fill="#c4620c"/>
+<rect x="498.0" y="270.0" width="3.0" height="14.0" rx="1" fill="#c4620c"/>
+<rect x="505.0" y="270.8" width="3.0" height="13.2" rx="1" fill="#c4620c"/>
+<rect x="512.0" y="271.5" width="3.0" height="12.5" rx="1" fill="#c4620c"/>
+<rect x="519.0" y="272.2" width="3.0" height="11.8" rx="1" fill="#c4620c"/>
+<rect x="526.0" y="273.0" width="3.0" height="11.0" rx="1" fill="#c4620c"/>
+<rect x="533.0" y="273.8" width="3.0" height="10.2" rx="1" fill="#c4620c"/>
+<rect x="540.0" y="274.5" width="3.0" height="9.5" rx="1" fill="#c4620c"/>
+<rect x="547.0" y="275.2" width="3.0" height="8.8" rx="1" fill="#c4620c"/>
+<rect x="554.0" y="276.0" width="3.0" height="8.0" rx="1" fill="#c4620c"/>
+<rect x="561.0" y="276.8" width="3.0" height="7.2" rx="1" fill="#c4620c"/>
+<rect x="568.0" y="277.5" width="3.0" height="6.5" rx="1" fill="#c4620c"/>
+<rect x="575.0" y="278.2" width="3.0" height="5.8" rx="1" fill="#c4620c"/>
+<rect x="582.0" y="279.0" width="3.0" height="5.0" rx="1" fill="#c4620c"/>
+<rect x="589.0" y="279.8" width="3.0" height="4.2" rx="1" fill="#c4620c"/>
+<rect x="596.0" y="280.5" width="3.0" height="3.5" rx="1" fill="#c4620c"/>
+<rect x="603.0" y="281.2" width="3.0" height="2.8" rx="1" fill="#c4620c"/>
+<rect x="610.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="617.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="624.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="631.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="638.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="645.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="652.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="659.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="666.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="673.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="680.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="687.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="694.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="701.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="708.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="715.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="722.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="729.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="736.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<rect x="743.0" y="280.0" width="3.0" height="22.0" rx="1" fill="#3a6fd8"/>
+<line x1="190.0" y1="316.0" x2="750.0" y2="316.0" stroke="#c8ced6" stroke-width="1.2"/>
+<text x="190.0" y="331.0" font-size="10" fill="#7d8590" text-anchor="middle">0 ms</text>
+<text x="330.0" y="331.0" font-size="10" fill="#7d8590" text-anchor="middle">500 ms</text>
+<text x="470.0" y="331.0" font-size="10" fill="#7d8590" text-anchor="middle">1000 ms</text>
+<text x="610.0" y="331.0" font-size="10" fill="#7d8590" text-anchor="middle">1500 ms</text>
+<text x="750.0" y="331.0" font-size="10" fill="#7d8590" text-anchor="middle">2000 ms</text>
+<text x="760.0" y="296.0" font-size="11.5" fill="#c4620c" font-weight="600">40 slow results</text>
+<text x="24.0" y="350.0" font-size="11.5" fill="#4b535d">Latency is measured from when each request was due, so the stall shows up in p99.</text>
+<text x="24.0" y="365.0" font-size="11.5" fill="#4b535d">bench/loadgen does this with -rate and -phases.</text>
+</svg>

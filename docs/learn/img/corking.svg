@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 320" width="860" height="320" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Corking: one send per connection per tick</title>
+<rect width="860" height="320" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">Corking: one send per connection per tick</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">Writes made during a tick wait in a queue and leave together when the tick ends.</text>
+<text x="24.0" y="102.0" font-size="12.5" fill="#1f2328" font-weight="600">immediate flush</text>
+<rect x="230.0" y="84.0" width="60.0" height="26.0" rx="5" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="260.0" y="102.0" font-size="11.5" fill="#1f2328" text-anchor="middle">write 1</text>
+<rect x="300.0" y="84.0" width="60.0" height="26.0" rx="5" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="330.0" y="102.0" font-size="11.5" fill="#1f2328" text-anchor="middle">write 2</text>
+<rect x="370.0" y="84.0" width="60.0" height="26.0" rx="5" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="400.0" y="102.0" font-size="11.5" fill="#1f2328" text-anchor="middle">write 3</text>
+<line x1="220.0" y1="134.0" x2="780.0" y2="134.0" stroke="#c8ced6" stroke-width="1.2"/>
+<text x="790.0" y="138.0" font-size="10.5" fill="#7d8590">kernel</text>
+<line x1="260.0" y1="112.0" x2="260.0" y2="126.4" stroke="#13968e" stroke-width="1.5"/>
+<path d="M260.0,132.0 L256.5,125.9 L263.5,125.9 z" fill="#13968e"/>
+<text x="266.0" y="128.0" font-size="10.5" fill="#13968e">send</text>
+<line x1="330.0" y1="112.0" x2="330.0" y2="126.4" stroke="#13968e" stroke-width="1.5"/>
+<path d="M330.0,132.0 L326.5,125.9 L333.5,125.9 z" fill="#13968e"/>
+<text x="336.0" y="128.0" font-size="10.5" fill="#13968e">send</text>
+<line x1="400.0" y1="112.0" x2="400.0" y2="126.4" stroke="#13968e" stroke-width="1.5"/>
+<path d="M400.0,132.0 L396.5,125.9 L403.5,125.9 z" fill="#13968e"/>
+<text x="406.0" y="128.0" font-size="10.5" fill="#13968e">send</text>
+<text x="460.0" y="102.0" font-size="11.5" fill="#4b535d">three sends</text>
+<rect x="220.0" y="176.0" width="300.0" height="0.1" rx="8" fill="#c8ced6"/>
+<text x="24.0" y="194.0" font-size="12.5" fill="#1f2328" font-weight="600">corked (the default)</text>
+<rect x="230.0" y="176.0" width="60.0" height="26.0" rx="5" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="260.0" y="194.0" font-size="11.5" fill="#1f2328" text-anchor="middle">write 1</text>
+<rect x="300.0" y="176.0" width="60.0" height="26.0" rx="5" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="330.0" y="194.0" font-size="11.5" fill="#1f2328" text-anchor="middle">write 2</text>
+<rect x="370.0" y="176.0" width="60.0" height="26.0" rx="5" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="400.0" y="194.0" font-size="11.5" fill="#1f2328" text-anchor="middle">write 3</text>
+<rect x="455.0" y="172.0" width="150.0" height="34.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="530.0" y="194.0" font-size="11" fill="#1f2328" text-anchor="middle">queued until tick ends</text>
+<line x1="612.0" y1="189.0" x2="644.4" y2="189.0" stroke="#4b535d" stroke-width="1.5"/>
+<path d="M650.0,189.0 L643.9,192.5 L643.9,185.5 z" fill="#4b535d"/>
+<rect x="655.0" y="176.0" width="110.0" height="26.0" rx="5" fill="#13968e"/>
+<text x="710.0" y="194.0" font-size="11.5" fill="#fcfcfb" font-weight="600" text-anchor="middle">one writev</text>
+<line x1="220.0" y1="232.0" x2="780.0" y2="232.0" stroke="#c8ced6" stroke-width="1.2"/>
+<line x1="710.0" y1="204.0" x2="710.0" y2="224.4" stroke="#13968e" stroke-width="1.5"/>
+<path d="M710.0,230.0 L706.5,223.9 L713.5,223.9 z" fill="#13968e"/>
+<text x="790.0" y="236.0" font-size="10.5" fill="#7d8590">kernel</text>
+<text x="24.0" y="270.0" font-size="11.5" fill="#4b535d">A response sent as a single body message is one send either way. Corking pays off for</text>
+<text x="24.0" y="286.0" font-size="11.5" fill="#4b535d">streamed chunks and pipelined responses, which it coalesces per connection.</text>
+</svg>

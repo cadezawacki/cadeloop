@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" width="860" height="420" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Two ways an operating system reports network I/O</title>
+<rect width="860" height="420" rx="10" fill="#0B0D11"/>
+<text x="24.0" y="34.0" font-size="16" fill="#e6edf3" font-weight="600">Two ways an operating system reports network I/O</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#b1bac4">Linux says when you may read. Windows says when the read is done.</text>
+<rect x="24.0" y="74.0" width="400.0" height="326.0" rx="10" fill="#0B0D11" stroke="#1c2129" stroke-width="1.2"/>
+<text x="44.0" y="100.0" font-size="13.5" fill="#e6edf3" font-weight="600">Readiness · Linux epoll</text>
+<rect x="54.0" y="114.0" width="100.0" height="28.0" rx="7" fill="#172a4f" stroke="#79a5f2" stroke-width="1.2"/>
+<text x="104.0" y="132.0" font-size="12" fill="#e6edf3" font-weight="600" text-anchor="middle">program</text>
+<line x1="104.0" y1="142.0" x2="104.0" y2="352.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<rect x="294.0" y="114.0" width="100.0" height="28.0" rx="7" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="344.0" y="132.0" font-size="12" fill="#e6edf3" font-weight="600" text-anchor="middle">kernel</text>
+<line x1="344.0" y1="142.0" x2="344.0" y2="352.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<line x1="108.0" y1="172.0" x2="334.4" y2="172.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M340.0,172.0 L333.9,175.5 L333.9,168.5 z" fill="#b1bac4"/>
+<text x="224.0" y="165.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">tell me when socket 7 is readable</text>
+<line x1="340.0" y1="218.0" x2="113.6" y2="218.0" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M108.0,218.0 L114.1,214.5 L114.1,221.5 z" fill="#36c2b6"/>
+<text x="224.0" y="211.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">socket 7 is readable</text>
+<line x1="108.0" y1="264.0" x2="334.4" y2="264.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M340.0,264.0 L333.9,267.5 L333.9,260.5 z" fill="#b1bac4"/>
+<text x="224.0" y="257.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">recv(socket 7)</text>
+<line x1="340.0" y1="310.0" x2="113.6" y2="310.0" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M108.0,310.0 L114.1,306.5 L114.1,313.5 z" fill="#36c2b6"/>
+<text x="224.0" y="303.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">here are 512 bytes</text>
+<text x="44.0" y="382.0" font-size="11.5" fill="#b1bac4">Two round trips per read; the data is copied at the end.</text>
+<rect x="436.0" y="74.0" width="400.0" height="326.0" rx="10" fill="#0B0D11" stroke="#1c2129" stroke-width="1.2"/>
+<text x="456.0" y="100.0" font-size="13.5" fill="#e6edf3" font-weight="600">Completion · Windows IOCP</text>
+<rect x="466.0" y="114.0" width="100.0" height="28.0" rx="7" fill="#172a4f" stroke="#79a5f2" stroke-width="1.2"/>
+<text x="516.0" y="132.0" font-size="12" fill="#e6edf3" font-weight="600" text-anchor="middle">program</text>
+<line x1="516.0" y1="142.0" x2="516.0" y2="352.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<rect x="706.0" y="114.0" width="100.0" height="28.0" rx="7" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="756.0" y="132.0" font-size="12" fill="#e6edf3" font-weight="600" text-anchor="middle">kernel</text>
+<line x1="756.0" y1="142.0" x2="756.0" y2="352.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<line x1="520.0" y1="172.0" x2="746.4" y2="172.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M752.0,172.0 L745.9,175.5 L745.9,168.5 z" fill="#b1bac4"/>
+<text x="636.0" y="165.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">read socket 7 into this buffer</text>
+<line x1="752.0" y1="318.0" x2="525.6" y2="318.0" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M520.0,318.0 L526.1,314.5 L526.1,321.5 z" fill="#36c2b6"/>
+<text x="636.0" y="311.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">done: 512 bytes in your buffer</text>
+<rect x="748.0" y="196.0" width="16.0" height="100.0" rx="4" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="740.0" y="242.0" font-size="10.5" fill="#b1bac4" text-anchor="end">fills the buffer</text>
+<text x="740.0" y="255.0" font-size="10.5" fill="#b1bac4" text-anchor="end">when data arrives</text>
+<text x="456.0" y="382.0" font-size="11.5" fill="#b1bac4">One round trip, but the buffer must stay put until it's done.</text>
+</svg>

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 280" width="860" height="280" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Why a 1 ms sleep can take 15 ms on Windows</title>
+<defs><pattern id="h0" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#eceff2"/><line x1="0" y1="0" x2="0" y2="7" stroke="#c8ced6" stroke-width="2.2"/></pattern><pattern id="h1" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#eceff2"/><line x1="0" y1="0" x2="0" y2="7" stroke="#c8ced6" stroke-width="2.2"/></pattern></defs>
+<rect width="860" height="280" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">Why a 1 ms sleep can take 15 ms on Windows</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">A plain wait ends on the next clock interrupt, every 15.6 ms. cadeloop also arms a high-resolution timer.</text>
+<line x1="190.0" y1="76.0" x2="190.0" y2="224.0" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 4"/>
+<text x="190.0" y="242.0" font-size="10.5" fill="#7d8590" text-anchor="middle">clock tick (0 ms)</text>
+<line x1="486.4" y1="76.0" x2="486.4" y2="224.0" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 4"/>
+<text x="486.4" y="242.0" font-size="10.5" fill="#7d8590" text-anchor="middle">clock tick (15.6 ms)</text>
+<line x1="782.8" y1="76.0" x2="782.8" y2="224.0" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 4"/>
+<text x="782.8" y="242.0" font-size="10.5" fill="#7d8590" text-anchor="middle">clock tick (31.2 ms)</text>
+<text x="24.0" y="121.0" font-size="12.5" fill="#1f2328" font-weight="600">asyncio, winloop</text>
+<rect x="190.0" y="104.0" width="292.6" height="26.0" rx="4" fill="url(#h0)"/>
+<line x1="209.0" y1="98.0" x2="209.0" y2="136.0" stroke="#3a6fd8" stroke-width="2"/>
+<rect x="479.6" y="102.0" width="6.0" height="30.0" rx="2" fill="#cf222e"/>
+<text x="492.6" y="121.0" font-size="11.5" fill="#cf222e" font-weight="600">wakes on the next tick: about 14 ms late</text>
+<text x="24.0" y="181.0" font-size="12.5" fill="#1f2328" font-weight="600">cadeloop</text>
+<rect x="190.0" y="164.0" width="29.4" height="26.0" rx="4" fill="url(#h1)"/>
+<line x1="209.0" y1="158.0" x2="209.0" y2="196.0" stroke="#3a6fd8" stroke-width="2"/>
+<rect x="216.4" y="162.0" width="6.0" height="30.0" rx="2" fill="#1a7f37"/>
+<text x="229.4" y="181.0" font-size="11.5" fill="#1a7f37" font-weight="600">wakes about 0.5 ms after the deadline</text>
+<text x="213.0" y="96.0" font-size="10.5" fill="#3a6fd8">asleep until 1 ms</text>
+<text x="24.0" y="270.0" font-size="11" fill="#7d8590">Medians measured on Windows 11 with asyncio.sleep(0.001) on an idle loop.</text>
+</svg>

@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 436" width="920" height="436" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>What runs in Python, and what doesn't</title>
+<rect width="920" height="436" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">What runs in Python, and what doesn't</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">One row per setup; the columns are jobs every request goes through.</text>
+<text x="295.0" y="88.0" font-size="11.5" fill="#4b535d" font-weight="600" text-anchor="middle">waiting for I/O</text>
+<text x="429.0" y="88.0" font-size="11.5" fill="#4b535d" font-weight="600" text-anchor="middle">scheduling</text>
+<text x="563.0" y="88.0" font-size="11.5" fill="#4b535d" font-weight="600" text-anchor="middle">HTTP parsing</text>
+<text x="697.0" y="88.0" font-size="11.5" fill="#4b535d" font-weight="600" text-anchor="middle">scope and reply</text>
+<text x="831.0" y="88.0" font-size="11.5" fill="#4b535d" font-weight="600" text-anchor="middle">your app</text>
+<text x="24.0" y="120.0" font-size="12.5" fill="#1f2328">uvicorn on asyncio</text>
+<rect x="230.0" y="103.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="294.0" y="122.0" font-size="11.5" fill="#1f2328" text-anchor="middle">C</text>
+<rect x="364.0" y="103.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="428.0" y="122.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="498.0" y="103.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="562.0" y="122.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python (h11)</text>
+<rect x="632.0" y="103.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="696.0" y="122.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="766.0" y="103.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="122.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="24.0" y="158.0" font-size="12.5" fill="#1f2328">uvicorn[standard] on uvloop</text>
+<rect x="230.0" y="141.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="294.0" y="160.0" font-size="11.5" fill="#1f2328" text-anchor="middle">C (libuv)</text>
+<rect x="364.0" y="141.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="428.0" y="160.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Cython</text>
+<rect x="498.0" y="141.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="562.0" y="160.0" font-size="11.5" fill="#1f2328" text-anchor="middle">C (httptools)</text>
+<rect x="632.0" y="141.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="696.0" y="160.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="766.0" y="141.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="160.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="24.0" y="196.0" font-size="12.5" fill="#1f2328">uvicorn on winloop</text>
+<rect x="230.0" y="179.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="294.0" y="198.0" font-size="11.5" fill="#1f2328" text-anchor="middle">C (libuv)</text>
+<rect x="364.0" y="179.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="428.0" y="198.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Cython</text>
+<rect x="498.0" y="179.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="562.0" y="198.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python (h11)</text>
+<rect x="632.0" y="179.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="696.0" y="198.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="766.0" y="179.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="198.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="24.0" y="234.0" font-size="12.5" fill="#1f2328">uvicorn on rloop / rsloop</text>
+<rect x="230.0" y="217.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="294.0" y="236.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="364.0" y="217.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="428.0" y="236.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="498.0" y="217.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="562.0" y="236.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python (h11)</text>
+<rect x="632.0" y="217.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="696.0" y="236.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="766.0" y="217.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="236.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="24.0" y="272.0" font-size="12.5" fill="#1f2328" font-weight="600">uvicorn on cadeloop</text>
+<rect x="230.0" y="255.0" width="128.0" height="28.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="294.0" y="274.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="364.0" y="255.0" width="128.0" height="28.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="428.0" y="274.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="498.0" y="255.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="562.0" y="274.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python (h11)</text>
+<rect x="632.0" y="255.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="696.0" y="274.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="766.0" y="255.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="274.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="24.0" y="310.0" font-size="12.5" fill="#1f2328">granian</text>
+<rect x="230.0" y="293.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="294.0" y="312.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust (tokio)</text>
+<rect x="364.0" y="293.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="428.0" y="312.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust + uvloop</text>
+<rect x="498.0" y="293.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="562.0" y="312.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust (hyper)</text>
+<rect x="632.0" y="293.0" width="128.0" height="28.0" rx="6" fill="#ebe3fb" stroke="#8250df" stroke-width="1"/>
+<text x="696.0" y="312.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="766.0" y="293.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="312.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<text x="24.0" y="348.0" font-size="12.5" fill="#1f2328" font-weight="600">cadeloop serve()</text>
+<rect x="230.0" y="331.0" width="128.0" height="28.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="294.0" y="350.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="364.0" y="331.0" width="128.0" height="28.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="428.0" y="350.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="498.0" y="331.0" width="128.0" height="28.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="562.0" y="350.0" font-size="11.5" fill="#1f2328" text-anchor="middle">C (llhttp)</text>
+<rect x="632.0" y="331.0" width="128.0" height="28.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="696.0" y="350.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Rust</text>
+<rect x="766.0" y="331.0" width="128.0" height="28.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1"/>
+<text x="830.0" y="350.0" font-size="11.5" fill="#1f2328" text-anchor="middle">Python</text>
+<rect x="230.0" y="382.0" width="14.0" height="12.0" rx="3" fill="#dde7fb"/>
+<text x="250.0" y="392.0" font-size="11.5" fill="#4b535d">Python</text>
+<rect x="310.6" y="382.0" width="14.0" height="12.0" rx="3" fill="#ebe3fb"/>
+<text x="330.6" y="392.0" font-size="11.5" fill="#4b535d">compiled: C, Cython or Rust</text>
+<rect x="526.5" y="382.0" width="14.0" height="12.0" rx="3" fill="#d3f1ec"/>
+<text x="546.5" y="392.0" font-size="11.5" fill="#4b535d">compiled: cadeloop</text>
+</svg>

@@ -1,0 +1,1330 @@
+{
+ "bench-linux-table-http": {
+  "title": "HTTP requests per second · Linux",
+  "subtitle": "64 keep-alive connections unless noted · one worker per server · median of 3 runs",
+  "columns": [
+   "workload",
+   "cadeloop serve()",
+   "granian",
+   "uvicorn[standard]",
+   "uvicorn + cadeloop",
+   "uvicorn + uvloop",
+   "uvicorn + asyncio",
+   "hypercorn"
+  ],
+  "rows": [
+   {
+    "label": "plaintext",
+    "cells": [
+     {
+      "text": "117 K",
+      "best": true
+     },
+     {
+      "text": "48.7 K"
+     },
+     {
+      "text": "24.5 K"
+     },
+     {
+      "text": "9.60 K"
+     },
+     {
+      "text": "6.39 K"
+     },
+     {
+      "text": "5.30 K"
+     },
+     {
+      "text": "3.57 K"
+     }
+    ]
+   },
+   {
+    "label": "plaintext, 1 connection",
+    "cells": [
+     {
+      "text": "28.1 K",
+      "best": true
+     },
+     {
+      "text": "7.95 K"
+     },
+     {
+      "text": "12.8 K"
+     },
+     {
+      "text": "5.59 K"
+     },
+     {
+      "text": "6.31 K"
+     },
+     {
+      "text": "5.34 K"
+     },
+     {
+      "text": "3.33 K"
+     }
+    ]
+   },
+   {
+    "label": "JSON",
+    "cells": [
+     {
+      "text": "49.9 K",
+      "best": true
+     },
+     {
+      "text": "27.4 K"
+     },
+     {
+      "text": "13.7 K"
+     },
+     {
+      "text": "7.87 K"
+     },
+     {
+      "text": "5.86 K"
+     },
+     {
+      "text": "5.44 K"
+     },
+     {
+      "text": "3.38 K"
+     }
+    ]
+   },
+   {
+    "label": "64 KiB body",
+    "cells": [
+     {
+      "text": "30.9 K",
+      "best": true
+     },
+     {
+      "text": "28.7 K"
+     },
+     {
+      "text": "18.4 K"
+     },
+     {
+      "text": "6.94 K"
+     },
+     {
+      "text": "6.07 K"
+     },
+     {
+      "text": "5.41 K"
+     },
+     {
+      "text": "3.48 K"
+     }
+    ]
+   },
+   {
+    "label": "1 MiB stream (16 conns)",
+    "cells": [
+     {
+      "text": "2.05 K",
+      "best": true
+     },
+     {
+      "text": "1.76 K"
+     },
+     {
+      "text": "1.12 K"
+     },
+     {
+      "text": "1.03 K"
+     },
+     {
+      "text": "620"
+     },
+     {
+      "text": "591"
+     },
+     {
+      "text": "395"
+     }
+    ]
+   },
+   {
+    "label": "16 KiB upload",
+    "cells": [
+     {
+      "text": "61.7 K",
+      "best": true
+     },
+     {
+      "text": "16.6 K"
+     },
+     {
+      "text": "15.4 K"
+     },
+     {
+      "text": "7.12 K"
+     },
+     {
+      "text": "5.26 K"
+     },
+     {
+      "text": "4.26 K"
+     },
+     {
+      "text": "3.25 K"
+     }
+    ]
+   },
+   {
+    "label": "1 ms await",
+    "cells": [
+     {
+      "text": "29.9 K",
+      "best": true
+     },
+     {
+      "text": "28.9 K"
+     },
+     {
+      "text": "17.9 K"
+     },
+     {
+      "text": "9.52 K"
+     },
+     {
+      "text": "6.34 K"
+     },
+     {
+      "text": "5.23 K"
+     },
+     {
+      "text": "3.81 K"
+     }
+    ]
+   },
+   {
+    "label": "conn per request (16)",
+    "cells": [
+     {
+      "text": "16.9 K",
+      "best": true
+     },
+     {
+      "text": "12.8 K"
+     },
+     {
+      "text": "10.5 K"
+     },
+     {
+      "text": "5.21 K"
+     },
+     {
+      "text": "4.13 K"
+     },
+     {
+      "text": "4.17 K"
+     },
+     {
+      "text": "2.19 K"
+     }
+    ]
+   },
+   {
+    "label": "pipelined ×16",
+    "cells": [
+     {
+      "text": "320 K",
+      "best": true
+     },
+     {
+      "text": "50.5 K"
+     },
+     {
+      "text": "21.7 K"
+     },
+     {
+      "text": "9.30 K"
+     },
+     {
+      "text": "6.63 K"
+     },
+     {
+      "text": "5.79 K"
+     },
+     {
+      "text": "4.36 K"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-linux-table-ws": {
+  "title": "WebSocket echo · Linux",
+  "subtitle": "messages per second, p99 round trip in small type",
+  "columns": [
+   "workload",
+   "cadeloop",
+   "granian",
+   "uvicorn[standard]",
+   "uvicorn + uvloop",
+   "uvicorn + asyncio",
+   "hypercorn"
+  ],
+  "rows": [
+   {
+    "label": "64 B, 1 connection",
+    "cells": [
+     {
+      "text": "27.7 K",
+      "sub": "91 µs",
+      "best": true
+     },
+     {
+      "text": "6.80 K",
+      "sub": "328 µs"
+     },
+     {
+      "text": "12.1 K",
+      "sub": "291 µs"
+     },
+     {
+      "text": "10.3 K",
+      "sub": "260 µs"
+     },
+     {
+      "text": "5.78 K",
+      "sub": "463 µs"
+     },
+     {
+      "text": "6.49 K",
+      "sub": "467 µs"
+     }
+    ]
+   },
+   {
+    "label": "64 B, 64 connections",
+    "cells": [
+     {
+      "text": "114 K",
+      "sub": "1.28 ms",
+      "best": true
+     },
+     {
+      "text": "50.6 K",
+      "sub": "2.95 ms"
+     },
+     {
+      "text": "19.2 K",
+      "sub": "5.70 ms"
+     },
+     {
+      "text": "22.6 K",
+      "sub": "5.31 ms"
+     },
+     {
+      "text": "10.3 K",
+      "sub": "10.88 ms"
+     },
+     {
+      "text": "11.6 K",
+      "sub": "8.78 ms"
+     }
+    ]
+   },
+   {
+    "label": "16 KiB, 16 connections",
+    "cells": [
+     {
+      "text": "42.1 K",
+      "sub": "967 µs",
+      "best": true
+     },
+     {
+      "text": "27.5 K",
+      "sub": "1.47 ms"
+     },
+     {
+      "text": "16.4 K",
+      "sub": "1.87 ms"
+     },
+     {
+      "text": "12.8 K",
+      "sub": "2.88 ms"
+     },
+     {
+      "text": "7.57 K",
+      "sub": "3.74 ms"
+     },
+     {
+      "text": "7.38 K",
+      "sub": "3.70 ms"
+     }
+    ]
+   },
+   {
+    "label": "1 KiB stream, 32 in flight ×16",
+    "cells": [
+     {
+      "text": "380 K",
+      "sub": "4.59 ms",
+      "best": true
+     },
+     {
+      "text": "35.4 K",
+      "sub": "22.02 ms"
+     },
+     {
+      "text": "39.7 K",
+      "sub": "21.76 ms"
+     },
+     {
+      "text": "28.8 K",
+      "sub": "39.32 ms"
+     },
+     {
+      "text": "29.4 K",
+      "sub": "33.03 ms"
+     },
+     {
+      "text": "23.0 K",
+      "sub": "43.52 ms"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-linux-table-tls": {
+  "title": "TLS · Linux",
+  "subtitle": "requests per second, p99 in small type · every server uses Python's ssl module, except granian (Rust)",
+  "columns": [
+   "workload",
+   "cadeloop",
+   "granian",
+   "uvicorn[standard]",
+   "uvicorn + uvloop",
+   "uvicorn + asyncio"
+  ],
+  "rows": [
+   {
+    "label": "plaintext, 64 keep-alive conns",
+    "cells": [
+     {
+      "text": "65.0 K",
+      "sub": "2.13 ms",
+      "best": true
+     },
+     {
+      "text": "45.4 K",
+      "sub": "3.24 ms"
+     },
+     {
+      "text": "15.4 K",
+      "sub": "7.86 ms"
+     },
+     {
+      "text": "5.88 K",
+      "sub": "16.52 ms"
+     },
+     {
+      "text": "5.21 K",
+      "sub": "19.92 ms"
+     }
+    ]
+   },
+   {
+    "label": "new connection per request (16)",
+    "cells": [
+     {
+      "text": "1.11 K",
+      "sub": "9.04 ms",
+      "best": true
+     },
+     {
+      "text": "1.06 K",
+      "sub": "18.35 ms"
+     },
+     {
+      "text": "763",
+      "sub": "5.96 ms"
+     },
+     {
+      "text": "690",
+      "sub": "6.16 ms"
+     },
+     {
+      "text": "753",
+      "sub": "14.42 ms"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-linux-table-echo": {
+  "title": "TCP echo, the loop alone · Linux",
+  "subtitle": "the same asyncio.Protocol on every loop · messages per second, p99 in small type",
+  "columns": [
+   "workload",
+   "cadeloop",
+   "uvloop",
+   "rloop",
+   "rsloop",
+   "asyncio"
+  ],
+  "rows": [
+   {
+    "label": "1 KiB, 1 connection",
+    "cells": [
+     {
+      "text": "33.7 K",
+      "sub": "76 µs",
+      "best": true
+     },
+     {
+      "text": "24.2 K",
+      "sub": "85 µs"
+     },
+     {
+      "text": "23.6 K",
+      "sub": "88 µs"
+     },
+     {
+      "text": "24.6 K",
+      "sub": "85 µs"
+     },
+     {
+      "text": "20.4 K",
+      "sub": "109 µs"
+     }
+    ]
+   },
+   {
+    "label": "1 KiB, 64 connections",
+    "cells": [
+     {
+      "text": "170 K",
+      "sub": "975 µs"
+     },
+     {
+      "text": "149 K",
+      "sub": "1.05 ms"
+     },
+     {
+      "text": "171 K",
+      "sub": "827 µs",
+      "best": true
+     },
+     {
+      "text": "150 K",
+      "sub": "975 µs"
+     },
+     {
+      "text": "115 K",
+      "sub": "1.46 ms"
+     }
+    ]
+   },
+   {
+    "label": "1 KiB, 16 in flight ×64",
+    "cells": [
+     {
+      "text": "352 K",
+      "sub": "14.94 ms"
+     },
+     {
+      "text": "366 K",
+      "sub": "18.09 ms"
+     },
+     {
+      "text": "366 K",
+      "sub": "18.87 ms"
+     },
+     {
+      "text": "381 K",
+      "sub": "13.63 ms",
+      "best": true
+     },
+     {
+      "text": "379 K",
+      "sub": "14.68 ms"
+     }
+    ]
+   },
+   {
+    "label": "64 KiB, 8 connections",
+    "cells": [
+     {
+      "text": "31.9 K",
+      "sub": "803 µs"
+     },
+     {
+      "text": "39.1 K",
+      "sub": "483 µs"
+     },
+     {
+      "text": "42.0 K",
+      "sub": "401 µs",
+      "best": true
+     },
+     {
+      "text": "36.1 K",
+      "sub": "406 µs"
+     },
+     {
+      "text": "37.7 K",
+      "sub": "541 µs"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-linux-table-plaintext": {
+  "title": "Plaintext HTTP in detail · Linux",
+  "subtitle": "64 connections · CPU is user + kernel time of the server's processes per request",
+  "columns": [
+   "server",
+   "req/s",
+   "p50",
+   "p99",
+   "p99.9",
+   "CPU / request",
+   "peak memory",
+   "threads"
+  ],
+  "rows": [
+   {
+    "label": "cadeloop serve()",
+    "cells": [
+     {
+      "text": "117 K",
+      "best": true
+     },
+     {
+      "text": "479 µs",
+      "best": true
+     },
+     {
+      "text": "1.28 ms",
+      "best": true
+     },
+     {
+      "text": "2.33 ms",
+      "best": true
+     },
+     {
+      "text": "8.4 µs",
+      "best": true
+     },
+     {
+      "text": "25 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "granian",
+    "cells": [
+     {
+      "text": "48.7 K"
+     },
+     {
+      "text": "1.31 ms"
+     },
+     {
+      "text": "2.92 ms"
+     },
+     {
+      "text": "5.37 ms"
+     },
+     {
+      "text": "31.5 µs"
+     },
+     {
+      "text": "25 MiB"
+     },
+     {
+      "text": "6"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn[standard]",
+    "cells": [
+     {
+      "text": "24.5 K"
+     },
+     {
+      "text": "2.49 ms"
+     },
+     {
+      "text": "4.92 ms"
+     },
+     {
+      "text": "7.73 ms"
+     },
+     {
+      "text": "40.3 µs"
+     },
+     {
+      "text": "24 MiB"
+     },
+     {
+      "text": "5"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + cadeloop",
+    "cells": [
+     {
+      "text": "9.60 K"
+     },
+     {
+      "text": "6.42 ms"
+     },
+     {
+      "text": "10.49 ms"
+     },
+     {
+      "text": "15.99 ms"
+     },
+     {
+      "text": "103.2 µs"
+     },
+     {
+      "text": "31 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + uvloop",
+    "cells": [
+     {
+      "text": "6.39 K"
+     },
+     {
+      "text": "9.31 ms"
+     },
+     {
+      "text": "15.20 ms"
+     },
+     {
+      "text": "22.81 ms"
+     },
+     {
+      "text": "155.1 µs"
+     },
+     {
+      "text": "23 MiB"
+     },
+     {
+      "text": "5"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + asyncio",
+    "cells": [
+     {
+      "text": "5.30 K"
+     },
+     {
+      "text": "11.67 ms"
+     },
+     {
+      "text": "18.09 ms"
+     },
+     {
+      "text": "26.74 ms"
+     },
+     {
+      "text": "187.1 µs"
+     },
+     {
+      "text": "21 MiB",
+      "best": true
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "hypercorn",
+    "cells": [
+     {
+      "text": "3.57 K"
+     },
+     {
+      "text": "16.52 ms"
+     },
+     {
+      "text": "26.48 ms"
+     },
+     {
+      "text": "33.29 ms"
+     },
+     {
+      "text": "278.2 µs"
+     },
+     {
+      "text": "21 MiB",
+      "best": true
+     },
+     {
+      "text": "1"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-linux-table-idle": {
+  "title": "Idle keep-alive connections · Linux",
+  "subtitle": "each of 5,000 connections made one request and was held open · unique memory (USS) of the server",
+  "columns": [
+   "server",
+   "at rest",
+   "holding 5,000",
+   "per connection",
+   "after they close",
+   "fds / conn"
+  ],
+  "rows": [
+   {
+    "label": "cadeloop serve()",
+    "cells": [
+     {
+      "text": "23 MiB"
+     },
+     {
+      "text": "64 MiB"
+     },
+     {
+      "text": "7.2 KiB"
+     },
+     {
+      "text": "33 MiB",
+      "best": true
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "granian",
+    "cells": [
+     {
+      "text": "–"
+     },
+     {
+      "text": "–"
+     },
+     {
+      "text": "–"
+     },
+     {
+      "text": "–"
+     },
+     {
+      "text": "–"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn[standard]",
+    "cells": [
+     {
+      "text": "24 MiB"
+     },
+     {
+      "text": "61 MiB"
+     },
+     {
+      "text": "6.2 KiB"
+     },
+     {
+      "text": "48 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + cadeloop",
+    "cells": [
+     {
+      "text": "28 MiB"
+     },
+     {
+      "text": "99 MiB"
+     },
+     {
+      "text": "11.7 KiB"
+     },
+     {
+      "text": "70 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + uvloop",
+    "cells": [
+     {
+      "text": "23 MiB"
+     },
+     {
+      "text": "57 MiB"
+     },
+     {
+      "text": "5.6 KiB"
+     },
+     {
+      "text": "45 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + asyncio",
+    "cells": [
+     {
+      "text": "20 MiB",
+      "best": true
+     },
+     {
+      "text": "54 MiB",
+      "best": true
+     },
+     {
+      "text": "5.5 KiB",
+      "best": true
+     },
+     {
+      "text": "53 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "hypercorn",
+    "cells": [
+     {
+      "text": "20 MiB",
+      "best": true
+     },
+     {
+      "text": "88 MiB"
+     },
+     {
+      "text": "11.2 KiB"
+     },
+     {
+      "text": "88 MiB"
+     },
+     {
+      "text": "0.94"
+     }
+    ]
+   }
+  ],
+  "notes": [
+   "granian accepted about 648 of the 5,000 connections with its default settings (256 timed out), so it has no comparable figure here."
+  ]
+ },
+ "bench-linux-table-timers": {
+  "title": "Timers and wake-ups · Linux",
+  "subtitle": "how late asyncio.sleep(d) returns on an idle loop (median / p99) · call_soon_threadsafe() into a sleeping loop",
+  "columns": [
+   "loop",
+   "sleep(1 ms)",
+   "sleep(5 ms)",
+   "sleep(10 ms)",
+   "cross-thread wake-up"
+  ],
+  "rows": [
+   {
+    "label": "cadeloop",
+    "cells": [
+     {
+      "text": "+0.13 / 0.37 ms"
+     },
+     {
+      "text": "+0.29 / 0.49 ms"
+     },
+     {
+      "text": "+0.32 / 1.89 ms"
+     },
+     {
+      "text": "93 / 642 µs"
+     }
+    ]
+   },
+   {
+    "label": "uvloop",
+    "cells": [
+     {
+      "text": "+0.16 / 0.98 ms"
+     },
+     {
+      "text": "+0.20 / 1.57 ms"
+     },
+     {
+      "text": "+0.25 / 0.46 ms"
+     },
+     {
+      "text": "95 / 617 µs"
+     }
+    ]
+   },
+   {
+    "label": "rloop",
+    "cells": [
+     {
+      "text": "+0.12 / 0.32 ms"
+     },
+     {
+      "text": "+0.17 / 33.26 ms"
+     },
+     {
+      "text": "+0.18 / 0.28 ms"
+     },
+     {
+      "text": "78 / 1034 µs",
+      "best": true
+     }
+    ]
+   },
+   {
+    "label": "rsloop",
+    "cells": [
+     {
+      "text": "+0.07 / 0.27 ms",
+      "best": true
+     },
+     {
+      "text": "+0.13 / 0.36 ms",
+      "best": true
+     },
+     {
+      "text": "+0.14 / 0.31 ms",
+      "best": true
+     },
+     {
+      "text": "94 / 320 µs"
+     }
+    ]
+   },
+   {
+    "label": "asyncio",
+    "cells": [
+     {
+      "text": "+0.16 / 0.28 ms"
+     },
+     {
+      "text": "+0.22 / 0.65 ms"
+     },
+     {
+      "text": "+0.24 / 0.46 ms"
+     },
+     {
+      "text": "123 / 599 µs"
+     }
+    ]
+   }
+  ],
+  "notes": [
+   "Highlighted: the lowest median in each column."
+  ]
+ },
+ "bench-linux-table-sched": {
+  "title": "Scheduling microbenchmarks · Linux",
+  "subtitle": "millions of operations per second · median of 15 runs, a fresh process each",
+  "columns": [
+   "benchmark",
+   "cadeloop",
+   "uvloop",
+   "rloop",
+   "rsloop",
+   "asyncio"
+  ],
+  "rows": [
+   {
+    "label": "task_fib",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "0.096",
+      "best": true
+     },
+     {
+      "text": "0.081"
+     },
+     {
+      "text": "0.088"
+     },
+     {
+      "text": "0.090"
+     },
+     {
+      "text": "0.056"
+     }
+    ]
+   },
+   {
+    "label": "call_soon_chain",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "3.412"
+     },
+     {
+      "text": "1.345"
+     },
+     {
+      "text": "3.456",
+      "best": true
+     },
+     {
+      "text": "1.939"
+     },
+     {
+      "text": "0.499"
+     }
+    ]
+   },
+   {
+    "label": "call_soon_burst",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "4.117",
+      "best": true
+     },
+     {
+      "text": "1.102"
+     },
+     {
+      "text": "2.536"
+     },
+     {
+      "text": "1.010"
+     },
+     {
+      "text": "0.710"
+     }
+    ]
+   },
+   {
+    "label": "timer_schedule_cancel",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "2.693",
+      "best": true
+     },
+     {
+      "text": "0.427"
+     },
+     {
+      "text": "1.683"
+     },
+     {
+      "text": "1.127"
+     },
+     {
+      "text": "0.492"
+     }
+    ]
+   },
+   {
+    "label": "timer_fire",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "2.219",
+      "best": true
+     },
+     {
+      "text": "1.136"
+     },
+     {
+      "text": "1.344"
+     },
+     {
+      "text": "0.988"
+     },
+     {
+      "text": "0.258"
+     }
+    ]
+   },
+   {
+    "label": "sleep0_chain",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "1.653",
+      "best": true
+     },
+     {
+      "text": "0.846"
+     },
+     {
+      "text": "1.496"
+     },
+     {
+      "text": "0.961"
+     },
+     {
+      "text": "0.368"
+     }
+    ]
+   },
+   {
+    "label": "task_spawn",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "0.262",
+      "best": true
+     },
+     {
+      "text": "0.252"
+     },
+     {
+      "text": "0.255"
+     },
+     {
+      "text": "0.254"
+     },
+     {
+      "text": "0.180"
+     }
+    ]
+   },
+   {
+    "label": "threadsafe_throughput",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "3.528"
+     },
+     {
+      "text": "1.734"
+     },
+     {
+      "text": "3.674",
+      "best": true
+     },
+     {
+      "text": "3.439"
+     },
+     {
+      "text": "0.060"
+     }
+    ]
+   },
+   {
+    "label": "future_chain",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "1.202",
+      "best": true
+     },
+     {
+      "text": "0.514"
+     },
+     {
+      "text": "0.869"
+     },
+     {
+      "text": "0.610"
+     },
+     {
+      "text": "0.210"
+     }
+    ]
+   },
+   {
+    "label": "gather_fanin",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "0.269",
+      "best": true
+     },
+     {
+      "text": "0.231"
+     },
+     {
+      "text": "0.243"
+     },
+     {
+      "text": "0.242"
+     },
+     {
+      "text": "0.153"
+     }
+    ]
+   },
+   {
+    "label": "queue_pingpong",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "1.134"
+     },
+     {
+      "text": "1.051"
+     },
+     {
+      "text": "1.150",
+      "best": true
+     },
+     {
+      "text": "1.129"
+     },
+     {
+      "text": "1.001"
+     }
+    ]
+   },
+   {
+    "label": "queue_pingpong_native",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "2.764"
+     },
+     {
+      "text": "2.710"
+     },
+     {
+      "text": "2.887",
+      "best": true
+     },
+     {
+      "text": "2.358"
+     },
+     {
+      "text": "2.041"
+     }
+    ]
+   }
+  ]
+ }
+}

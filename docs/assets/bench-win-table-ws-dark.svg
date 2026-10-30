@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 767 248" width="767" height="248" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>WebSocket echo · Windows 11</title>
+<rect width="767" height="248" fill="#0B0D11" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#ffffff">WebSocket echo · Windows 11</text>
+<text x="24" y="62" font-size="12" fill="#c9d1d9">messages per second, p99 round trip in small type</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#c9d1d9">workload</text>
+<text x="336.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">cadeloop</text>
+<text x="473.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">uvicorn + winloop</text>
+<text x="609.0" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">uvicorn + asyncio</text>
+<text x="729.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">hypercorn</text>
+<line x1="24" y1="106.0" x2="743.2" y2="106.0" stroke="#232830" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#ffffff">64 B, 1 connection</text>
+<rect x="254.3" y="110.0" width="90.6" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="336.9" y="125.5" font-size="11" text-anchor="end" fill="#1d5a50">45 µs</text>
+<text x="302.8" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">48.3 K</text>
+<text x="473.1" y="125.5" font-size="11" text-anchor="end" fill="#8b949e">133 µs</text>
+<text x="432.9" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">22.8 K</text>
+<text x="609.0" y="125.5" font-size="11" text-anchor="end" fill="#8b949e">137 µs</text>
+<text x="568.8" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">17.7 K</text>
+<text x="729.2" y="125.5" font-size="11" text-anchor="end" fill="#8b949e">160 µs</text>
+<text x="689.0" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">15.5 K</text>
+<line x1="24" y1="136.0" x2="743.2" y2="136.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#ffffff">64 B, 64 connections</text>
+<rect x="248.1" y="140.0" width="96.7" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="336.9" y="155.5" font-size="11" text-anchor="end" fill="#1d5a50">999 µs</text>
+<text x="296.7" y="155.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">77.8 K</text>
+<text x="473.1" y="155.5" font-size="11" text-anchor="end" fill="#8b949e">3.93 ms</text>
+<text x="427.5" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">43.3 K</text>
+<text x="609.0" y="155.5" font-size="11" text-anchor="end" fill="#8b949e">4.52 ms</text>
+<text x="563.4" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">31.3 K</text>
+<text x="729.2" y="155.5" font-size="11" text-anchor="end" fill="#8b949e">3.18 ms</text>
+<text x="683.6" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">26.3 K</text>
+<line x1="24" y1="166.0" x2="743.2" y2="166.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#ffffff">16 KiB, 16 connections</text>
+<rect x="248.1" y="170.0" width="96.7" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="336.9" y="185.5" font-size="11" text-anchor="end" fill="#1d5a50">463 µs</text>
+<text x="296.7" y="185.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">47.6 K</text>
+<text x="473.1" y="185.5" font-size="11" text-anchor="end" fill="#8b949e">2.52 ms</text>
+<text x="427.5" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">21.0 K</text>
+<text x="609.0" y="185.5" font-size="11" text-anchor="end" fill="#8b949e">3.24 ms</text>
+<text x="563.4" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">18.5 K</text>
+<text x="729.2" y="185.5" font-size="11" text-anchor="end" fill="#8b949e">1.46 ms</text>
+<text x="683.6" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">15.4 K</text>
+<line x1="24" y1="196.0" x2="743.2" y2="196.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#ffffff">1 KiB stream, 32 in flight ×16</text>
+<rect x="246.9" y="200.0" width="98.0" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="336.9" y="215.5" font-size="11" text-anchor="end" fill="#1d5a50">1.67 ms</text>
+<text x="291.3" y="215.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">407 K</text>
+<text x="473.1" y="215.5" font-size="11" text-anchor="end" fill="#8b949e">17.56 ms</text>
+<text x="421.4" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">92.1 K</text>
+<text x="609.0" y="215.5" font-size="11" text-anchor="end" fill="#8b949e">19.14 ms</text>
+<text x="557.2" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">66.4 K</text>
+<text x="729.2" y="215.5" font-size="11" text-anchor="end" fill="#8b949e">12.06 ms</text>
+<text x="677.5" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">56.7 K</text>
+</svg>

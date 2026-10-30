@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 188" width="920" height="188" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>TLS · Linux</title>
+<rect width="920" height="188" fill="#fcfcfb" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">TLS · Linux</text>
+<text x="24" y="62" font-size="12" fill="#52514e">requests per second, p99 in small type · every server uses Python's ssl module, except granian (Rust)</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">workload</text>
+<text x="357.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">cadeloop</text>
+<text x="478.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">granian</text>
+<text x="617.3" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn[standard]</text>
+<text x="746.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn + uvloop</text>
+<text x="881.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn + asyncio</text>
+<line x1="24" y1="106.0" x2="895.9" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#0b0b0b">plaintext, 64 keep-alive conns</text>
+<rect x="263.8" y="110.0" width="102.1" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="357.9" y="125.5" font-size="11" text-anchor="end" fill="#24665c">2.13 ms</text>
+<text x="312.3" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">65.0 K</text>
+<text x="478.2" y="125.5" font-size="11" text-anchor="end" fill="#898781">3.24 ms</text>
+<text x="432.6" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">45.4 K</text>
+<text x="617.3" y="125.5" font-size="11" text-anchor="end" fill="#898781">7.86 ms</text>
+<text x="571.7" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">15.4 K</text>
+<text x="746.1" y="125.5" font-size="11" text-anchor="end" fill="#898781">16.52 ms</text>
+<text x="694.3" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.88 K</text>
+<text x="881.9" y="125.5" font-size="11" text-anchor="end" fill="#898781">19.92 ms</text>
+<text x="830.2" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.21 K</text>
+<line x1="24" y1="136.0" x2="895.9" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">new connection per request (16)</text>
+<rect x="263.8" y="140.0" width="102.1" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="357.9" y="155.5" font-size="11" text-anchor="end" fill="#24665c">9.04 ms</text>
+<text x="312.3" y="155.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">1.11 K</text>
+<text x="478.2" y="155.5" font-size="11" text-anchor="end" fill="#898781">18.35 ms</text>
+<text x="426.4" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.06 K</text>
+<text x="617.3" y="155.5" font-size="11" text-anchor="end" fill="#898781">5.96 ms</text>
+<text x="571.7" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">763</text>
+<text x="746.1" y="155.5" font-size="11" text-anchor="end" fill="#898781">6.16 ms</text>
+<text x="700.5" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">690</text>
+<text x="881.9" y="155.5" font-size="11" text-anchor="end" fill="#898781">14.42 ms</text>
+<text x="830.2" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">753</text>
+</svg>

@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 380" width="820" height="380" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Three requests, one thread</title>
+<defs><pattern id="h0" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern><pattern id="h1" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern><pattern id="h2" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern><pattern id="h3" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern><pattern id="h4" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern><pattern id="h5" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern><pattern id="h6" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#232830"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b434d" stroke-width="2.2"/></pattern></defs>
+<rect width="820" height="380" rx="10" fill="#0B0D11"/>
+<text x="24.0" y="34.0" font-size="16" fill="#e6edf3" font-weight="600">Three requests, one thread</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#b1bac4">Each request does a little work, waits 80 ms for a database, then does a little more.</text>
+<text x="24.0" y="92.0" font-size="13" fill="#e6edf3" font-weight="600">Blocking code: one request at a time</text>
+<rect x="96.0" y="104.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="114.5" y="119.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">A</text>
+<rect x="133.0" y="104.0" width="148.0" height="22.0" rx="4" fill="url(#h0)"/>
+<text x="207.0" y="119.0" font-size="11" fill="#b1bac4" text-anchor="middle">waiting</text>
+<rect x="281.0" y="104.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="299.5" y="119.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">A</text>
+<rect x="318.0" y="104.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="336.5" y="119.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">B</text>
+<rect x="355.0" y="104.0" width="148.0" height="22.0" rx="4" fill="url(#h1)"/>
+<rect x="503.0" y="104.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="521.5" y="119.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">B</text>
+<rect x="540.0" y="104.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="558.5" y="119.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">C</text>
+<rect x="577.0" y="104.0" width="148.0" height="22.0" rx="4" fill="url(#h2)"/>
+<rect x="725.0" y="104.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="743.5" y="119.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">C</text>
+<line x1="762.0" y1="98.0" x2="762.0" y2="132.0" stroke="#ff8a82" stroke-width="2"/>
+<text x="756.0" y="146.0" font-size="11.5" fill="#ff8a82" font-weight="600" text-anchor="end">all done at 360 ms</text>
+<text x="24.0" y="180.0" font-size="13" fill="#e6edf3" font-weight="600">Event loop: while one request waits, the thread runs another</text>
+<text x="78.0" y="207.0" font-size="12" fill="#b1bac4" font-weight="600" text-anchor="end">A</text>
+<rect x="96.0" y="192.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="114.5" y="207.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">A</text>
+<rect x="133.0" y="192.0" width="148.0" height="22.0" rx="4" fill="url(#h3)"/>
+<rect x="281.0" y="192.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="299.5" y="207.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">A</text>
+<text x="78.0" y="237.0" font-size="12" fill="#b1bac4" font-weight="600" text-anchor="end">B</text>
+<rect x="133.0" y="222.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="151.5" y="237.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">B</text>
+<rect x="170.0" y="222.0" width="148.0" height="22.0" rx="4" fill="url(#h4)"/>
+<rect x="318.0" y="222.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="336.5" y="237.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">B</text>
+<text x="78.0" y="267.0" font-size="12" fill="#b1bac4" font-weight="600" text-anchor="end">C</text>
+<rect x="170.0" y="252.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="188.5" y="267.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">C</text>
+<rect x="207.0" y="252.0" width="148.0" height="22.0" rx="4" fill="url(#h5)"/>
+<rect x="355.0" y="252.0" width="37.0" height="22.0" rx="4" fill="#79a5f2"/>
+<text x="373.5" y="267.0" font-size="11" fill="#0B0D11" font-weight="600" text-anchor="middle">C</text>
+<text x="78.0" y="303.0" font-size="11.5" fill="#b1bac4" text-anchor="end">thread</text>
+<rect x="96.0" y="290.0" width="111.0" height="18.0" rx="4" fill="#79a5f2"/>
+<rect x="281.0" y="290.0" width="111.0" height="18.0" rx="4" fill="#79a5f2"/>
+<rect x="207.0" y="290.0" width="74.0" height="18.0" rx="4" fill="#1c2129"/>
+<text x="244.0" y="303.0" font-size="10.5" fill="#8b949e" text-anchor="middle">idle</text>
+<line x1="392.0" y1="186.0" x2="392.0" y2="312.0" stroke="#57d47a" stroke-width="2"/>
+<text x="400.0" y="306.0" font-size="11.5" fill="#57d47a" font-weight="600">all done at 160 ms</text>
+<line x1="96.0" y1="336.0" x2="762.0" y2="336.0" stroke="#3b434d" stroke-width="1.2"/>
+<line x1="96.0" y1="336.0" x2="96.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="96.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">0 ms</text>
+<line x1="170.0" y1="336.0" x2="170.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="170.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">40 ms</text>
+<line x1="244.0" y1="336.0" x2="244.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="244.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">80 ms</text>
+<line x1="318.0" y1="336.0" x2="318.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="318.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">120 ms</text>
+<line x1="392.0" y1="336.0" x2="392.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="392.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">160 ms</text>
+<line x1="466.0" y1="336.0" x2="466.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="466.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">200 ms</text>
+<line x1="540.0" y1="336.0" x2="540.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="540.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">240 ms</text>
+<line x1="614.0" y1="336.0" x2="614.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="614.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">280 ms</text>
+<line x1="688.0" y1="336.0" x2="688.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="688.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">320 ms</text>
+<line x1="762.0" y1="336.0" x2="762.0" y2="340.0" stroke="#3b434d" stroke-width="1.2"/>
+<text x="762.0" y="353.0" font-size="10.5" fill="#8b949e" text-anchor="middle">360 ms</text>
+<rect x="470.0" y="356.0" width="14.0" height="12.0" rx="3" fill="#79a5f2"/>
+<text x="490.0" y="366.0" font-size="11.5" fill="#b1bac4">running Python code</text>
+<rect x="634.4" y="356.0" width="14.0" height="12.0" rx="4" fill="url(#h6)"/>
+<text x="654.4" y="366.0" font-size="11.5" fill="#b1bac4">waiting for I/O</text>
+</svg>

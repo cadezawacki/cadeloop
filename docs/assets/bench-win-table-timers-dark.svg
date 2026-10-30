@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 723 236" width="723" height="236" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>Timers and wake-ups · Windows 11</title>
+<rect width="723" height="236" fill="#0B0D11" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#ffffff">Timers and wake-ups · Windows 11</text>
+<text x="24" y="62" font-size="12" fill="#c9d1d9">how late asyncio.sleep(d) returns on an idle loop (median / p99) · call_soon_threadsafe() into a parked loop</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#c9d1d9">loop</text>
+<text x="238.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">sleep(1 ms)</text>
+<text x="383.4" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">sleep(5 ms)</text>
+<text x="520.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">sleep(10 ms)</text>
+<text x="684.7" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">cross-thread wakeup</text>
+<line x1="24" y1="106.0" x2="698.7" y2="106.0" stroke="#232830" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#ffffff">cadeloop</text>
+<rect x="128.3" y="110.0" width="117.8" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="238.1" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">+0.55 / 0.88 ms</text>
+<rect x="273.6" y="110.0" width="117.8" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="383.4" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">+0.40 / 0.63 ms</text>
+<rect x="411.1" y="110.0" width="117.8" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="520.9" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">+0.31 / 0.82 ms</text>
+<rect x="601.2" y="110.0" width="91.5" height="22" rx="6" fill="#a5e6da" stroke="#c6f2ea" stroke-width="1"/>
+<text x="684.7" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#02261f">16 / 117 µs</text>
+<line x1="24" y1="136.0" x2="698.7" y2="136.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#ffffff">winloop</text>
+<text x="238.1" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">+14.49 / 15.41 ms</text>
+<text x="383.4" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">+10.73 / 15.17 ms</text>
+<text x="520.9" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">+6.00 / 12.47 ms</text>
+<text x="684.7" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">19 / 66 µs</text>
+<line x1="24" y1="166.0" x2="698.7" y2="166.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#ffffff">asyncio</text>
+<text x="238.1" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">+14.33 / 15.51 ms</text>
+<text x="383.4" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">+10.82 / 15.22 ms</text>
+<text x="520.9" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">+5.88 / 11.31 ms</text>
+<text x="684.7" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">68 / 162 µs</text>
+<text x="24" y="218.0" font-size="11" fill="#8b949e">Highlighted: the lowest median in each column.</text>
+</svg>

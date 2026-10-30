@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 326" width="860" height="326" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Measure several times, and rotate the order</title>
+<rect width="860" height="326" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">Measure several times, and rotate the order</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">Two runs of the same thing differ. Machine state drifts during a session, too.</text>
+<text x="24.0" y="122.0" font-size="12.5" fill="#1f2328" font-weight="600">server A</text>
+<rect x="351.2" y="110.0" width="135.2" height="16.0" rx="4" fill="#dde7fb"/>
+<rect x="349.2" y="106.0" width="4.0" height="24.0" rx="2" fill="#3a6fd8"/>
+<rect x="484.4" y="106.0" width="4.0" height="24.0" rx="2" fill="#3a6fd8"/>
+<rect x="419.4" y="106.0" width="4.0" height="24.0" rx="2" fill="#3a6fd8"/>
+<rect x="418.4" y="102.0" width="6.0" height="32.0" rx="2" fill="#1f2328"/>
+<text x="596.0" y="122.0" font-size="11.5" fill="#4b535d">median 63.9 K, range 61.2–66.4 K</text>
+<text x="24.0" y="186.0" font-size="12.5" fill="#1f2328" font-weight="600">server B</text>
+<rect x="270.6" y="174.0" width="174.2" height="16.0" rx="4" fill="#dde7fb"/>
+<rect x="442.8" y="170.0" width="4.0" height="24.0" rx="2" fill="#3a6fd8"/>
+<rect x="268.6" y="170.0" width="4.0" height="24.0" rx="2" fill="#3a6fd8"/>
+<rect x="383.0" y="170.0" width="4.0" height="24.0" rx="2" fill="#3a6fd8"/>
+<rect x="382.0" y="166.0" width="6.0" height="32.0" rx="2" fill="#1f2328"/>
+<text x="596.0" y="186.0" font-size="11.5" fill="#4b535d">median 62.5 K, range 58.1–64.8 K</text>
+<line x1="190.0" y1="236.0" x2="580.0" y2="236.0" stroke="#c8ced6" stroke-width="1.2"/>
+<text x="190.0" y="252.0" font-size="10.5" fill="#7d8590" text-anchor="middle">55 K</text>
+<text x="320.0" y="252.0" font-size="10.5" fill="#7d8590" text-anchor="middle">60 K</text>
+<text x="450.0" y="252.0" font-size="10.5" fill="#7d8590" text-anchor="middle">65 K</text>
+<text x="580.0" y="252.0" font-size="10.5" fill="#7d8590" text-anchor="middle">70 K</text>
+<text x="24.0" y="282.0" font-size="11.5" fill="#4b535d">The ranges overlap, so with one run each, either server could come out ahead.</text>
+<text x="24.0" y="297.0" font-size="11.5" fill="#4b535d">Report the median of several runs with the range next to it.</text>
+<text x="830.0" y="298.0" font-size="10.5" fill="#7d8590" font-style="italic" text-anchor="end">illustrative numbers</text>
+</svg>

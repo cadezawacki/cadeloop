@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 284" width="880" height="284" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>One tick, step by step</title>
+<defs><pattern id="h0" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#eceff2"/><line x1="0" y1="0" x2="0" y2="7" stroke="#c8ced6" stroke-width="2.2"/></pattern><pattern id="h1" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#eceff2"/><line x1="0" y1="0" x2="0" y2="7" stroke="#c8ced6" stroke-width="2.2"/></pattern></defs>
+<rect width="880" height="284" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">One tick, step by step</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">The loop holds the GIL for the whole tick except the wait, so other Python threads run while it sleeps.</text>
+<rect x="30.0" y="130.0" width="92.0" height="44.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<text x="76.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">flush</text>
+<text x="76.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">send writes left</text>
+<text x="76.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">from last tick</text>
+<rect x="126.0" y="130.0" width="100.0" height="44.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<text x="176.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">prepare</text>
+<text x="176.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">work from other</text>
+<text x="176.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">threads, timeout</text>
+<rect x="230.0" y="130.0" width="152.0" height="44.0" rx="6" fill="url(#h0)"/>
+<text x="306.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">wait for I/O</text>
+<text x="306.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">spin a little,</text>
+<text x="306.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">then sleep</text>
+<rect x="386.0" y="130.0" width="92.0" height="44.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<text x="432.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">translate</text>
+<text x="432.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">completions</text>
+<text x="432.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">become events</text>
+<rect x="482.0" y="130.0" width="100.0" height="44.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="532.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">callbacks</text>
+<text x="532.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">everything that</text>
+<text x="532.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">was ready</text>
+<rect x="586.0" y="130.0" width="100.0" height="44.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="636.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">I/O events</text>
+<text x="636.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">protocols and</text>
+<text x="636.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">HTTP requests</text>
+<rect x="690.0" y="130.0" width="72.0" height="44.0" rx="6" fill="#dde7fb" stroke="#3a6fd8" stroke-width="1.2"/>
+<text x="726.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">timers</text>
+<text x="726.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">the ones</text>
+<text x="726.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">that came due</text>
+<rect x="766.0" y="130.0" width="86.0" height="44.0" rx="6" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<text x="809.0" y="157.0" font-size="12.5" fill="#1f2328" font-weight="600" text-anchor="middle">flush</text>
+<text x="809.0" y="196.0" font-size="11" fill="#4b535d" text-anchor="middle">send this</text>
+<text x="809.0" y="210.0" font-size="11" fill="#4b535d" text-anchor="middle">tick's writes</text>
+<text x="30.0" y="104.0" font-size="11.5" fill="#4b535d" font-weight="600">GIL</text>
+<rect x="30.0" y="110.0" width="92.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<rect x="126.0" y="110.0" width="100.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<rect x="230.0" y="110.0" width="152.0" height="8.0" rx="3" fill="#fbe6d2" stroke="#c4620c" stroke-width="1"/>
+<rect x="386.0" y="110.0" width="92.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<rect x="482.0" y="110.0" width="100.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<rect x="586.0" y="110.0" width="100.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<rect x="690.0" y="110.0" width="72.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<rect x="766.0" y="110.0" width="86.0" height="8.0" rx="3" fill="#3a6fd8"/>
+<text x="306.0" y="101.0" font-size="11" fill="#c4620c" font-weight="600" text-anchor="middle">released</text>
+<rect x="30.0" y="244.0" width="14.0" height="12.0" rx="3" fill="#d3f1ec"/>
+<text x="50.0" y="254.0" font-size="11.5" fill="#4b535d">cadeloop (Rust)</text>
+<rect x="168.6" y="244.0" width="14.0" height="12.0" rx="3" fill="#dde7fb"/>
+<text x="188.6" y="254.0" font-size="11.5" fill="#4b535d">your Python code runs here</text>
+<rect x="378.0" y="244.0" width="14.0" height="12.0" rx="4" fill="url(#h1)"/>
+<text x="398.0" y="254.0" font-size="11.5" fill="#4b535d">waiting</text>
+</svg>

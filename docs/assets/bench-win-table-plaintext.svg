@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 812 278" width="812" height="278" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>Plaintext HTTP in detail · Windows 11</title>
+<rect width="812" height="278" fill="#fcfcfb" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">Plaintext HTTP in detail · Windows 11</text>
+<text x="24" y="62" font-size="12" fill="#52514e">64 connections · CPU is user + kernel time of the server process tree per request</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">server</text>
+<text x="224.0" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">req/s</text>
+<text x="302.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">p50</text>
+<text x="381.7" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">p99</text>
+<text x="468.3" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">p99.9</text>
+<text x="586.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">CPU / request</text>
+<text x="696.5" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">peak memory</text>
+<text x="774.4" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">threads</text>
+<line x1="24" y1="106.0" x2="788.4" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#0b0b0b">cadeloop serve()</text>
+<rect x="175.5" y="110.0" width="56.5" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="224.0" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">78.0 K</text>
+<rect x="250.8" y="110.0" width="60.1" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="302.9" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">819 µs</text>
+<rect x="329.6" y="110.0" width="60.1" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="381.7" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">991 µs</text>
+<rect x="409.4" y="110.0" width="66.8" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="468.3" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">1.75 ms</text>
+<rect x="529.9" y="110.0" width="64.2" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="586.1" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">12.8 µs</text>
+<text x="696.5" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">33 MiB</text>
+<text x="774.4" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">5</text>
+<line x1="24" y1="136.0" x2="788.4" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">uvicorn + cadeloop</text>
+<text x="224.0" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">18.4 K</text>
+<text x="302.9" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">3.38 ms</text>
+<text x="381.7" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.05 ms</text>
+<text x="468.3" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.77 ms</text>
+<text x="586.1" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">54.1 µs</text>
+<text x="696.5" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">37 MiB</text>
+<text x="774.4" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">5</text>
+<line x1="24" y1="166.0" x2="788.4" y2="166.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#0b0b0b">uvicorn + winloop</text>
+<text x="224.0" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">18.0 K</text>
+<text x="302.9" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">3.44 ms</text>
+<text x="381.7" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">6.95 ms</text>
+<text x="468.3" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.73 ms</text>
+<text x="586.1" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">55.3 µs</text>
+<text x="696.5" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">61 MiB</text>
+<text x="774.4" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">12</text>
+<line x1="24" y1="196.0" x2="788.4" y2="196.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#0b0b0b">uvicorn + asyncio</text>
+<text x="224.0" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">10.8 K</text>
+<text x="302.9" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.83 ms</text>
+<text x="381.7" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.01 ms</text>
+<text x="468.3" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">10.09 ms</text>
+<text x="586.1" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">92.2 µs</text>
+<text x="696.5" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">29 MiB</text>
+<text x="774.4" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">5</text>
+<line x1="24" y1="226.0" x2="788.4" y2="226.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="245.5" font-size="13" fill="#0b0b0b">hypercorn</text>
+<text x="224.0" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.6 K</text>
+<text x="302.9" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">8.39 ms</text>
+<text x="381.7" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">9.96 ms</text>
+<text x="468.3" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">13.11 ms</text>
+<text x="586.1" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">131.5 µs</text>
+<rect x="644.0" y="230.0" width="60.5" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="696.5" y="245.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">28 MiB</text>
+<text x="774.4" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">5</text>
+</svg>

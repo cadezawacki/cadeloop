@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 594 488" width="594" height="488" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>Scheduling microbenchmarks · Linux</title>
+<rect width="594" height="488" fill="#fcfcfb" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">Scheduling microbenchmarks · Linux</text>
+<text x="24" y="62" font-size="12" fill="#52514e">millions of operations per second · median of 15 runs, a fresh process each</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">benchmark</text>
+<text x="283.5" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">cadeloop</text>
+<text x="350.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvloop</text>
+<text x="413.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">rloop</text>
+<text x="481.3" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">rsloop</text>
+<text x="555.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">asyncio</text>
+<line x1="24" y1="106.0" x2="569.9" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">task_fib</text>
+<rect x="240.5" y="110.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">0.096</text>
+<text x="350.9" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.081</text>
+<text x="413.9" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.088</text>
+<text x="481.3" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.090</text>
+<text x="555.9" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.056</text>
+<line x1="24" y1="136.0" x2="569.9" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">call_soon_chain</text>
+<text x="283.5" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">3.412</text>
+<text x="350.9" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.345</text>
+<rect x="370.9" y="140.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="413.9" y="155.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">3.456</text>
+<text x="481.3" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.939</text>
+<text x="555.9" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.499</text>
+<line x1="24" y1="166.0" x2="569.9" y2="166.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">call_soon_burst</text>
+<rect x="240.5" y="170.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="185.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">4.117</text>
+<text x="350.9" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.102</text>
+<text x="413.9" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">2.536</text>
+<text x="481.3" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.010</text>
+<text x="555.9" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.710</text>
+<line x1="24" y1="196.0" x2="569.9" y2="196.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">timer_schedule_cancel</text>
+<rect x="240.5" y="200.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="215.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">2.693</text>
+<text x="350.9" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.427</text>
+<text x="413.9" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.683</text>
+<text x="481.3" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.127</text>
+<text x="555.9" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.492</text>
+<line x1="24" y1="226.0" x2="569.9" y2="226.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="245.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">timer_fire</text>
+<rect x="240.5" y="230.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="245.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">2.219</text>
+<text x="350.9" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.136</text>
+<text x="413.9" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.344</text>
+<text x="481.3" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.988</text>
+<text x="555.9" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.258</text>
+<line x1="24" y1="256.0" x2="569.9" y2="256.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="275.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">sleep0_chain</text>
+<rect x="240.5" y="260.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">1.653</text>
+<text x="350.9" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.846</text>
+<text x="413.9" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.496</text>
+<text x="481.3" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.961</text>
+<text x="555.9" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.368</text>
+<line x1="24" y1="286.0" x2="569.9" y2="286.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="305.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">task_spawn</text>
+<rect x="240.5" y="290.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="305.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">0.262</text>
+<text x="350.9" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.252</text>
+<text x="413.9" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.255</text>
+<text x="481.3" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.254</text>
+<text x="555.9" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.180</text>
+<line x1="24" y1="316.0" x2="569.9" y2="316.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="335.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">threadsafe_throughput</text>
+<text x="283.5" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">3.528</text>
+<text x="350.9" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.734</text>
+<rect x="370.9" y="320.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="413.9" y="335.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">3.674</text>
+<text x="481.3" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">3.439</text>
+<text x="555.9" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.060</text>
+<line x1="24" y1="346.0" x2="569.9" y2="346.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="365.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">future_chain</text>
+<rect x="240.5" y="350.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="365.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">1.202</text>
+<text x="350.9" y="365.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.514</text>
+<text x="413.9" y="365.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.869</text>
+<text x="481.3" y="365.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.610</text>
+<text x="555.9" y="365.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.210</text>
+<line x1="24" y1="376.0" x2="569.9" y2="376.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="395.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">gather_fanin</text>
+<rect x="240.5" y="380.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="283.5" y="395.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">0.269</text>
+<text x="350.9" y="395.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.231</text>
+<text x="413.9" y="395.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.243</text>
+<text x="481.3" y="395.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.242</text>
+<text x="555.9" y="395.5" font-size="13" text-anchor="end" fill="#0b0b0b">0.153</text>
+<line x1="24" y1="406.0" x2="569.9" y2="406.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="425.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">queue_pingpong</text>
+<text x="283.5" y="425.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.134</text>
+<text x="350.9" y="425.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.051</text>
+<rect x="370.9" y="410.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="413.9" y="425.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">1.150</text>
+<text x="481.3" y="425.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.129</text>
+<text x="555.9" y="425.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.001</text>
+<line x1="24" y1="436.0" x2="569.9" y2="436.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="455.5" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#0b0b0b">queue_pingpong_native</text>
+<text x="283.5" y="455.5" font-size="13" text-anchor="end" fill="#0b0b0b">2.764</text>
+<text x="350.9" y="455.5" font-size="13" text-anchor="end" fill="#0b0b0b">2.710</text>
+<rect x="370.9" y="440.0" width="51.0" height="22" rx="6" fill="#c9efe8" stroke="#8fd8cb" stroke-width="1"/>
+<text x="413.9" y="455.5" font-size="13" text-anchor="end" font-weight="700" fill="#03332d">2.887</text>
+<text x="481.3" y="455.5" font-size="13" text-anchor="end" fill="#0b0b0b">2.358</text>
+<text x="555.9" y="455.5" font-size="13" text-anchor="end" fill="#0b0b0b">2.041</text>
+</svg>
