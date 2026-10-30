@@ -496,13 +496,13 @@ import in this container and is excluded.)
 Current Windows numbers -- HTTP, WebSocket, TLS, TCP echo, timers,
 scheduling, memory per connection, overload and recovery, with charts --
 are in the [top-level README](../README.md#windows-11-iocp), measured with
-the native harness in [`bench/windows/`](../bench/windows/README.md);
-methodology in [benchmarks.md](benchmarks.md#windows). The summary data
+the native harness in [`bench/suite/`](../bench/suite/README.md);
+methodology in [benchmarks.md](benchmarks.md#windows-environment). The summary data
 behind them is in [`bench/baselines/windows-2026-10/`](../bench/baselines/windows-2026-10/).
 
 The figures that stood here until October 2026 (cadeloop-native 34.7 K
 req/s, 64-connection echo 41.2 K msg/s, single-connection echo 30 µs p50)
-came from the Python load generator that [benchmarks.md](benchmarks.md#trap-1--the-load-generator-was-the-bottleneck)
+came from the Python load generator that [benchmarks.md](benchmarks.md#trap-1-the-load-generator-was-the-bottleneck)
 shows to be GIL-bound, and are superseded. On the same machine, the native
 generator measured cadeloop-native at 73.7 K req/s for the then-current
 1.0.1 build -- but only with the host's network-filtering software paused:

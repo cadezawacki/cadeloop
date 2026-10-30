@@ -7,7 +7,7 @@ L4  Python user code / ASGI app
 L3  python/cadeloop: Loop facade, EventLoopPolicy, Config, CLI     [Python]
 L2  crates/pyshim: CoreLoop/Handle bindings, HTTP+ASGI engine (M2) [Rust/PyO3]
 L1  crates/core::reactor: completion dispatch, timer heap, queues  [Rust]
-L0  crates/core::backend: IOCP | RIO (M3) | portable-dev           [Rust]
+L0  crates/core::backend: IOCP | RIO | epoll (Linux) | portable   [Rust]
 ```
 
 ## Crate split
@@ -89,13 +89,21 @@ container-of recovery, generation-checked). State machine
 recycles only after its completion is reaped, `CancelIoEx` tolerates
 `ERROR_NOT_FOUND`, and stale completions are debug-fatal / release-ignored.
 
-## Portable dev backend
+## Linux, and the portable backend
 
-Non-Windows hosts get a condvar-based completion queue good for timers,
-`call_soon`, and `call_soon_threadsafe` — enough to develop and
-conformance-test L1/L3 anywhere. It implements no socket ops and is never
-published (wheels are cp311-win_amd64 only, R-110). `backend="auto"|"iocp"|"rio"`
-all resolve to it off-Windows.
+On Linux every `backend` value resolves to the epoll backend
+(`crates/core/src/backend/epoll.rs`). It emulates the IOCP operation
+surface over readiness: `post_*` makes the syscall at once (an inline
+completion, as with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`), and on
+`EWOULDBLOCK` parks the op until epoll reports the descriptor ready, then
+finishes it and emits the same `Completion` events IOCP would. L1 to L3
+therefore run the same code on both platforms, sockets included, and Linux
+wheels (manylinux2014) are published.
+
+Other hosts (macOS, the BSDs) get the portable backend: a condvar-based
+completion queue that handles timers, `call_soon` and
+`call_soon_threadsafe`, enough to develop and test loop semantics anywhere.
+It has no socket operations and is not published.
 
 ## Facade fast paths (R-050)
 

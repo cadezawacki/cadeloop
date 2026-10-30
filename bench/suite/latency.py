@@ -1,13 +1,14 @@
-"""Timer and cross-thread wakeup latency on Windows event loops.
+"""Timer and cross-thread wakeup latency per event loop (Windows or Linux).
 
-  python bench/windows/latency.py --pkg baseline=PATH --pkg candidate=PATH --out timers.json
+  python bench/suite/latency.py --pkg candidate=PATH --out timers.json
 
 Per loop, in a fresh process each:
   * overshoot of asyncio.sleep(d) past d on an idle loop, d = 0.5..50 ms
   * the same while another task keeps the loop busy with short callbacks
   * call_soon_threadsafe(): another thread's call until the callback runs,
     with the loop parked
-Times are perf_counter (QueryPerformanceCounter) deltas in milliseconds.
+Times are perf_counter deltas in milliseconds (QueryPerformanceCounter on
+Windows, CLOCK_MONOTONIC on Linux).
 """
 
 import argparse
@@ -21,11 +22,9 @@ import asyncio, json, random, sys, threading, time
 
 name = sys.argv[1]
 if name == "asyncio":
-    loop = asyncio.ProactorEventLoop()
-elif name == "winloop":
-    import winloop; loop = winloop.new_event_loop()
+    loop = asyncio.new_event_loop()
 else:
-    import cadeloop; loop = cadeloop.new_event_loop()
+    loop = __import__(name).new_event_loop()
 asyncio.set_event_loop(loop)
 
 def stats(xs):
@@ -87,7 +86,8 @@ def main():
     pkgs = dict(p.split("=", 1) for p in a.pkg)
     runs = [(f"cadeloop[{n}]", "cadeloop", p) for n, p in pkgs.items()]
     anyp = next(iter(pkgs.values()))
-    runs += [("winloop", "winloop", anyp), ("asyncio", "asyncio", anyp)]
+    others = ("winloop", "asyncio") if os.name == "nt" else ("uvloop", "rloop", "rsloop", "asyncio")
+    runs += [(name, name, anyp) for name in others]
     out = {}
     for label, kind, pkg in runs:
         env = dict(os.environ, PYTHONPATH=pkg)

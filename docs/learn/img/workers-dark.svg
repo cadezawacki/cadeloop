@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 360" width="900" height="360" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Running several worker processes</title>
+<rect width="900" height="360" rx="10" fill="#0B0D11"/>
+<text x="24.0" y="34.0" font-size="16" fill="#e6edf3" font-weight="600">Running several worker processes</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#b1bac4">One worker per CPU. How a new connection reaches a worker differs between Linux and Windows.</text>
+<text x="24.0" y="92.0" font-size="13" fill="#e6edf3" font-weight="600">Linux: fork, one listener each</text>
+<rect x="120.0" y="104.0" width="240.0" height="52.0" rx="8" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="240.0" y="124.0" font-size="12" fill="#e6edf3" text-anchor="middle">supervisor</text>
+<text x="240.0" y="139.0" font-size="12" fill="#e6edf3" text-anchor="middle">imports the app, then forks</text>
+<line x1="240.0" y1="158.0" x2="104.6" y2="194.7" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M100.0,196.0 L104.2,191.7 L105.8,197.5 z" fill="#b1bac4"/>
+<rect x="40.0" y="198.0" width="120.0" height="52.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="100.0" y="218.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">worker 1</text>
+<text x="100.0" y="233.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">listens on :8000</text>
+<line x1="100.0" y1="300.0" x2="100.0" y2="258.8" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M100.0,254.0 L103.0,259.2 L97.0,259.2 z" fill="#36c2b6"/>
+<line x1="240.0" y1="158.0" x2="240.0" y2="191.2" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M240.0,196.0 L237.0,190.8 L243.0,190.8 z" fill="#b1bac4"/>
+<rect x="180.0" y="198.0" width="120.0" height="52.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="240.0" y="218.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">worker 2</text>
+<text x="240.0" y="233.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">listens on :8000</text>
+<line x1="240.0" y1="300.0" x2="240.0" y2="258.8" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M240.0,254.0 L243.0,259.2 L237.0,259.2 z" fill="#36c2b6"/>
+<line x1="240.0" y1="158.0" x2="375.4" y2="194.7" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M380.0,196.0 L374.2,197.5 L375.8,191.7 z" fill="#b1bac4"/>
+<rect x="320.0" y="198.0" width="120.0" height="52.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="380.0" y="218.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">worker 3</text>
+<text x="380.0" y="233.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">listens on :8000</text>
+<line x1="380.0" y1="300.0" x2="380.0" y2="258.8" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M380.0,254.0 L383.0,259.2 L377.0,259.2 z" fill="#36c2b6"/>
+<rect x="40.0" y="302.0" width="400.0" height="30.0" rx="8" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="240.0" y="322.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">kernel spreads new connections (SO_REUSEPORT)</text>
+<text x="484.0" y="92.0" font-size="13" fill="#e6edf3" font-weight="600">Windows: one listener, connections handed over</text>
+<rect x="560.0" y="104.0" width="240.0" height="52.0" rx="8" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="680.0" y="124.0" font-size="12" fill="#e6edf3" text-anchor="middle">supervisor</text>
+<text x="680.0" y="139.0" font-size="12" fill="#e6edf3" text-anchor="middle">owns :8000 and accepts</text>
+<line x1="680.0" y1="158.0" x2="548.6" y2="194.7" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M544.0,196.0 L548.2,191.7 L549.8,197.5 z" fill="#36c2b6"/>
+<rect x="484.0" y="198.0" width="120.0" height="52.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="544.0" y="218.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">worker 1</text>
+<text x="544.0" y="233.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">imports the app</text>
+<line x1="680.0" y1="158.0" x2="680.0" y2="191.2" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M680.0,196.0 L677.0,190.8 L683.0,190.8 z" fill="#36c2b6"/>
+<rect x="620.0" y="198.0" width="120.0" height="52.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="680.0" y="218.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">worker 2</text>
+<text x="680.0" y="233.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">imports the app</text>
+<line x1="680.0" y1="158.0" x2="811.4" y2="194.7" stroke="#36c2b6" stroke-width="1.5"/>
+<path d="M816.0,196.0 L810.2,197.5 L811.8,191.7 z" fill="#36c2b6"/>
+<rect x="756.0" y="198.0" width="120.0" height="52.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="816.0" y="218.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">worker 3</text>
+<text x="816.0" y="233.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">imports the app</text>
+<text x="680.0" y="286.0" font-size="11.5" fill="#b1bac4" text-anchor="middle">each accepted socket is duplicated into a worker</text>
+<text x="680.0" y="301.0" font-size="11.5" fill="#b1bac4" text-anchor="middle">(WSADuplicateSocketW over a pipe)</text>
+</svg>

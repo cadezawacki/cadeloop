@@ -656,6 +656,10 @@ impl IoBackend for RioBackend {
         self.inner.detach_socket(socket);
     }
 
+    fn registers_buffers(&self) -> bool {
+        true
+    }
+
     fn register_buffers(&mut self, regions: &mut [(*mut u8, usize, &mut Option<u64>)]) -> io::Result<()> {
         for (ptr, len, cookie) in regions.iter_mut() {
             if cookie.is_some() {

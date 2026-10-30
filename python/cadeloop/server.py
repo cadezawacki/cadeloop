@@ -669,6 +669,7 @@ def _serve_single(
     loop = Loop(
         backend=config.backend,
         spin_us=config.spin_us,
+        adaptive_spin=config.adaptive_spin,
         high_water=config.write_high_water,
         low_water=config.write_low_water,
         accept_pool=config.accept_pool,

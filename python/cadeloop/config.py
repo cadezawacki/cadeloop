@@ -70,6 +70,15 @@ class Config:
     backend: str = "auto"  # R-020
     latency_mode: str = "balanced"  # R-060
     spin_us: int | None = None  # R-060 (None -> derived from latency_mode)
+    # R-060: spin only while spins are finding work, instead of before
+    # every park. A spin that nothing arrives during is spin_us of CPU
+    # burned for no gain, and under sparse traffic that is nearly all of
+    # them; the gate keeps spinning while more than about one spin in four
+    # finds work and, below that, probes one park in eight, so dense
+    # traffic reopens it within a few parks.
+    # None -> derived from latency_mode (on unless "spin", whose
+    # deployments have dedicated the core to it).
+    adaptive_spin: bool | None = None
     # R-060/R-035: put each HTTP response on the wire the moment it is
     # wire-ready instead of corking it until the tick's flush phase.
     # Corking is the throughput choice and stays the default; immediate
@@ -138,10 +147,10 @@ class Config:
                 raise TypeError(
                     f"{field} must be a bool, got {type(getattr(self, field)).__name__}"
                 )
-        if self.immediate_flush is not None and not isinstance(self.immediate_flush, bool):
-            raise TypeError(
-                f"immediate_flush must be a bool or None, got {type(self.immediate_flush).__name__}"
-            )
+        for field in ("adaptive_spin", "immediate_flush"):
+            value = getattr(self, field)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{field} must be a bool or None, got {type(value).__name__}")
         if self.backend not in _BACKENDS:
             raise ValueError(
                 f"backend must be one of {_BACKENDS}, got {self.backend!r}"
@@ -168,6 +177,8 @@ class Config:
             )
         if self.spin_us is None:
             self.spin_us = LATENCY_PRESETS[self.latency_mode]
+        if self.adaptive_spin is None:
+            self.adaptive_spin = self.latency_mode != "spin"
         if self.immediate_flush is None:
             self.immediate_flush = self.latency_mode == "spin"
         for field, (minimum, maximum) in _INT_FIELDS.items():

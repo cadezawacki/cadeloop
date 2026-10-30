@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 430" width="820" height="430" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>What happens at an await</title>
+<rect width="820" height="430" rx="10" fill="#0B0D11"/>
+<text x="24.0" y="34.0" font-size="16" fill="#e6edf3" font-weight="600">What happens at an await</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#b1bac4">A coroutine never blocks the thread. It hands the waiting to the loop and steps aside.</text>
+<rect x="65.0" y="76.0" width="170.0" height="34.0" rx="8" fill="#172a4f" stroke="#79a5f2" stroke-width="1.2"/>
+<text x="150.0" y="98.0" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="middle">your coroutine</text>
+<line x1="150.0" y1="110.0" x2="150.0" y2="410.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<rect x="325.0" y="76.0" width="170.0" height="34.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="410.0" y="98.0" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="middle">event loop</text>
+<line x1="410.0" y1="110.0" x2="410.0" y2="410.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<rect x="585.0" y="76.0" width="170.0" height="34.0" rx="8" fill="#232830" stroke="#8b949e" stroke-width="1.2"/>
+<text x="670.0" y="98.0" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="middle">operating system</text>
+<line x1="670.0" y1="110.0" x2="670.0" y2="410.0" stroke="#3b434d" stroke-width="1.2" stroke-dasharray="4 4"/>
+<rect x="144.0" y="122.0" width="12.0" height="40.0" rx="3" fill="#79a5f2"/>
+<line x1="156.0" y1="152.0" x2="398.4" y2="152.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M404.0,152.0 L397.9,155.5 L397.9,148.5 z" fill="#b1bac4"/>
+<text x="280.0" y="144.0" font-size="12" fill="#e6edf3" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">await reader.read()</text>
+<text x="280.0" y="168.0" font-size="11" fill="#8b949e" text-anchor="middle">suspend me until data comes</text>
+<line x1="416.0" y1="200.0" x2="658.4" y2="200.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M664.0,200.0 L657.9,203.5 L657.9,196.5 z" fill="#b1bac4"/>
+<text x="540.0" y="192.0" font-size="12" fill="#e6edf3" text-anchor="middle">watch this socket for me</text>
+<rect x="404.0" y="222.0" width="12.0" height="78.0" rx="3" fill="#36c2b6"/>
+<rect x="426.0" y="230.0" width="200.0" height="56.0" rx="8" fill="#0e3733" stroke="#36c2b6" stroke-width="1.2"/>
+<text x="526.0" y="254.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">runs other coroutines</text>
+<text x="526.0" y="269.0" font-size="11.5" fill="#e6edf3" text-anchor="middle">meanwhile</text>
+<line x1="664.0" y1="328.0" x2="421.6" y2="328.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M416.0,328.0 L422.1,324.5 L422.1,331.5 z" fill="#b1bac4"/>
+<text x="540.0" y="320.0" font-size="12" fill="#e6edf3" text-anchor="middle">data arrived</text>
+<line x1="404.0" y1="372.0" x2="161.6" y2="372.0" stroke="#b1bac4" stroke-width="1.5"/>
+<path d="M156.0,372.0 L162.1,368.5 L162.1,375.5 z" fill="#b1bac4"/>
+<text x="280.0" y="364.0" font-size="12" fill="#e6edf3" text-anchor="middle">resume, here is the data</text>
+<rect x="144.0" y="380.0" width="12.0" height="26.0" rx="3" fill="#79a5f2"/>
+<text x="166.0" y="398.0" font-size="11.5" fill="#b1bac4">carries on after the await</text>
+</svg>

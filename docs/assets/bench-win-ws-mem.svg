@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <rect width="760" height="380" fill="#fcfcfb" rx="8"/>
 <text x="24" y="34" font-size="16" font-weight="600" fill="#0b0b0b">WebSocket server memory under load (Windows 11)</text>
-<text x="24" y="54" font-size="12" fill="#52514e">peak private bytes of the server process tree, MiB; lower is better</text>
+<text x="24" y="54" font-size="12" fill="#52514e">peak private bytes of the server's processes, MiB; lower is better</text>
 <rect x="24.0" y="66" width="12" height="12" rx="3" fill="#13968e"/>
 <text x="41.0" y="76" font-size="12" fill="#52514e">cadeloop</text>
 <rect x="111.8" y="66" width="12" height="12" rx="3" fill="#008300"/>

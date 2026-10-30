@@ -1,0 +1,1150 @@
+{
+ "bench-win-table-http": {
+  "title": "HTTP requests per second · Windows 11",
+  "subtitle": "64 keep-alive connections unless noted · one worker per server · median of 3 runs",
+  "columns": [
+   "workload",
+   "cadeloop serve()",
+   "uvicorn + cadeloop",
+   "uvicorn + winloop",
+   "uvicorn + asyncio",
+   "hypercorn"
+  ],
+  "rows": [
+   {
+    "label": "plaintext",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "78.0 K",
+      "rank": 1
+     },
+     {
+      "text": "18.4 K",
+      "rank": 2
+     },
+     {
+      "text": "18.0 K",
+      "rank": 3
+     },
+     {
+      "text": "10.8 K"
+     },
+     {
+      "text": "7.6 K"
+     }
+    ]
+   },
+   {
+    "label": "plaintext, 1 connection",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "47.2 K",
+      "rank": 1
+     },
+     {
+      "text": "13.1 K",
+      "rank": 2
+     },
+     {
+      "text": "10.9 K",
+      "rank": 3
+     },
+     {
+      "text": "7.7 K"
+     },
+     {
+      "text": "5.8 K"
+     }
+    ]
+   },
+   {
+    "label": "JSON",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "57.8 K",
+      "rank": 1
+     },
+     {
+      "text": "16.0 K",
+      "rank": 2
+     },
+     {
+      "text": "15.9 K",
+      "rank": 3
+     },
+     {
+      "text": "10.0 K"
+     },
+     {
+      "text": "7.0 K"
+     }
+    ]
+   },
+   {
+    "label": "64 KiB body",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "41.2 K",
+      "rank": 1
+     },
+     {
+      "text": "14.5 K",
+      "rank": 3
+     },
+     {
+      "text": "14.9 K",
+      "rank": 2
+     },
+     {
+      "text": "8.9 K"
+     },
+     {
+      "text": "6.4 K"
+     }
+    ]
+   },
+   {
+    "label": "1 MiB stream (16 conns)",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "3.3 K",
+      "rank": 1
+     },
+     {
+      "text": "2.0 K",
+      "rank": 2
+     },
+     {
+      "text": "2.0 K",
+      "rank": 2
+     },
+     {
+      "text": "1.1 K"
+     },
+     {
+      "text": "858"
+     }
+    ]
+   },
+   {
+    "label": "16 KiB upload",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "61.1 K",
+      "rank": 1
+     },
+     {
+      "text": "13.0 K",
+      "rank": 2
+     },
+     {
+      "text": "12.8 K",
+      "rank": 3
+     },
+     {
+      "text": "9.1 K"
+     },
+     {
+      "text": "6.2 K"
+     }
+    ]
+   },
+   {
+    "label": "1 ms await",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "31.6 K",
+      "rank": 1
+     },
+     {
+      "text": "17.4 K",
+      "rank": 2
+     },
+     {
+      "text": "10.9 K",
+      "rank": 3
+     },
+     {
+      "text": "10.1 K"
+     },
+     {
+      "text": "7.0 K"
+     }
+    ]
+   },
+   {
+    "label": "conn per request (16)",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "24.1 K",
+      "rank": 1
+     },
+     {
+      "text": "8.6 K",
+      "rank": 3
+     },
+     {
+      "text": "9.2 K",
+      "rank": 2
+     },
+     {
+      "text": "4.7 K"
+     },
+     {
+      "text": "2.9 K"
+     }
+    ]
+   },
+   {
+    "label": "pipelined ×16",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "553 K",
+      "rank": 1
+     },
+     {
+      "text": "17.5 K",
+      "rank": 3
+     },
+     {
+      "text": "17.6 K",
+      "rank": 2
+     },
+     {
+      "text": "13.2 K"
+     },
+     {
+      "text": "7.7 K"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-win-table-plaintext": {
+  "title": "Plaintext HTTP in detail · Windows 11",
+  "subtitle": "64 connections · CPU is user + kernel time of the server process tree per request",
+  "columns": [
+   "server",
+   "req/s",
+   "p50",
+   "p99",
+   "p99.9",
+   "CPU / request",
+   "peak memory",
+   "threads"
+  ],
+  "rows": [
+   {
+    "label": "cadeloop serve()",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "78.0 K",
+      "rank": 1
+     },
+     {
+      "text": "819 µs",
+      "rank": 1
+     },
+     {
+      "text": "991 µs",
+      "rank": 1
+     },
+     {
+      "text": "1.75 ms",
+      "rank": 1
+     },
+     {
+      "text": "12.8 µs",
+      "rank": 1
+     },
+     {
+      "text": "33 MiB",
+      "rank": 3
+     },
+     {
+      "text": "5"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + cadeloop",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "18.4 K",
+      "rank": 2
+     },
+     {
+      "text": "3.38 ms",
+      "rank": 2
+     },
+     {
+      "text": "5.05 ms",
+      "rank": 2
+     },
+     {
+      "text": "5.77 ms",
+      "rank": 2
+     },
+     {
+      "text": "54.1 µs",
+      "rank": 2
+     },
+     {
+      "text": "37 MiB"
+     },
+     {
+      "text": "5"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + winloop",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "18.0 K",
+      "rank": 3
+     },
+     {
+      "text": "3.44 ms",
+      "rank": 3
+     },
+     {
+      "text": "6.95 ms",
+      "rank": 3
+     },
+     {
+      "text": "7.73 ms",
+      "rank": 3
+     },
+     {
+      "text": "55.3 µs",
+      "rank": 3
+     },
+     {
+      "text": "61 MiB"
+     },
+     {
+      "text": "12"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + asyncio",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "10.8 K"
+     },
+     {
+      "text": "5.83 ms"
+     },
+     {
+      "text": "7.01 ms"
+     },
+     {
+      "text": "10.09 ms"
+     },
+     {
+      "text": "92.2 µs"
+     },
+     {
+      "text": "29 MiB",
+      "rank": 2
+     },
+     {
+      "text": "5"
+     }
+    ]
+   },
+   {
+    "label": "hypercorn",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "7.6 K"
+     },
+     {
+      "text": "8.39 ms"
+     },
+     {
+      "text": "9.96 ms"
+     },
+     {
+      "text": "13.11 ms"
+     },
+     {
+      "text": "131.5 µs"
+     },
+     {
+      "text": "28 MiB",
+      "rank": 1
+     },
+     {
+      "text": "5"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-win-table-idle": {
+  "title": "Idle keep-alive connections · Windows 11",
+  "subtitle": "each connection made one request and was held open · private bytes of the server",
+  "columns": [
+   "server",
+   "at rest",
+   "holding 5,000",
+   "per connection",
+   "after they close",
+   "handles / conn"
+  ],
+  "rows": [
+   {
+    "label": "cadeloop serve()",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "30 MiB",
+      "rank": 3
+     },
+     {
+      "text": "68 MiB",
+      "rank": 1
+     },
+     {
+      "text": "6.6 KiB",
+      "rank": 2
+     },
+     {
+      "text": "42 MiB",
+      "rank": 1
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + cadeloop",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "36 MiB"
+     },
+     {
+      "text": "106 MiB",
+      "rank": 3
+     },
+     {
+      "text": "11.2 KiB",
+      "rank": 3
+     },
+     {
+      "text": "67 MiB",
+      "rank": 2
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + winloop",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "61 MiB"
+     },
+     {
+      "text": "98 MiB",
+      "rank": 2
+     },
+     {
+      "text": "6.4 KiB",
+      "rank": 1
+     },
+     {
+      "text": "79 MiB",
+      "rank": 3
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "uvicorn + asyncio",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "25 MiB",
+      "rank": 2
+     },
+     {
+      "text": "376 MiB"
+     },
+     {
+      "text": "57.9 KiB"
+     },
+     {
+      "text": "376 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   },
+   {
+    "label": "hypercorn",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "23 MiB",
+      "rank": 1
+     },
+     {
+      "text": "408 MiB"
+     },
+     {
+      "text": "63.0 KiB"
+     },
+     {
+      "text": "408 MiB"
+     },
+     {
+      "text": "1"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-win-table-ws": {
+  "title": "WebSocket echo · Windows 11",
+  "subtitle": "messages per second, p99 round trip in small type",
+  "columns": [
+   "workload",
+   "cadeloop",
+   "uvicorn + winloop",
+   "uvicorn + asyncio",
+   "hypercorn"
+  ],
+  "rows": [
+   {
+    "label": "64 B, 1 connection",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "48.3 K",
+      "sub": "45 µs",
+      "rank": 1
+     },
+     {
+      "text": "22.8 K",
+      "sub": "133 µs",
+      "rank": 2
+     },
+     {
+      "text": "17.7 K",
+      "sub": "137 µs",
+      "rank": 3
+     },
+     {
+      "text": "15.5 K",
+      "sub": "160 µs"
+     }
+    ]
+   },
+   {
+    "label": "64 B, 64 connections",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "77.8 K",
+      "sub": "999 µs",
+      "rank": 1
+     },
+     {
+      "text": "43.3 K",
+      "sub": "3.93 ms",
+      "rank": 2
+     },
+     {
+      "text": "31.3 K",
+      "sub": "4.52 ms",
+      "rank": 3
+     },
+     {
+      "text": "26.3 K",
+      "sub": "3.18 ms"
+     }
+    ]
+   },
+   {
+    "label": "16 KiB, 16 connections",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "47.6 K",
+      "sub": "463 µs",
+      "rank": 1
+     },
+     {
+      "text": "21.0 K",
+      "sub": "2.52 ms",
+      "rank": 2
+     },
+     {
+      "text": "18.5 K",
+      "sub": "3.24 ms",
+      "rank": 3
+     },
+     {
+      "text": "15.4 K",
+      "sub": "1.46 ms"
+     }
+    ]
+   },
+   {
+    "label": "1 KiB stream, 32 in flight ×16",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "407 K",
+      "sub": "1.67 ms",
+      "rank": 1
+     },
+     {
+      "text": "92.1 K",
+      "sub": "17.56 ms",
+      "rank": 2
+     },
+     {
+      "text": "66.4 K",
+      "sub": "19.14 ms",
+      "rank": 3
+     },
+     {
+      "text": "56.7 K",
+      "sub": "12.06 ms"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-win-table-tls": {
+  "title": "TLS 1.3 · Windows 11",
+  "subtitle": "requests per second, p99 in small type · Python's ssl module in every server",
+  "columns": [
+   "workload",
+   "cadeloop",
+   "uvicorn + winloop",
+   "uvicorn + asyncio"
+  ],
+  "rows": [
+   {
+    "label": "plaintext, 64 keep-alive conns",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "62.6 K",
+      "sub": "1.39 ms",
+      "rank": 1
+     },
+     {
+      "text": "15.7 K",
+      "sub": "7.93 ms",
+      "rank": 2
+     },
+     {
+      "text": "9.2 K",
+      "sub": "8.32 ms"
+     }
+    ]
+   },
+   {
+    "label": "new connection per request (16)",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "3.6 K",
+      "sub": "2.85 ms",
+      "rank": 1
+     },
+     {
+      "text": "2.3 K",
+      "sub": "4.59 ms",
+      "rank": 2
+     },
+     {
+      "text": "1.5 K",
+      "sub": "3.05 ms"
+     }
+    ]
+   }
+  ]
+ },
+ "bench-win-table-timers": {
+  "title": "Timers and wake-ups · Windows 11",
+  "subtitle": "how late asyncio.sleep(d) returns on an idle loop (median / p99) · call_soon_threadsafe() into a parked loop",
+  "columns": [
+   "loop",
+   "sleep(1 ms)",
+   "sleep(5 ms)",
+   "sleep(10 ms)",
+   "cross-thread wakeup"
+  ],
+  "rows": [
+   {
+    "label": "cadeloop",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "+0.55 / 0.88 ms",
+      "rank": 1
+     },
+     {
+      "text": "+0.40 / 0.63 ms",
+      "rank": 1
+     },
+     {
+      "text": "+0.31 / 0.82 ms",
+      "rank": 1
+     },
+     {
+      "text": "16 / 117 µs",
+      "rank": 1
+     }
+    ]
+   },
+   {
+    "label": "winloop",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "+14.49 / 15.41 ms"
+     },
+     {
+      "text": "+10.73 / 15.17 ms",
+      "rank": 2
+     },
+     {
+      "text": "+6.00 / 12.47 ms"
+     },
+     {
+      "text": "19 / 66 µs",
+      "rank": 2
+     }
+    ]
+   },
+   {
+    "label": "asyncio",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "+14.33 / 15.51 ms",
+      "rank": 2
+     },
+     {
+      "text": "+10.82 / 15.22 ms"
+     },
+     {
+      "text": "+5.88 / 11.31 ms",
+      "rank": 2
+     },
+     {
+      "text": "68 / 162 µs"
+     }
+    ]
+   }
+  ],
+  "notes": [
+   "Places go by the median in each column."
+  ]
+ },
+ "bench-win-table-echo": {
+  "title": "TCP echo, the loop alone · Windows 11",
+  "subtitle": "the same asyncio.Protocol on every loop · messages per second, p99 in small type",
+  "columns": [
+   "workload",
+   "cadeloop",
+   "winloop",
+   "rsloop",
+   "asyncio"
+  ],
+  "rows": [
+   {
+    "label": "1 KiB, 1 connection",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "51.8 K",
+      "sub": "41 µs",
+      "rank": 1
+     },
+     {
+      "text": "40.4 K",
+      "sub": "54 µs",
+      "rank": 2
+     },
+     {
+      "text": "40.4 K",
+      "sub": "48 µs",
+      "rank": 2
+     },
+     {
+      "text": "31.5 K",
+      "sub": "79 µs"
+     }
+    ]
+   },
+   {
+    "label": "1 KiB, 64 connections",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "84.4 K",
+      "sub": "909 µs",
+      "rank": 2
+     },
+     {
+      "text": "80.1 K",
+      "sub": "1.56 ms",
+      "rank": 3
+     },
+     {
+      "text": "87.7 K",
+      "sub": "958 µs",
+      "rank": 1
+     },
+     {
+      "text": "53.6 K",
+      "sub": "1.54 ms"
+     }
+    ]
+   },
+   {
+    "label": "1 KiB, 16 in flight ×64",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "346 K",
+      "sub": "3.44 ms",
+      "rank": 3
+     },
+     {
+      "text": "375 K",
+      "sub": "5.18 ms",
+      "rank": 2
+     },
+     {
+      "text": "457 K",
+      "sub": "2.49 ms",
+      "rank": 1
+     },
+     {
+      "text": "287 K",
+      "sub": "4.46 ms"
+     }
+    ]
+   },
+   {
+    "label": "64 KiB, 8 connections",
+    "label_code": false,
+    "cells": [
+     {
+      "text": "29.8 K",
+      "sub": "614 µs",
+      "rank": 3
+     },
+     {
+      "text": "26.8 K",
+      "sub": "745 µs"
+     },
+     {
+      "text": "43.7 K",
+      "sub": "324 µs",
+      "rank": 1
+     },
+     {
+      "text": "31.4 K",
+      "sub": "459 µs",
+      "rank": 2
+     }
+    ]
+   }
+  ]
+ },
+ "bench-win-table-sched": {
+  "title": "Scheduling microbenchmarks · Windows 11",
+  "subtitle": "millions of operations per second · median of 5 runs, fresh process each · hung = never finished (killed at 12 s)",
+  "columns": [
+   "benchmark",
+   "cadeloop",
+   "winloop",
+   "rsloop",
+   "asyncio"
+  ],
+  "rows": [
+   {
+    "label": "task_fib",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "0.194",
+      "rank": 2
+     },
+     {
+      "text": "0.186",
+      "rank": 3
+     },
+     {
+      "text": "0.196",
+      "rank": 1
+     },
+     {
+      "text": "0.125"
+     }
+    ]
+   },
+   {
+    "label": "call_soon_chain",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "11.027",
+      "rank": 1
+     },
+     {
+      "text": "2.347",
+      "rank": 3
+     },
+     {
+      "text": "9.785",
+      "rank": 2
+     },
+     {
+      "text": "0.906"
+     }
+    ]
+   },
+   {
+    "label": "call_soon_burst",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "12.652",
+      "rank": 1
+     },
+     {
+      "text": "1.596",
+      "rank": 2
+     },
+     {
+      "text": "hung"
+     },
+     {
+      "text": "1.170"
+     }
+    ]
+   },
+   {
+    "label": "timer_schedule_cancel",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "6.732",
+      "rank": 1
+     },
+     {
+      "text": "0.744"
+     },
+     {
+      "text": "hung"
+     },
+     {
+      "text": "0.910",
+      "rank": 2
+     }
+    ]
+   },
+   {
+    "label": "timer_fire",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "4.619",
+      "rank": 1
+     },
+     {
+      "text": "2.016",
+      "rank": 2
+     },
+     {
+      "text": "hung"
+     },
+     {
+      "text": "0.530"
+     }
+    ]
+   },
+   {
+    "label": "sleep0_chain",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "3.635",
+      "rank": 1
+     },
+     {
+      "text": "1.555",
+      "rank": 3
+     },
+     {
+      "text": "3.265",
+      "rank": 2
+     },
+     {
+      "text": "0.758"
+     }
+    ]
+   },
+   {
+    "label": "task_spawn",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "0.565",
+      "rank": 2
+     },
+     {
+      "text": "0.497",
+      "rank": 3
+     },
+     {
+      "text": "0.567",
+      "rank": 1
+     },
+     {
+      "text": "0.381"
+     }
+    ]
+   },
+   {
+    "label": "threadsafe_throughput",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "8.066",
+      "rank": 1
+     },
+     {
+      "text": "2.570",
+      "rank": 3
+     },
+     {
+      "text": "4.581",
+      "rank": 2
+     },
+     {
+      "text": "0.069"
+     }
+    ]
+   },
+   {
+    "label": "future_chain",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "2.725",
+      "rank": 2
+     },
+     {
+      "text": "0.945",
+      "rank": 3
+     },
+     {
+      "text": "2.820",
+      "rank": 1
+     },
+     {
+      "text": "0.405"
+     }
+    ]
+   },
+   {
+    "label": "gather_fanin",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "0.613",
+      "rank": 1
+     },
+     {
+      "text": "0.519",
+      "rank": 3
+     },
+     {
+      "text": "0.572",
+      "rank": 2
+     },
+     {
+      "text": "0.334"
+     }
+    ]
+   },
+   {
+    "label": "queue_pingpong",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "1.871",
+      "rank": 1
+     },
+     {
+      "text": "1.765",
+      "rank": 3
+     },
+     {
+      "text": "1.853",
+      "rank": 2
+     },
+     {
+      "text": "1.759"
+     }
+    ]
+   },
+   {
+    "label": "queue_pingpong_native",
+    "label_code": true,
+    "cells": [
+     {
+      "text": "6.055",
+      "rank": 1
+     },
+     {
+      "text": "5.369",
+      "rank": 3
+     },
+     {
+      "text": "5.927",
+      "rank": 2
+     },
+     {
+      "text": "4.977"
+     }
+    ]
+   }
+  ]
+ }
+}

@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 1388" width="760" height="1388" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<rect width="760" height="1388" fill="#fcfcfb" rx="8"/>
+<text x="24" y="34" font-size="16" font-weight="600" fill="#0b0b0b">Scheduling microbenchmarks (Linux)</text>
+<text x="24" y="54" font-size="12" fill="#52514e">throughput as a share of the fastest loop per benchmark; higher is better</text>
+<rect x="24.0" y="66" width="12" height="12" rx="3" fill="#13968e"/>
+<text x="41.0" y="76" font-size="12" fill="#52514e">cadeloop</text>
+<rect x="111.8" y="66" width="12" height="12" rx="3" fill="#008300"/>
+<text x="128.8" y="76" font-size="12" fill="#52514e">uvloop</text>
+<rect x="186.4" y="66" width="12" height="12" rx="3" fill="#eda100"/>
+<text x="203.4" y="76" font-size="12" fill="#52514e">rloop</text>
+<rect x="254.4" y="66" width="12" height="12" rx="3" fill="#e87ba4"/>
+<text x="271.4" y="76" font-size="12" fill="#52514e">rsloop</text>
+<rect x="329.0" y="66" width="12" height="12" rx="3" fill="#6250d6"/>
+<text x="346.0" y="76" font-size="12" fill="#52514e">asyncio</text>
+<text x="138" y="141.0" font-size="12" text-anchor="end" fill="#0b0b0b">task_fib</text>
+<line x1="150" y1="89" x2="150" y2="181" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,92.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="91.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="105" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,110.0 h452.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-452.0 z" fill="#008300"/><rect x="150.0" y="109.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,128.0 h492.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-492.6 z" fill="#eda100"/><rect x="150.0" y="127.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,146.0 h502.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-502.1 z" fill="#e87ba4"/><rect x="150.0" y="145.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,164.0 h311.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-311.8 z" fill="#6250d6"/><rect x="150.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="247.0" font-size="12" text-anchor="end" fill="#0b0b0b">call_soon_chain</text>
+<line x1="150" y1="195" x2="150" y2="287" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,198.0 h529.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-529.1 z" fill="#13968e"/><rect x="150.0" y="197.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="689.1" y="211" font-size="11" fill="#52514e">99%</text>
+<path d="M150.0,216.0 h206.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-206.1 z" fill="#008300"/><rect x="150.0" y="215.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,234.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#eda100"/><rect x="150.0" y="233.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,252.0 h299.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-299.0 z" fill="#e87ba4"/><rect x="150.0" y="251.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,270.0 h73.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-73.9 z" fill="#6250d6"/><rect x="150.0" y="269.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="353.0" font-size="12" text-anchor="end" fill="#0b0b0b">call_soon_burst</text>
+<line x1="150" y1="301" x2="150" y2="393" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,304.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="303.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="317" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,322.0 h140.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-140.5 z" fill="#008300"/><rect x="150.0" y="321.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,340.0 h328.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-328.7 z" fill="#eda100"/><rect x="150.0" y="339.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,358.0 h128.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-128.5 z" fill="#e87ba4"/><rect x="150.0" y="357.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,376.0 h89.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-89.1 z" fill="#6250d6"/><rect x="150.0" y="375.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="459.0" font-size="12" text-anchor="end" fill="#0b0b0b">timer_schedule_cancel</text>
+<line x1="150" y1="407" x2="150" y2="499" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,410.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="409.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="423" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,428.0 h81.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-81.7 z" fill="#008300"/><rect x="150.0" y="427.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,446.0 h333.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-333.5 z" fill="#eda100"/><rect x="150.0" y="445.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,464.0 h222.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-222.0 z" fill="#e87ba4"/><rect x="150.0" y="463.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,482.0 h94.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-94.6 z" fill="#6250d6"/><rect x="150.0" y="481.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="565.0" font-size="12" text-anchor="end" fill="#0b0b0b">timer_fire</text>
+<line x1="150" y1="513" x2="150" y2="605" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,516.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="515.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="529" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,534.0 h272.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-272.5 z" fill="#008300"/><rect x="150.0" y="533.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,552.0 h323.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-323.2 z" fill="#eda100"/><rect x="150.0" y="551.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,570.0 h236.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-236.3 z" fill="#e87ba4"/><rect x="150.0" y="569.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,588.0 h58.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-58.7 z" fill="#6250d6"/><rect x="150.0" y="587.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="671.0" font-size="12" text-anchor="end" fill="#0b0b0b">sleep0_chain</text>
+<line x1="150" y1="619" x2="150" y2="711" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,622.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="621.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="635" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,640.0 h272.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-272.4 z" fill="#008300"/><rect x="150.0" y="639.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,658.0 h484.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-484.7 z" fill="#eda100"/><rect x="150.0" y="657.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,676.0 h310.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-310.0 z" fill="#e87ba4"/><rect x="150.0" y="675.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,694.0 h116.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-116.3 z" fill="#6250d6"/><rect x="150.0" y="693.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="777.0" font-size="12" text-anchor="end" fill="#0b0b0b">task_spawn</text>
+<line x1="150" y1="725" x2="150" y2="817" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,728.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="727.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="741" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,746.0 h514.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-514.7 z" fill="#008300"/><rect x="150.0" y="745.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,764.0 h520.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-520.9 z" fill="#eda100"/><rect x="150.0" y="763.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,782.0 h519.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-519.1 z" fill="#e87ba4"/><rect x="150.0" y="781.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,800.0 h367.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-367.9 z" fill="#6250d6"/><rect x="150.0" y="799.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="883.0" font-size="12" text-anchor="end" fill="#0b0b0b">threadsafe_throughput</text>
+<line x1="150" y1="831" x2="150" y2="923" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,834.0 h514.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-514.5 z" fill="#13968e"/><rect x="150.0" y="833.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="674.5" y="847" font-size="11" fill="#52514e">96%</text>
+<path d="M150.0,852.0 h250.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-250.9 z" fill="#008300"/><rect x="150.0" y="851.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,870.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#eda100"/><rect x="150.0" y="869.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,888.0 h501.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-501.5 z" fill="#e87ba4"/><rect x="150.0" y="887.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,906.0 h4.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-4.8 z" fill="#6250d6"/><rect x="150.0" y="905.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="989.0" font-size="12" text-anchor="end" fill="#0b0b0b">future_chain</text>
+<line x1="150" y1="937" x2="150" y2="1029" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,940.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="939.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="953" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,958.0 h227.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-227.1 z" fill="#008300"/><rect x="150.0" y="957.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,976.0 h386.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-386.6 z" fill="#eda100"/><rect x="150.0" y="975.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,994.0 h270.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-270.1 z" fill="#e87ba4"/><rect x="150.0" y="993.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1012.0 h90.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-90.4 z" fill="#6250d6"/><rect x="150.0" y="1011.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="1095.0" font-size="12" text-anchor="end" fill="#0b0b0b">gather_fanin</text>
+<line x1="150" y1="1043" x2="150" y2="1135" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,1046.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="1045.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="1059" font-size="11" fill="#52514e">100%</text>
+<path d="M150.0,1064.0 h458.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-458.8 z" fill="#008300"/><rect x="150.0" y="1063.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1082.0 h484.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-484.4 z" fill="#eda100"/><rect x="150.0" y="1081.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1100.0 h480.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-480.7 z" fill="#e87ba4"/><rect x="150.0" y="1099.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1118.0 h302.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-302.5 z" fill="#6250d6"/><rect x="150.0" y="1117.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="1201.0" font-size="12" text-anchor="end" fill="#0b0b0b">queue_pingpong</text>
+<line x1="150" y1="1149" x2="150" y2="1241" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,1152.0 h528.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-528.2 z" fill="#13968e"/><rect x="150.0" y="1151.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="688.2" y="1165" font-size="11" fill="#52514e">99%</text>
+<path d="M150.0,1170.0 h489.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-489.6 z" fill="#008300"/><rect x="150.0" y="1169.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1188.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#eda100"/><rect x="150.0" y="1187.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1206.0 h526.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-526.1 z" fill="#e87ba4"/><rect x="150.0" y="1205.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1224.0 h466.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-466.0 z" fill="#6250d6"/><rect x="150.0" y="1223.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="138" y="1307.0" font-size="12" text-anchor="end" fill="#0b0b0b">queue_pingpong_native</text>
+<line x1="150" y1="1255" x2="150" y2="1347" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,1258.0 h512.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-512.9 z" fill="#13968e"/><rect x="150.0" y="1257.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="672.9" y="1271" font-size="11" fill="#52514e">96%</text>
+<path d="M150.0,1276.0 h503.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-503.0 z" fill="#008300"/><rect x="150.0" y="1275.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1294.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#eda100"/><rect x="150.0" y="1293.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1312.0 h437.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-437.0 z" fill="#e87ba4"/><rect x="150.0" y="1311.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,1330.0 h377.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-377.8 z" fill="#6250d6"/><rect x="150.0" y="1329.0" width="0" height="0" fill="#fcfcfb"/>
+</svg>

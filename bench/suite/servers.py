@@ -1,8 +1,10 @@
-"""Server launcher for the Windows suite (run by run_suite.py).
+"""Server launcher for the benchmark suite (run by run_suite.py).
 
-  servers.py http --impl cadeloop|uvicorn|hypercorn [--loop asyncio|winloop|cadeloop]
+  servers.py http --impl cadeloop|uvicorn|hypercorn|granian
+                  [--loop asyncio|uvloop|winloop|cadeloop]
+                  [--http h11|httptools] [--ws wsproto|websockets]
                   --port P [--workers N] [--tls CERT KEY]
-  servers.py echo --loop asyncio|winloop|rsloop|cadeloop --port P
+  servers.py echo --loop asyncio|uvloop|winloop|rloop|rsloop|cadeloop --port P
 
 Readiness is NOT announced here: the runner waits until a real request
 (or echo round trip) succeeds.
@@ -18,7 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def make_loop(kind):
     if kind == "asyncio":
-        return asyncio.ProactorEventLoop()
+        # The stdlib default: proactor (IOCP) on Windows, selector (epoll)
+        # on Linux.
+        return asyncio.new_event_loop()
     return __import__(kind).new_event_loop()
 
 
@@ -49,6 +53,8 @@ def main():
     p.add_argument("kind", choices=["http", "echo"])
     p.add_argument("--impl", default="cadeloop")
     p.add_argument("--loop", default="asyncio")
+    p.add_argument("--http", default="h11", help="uvicorn's HTTP parser")
+    p.add_argument("--ws", default="wsproto", help="uvicorn's WebSocket implementation")
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--tls", nargs=2, metavar=("CERT", "KEY"))
@@ -73,7 +79,7 @@ def main():
         if a.tls:
             kw = {"ssl_certfile": a.tls[0], "ssl_keyfile": a.tls[1]}
         cfg = uvicorn.Config("app:app", host="127.0.0.1", port=a.port, log_level="critical", lifespan="off",
-                             http="h11", ws="wsproto", loop="none", access_log=False, **kw)
+                             http=a.http, ws=a.ws, loop="none", access_log=False, **kw)
         lp = make_loop(a.loop)
         lp.run_until_complete(uvicorn.Server(cfg).serve())
     elif a.impl == "hypercorn":
@@ -89,6 +95,19 @@ def main():
             cfg.certfile, cfg.keyfile = a.tls
         lp = make_loop(a.loop)
         lp.run_until_complete(serve(app, cfg))
+    elif a.impl == "granian":
+        # granian runs its own Rust HTTP stack and drives the app on
+        # uvloop; one worker, as every other contender.
+        from granian import Granian
+        from granian.constants import Interfaces, Loops
+
+        kw = {}
+        if a.tls:
+            from pathlib import Path
+
+            kw = {"ssl_cert": Path(a.tls[0]), "ssl_key": Path(a.tls[1])}
+        Granian("app:app", address="127.0.0.1", port=a.port, interface=Interfaces.ASGI, workers=a.workers,
+                loop=Loops.uvloop, log_enabled=False, **kw).serve()
 
 
 if __name__ == "__main__":

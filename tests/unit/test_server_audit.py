@@ -1495,6 +1495,7 @@ def test_s8_the_console_script_imports_the_app_from_the_current_directory(tmp_pa
         ({"access_log": "false"}, TypeError),
         ({"pin": "false"}, TypeError),
         ({"immediate_flush": "false"}, TypeError),
+        ({"adaptive_spin": "false"}, TypeError),
         ({"workers": "4"}, TypeError),
         ({"workers": True}, TypeError),
         ({"grace": "10"}, TypeError),

@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use crate::backend::{self, BackendKind, Completion, IoBackend, Wakeup};
 use crate::ready::{CrossThreadQueue, ReadyQueue, INITIAL_BATCH_CAPACITY};
+use crate::spin_gate::SpinGate;
 use crate::time::{Clock, Ticks};
 use crate::timer::{TimerHeap, TimerPayload};
 
@@ -46,6 +47,9 @@ pub struct ReactorConfig {
     pub backend: BackendKind,
     /// R-060: busy-poll window before parking, microseconds. 0 disables.
     pub spin_us: u64,
+    /// R-060: spin only while spins are finding work (`spin_gate`), rather
+    /// than before every park.
+    pub adaptive_spin: bool,
     /// R-030: completion batch size per GetQueuedCompletionStatusEx call.
     pub poll_batch: usize,
     /// R-041/R-042: RIO completion/request queue sizing.
@@ -60,6 +64,7 @@ impl Default for ReactorConfig {
         ReactorConfig {
             backend: BackendKind::Auto,
             spin_us: 20,
+            adaptive_spin: false,
             poll_batch: 256,
             backend_opts: backend::BackendOptions::default(),
             clock_offset_ns: 0,
@@ -75,6 +80,11 @@ pub struct Stats {
     pub callbacks_dispatched: u64,
     pub timers_fired: u64,
     pub xthread_items: u64,
+    /// Parks preceded by a spin (each one of `polls`).
+    pub spins: u64,
+    /// Spins that work arrived during: the parks spinning saved. Work
+    /// already waiting when a spin began is not counted -- the park would
+    /// have returned as fast.
     pub spin_hits: u64,
     /// Zero-timeout polls skipped outright because the backend had no
     /// possible completion source (has_io_interest() == false).
@@ -117,6 +127,8 @@ pub struct Reactor<T> {
     /// The last `poll_timeout` ends at a timer's deadline (not the idle
     /// clamp): the park should end on time (`IoBackend::poll_precise`).
     deadline_bound: bool,
+    /// R-060 adaptive spinning (`ReactorConfig::adaptive_spin`).
+    spin_gate: SpinGate,
 }
 
 impl<T: TimerPayload> Reactor<T> {
@@ -140,6 +152,7 @@ impl<T: TimerPayload> Reactor<T> {
             spare: VecDeque::with_capacity(INITIAL_BATCH_CAPACITY),
             expired: VecDeque::new(),
             deadline_bound: false,
+            spin_gate: SpinGate::new(),
         })
     }
 
@@ -400,15 +413,29 @@ impl<T: TimerPayload> Reactor<T> {
         }
         self.stats.polls += 1;
         let mut timeout = timeout;
-        if self.cfg.spin_us > 0 {
-            let spin_budget = Duration::from_micros(self.cfg.spin_us).min(timeout);
+        if self.cfg.spin_us > 0 && (!self.cfg.adaptive_spin || self.spin_gate.should_spin()) {
+            self.stats.spins += 1;
+            let window = Duration::from_micros(self.cfg.spin_us);
+            let spin_budget = window.min(timeout);
             let spin_start = std::time::Instant::now();
+            let mut first_look = true;
             while spin_start.elapsed() < spin_budget {
                 if self.backend.try_poll(&mut self.completions)? > 0 || !self.xthread.is_empty() {
-                    self.stats.spin_hits += 1;
+                    // Work already waiting at the first look would have
+                    // ended a park as fast; only work that arrived while
+                    // spinning shows the spin paid (`SpinGate`).
+                    if !first_look {
+                        self.stats.spin_hits += 1;
+                        self.spin_gate.record(true);
+                    }
                     return Ok(());
                 }
+                first_look = false;
                 std::hint::spin_loop();
+            }
+            // A spin a due timer cut short says nothing about the traffic.
+            if spin_budget == window {
+                self.spin_gate.record(false);
             }
             // The spin was part of the wait: a park that ends on time must
             // not add it again.
@@ -573,6 +600,7 @@ impl<T: TimerPayload> Reactor<T> {
 mod tests {
     use super::*;
 
+    use crate::spin_gate::{MAX_CREDIT, PROBE_EVERY};
     use crate::timer::testing::Tok;
 
     type T = Tok<u32>;
@@ -780,5 +808,69 @@ mod tests {
         assert_eq!(r.ready_len(), 0);
         assert_eq!(r.timers_len(), 0);
         assert!(run_tick(&mut r).is_empty());
+    }
+
+    fn spinning(adaptive_spin: bool) -> Reactor<T> {
+        Reactor::new(ReactorConfig { spin_us: 20, adaptive_spin, ..Default::default() }).unwrap()
+    }
+
+    /// A park nothing ends early: its spin, if any, finds nothing.
+    fn quiet_park(r: &mut Reactor<T>) {
+        r.prepare_tick();
+        r.poll(Duration::from_micros(300)).unwrap();
+        r.finish_poll();
+    }
+
+    #[test]
+    fn adaptive_spin_stops_spinning_while_nothing_arrives() {
+        let mut fixed = spinning(false);
+        let mut adaptive = spinning(true);
+        for _ in 0..128 {
+            quiet_park(&mut fixed);
+            quiet_park(&mut adaptive);
+        }
+        assert_eq!(fixed.stats.spins, 128);
+        // The misses spend the gate's credit; after that, a probe now and
+        // then.
+        let most = (MAX_CREDIT + 128 / PROBE_EVERY) as u64;
+        assert!(adaptive.stats.spins <= most, "{} of 128 parks spun", adaptive.stats.spins);
+        assert_eq!(adaptive.stats.polls, 128, "every park still polls");
+    }
+
+    #[test]
+    fn work_waiting_before_the_spin_does_not_hold_the_gate_open() {
+        // An echo server's parks: every other one finds the completion of
+        // the send it just made already waiting, the rest wait out their
+        // whole window. Counting the first as hits kept the gate open for
+        // good, and it spun before every park.
+        let mut r = spinning(true);
+        let (q, wake) = r.cross_thread_handles();
+        for i in 0..192 {
+            r.prepare_tick();
+            if i % 2 == 0 {
+                if q.push(tok(i)) {
+                    wake.wake();
+                }
+                r.poll(Duration::from_millis(1)).unwrap();
+            } else {
+                r.poll(Duration::from_micros(300)).unwrap();
+            }
+            r.finish_poll();
+            while r.pop_ready_batched().is_some() {}
+        }
+        assert!(r.stats.spins < 192 / 3, "{} of 192 parks spun", r.stats.spins);
+    }
+
+    #[test]
+    fn a_spin_a_due_timer_cuts_short_is_not_counted_against_the_gate() {
+        // Parks shorter than the window say nothing about the traffic: a
+        // loop running a fast timer keeps spinning through them.
+        let mut r = spinning(true);
+        for _ in 0..64 {
+            r.prepare_tick();
+            r.poll(Duration::from_micros(10)).unwrap();
+            r.finish_poll();
+        }
+        assert_eq!(r.stats.spins, 64);
     }
 }

@@ -764,7 +764,7 @@ impl CoreLoop {
     #[new]
     #[pyo3(signature = (backend="auto", spin_us=20, high_water=65536, low_water=16384,
                         rio_cq_size=65536, rio_rq_recv=32, rio_rq_send=32,
-                        tfo=false, loopback_fast_path=true))]
+                        tfo=false, loopback_fast_path=true, adaptive_spin=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -777,6 +777,7 @@ impl CoreLoop {
         rio_rq_send: u32,
         tfo: bool,
         loopback_fast_path: bool,
+        adaptive_spin: bool,
     ) -> PyResult<Self> {
         let kind = BackendKind::parse(backend).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -795,19 +796,18 @@ impl CoreLoop {
         let cfg = ReactorConfig {
             backend: kind,
             spin_us,
+            adaptive_spin,
             clock_offset_ns: clock_offset,
             backend_opts: cadeloop_core::backend::BackendOptions { rio_cq_size, rio_rq_recv, rio_rq_send },
             ..Default::default()
         };
-        let reactor: Reactor<HandleRef> = Reactor::new(cfg)?;
+        let mut reactor: Reactor<HandleRef> = Reactor::new(cfg)?;
         let (xqueue, waker) = reactor.cross_thread_handles();
         let timer_cancels = reactor.timer_cancel_counter();
+        let mut net = NetState::default();
+        net.buffers.set_commit_regions(reactor.backend_mut().registers_buffers());
         Ok(CoreLoop {
-            state: StateCell::new(LoopState {
-                reactor,
-                net: NetState::default(),
-                completions_scratch: Vec::with_capacity(512),
-            }),
+            state: StateCell::new(LoopState { reactor, net, completions_scratch: Vec::with_capacity(512) }),
             xqueue,
             snaps: SnapCache::default(),
             waker,
@@ -2063,6 +2063,7 @@ impl CoreLoop {
         d.set_item("callbacks_dispatched", stats.callbacks_dispatched)?;
         d.set_item("timers_fired", stats.timers_fired)?;
         d.set_item("xthread_items", stats.xthread_items)?;
+        d.set_item("spins", stats.spins)?;
         d.set_item("spin_hits", stats.spin_hits)?;
         d.set_item("polls_elided", stats.polls_elided)?;
         d.set_item("precise_parks", stats.precise_parks)?;

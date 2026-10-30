@@ -289,6 +289,12 @@ pub trait IoBackend {
     fn register_buffers(&mut self, _regions: &mut [(*mut u8, usize, &mut Option<u64>)]) -> io::Result<()> {
         Ok(())
     }
+    /// Does `register_buffers` hand regions to the kernel? Then the buffer
+    /// pool commits each region whole as it allocates it (RIO locks the
+    /// pages it registers), instead of slot by slot.
+    fn registers_buffers(&self) -> bool {
+        false
+    }
     fn deregister_buffers(&mut self, _cookies: &[u64]) -> io::Result<()> {
         Ok(())
     }

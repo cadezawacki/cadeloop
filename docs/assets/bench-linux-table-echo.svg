@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 873 248" width="873" height="248" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>TCP echo, the loop alone · Linux</title>
+<rect width="873" height="248" fill="#fcfcfb" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">TCP echo, the loop alone · Linux</text>
+<text x="24" y="62" font-size="12" fill="#52514e">the same asyncio.Protocol on every loop · messages per second, p99 in small type</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">workload</text>
+<text x="298.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">cadeloop</text>
+<text x="432.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvloop</text>
+<text x="566.4" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">rloop</text>
+<text x="700.5" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">rsloop</text>
+<text x="834.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">asyncio</text>
+<line x1="24" y1="106.0" x2="848.6" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#0b0b0b">1 KiB, 1 connection</text>
+<rect x="197.6" y="110.0" width="108.6" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="210.1" cy="121.0" r="6.5" fill="#eab53b"/>
+<text x="210.1" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="298.1" y="125.5" font-size="11" text-anchor="end" fill="#72552b">76 µs</text>
+<text x="264.1" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">33.7 K</text>
+<rect x="331.7" y="110.0" width="108.6" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="344.2" cy="121.0" r="6.5" fill="#c6764d"/>
+<text x="344.2" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="432.2" y="125.5" font-size="11" text-anchor="end" fill="#834e36">85 µs</text>
+<text x="398.2" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">24.2 K</text>
+<text x="566.4" y="125.5" font-size="11" text-anchor="end" fill="#898781">88 µs</text>
+<text x="532.3" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">23.6 K</text>
+<rect x="600.0" y="110.0" width="108.6" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="612.5" cy="121.0" r="6.5" fill="#afb5bc"/>
+<text x="612.5" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="700.5" y="125.5" font-size="11" text-anchor="end" fill="#575b60">85 µs</text>
+<text x="666.5" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">24.6 K</text>
+<text x="834.6" y="125.5" font-size="11" text-anchor="end" fill="#898781">109 µs</text>
+<text x="794.4" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">20.4 K</text>
+<line x1="24" y1="136.0" x2="848.6" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">1 KiB, 64 connections</text>
+<rect x="195.5" y="140.0" width="110.6" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="208.0" cy="151.0" r="6.5" fill="#afb5bc"/>
+<text x="208.0" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="298.1" y="155.5" font-size="11" text-anchor="end" fill="#575b60">975 µs</text>
+<text x="257.9" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">170 K</text>
+<text x="432.2" y="155.5" font-size="11" text-anchor="end" fill="#898781">1.05 ms</text>
+<text x="386.7" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">149 K</text>
+<rect x="463.8" y="140.0" width="110.6" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="476.3" cy="151.0" r="6.5" fill="#eab53b"/>
+<text x="476.3" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="566.4" y="155.5" font-size="11" text-anchor="end" fill="#72552b">827 µs</text>
+<text x="526.2" y="155.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">171 K</text>
+<rect x="597.9" y="140.0" width="110.6" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="610.4" cy="151.0" r="6.5" fill="#c6764d"/>
+<text x="610.4" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="700.5" y="155.5" font-size="11" text-anchor="end" fill="#834e36">975 µs</text>
+<text x="660.3" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">150 K</text>
+<text x="834.6" y="155.5" font-size="11" text-anchor="end" fill="#898781">1.46 ms</text>
+<text x="789.0" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">115 K</text>
+<line x1="24" y1="166.0" x2="848.6" y2="166.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#0b0b0b">1 KiB, 16 in flight ×64</text>
+<text x="298.1" y="185.5" font-size="11" text-anchor="end" fill="#898781">14.94 ms</text>
+<text x="246.4" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">352 K</text>
+<rect x="318.1" y="170.0" width="122.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="330.6" cy="181.0" r="6.5" fill="#c6764d"/>
+<text x="330.6" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="432.2" y="185.5" font-size="11" text-anchor="end" fill="#834e36">18.09 ms</text>
+<text x="380.5" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">366 K</text>
+<rect x="452.2" y="170.0" width="122.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="464.7" cy="181.0" r="6.5" fill="#c6764d"/>
+<text x="464.7" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="566.4" y="185.5" font-size="11" text-anchor="end" fill="#834e36">18.87 ms</text>
+<text x="514.6" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">366 K</text>
+<rect x="586.4" y="170.0" width="122.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="598.9" cy="181.0" r="6.5" fill="#eab53b"/>
+<text x="598.9" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="700.5" y="185.5" font-size="11" text-anchor="end" fill="#72552b">13.63 ms</text>
+<text x="648.8" y="185.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">381 K</text>
+<rect x="720.5" y="170.0" width="122.1" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="733.0" cy="181.0" r="6.5" fill="#afb5bc"/>
+<text x="733.0" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="834.6" y="185.5" font-size="11" text-anchor="end" fill="#575b60">14.68 ms</text>
+<text x="782.9" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">379 K</text>
+<line x1="24" y1="196.0" x2="848.6" y2="196.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#0b0b0b">64 KiB, 8 connections</text>
+<text x="298.1" y="215.5" font-size="11" text-anchor="end" fill="#898781">803 µs</text>
+<text x="257.9" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">31.9 K</text>
+<rect x="325.5" y="200.0" width="114.7" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="338.0" cy="211.0" r="6.5" fill="#afb5bc"/>
+<text x="338.0" y="214.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="432.2" y="215.5" font-size="11" text-anchor="end" fill="#575b60">483 µs</text>
+<text x="392.0" y="215.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">39.1 K</text>
+<rect x="459.7" y="200.0" width="114.7" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="472.2" cy="211.0" r="6.5" fill="#eab53b"/>
+<text x="472.2" y="214.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="566.4" y="215.5" font-size="11" text-anchor="end" fill="#72552b">401 µs</text>
+<text x="526.2" y="215.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">42.0 K</text>
+<text x="700.5" y="215.5" font-size="11" text-anchor="end" fill="#898781">406 µs</text>
+<text x="660.3" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">36.1 K</text>
+<rect x="727.9" y="200.0" width="114.7" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="740.4" cy="211.0" r="6.5" fill="#c6764d"/>
+<text x="740.4" y="214.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="834.6" y="215.5" font-size="11" text-anchor="end" fill="#834e36">541 µs</text>
+<text x="794.4" y="215.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">37.7 K</text>
+</svg>

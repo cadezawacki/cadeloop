@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 762 356" width="762" height="356" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>Idle keep-alive connections · Linux</title>
+<rect width="762" height="356" fill="#0B0D11" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#ffffff">Idle keep-alive connections · Linux</text>
+<text x="24" y="62" font-size="12" fill="#c9d1d9">each of 5,000 connections made one request and was held open · unique memory (USS) of the server</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#c9d1d9">server</text>
+<text x="250.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">at rest</text>
+<text x="363.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">holding 5,000</text>
+<text x="489.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">per connection</text>
+<text x="626.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">after they close</text>
+<text x="723.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#c9d1d9">fds / conn</text>
+<line x1="24" y1="106.0" x2="737.6" y2="106.0" stroke="#232830" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#ffffff">cadeloop serve()</text>
+<rect x="180.4" y="110.0" width="78.5" height="22" rx="6" fill="#3a2619" stroke="#6f4c34" stroke-width="1"/>
+<circle cx="192.9" cy="121.0" r="6.5" fill="#d2865b"/>
+<text x="192.9" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="250.9" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#f7d7c2">23 MiB</text>
+<text x="363.2" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">64 MiB</text>
+<text x="489.1" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">7.2 KiB</text>
+<rect x="555.6" y="110.0" width="78.5" height="22" rx="6" fill="#3a2f16" stroke="#6c582d" stroke-width="1"/>
+<circle cx="568.1" cy="121.0" r="6.5" fill="#ecbd4a"/>
+<text x="568.1" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2f1e02">1</text>
+<text x="626.1" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#f6e7bb">33 MiB</text>
+<text x="723.6" y="125.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="136.0" x2="737.6" y2="136.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#ffffff">granian</text>
+<text x="250.9" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">–</text>
+<text x="363.2" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">–</text>
+<text x="489.1" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">–</text>
+<text x="626.1" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">–</text>
+<text x="723.6" y="155.5" font-size="13" text-anchor="end" fill="#ffffff">–</text>
+<line x1="24" y1="166.0" x2="737.6" y2="166.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#ffffff">uvicorn[standard]</text>
+<text x="250.9" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">24 MiB</text>
+<rect x="292.6" y="170.0" width="78.5" height="22" rx="6" fill="#3a2619" stroke="#6f4c34" stroke-width="1"/>
+<circle cx="305.1" cy="181.0" r="6.5" fill="#d2865b"/>
+<text x="305.1" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="363.2" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#f7d7c2">61 MiB</text>
+<rect x="417.1" y="170.0" width="80.0" height="22" rx="6" fill="#3a2619" stroke="#6f4c34" stroke-width="1"/>
+<circle cx="429.6" cy="181.0" r="6.5" fill="#d2865b"/>
+<text x="429.6" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="489.1" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#f7d7c2">6.2 KiB</text>
+<rect x="555.6" y="170.0" width="78.5" height="22" rx="6" fill="#3a2619" stroke="#6f4c34" stroke-width="1"/>
+<circle cx="568.1" cy="181.0" r="6.5" fill="#d2865b"/>
+<text x="568.1" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="626.1" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#f7d7c2">48 MiB</text>
+<text x="723.6" y="185.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="196.0" x2="737.6" y2="196.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#ffffff">uvicorn + cadeloop</text>
+<text x="250.9" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">28 MiB</text>
+<text x="363.2" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">99 MiB</text>
+<text x="489.1" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">11.7 KiB</text>
+<text x="626.1" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">70 MiB</text>
+<text x="723.6" y="215.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="226.0" x2="737.6" y2="226.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="245.5" font-size="13" fill="#ffffff">uvicorn + uvloop</text>
+<rect x="180.4" y="230.0" width="78.5" height="22" rx="6" fill="#3a2619" stroke="#6f4c34" stroke-width="1"/>
+<circle cx="192.9" cy="241.0" r="6.5" fill="#d2865b"/>
+<text x="192.9" y="244.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="250.9" y="245.5" font-size="13" text-anchor="end" font-weight="600" fill="#f7d7c2">23 MiB</text>
+<rect x="292.6" y="230.0" width="78.5" height="22" rx="6" fill="#2c2e31" stroke="#54595e" stroke-width="1"/>
+<circle cx="305.1" cy="241.0" r="6.5" fill="#b2b8bf"/>
+<text x="305.1" y="244.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="363.2" y="245.5" font-size="13" text-anchor="end" font-weight="600" fill="#e5e8ec">57 MiB</text>
+<rect x="417.1" y="230.0" width="80.0" height="22" rx="6" fill="#2c2e31" stroke="#54595e" stroke-width="1"/>
+<circle cx="429.6" cy="241.0" r="6.5" fill="#b2b8bf"/>
+<text x="429.6" y="244.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="489.1" y="245.5" font-size="13" text-anchor="end" font-weight="600" fill="#e5e8ec">5.6 KiB</text>
+<rect x="555.6" y="230.0" width="78.5" height="22" rx="6" fill="#2c2e31" stroke="#54595e" stroke-width="1"/>
+<circle cx="568.1" cy="241.0" r="6.5" fill="#b2b8bf"/>
+<text x="568.1" y="244.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="626.1" y="245.5" font-size="13" text-anchor="end" font-weight="600" fill="#e5e8ec">45 MiB</text>
+<text x="723.6" y="245.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="256.0" x2="737.6" y2="256.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="275.5" font-size="13" fill="#ffffff">uvicorn + asyncio</text>
+<rect x="180.4" y="260.0" width="78.5" height="22" rx="6" fill="#3a2f16" stroke="#6c582d" stroke-width="1"/>
+<circle cx="192.9" cy="271.0" r="6.5" fill="#ecbd4a"/>
+<text x="192.9" y="274.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2f1e02">1</text>
+<text x="250.9" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#f6e7bb">20 MiB</text>
+<rect x="292.6" y="260.0" width="78.5" height="22" rx="6" fill="#3a2f16" stroke="#6c582d" stroke-width="1"/>
+<circle cx="305.1" cy="271.0" r="6.5" fill="#ecbd4a"/>
+<text x="305.1" y="274.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2f1e02">1</text>
+<text x="363.2" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#f6e7bb">54 MiB</text>
+<rect x="417.1" y="260.0" width="80.0" height="22" rx="6" fill="#3a2f16" stroke="#6c582d" stroke-width="1"/>
+<circle cx="429.6" cy="271.0" r="6.5" fill="#ecbd4a"/>
+<text x="429.6" y="274.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2f1e02">1</text>
+<text x="489.1" y="275.5" font-size="13" text-anchor="end" font-weight="700" fill="#f6e7bb">5.5 KiB</text>
+<text x="626.1" y="275.5" font-size="13" text-anchor="end" fill="#ffffff">53 MiB</text>
+<text x="723.6" y="275.5" font-size="13" text-anchor="end" fill="#ffffff">1</text>
+<line x1="24" y1="286.0" x2="737.6" y2="286.0" stroke="#171A1F" stroke-width="1"/>
+<text x="38.0" y="305.5" font-size="13" fill="#ffffff">hypercorn</text>
+<rect x="180.4" y="290.0" width="78.5" height="22" rx="6" fill="#3a2f16" stroke="#6c582d" stroke-width="1"/>
+<circle cx="192.9" cy="301.0" r="6.5" fill="#ecbd4a"/>
+<text x="192.9" y="304.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2f1e02">1</text>
+<text x="250.9" y="305.5" font-size="13" text-anchor="end" font-weight="700" fill="#f6e7bb">20 MiB</text>
+<text x="363.2" y="305.5" font-size="13" text-anchor="end" fill="#ffffff">88 MiB</text>
+<text x="489.1" y="305.5" font-size="13" text-anchor="end" fill="#ffffff">11.2 KiB</text>
+<text x="626.1" y="305.5" font-size="13" text-anchor="end" fill="#ffffff">88 MiB</text>
+<text x="723.6" y="305.5" font-size="13" text-anchor="end" fill="#ffffff">0.94</text>
+<text x="24" y="338.0" font-size="11" fill="#8b949e">granian accepted about 648 of the 5,000 connections with its default settings (256 timed out), so it has no comparable figure here.</text>
+</svg>

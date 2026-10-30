@@ -2104,6 +2104,39 @@ def test_latency_mode_spin_selects_immediate_flush():
     assert cadeloop.Config(latency_mode="balanced", immediate_flush=True).immediate_flush is True
 
 
+def test_only_latency_mode_spin_spins_before_every_park():
+    """R-060: the other modes spin only while spins find work; "spin"
+    has the core to itself and spins unconditionally."""
+    assert cadeloop.Config().adaptive_spin is True
+    assert cadeloop.Config(latency_mode="throughput").adaptive_spin is True
+    assert cadeloop.Config(latency_mode="spin").adaptive_spin is False
+    assert cadeloop.Config(latency_mode="spin", adaptive_spin=True).adaptive_spin is True
+    assert cadeloop.Config(adaptive_spin=False).adaptive_spin is False
+
+
+def test_adaptive_spin_reaches_the_loop(monkeypatch):
+    import cadeloop.__main__ as cli
+    from cadeloop import server as srv
+
+    seen = {}
+    monkeypatch.setattr(cli, "serve", lambda app, host, port, **kw: seen.update(kw))
+    monkeypatch.setattr(cli, "load_app", lambda spec: None)
+    assert cli.main(["m:a", "--no-adaptive-spin"]) == 0 and seen["adaptive_spin"] is False
+
+    class Built(Exception):
+        pass
+
+    def loop(**kwargs):
+        seen.update(kwargs)
+        raise Built
+
+    monkeypatch.setattr(srv, "Loop", loop)
+    for mode, adaptive in (("balanced", True), ("spin", False)):
+        with pytest.raises(Built):
+            srv._serve_single(None, "127.0.0.1", 0, cadeloop.Config(latency_mode=mode))
+        assert seen["adaptive_spin"] is adaptive, mode
+
+
 # --------------------------------------------------------------------- #
 # Expect: 100-continue (RFC 7231 5.1.1) and 205 framing (6.3.6)         #
 # --------------------------------------------------------------------- #

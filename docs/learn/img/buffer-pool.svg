@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 300" width="860" height="300" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Where received bytes go</title>
+<rect width="860" height="300" rx="10" fill="#fcfcfb"/>
+<text x="24.0" y="34.0" font-size="16" fill="#1f2328" font-weight="600">Where received bytes go</text>
+<text x="24.0" y="55.0" font-size="12.5" fill="#4b535d">Reads land in slots carved from 2 MiB regions. A slot is reused, not freed, once its data has been used.</text>
+<text x="24.0" y="110.0" font-size="12.5" fill="#1f2328" font-weight="600">4 KiB slots</text>
+<rect x="150.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="185.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="220.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="255.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="290.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="325.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="360.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="395.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="430.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="465.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="500.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="535.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="570.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="605.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="640.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="675.0" y="92.0" width="31.0" height="26.0" rx="4" fill="#13968e"/>
+<text x="24.0" y="156.0" font-size="12.5" fill="#1f2328" font-weight="600">16 KiB slots</text>
+<rect x="150.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="220.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="290.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="360.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="430.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="500.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="570.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="640.0" y="138.0" width="66.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<text x="24.0" y="202.0" font-size="12.5" fill="#1f2328" font-weight="600">64 KiB slots</text>
+<rect x="150.0" y="184.0" width="136.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="290.0" y="184.0" width="136.0" height="26.0" rx="4" fill="#d3f1ec" stroke="#13968e" stroke-width="1.2"/>
+<rect x="430.0" y="184.0" width="136.0" height="26.0" rx="4" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="570.0" y="184.0" width="136.0" height="26.0" rx="4" fill="#13968e"/>
+<rect x="150.0" y="238.0" width="14.0" height="12.0" rx="3" fill="#13968e"/>
+<text x="170.0" y="248.0" font-size="11.5" fill="#4b535d">holding data (a read, or a memoryview you kept)</text>
+<rect x="494.7" y="238.0" width="14.0" height="12.0" rx="3" fill="#d3f1ec" stroke="#13968e" stroke-width="1"/>
+<text x="514.7" y="248.0" font-size="11.5" fill="#4b535d">free, kept warm</text>
+<rect x="150.0" y="262.0" width="14.0" height="12.0" rx="3" fill="#fcfcfb" stroke="#c8ced6" stroke-width="1"/>
+<text x="170.0" y="272.0" font-size="11.5" fill="#4b535d">free beyond the warm set: handed back to the OS</text>
+<text x="730.0" y="110.0" font-size="11" fill="#4b535d">bigger reads move</text>
+<text x="730.0" y="125.0" font-size="11" fill="#4b535d">up a size class;</text>
+<text x="730.0" y="140.0" font-size="11" fill="#4b535d">small ones move</text>
+<text x="730.0" y="155.0" font-size="11" fill="#4b535d">back down</text>
+</svg>

@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -44,4 +46,20 @@ func sleepUntil(t int64) {
 	if d := t - now(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
+}
+
+// cpuTimes is this process's user and kernel CPU time, in seconds.
+func cpuTimes() (user, kernel float64) {
+	h, err := syscall.GetCurrentProcess()
+	if err != nil {
+		return 0, 0
+	}
+	var c, e, k, u syscall.Filetime
+	if err := syscall.GetProcessTimes(h, &c, &e, &k, &u); err != nil {
+		return 0, 0
+	}
+	ft := func(f syscall.Filetime) float64 {
+		return float64(uint64(f.HighDateTime)<<32|uint64(f.LowDateTime)) / 1e7
+	}
+	return ft(u), ft(k)
 }
