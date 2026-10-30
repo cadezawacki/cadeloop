@@ -2288,14 +2288,14 @@ class _Recorder(asyncio.Protocol):
         self.log.append((self.name, "lost"))
 
 
-def _in_the_iteration_that_sees(loop, cause, then):
+def _in_the_iteration_that_sees(loop, cause, then, settle=0.05):
     """Run `cause()` (which makes our socket readable or a timer due) and
     queue `then` so that it runs in the very iteration whose poll sees that
     -- as a callback the previous iteration queued, so ahead of the I/O."""
 
     def arm():
         cause()
-        time.sleep(0.05)  # the bytes / FIN arrive, timers come due
+        time.sleep(settle)  # the bytes / FIN arrive, timers come due
         loop.call_soon(then)
 
     loop.call_soon(arm)
@@ -2323,14 +2323,18 @@ def test_an_iterations_io_callbacks_run_before_its_due_timers(loop):
             r.recv(100)
 
         loop.add_reader(r, on_readable)
-        loop.call_later(0.01, order.append, "timer")
+        # Not due before `cause` runs, and due by the iteration after it, on
+        # any clock: asyncio counts a timer within one clock tick as due
+        # now, and CPython 3.11's monotonic clock on Windows ticks every
+        # 15.6 ms, so a 10 ms timer ran ahead of everything there.
+        loop.call_later(0.05, order.append, "timer")
 
         def cause():
             w.send(b"x")
             peer.send(b"y")
 
-        _in_the_iteration_that_sees(loop, cause, lambda: order.append("call_soon"))
-        await asyncio.sleep(0.2)
+        _in_the_iteration_that_sees(loop, cause, lambda: order.append("call_soon"), settle=0.15)
+        await asyncio.sleep(0.3)
         loop.remove_reader(r)
         transport.close()
         for s in (r, w, peer):

@@ -773,9 +773,13 @@ mod tests {
         }
 
         // A region that came committed whole: large pages, a region RIO
-        // registers, or the portable fallback.
+        // registers, or the portable fallback. Committed for real: its
+        // slots are never paged in, and on Windows a merely reserved one
+        // took the debug build's poison-on-free as a write to uncommitted
+        // memory (STATUS_ACCESS_VIOLATION). Linux maps lazily even when
+        // asked to commit, so there the flag is set by hand.
         let mut q = BufferPool::new();
-        let mut region = Region::alloc(false);
+        let mut region = Region::alloc(true);
         region.fresh_held = true;
         q.class_mut(SizeClass::S4K).add_region(region);
         assert_eq!(q.bytes_held(), REGION_SIZE);
@@ -786,9 +790,9 @@ mod tests {
         assert!(!q.class(SizeClass::S4K).paged_out[id.index as usize]);
         assert_free_accounting(&q, SizeClass::S4K);
         // Past the warm set, as it is here, a released slot of a pageable
-        // region is paged out.
+        // region is paged out (not one of large pages, which cannot be).
         assert!(q.release(id));
-        let paged = if PAGES_OUT { size } else { 0 };
+        let paged = if PAGES_OUT && q.class(SizeClass::S4K).pageable(id.index) { size } else { 0 };
         assert_eq!(q.bytes_held(), REGION_SIZE - paged);
         assert_free_accounting(&q, SizeClass::S4K);
     }
