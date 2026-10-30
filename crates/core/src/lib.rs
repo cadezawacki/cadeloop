@@ -14,6 +14,7 @@ pub mod netsys;
 pub mod opslab;
 pub mod reactor;
 pub mod ready;
+mod spin_gate;
 pub mod time;
 pub mod timer;
 pub mod ws;

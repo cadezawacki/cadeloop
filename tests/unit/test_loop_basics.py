@@ -659,12 +659,38 @@ def test_stats_shape(loop):
         "callbacks_dispatched",
         "timers_fired",
         "xthread_items",
+        "spins",
         "spin_hits",
         "ready_len",
         "timers_len",
     ):
         assert key in stats
     assert stats["ticks"] > 0
+
+
+def _spins_over_sparse_sleeps(adaptive_spin):
+    lp = cadeloop.Loop(spin_us=20, adaptive_spin=adaptive_spin)
+    try:
+
+        async def main():
+            for _ in range(128):
+                await asyncio.sleep(0.0005)
+
+        lp.run_until_complete(main())
+        return lp.stats()["spins"]
+    finally:
+        lp.close()
+
+
+def test_adaptive_spin_stops_spinning_while_spins_find_nothing():
+    """R-060: every sleep is a park nothing ends early, so a spin before
+    it burns its whole window for nothing. The fixed spin pays that before
+    every park; the adaptive gate stops after a run of misses and only
+    probes now and then."""
+    fixed = _spins_over_sparse_sleeps(adaptive_spin=False)
+    adaptive = _spins_over_sparse_sleeps(adaptive_spin=True)
+    assert fixed >= 128, fixed
+    assert adaptive * 3 < fixed, (adaptive, fixed)
 
 
 def test_sigint_interrupts_idle_park_promptly():

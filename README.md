@@ -839,8 +839,9 @@ cadeloop.serve(app, "0.0.0.0", 8000, **vars(cfg))
 | field | type | default | meaning |
 |---|---|---|---|
 | `backend` | `str` | `"auto"` | `"auto"`, `"iocp"`, `"rio"`, `"epoll"`. `"rio"` additionally requires `CADELOOP_ALLOW_EXPERIMENTAL_RIO=1`. |
-| `latency_mode` | `str` | `"balanced"` | Preset controlling spin and flush behaviour: `"throughput"` (spin 0µs), `"balanced"` (20µs), `"spin"` (200µs + immediate flush). |
+| `latency_mode` | `str` | `"balanced"` | Preset controlling spin and flush behaviour: `"throughput"` (spin 0µs), `"balanced"` (20µs while spins catch work), `"spin"` (200µs before every park + immediate flush). |
 | `spin_us` | `int \| None` | `None` | Explicit spin window in µs, overriding the preset. `None` derives it from `latency_mode`. |
+| `adaptive_spin` | `bool \| None` | `None` | Spin only while spins are catching work, rather than before every park. `None` derives from `latency_mode` (on unless `"spin"`). |
 | `immediate_flush` | `bool \| None` | `None` | Put each response on the wire as soon as it is ready instead of corking until the tick's flush phase. Costs syscalls, buys tail latency. `None` derives from `latency_mode` (on only for `"spin"`). |
 
 #### Kernel I/O
@@ -986,6 +987,7 @@ immediately rather than after the port is taken.
 | `--latency-mode {throughput,balanced,spin}` | `latency_mode` | |
 | `--access-log` / `--no-access-log` | `access_log` | |
 | `--spin-us N` | `spin_us` | Accepts `none` to derive from `--latency-mode`. |
+| `--adaptive-spin` / `--no-adaptive-spin` | `adaptive_spin` | |
 | `--immediate-flush` / `--no-immediate-flush` | `immediate_flush` | |
 | `--accept-pool N` | `accept_pool` | |
 | `--rio-cq-size N`, `--rio-rq-recv N`, `--rio-rq-send N` | RIO fields | Windows RIO only. |
@@ -1044,7 +1046,8 @@ print(loop.stats())
 | `callbacks_dispatched` | Callbacks run. |
 | `timers_fired` | Timers that fired. |
 | `xthread_items` | Callbacks and timers other threads handed over while the loop was parked in its poll. Calls made while the loop is reachable -- including every `call_soon_threadsafe` from its own thread -- go straight to the ready queue and are not counted. |
-| `spin_hits` | Times the spin window found work without a blocking wait. |
+| `spins` | Waits preceded by a spin. With adaptive spinning, far fewer than `polls` while spins catch nothing. |
+| `spin_hits` | Spins that caught work arriving during the window, saving a blocking wait. Work already waiting when the spin began is not counted. |
 | `precise_parks` | Waits bounded by a timer's deadline that ended on a high-resolution timer (Windows IOCP) rather than the system clock tick. |
 | `ready_len`, `timers_len` | Current ready-queue and timer-heap depth. |
 | `connections`, `listeners` | Live counts. |
@@ -1083,36 +1086,55 @@ cadeloop myapp:app --host 0.0.0.0 --port 8000 --workers 0
 
 ### Choosing a latency mode
 
-`latency_mode` sets two things at once: how long the loop spins before making a
-blocking kernel wait, and whether responses are flushed immediately or corked
-until the tick's flush phase.
+`latency_mode` sets three things at once: how long the loop spins before making
+a blocking kernel wait, whether it spins before every wait or only while spinning
+is catching work, and whether responses are flushed immediately or corked until
+the tick's flush phase.
 
-| mode | `spin_us` | `immediate_flush` | behaviour |
-|---|---:|---|---|
-| `throughput` | 0 | off | Never spins. Every idle tick makes a blocking wait; writes coalesce and go out at tick end. Lowest CPU per request, highest syscall efficiency. |
-| `balanced` *(default)* | 20 | off | Spins 20 µs before parking. Catches work that arrives during the tick without a wake-up round trip, at a small idle-CPU cost. |
-| `spin` | 200 | on | Spins 200 µs *and* writes each response the moment it is ready. Trades CPU and syscalls for tail latency. |
+| mode | `spin_us` | `adaptive_spin` | `immediate_flush` | behaviour |
+|---|---:|---|---|---|
+| `throughput` | 0 | — | off | Never spins. Every idle tick makes a blocking wait; writes coalesce and go out at tick end. Lowest CPU per request, highest syscall efficiency. |
+| `balanced` *(default)* | 20 | on | off | Spins up to 20 µs before parking while spins are catching work, and parks straight away while they are not. |
+| `spin` | 200 | off | on | Spins 200 µs before every park *and* writes each response the moment it is ready. Trades CPU and syscalls for tail latency. |
 
 **Spinning** removes the sleep/wake round trip when work arrives just after the
-loop decides to park. It costs idle CPU: with `spin_us=200` a loop serving light
+loop decides to park. A spin that nothing arrives during is its whole window of
+CPU spent for nothing: spinning 200 µs before every park, a loop serving light
 traffic burns close to a core doing nothing.
+
+**Adaptive spinning** (`adaptive_spin`) spins only while spins pay. A spin that
+catches work earns credit and one that catches nothing spends it, so the loop
+keeps spinning while more than about one spin in four catches work, however
+the misses bunch together, and parks without spinning below that. Stopped, it
+probes with a spin one park in eight; the first probe that catches work turns
+spinning back on, so traffic that turns dense gets it back within a few parks.
+Work already waiting when a spin begins does not count as a catch, since a park
+would have returned just as fast. The bookkeeping is a few integer operations
+per park.
+`stats()["spins"]` counts the parks that spun and `stats()["spin_hits"]` the
+spins that caught work. `spin` mode turns it off: picking `spin` means the
+loop has the core to itself. Measured numbers are in
+[`docs/ops.md`](docs/ops.md#latency-modes-r-060).
 
 **Immediate flush** matters for tail latency specifically. With corking, a
 response that became wire-ready first still waits behind however many *other*
 connections' app dispatch the same tick batched ahead of it. Flushing
-immediately puts it on the wire straight away — at the cost of one syscall per
-response instead of one per batch. Either way nothing corked is lost:
-`close()` and `abort()` hand any corked output to the kernel first.
+immediately puts it on the wire straight away. A response sent as one body
+message is one send either way; streamed chunks and pipelined responses are
+where corking saves sends, by coalescing what one tick produced for a
+connection. Either way nothing corked is lost: `close()` and `abort()` hand any
+corked output to the kernel first.
 
-The two are independent, so a mixed setting is legitimate:
+The settings are independent, so a mixed setting is legitimate:
 
 ```python
-# spin for wake-up latency, but keep corking for syscall efficiency
-cadeloop.serve(app, "0.0.0.0", 8000, spin_us=200, immediate_flush=False)
+# spin before every park for wake-up latency, but keep corking
+cadeloop.serve(app, "0.0.0.0", 8000, spin_us=200, adaptive_spin=False, immediate_flush=False)
 ```
 
-Measure before committing. On a small or shared VM the run-to-run p99 spread
-can exceed the difference between modes in both directions;
+Measure before committing. On Linux loopback, immediate flush measured as a
+net loss: the same one send per request, but less throughput and more server
+CPU per request (numbers in [`docs/ops.md`](docs/ops.md#latency-modes-r-060)).
 `stats()["sends_posted"]` read against `stats()["bytes_sent"]` shows what
 corking is actually buying.
 

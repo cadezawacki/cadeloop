@@ -12,7 +12,7 @@ request at all; the level is re-read once a second.
 
 ## Introspection (R-103/R-141)
 `loop.stats()` returns counters: `ticks, polls, completions,
-callbacks_dispatched, timers_fired, xthread_items, spin_hits, ready_len,
+callbacks_dispatched, timers_fired, xthread_items, spins, spin_hits, ready_len,
 timers_len, backend` (M1 adds `syscalls_saved_inline, buffers_in_use`;
 M2 adds `tasks_eager_completed`). `Config(stats_endpoint=<port>)` serves
 the same dict as JSON, bound to 127.0.0.1 only, with a `worker` key
@@ -46,9 +46,72 @@ cadeloop does not configure NICs programmatically (spec §8).
 `spin` (200µs). Spinning trades CPU for tail latency; use `spin` only on
 dedicated cores.
 
+### Adaptive spinning
+Outside `spin` mode the loop spins only while spins are catching work
+(`adaptive_spin`, `--adaptive-spin` / `--no-adaptive-spin`;
+`crates/core/src/spin_gate.rs`). A spin that catches work earns three
+credits, one that catches nothing spends one, and the loop spins while it
+has credit (at most twelve): it keeps spinning while more than one spin in
+four catches work and stops below that. While stopped, one park in eight
+spins as a probe, and a probe that catches work starts it again. The cost
+is a few integer operations per park; the window itself is measured with
+the timestamps the spin already takes.
+
+A credit rather than a run of misses: the first version stopped after four
+misses in a row. On back-to-back ping-pong whose spins caught 97% of
+messages, a bunch of four misses stopped it anyway, and stopped, its spins
+caught only about 60% -- often enough to miss four in a row again. One of
+three runs stayed there with more than half its parks not spinning; with
+the credit, five of five ran like the fixed spin.
+
+A catch is work that arrives during the spin. Work already waiting at its
+first look -- typically the completion of a send the loop just made --
+would have ended a park as fast, and counting it kept an echo server
+spinning before every park although every spin that actually waited caught
+nothing.
+
+`stats()["spins"]` counts the parks that spun and `spin_hits` the spins
+that caught work, so `spin_hits / spins` is the hit rate the gate acts on.
+`spin` mode turns the gate off: a deployment that picked it has dedicated
+the core, and wants the spin before every park.
+
+Measured on a 4-vCPU Linux VM (epoll backend): an asyncio echo server on
+`Loop(spin_us=...)`, one Python client sending 64-byte messages over
+loopback (`TCP_NODELAY`) and waiting for each echo, server CPU from
+`/proc/<pid>/task/*/schedstat`, medians of three 2-second runs. Rates are
+messages per second; CPU is server CPU per message.
+
+| traffic | no spin | 20 µs before every park | 20 µs adaptive |
+|---|---|---|---|
+| back to back | 26,955/s, p50 34.1 µs, 19.1 µs CPU | 42,572/s, p50 20.9 µs, 22.9 µs CPU | 40,673/s, p50 21.5 µs, 23.8 µs CPU |
+| 50 µs gaps | p50 36.5 µs, 22.0 µs CPU | p50 36.9 µs, 41.3 µs CPU | p50 35.6 µs, 25.6 µs CPU |
+| 200 µs gaps | p50 61.9 µs, 32.5 µs CPU | p50 37.7 µs, 45.9 µs CPU | p50 57.6 µs, 33.7 µs CPU |
+| 1 ms gaps | p50 89.8 µs, 47.2 µs CPU | p50 92.9 µs, 70.4 µs CPU | p50 89.0 µs, 52.9 µs CPU |
+| 5 ms gaps | p50 143.3 µs, 75.8 µs CPU | p50 146.4 µs, 98.2 µs CPU | p50 135.8 µs, 79.8 µs CPU |
+| bursts of 20, 1 ms apart | 10,797/s, p50 34.3 µs, 21.7 µs CPU | 12,517/s, p50 22.9 µs, 26.9 µs CPU | 12,278/s, p50 23.3 µs, 28.3 µs CPU |
+| bursts of 200, 5 ms apart | 15,097/s, p50 35.6 µs, 21.0 µs CPU | 18,881/s, p50 23.5 µs, 26.3 µs CPU | 19,485/s, p50 22.4 µs, 25.0 µs CPU |
+
+- Back to back, the gate stays open: 2.00 spins and 0.97–0.99 caught
+  messages per message in five of five runs, as with the fixed spin. Eight
+  interleaved runs each measured 39,811/s fixed against 40,050/s adaptive,
+  so the table's 4.5% is run-to-run noise.
+- At 50 µs, 200 µs and 1 ms gaps none of the fixed spin's spins caught
+  anything (`spin_hits` 0); the gate cut them from 2.00 to 0.26 per
+  message.
+- At 200 µs gaps the fixed spin's p50 was still lower, in two separate
+  sessions, although it caught nothing there. The gain comes from
+  something other than caught work -- plausibly how fast this VM wakes a
+  core that slept slightly less, but that was not isolated -- and the gate
+  cannot see it. Where that latency is worth the CPU,
+  `--no-adaptive-spin` keeps it.
+- Absolute numbers moved a lot between two sessions on this VM type (the
+  no-spin back-to-back rate by 66%); compare within a row.
+
+### Write policy
 The mode also picks the write policy. By default an HTTP response is
 *corked* (R-035): it is queued and flushed at the tick's flush phase, so
-several connections' responses leave in one `writev`/`WSASend`. That is
+the responses and stream chunks one tick produced for a connection leave in
+one `writev`/`WSASend`. That is
 the throughput choice, and it is the right default — but it couples a
 response's latency to how much *other* work the same tick batched in
 front of it. `immediate_flush` (`--immediate-flush` / `--no-immediate-flush`)
@@ -62,12 +125,27 @@ Two caveats worth stating plainly:
   becomes up to N sends instead of one. A single-message response is
   unaffected — `http.response.start` only stashes the head, so head and
   body still leave together.
-- We have not measured a latency win from it. On a 4-core VM with a
-  single-process load generator the run-to-run p99 spread was larger than
-  any difference between the modes, in both directions. The knob exists
-  because the trade-off is real and deployment-specific; measure it on
-  your own hardware before turning it on. `stats()["sends_posted"]`, read
-  against `bytes_sent`, shows what corking is buying you.
+- On Linux loopback it measured as a net loss. One worker on a 4-vCPU VM,
+  64 keep-alive connections from `bench/loadgen` (built for Linux, 3
+  threads), medians of 3 runs:
+
+  | app | corked | immediate flush |
+  |---|---|---|
+  | hello world, closed loop | 66,207 req/s, 14.7 µs CPU/req | 57,020 req/s, 17.0 µs CPU/req |
+  | ~14 µs of Python per request, closed loop | 34,514 req/s, 28.7 µs CPU/req | 20,375 req/s, 48.7 µs CPU/req |
+  | ~14 µs of Python per request, 15,000 req/s open loop | p50 348 µs, p99 2.5 ms | p50 1.8 ms, p99 191 ms |
+
+  Every variant posted one send per request. Flushing only *finished*
+  responses that had nothing pipelined behind them -- the case where
+  corking cannot save a send -- measured no better: within 3% of immediate
+  flush's closed-loop throughput, and a 168 ms p99 at 15,000 req/s. With
+  the ~14 µs app it dispatched tens of requests per tick, as corking did,
+  so its extra CPU is neither syscalls nor smaller batches; where it goes
+  was not isolated. That is why no mode flushes early on its own. Windows
+  is unmeasured: the knob exists because the trade-off is
+  deployment-specific, so measure it on your own hardware before turning
+  it on. `stats()["sends_posted"]`, read against `bytes_sent`, shows what
+  corking is buying you.
 
 
 ## Cutting a release
