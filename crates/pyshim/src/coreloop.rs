@@ -799,15 +799,13 @@ impl CoreLoop {
             backend_opts: cadeloop_core::backend::BackendOptions { rio_cq_size, rio_rq_recv, rio_rq_send },
             ..Default::default()
         };
-        let reactor: Reactor<HandleRef> = Reactor::new(cfg)?;
+        let mut reactor: Reactor<HandleRef> = Reactor::new(cfg)?;
         let (xqueue, waker) = reactor.cross_thread_handles();
         let timer_cancels = reactor.timer_cancel_counter();
+        let mut net = NetState::default();
+        net.buffers.set_commit_regions(reactor.backend_mut().registers_buffers());
         Ok(CoreLoop {
-            state: StateCell::new(LoopState {
-                reactor,
-                net: NetState::default(),
-                completions_scratch: Vec::with_capacity(512),
-            }),
+            state: StateCell::new(LoopState { reactor, net, completions_scratch: Vec::with_capacity(512) }),
             xqueue,
             snaps: SnapCache::default(),
             waker,

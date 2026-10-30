@@ -1,10 +1,11 @@
 //! Buffer slabs (R-071, R-072, R-073).
 //!
 //! Size classes {4 KiB, 16 KiB, 64 KiB}. Each slab is one 2 MiB region
-//! (`VirtualAlloc` on Windows, attempting large pages via
-//! `MEM_LARGE_PAGES` when `SeLockMemoryPrivilege` is held, with silent
-//! fallback; an anonymous `mmap` on Linux; `alloc_zeroed` elsewhere for
-//! dev/test builds), carved into fixed-size slots with a per-class
+//! (`VirtualAlloc` on Windows -- reserved, and committed slot by slot as
+//! slots are handed out, unless large pages (`MEM_LARGE_PAGES`, when
+//! `SeLockMemoryPrivilege` is held) or buffer registration need it
+//! committed whole; an anonymous `mmap` on Linux; `alloc_zeroed` elsewhere
+//! for dev/test builds), carved into fixed-size slots with a per-class
 //! freelist.
 //!
 //! The pool is thread-affine — only the loop thread touches it — so slot
@@ -157,6 +158,12 @@ struct Region {
     /// Filled by the RIO backend after RIORegisterBuffer (opaque here).
     pub rio_buffer_id: Option<u64>,
     large_pages: bool,
+    /// Do its slots count against the OS before they are first used? Yes
+    /// for an allocation committed whole (Windows large pages, or a region
+    /// committed for registration) and for `alloc_zeroed`. No for a Linux
+    /// mapping, faulted in page by page, or a Windows reservation, whose
+    /// slots `page_in` commits as `acquire` hands them out.
+    fresh_held: bool,
 }
 
 impl Region {
@@ -172,13 +179,17 @@ impl Region {
 // default which is exactly right. No unsafe Send/Sync impls.
 
 impl Region {
-    fn alloc() -> Region {
+    /// `commit`: commit the region whole now (Windows), for a backend that
+    /// registers regions with the kernel -- RIO locks a region's pages when
+    /// it registers it, so they must exist.
+    fn alloc(commit: bool) -> Region {
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::Memory::{
                 VirtualAlloc, MEM_COMMIT, MEM_LARGE_PAGES, MEM_RESERVE, PAGE_READWRITE,
             };
-            // R-071: attempt large pages, silent fallback.
+            // R-071: attempt large pages, silent fallback. They can only be
+            // allocated committed (and locked), whole.
             let ptr = unsafe {
                 VirtualAlloc(
                     std::ptr::null(),
@@ -188,16 +199,23 @@ impl Region {
                 )
             };
             if !ptr.is_null() {
-                return Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: true };
+                return Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: true, fresh_held: true };
             }
-            let ptr = unsafe {
-                VirtualAlloc(std::ptr::null(), REGION_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-            };
+            // Otherwise reserved only: `page_in` commits each slot as it is
+            // first handed out. Committed whole, a region charged its full
+            // 2 MiB of commit for slots no connection had ever used -- and
+            // `bytes_held`, which counts a never-used slot as holding
+            // nothing, reported a fraction of it (one region with 92 of its
+            // 512 4 KiB slots ever used: 368 KiB reported, 2 MiB committed).
+            let flags = if commit { MEM_COMMIT | MEM_RESERVE } else { MEM_RESERVE };
+            let ptr = unsafe { VirtualAlloc(std::ptr::null(), REGION_SIZE, flags, PAGE_READWRITE) };
             assert!(!ptr.is_null(), "VirtualAlloc({REGION_SIZE}) failed");
-            Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false }
+            Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false, fresh_held: commit }
         }
         #[cfg(target_os = "linux")]
         {
+            // Nothing registers buffers on Linux; there is nothing to commit.
+            let _ = commit;
             // Straight from the kernel, not the global allocator. Under
             // mimalloc (the extension's allocator, R-070) `alloc_zeroed` of
             // a 2 MiB region came back fully resident, so every connection's
@@ -224,14 +242,15 @@ impl Region {
             // Advisory: a kernel without THP refuses it, and then there are
             // no huge pages to avoid.
             unsafe { libc::madvise(ptr, REGION_SIZE, libc::MADV_NOHUGEPAGE) };
-            Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false }
+            Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false, fresh_held: false }
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
+            let _ = commit;
             let layout = std::alloc::Layout::from_size_align(REGION_SIZE, 4096).unwrap();
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             assert!(!ptr.is_null(), "region alloc failed");
-            Region { ptr, rio_buffer_id: None, large_pages: false }
+            Region { ptr, rio_buffer_id: None, large_pages: false, fresh_held: true }
         }
     }
 }
@@ -268,12 +287,12 @@ pub const RESIDENT_FREE_SLOTS: usize = 256;
 
 /// Whether `page_out` actually returns memory on this platform.
 ///
-/// On Windows a region is committed whole, so a slot is private memory
-/// (commit charge) whether or not it is in use, and a pool that never
-/// decommitted held its peak for good: 5,000 idle connections closing left
-/// 256 MiB committed. Regions RIO has registered with the kernel, and
-/// large-page regions (which cannot be decommitted piecewise), keep every
-/// page (`Region::pageable`).
+/// On Windows a slot, once committed, is private memory (commit charge)
+/// whether or not it is in use, and a pool that never decommitted held its
+/// peak for good: 5,000 idle connections closing left 256 MiB committed.
+/// Regions RIO has registered with the kernel, and large-page regions
+/// (which cannot be decommitted piecewise), keep every page
+/// (`Region::pageable`).
 const PAGES_OUT: bool = cfg!(any(target_os = "linux", windows));
 
 /// Hand a free slot's pages back to the OS. On Linux they read as zero
@@ -337,6 +356,8 @@ struct ClassPool {
     /// range. Always zero in a correct run.
     stale_rejections: u64,
     in_use: usize,
+    /// Commit new regions whole (`BufferPool::set_commit_regions`).
+    commit_regions: bool,
 }
 
 impl ClassPool {
@@ -351,18 +372,28 @@ impl ClassPool {
             resident_free: 0,
             stale_rejections: 0,
             in_use: 0,
+            commit_regions: false,
         }
     }
 
     fn grow(&mut self) {
-        let region = Region::alloc();
+        self.add_region(Region::alloc(self.commit_regions));
+    }
+
+    fn add_region(&mut self, region: Region) {
         let base = (self.regions.len() * self.class.slots_per_region()) as u32;
+        let held = region.fresh_held;
         self.regions.push(region);
         let n = self.class.slots_per_region() as u32;
         self.refcounts.resize(self.refcounts.len() + n as usize, 0);
         self.generations.resize(self.generations.len() + n as usize, 0);
-        // Fresh mappings have no resident pages yet.
-        self.paged_out.resize(self.paged_out.len() + n as usize, true);
+        // A fresh slot holds nothing from the OS until it is first used --
+        // unless its region came committed (`Region::fresh_held`), in which
+        // case it is resident (no `page_in` on acquire) and counted so.
+        self.paged_out.resize(self.paged_out.len() + n as usize, !held);
+        if held {
+            self.resident_free += n as usize;
+        }
         // Only ever grown empty; pushed in reverse so low indices are
         // handed out first.
         for i in (0..n).rev() {
@@ -533,7 +564,9 @@ impl BufferPool {
     }
 
     /// Bytes the pool keeps from the OS: its regions, less the free slots
-    /// paged out (see `PAGES_OUT`). On Windows, its commit charge.
+    /// that hold nothing -- never used, or paged out (see `PAGES_OUT`). On
+    /// Windows, its commit charge; on Linux, an upper bound on its resident
+    /// pages (a used slot's untouched pages are counted).
     pub fn bytes_held(&self) -> usize {
         self.classes
             .iter()
@@ -562,6 +595,17 @@ impl BufferPool {
 
     pub fn any_large_pages(&self) -> bool {
         self.classes.iter().any(|c| c.regions.iter().any(|r| r.large_pages))
+    }
+
+    /// Commit each region whole as it is allocated (Windows), for a
+    /// backend that registers regions with the kernel: RIO locks a
+    /// region's pages when it registers it, so they must already be
+    /// committed. Set before the first `acquire`; elsewhere a region is
+    /// committed slot by slot, as slots are first handed out.
+    pub fn set_commit_regions(&mut self, commit: bool) {
+        for c in &mut self.classes {
+            c.commit_regions = commit;
+        }
     }
 
     /// True once after any slab growth (R-043 registration cue).
@@ -673,6 +717,80 @@ mod tests {
         for id in again {
             p.release(id);
         }
+    }
+
+    /// Windows: a region is reserved and its slots committed one by one as
+    /// they are handed out, so a slot never used is neither committed nor
+    /// counted -- unless the backend registers regions (RIO), which needs
+    /// them committed whole, and then all of it is counted.
+    #[cfg(windows)]
+    #[test]
+    fn a_region_is_committed_slot_by_slot_unless_registration_needs_it_whole() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE,
+        };
+        let state = |ptr: *mut u8| {
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            unsafe { VirtualQuery(ptr.cast(), &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+            m.State
+        };
+        let size = SizeClass::S16K.size();
+        let mut p = BufferPool::new();
+        let a = p.acquire(SizeClass::S16K);
+        if !p.any_large_pages() {
+            let first = p.slot_ptr(a);
+            assert_eq!(state(first), MEM_COMMIT);
+            assert_eq!(state(unsafe { first.add(size) }), MEM_RESERVE, "a slot never handed out");
+            assert_eq!(p.bytes_held(), size);
+        }
+        p.release(a);
+        let mut q = BufferPool::new();
+        q.set_commit_regions(true);
+        let b = q.acquire(SizeClass::S16K);
+        assert_eq!(state(unsafe { q.slot_ptr(b).add(size) }), MEM_COMMIT, "committed whole");
+        assert_eq!(q.bytes_held(), REGION_SIZE);
+        q.release(b);
+    }
+
+    /// `bytes_held` counts a slot never used as holding nothing only where
+    /// that is true: a lazily faulted Linux mapping, or a Windows region
+    /// reserved and committed slot by slot. One that came committed whole
+    /// counted the same way under-reported its commit charge (368 KiB
+    /// reported of 2 MiB committed); its slots are now held, resident and
+    /// never paged in.
+    #[test]
+    fn never_used_slots_count_as_held_only_in_a_region_that_came_committed() {
+        let size = SizeClass::S4K.size();
+        let mut p = BufferPool::new();
+        let ids: Vec<SlotId> = (0..3).map(|_| p.acquire(SizeClass::S4K)).collect();
+        let expected = if cfg!(any(windows, target_os = "linux")) { 3 * size } else { REGION_SIZE };
+        if !p.any_large_pages() {
+            assert_eq!(p.bytes_held(), expected);
+        }
+        assert_free_accounting(&p, SizeClass::S4K);
+        for id in ids {
+            assert!(p.release(id));
+        }
+
+        // A region that came committed whole: large pages, a region RIO
+        // registers, or the portable fallback.
+        let mut q = BufferPool::new();
+        let mut region = Region::alloc(false);
+        region.fresh_held = true;
+        q.class_mut(SizeClass::S4K).add_region(region);
+        assert_eq!(q.bytes_held(), REGION_SIZE);
+        assert_free_accounting(&q, SizeClass::S4K);
+        assert_eq!(q.class(SizeClass::S4K).resident_free, SizeClass::S4K.slots_per_region());
+        let id = q.acquire(SizeClass::S4K);
+        assert_eq!(q.bytes_held(), REGION_SIZE, "using a committed slot commits nothing more");
+        assert!(!q.class(SizeClass::S4K).paged_out[id.index as usize]);
+        assert_free_accounting(&q, SizeClass::S4K);
+        // Past the warm set, as it is here, a released slot of a pageable
+        // region is paged out.
+        assert!(q.release(id));
+        let paged = if PAGES_OUT { size } else { 0 };
+        assert_eq!(q.bytes_held(), REGION_SIZE - paged);
+        assert_free_accounting(&q, SizeClass::S4K);
     }
 
     #[test]
