@@ -836,10 +836,10 @@ serves the same dict as JSON.
 | `completions` | I/O operations that finished. |
 | `callbacks_dispatched` | Callbacks run. |
 | `timers_fired` | Timers that went off. |
-| `xthread_items` | Callbacks and timers that other threads handed over while the loop was asleep. |
+| `xthread_items` | Callbacks and timers that other threads handed to the loop: `call_soon_threadsafe()`, finished `run_in_executor()` work, and FastAPI's plain `def` endpoints, which run in a thread pool. |
 | `spins` | Waits that began with a spin. |
 | `spin_hits` | Spins that caught new work, saving a sleep and a wake-up. Work that was already waiting when the spin began doesn't count. |
-| `precise_parks` | Waits ended by a high-resolution timer (Windows). |
+| `precise_parks` | Waits bounded by a due timer that used a high-resolution timer (Windows), so they end on time rather than on the next 15.6 ms clock tick. Some end earlier, on I/O. |
 | `ready_len`, `timers_len` | Callbacks waiting to run, and timers scheduled, right now. |
 | `connections`, `listeners` | Open connections and listening sockets. |
 | `connections_accepted` | Connections accepted so far. |

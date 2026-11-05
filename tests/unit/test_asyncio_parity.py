@@ -2342,7 +2342,13 @@ def test_an_iterations_io_callbacks_run_before_its_due_timers(loop):
         await asyncio.sleep(0.01)
 
     loop.run_until_complete(asyncio.wait_for(main(), 10))
-    assert order == ["call_soon", "reader", "data_received", "timer"]
+    # The callback queued before the iteration first, its due timer last,
+    # the iteration's I/O in between. The order of the two I/O callbacks is
+    # the selector's and promised by nothing: asyncio's selector loop on
+    # Windows hands select() its sockets as a set, so the two came back in
+    # either order, depending on their handle values.
+    assert order[0] == "call_soon" and order[-1] == "timer", order
+    assert sorted(order[1:-1]) == ["data_received", "reader"], order
 
 
 def test_data_wins_the_race_with_an_idle_timeout_due_in_its_iteration(loop):
