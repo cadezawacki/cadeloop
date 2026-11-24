@@ -100,6 +100,12 @@ finishes it and emits the same `Completion` events IOCP would. L1 to L3
 therefore run the same code on both platforms, sockets included, and Linux
 wheels (manylinux2014) are published.
 
+Because epoll's receives only read inside a poll, a plain protocol's large
+reads (32 KiB and up) are turned into `bytes` at dispatch, one at a time,
+with the next receive posted after the delivery; and a write flushed as it
+is made has its send settled before `write()` returns (ADR-34). The
+completion backends keep the path described above.
+
 Other hosts (macOS, the BSDs) get the portable backend: a condvar-based
 completion queue that handles timers, `call_soon` and
 `call_soon_threadsafe`, enough to develop and test loop semantics anywhere.
@@ -135,6 +141,10 @@ send() (app -> wire):         validate + serialize head/body in Rust ->
                               corked write queue (same R-035 machinery as
                               transport writes; flushed same tick)
 ```
+
+A body of 16 KiB or more is not serialized at all: the queue holds the
+application's `bytes` object behind the head and the kernel reads from it
+(ADR-33); large `websocket.send` payloads go the same way.
 
 Framing is decided at the FIRST `http.response.body`: complete responses
 get `content-length`, streams get chunked (HTTP/1.1) or close-delimited

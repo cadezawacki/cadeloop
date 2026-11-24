@@ -588,3 +588,109 @@ it is closing or gone, held while reading is paused (EOF too, delivered
 after the held bytes by `resume_reading`), otherwise delivered to the
 current protocol; `resume_writing` goes only to the protocol that was
 paused.
+
+## ADR-33: Large outbound payloads are sent from the application's bytes object
+The HTTP engine copied every response body behind its head into one
+buffer: one allocation and one memcpy per body message. For a small body
+that is the right shape -- one queue entry, one iovec, and consecutive
+responses coalesce. For a large one the copy was the cost: on 64 KiB
+responses the memcpy and the buffer it filled were a tenth of the
+server's CPU, to move bytes that were already sitting still in an
+immutable object the application had just handed over.
+
+A body of 16 KiB or more in a `bytes` object is now queued by reference:
+the head (and any chunk-size line) as an owned buffer, the body as a
+`WriteBuf::Bytes` holding the object, then the chunk's CRLF or the
+terminating chunk -- all three under one flush decision, so a response
+still leaves in one send. That is the retention `Transport.write()` has
+always used for large writes (R-074), so partial sends, cancellation and
+teardown already handle it; the reference is released through the
+graveyard, never in the cell. Every framing comes out byte for byte as
+before (content-length, caller-declared length, chunked, chunked with
+trailers, HTTP/1.0 close-delimited, HEAD). TLS connections keep the
+copy: their output is encrypted out of a staging buffer. Other buffer
+types (`bytearray`, `memoryview`) are copied, as they must be.
+
+`websocket.send` had the same shape twice over: the message was extracted
+into a `String` or `Vec`, then copied again into its frame. The frame is
+now built from the message's own storage, and a `bytes` payload of 16 KiB
+or more is sent by reference behind a header-only buffer.
+
+Inbound, WebSocket unmasking ran a byte at a time (`byte ^= mask[i & 3]`,
+which the compiler leaves scalar) and was a third of the server's CPU on
+64 KiB frames; it now XORs eight bytes at a time, which vectorizes.
+
+Linux, loopback, one session, interleaved runs against the previous build
+(medians): 64 KiB responses 32.1 K -> 48.9 K req/s; 1 MiB streamed in
+16 KiB chunks 2.2 K -> 2.8 K req/s (between +8% and +29% over three
+runs); WebSocket echo 14.0 K -> 21.5 K msg/s at 64 KiB and 51.4 K ->
+66.8 K at 16 KiB. Small requests and messages are unchanged within noise.
+
+## ADR-34: On epoll, a plain protocol's large reads become bytes at dispatch
+A read was turned into a `bytes` object as its completion was translated,
+in the cell, and its receive re-posted into the same slot. With several
+large reads in one tick that allocated all of their objects back to back
+before the first was delivered, and -- for a protocol that writes them
+straight back -- freed them together a tick later, when the sends'
+completions were reaped. The allocator never saw one of those blocks come
+back before it was asked for the next, so each tick took fresh memory:
+past glibc's trim threshold the heap was handed back to the kernel and
+faulted in again, and every copy landed cache-cold. On an echo of 64 KiB
+messages that was most of the distance to uvloop, which reads, delivers,
+writes and frees one message before it touches the next.
+
+On the readiness backend a read of 32 KiB or more now travels as a
+BufferedProtocol's does: the event takes the slot, and the bytes object
+is made when the event is dispatched, in the cell entry that routes it,
+which gives the slot back in the same breath. Two things make that pay:
+
+* The next receive is posted by the dispatch, after the delivery. The
+  slot is back in the pool by then and is the one that receive is given,
+  so a connection keeps reading into one warm buffer. Posted at translate
+  instead, every connection alternated between two, and a tick with more
+  large reads than the pool keeps resident (256) paged slots out and
+  faulted them back in: measured at 512 connections, 16% *slower* than
+  before the change. Nothing is lost by waiting -- this backend reads
+  only inside a poll, and the next poll comes after the dispatch either
+  way -- and `post_recv` declines by itself whatever the delivery did in
+  between (paused, closed, raised, or had the receive posted already by a
+  `resume_reading()` from another callback).
+* A write large enough to be flushed as it is made (R-035) has its send
+  settled at once when the backend finished it inside the post
+  (`IoBackend::take_staged_op`), so the buffers it was sent from are
+  released before `write()` returns instead of a tick later. Only that
+  one completion is applied: applying everything staged from inside a
+  write would let one callback read ahead on every other connection.
+
+Each message is then allocated, filled, delivered, sent and freed before
+the next, which reuses the same block. The completion backends keep their
+path (`IoBackend::completes_inline` is false there): on IOCP the kernel
+fills a posted buffer on its own, a receive posted early does overlap
+with the callbacks, and none of this has been measured on Windows.
+
+Echo of 64 KiB messages, measured as above: 38.2 K -> 43.6 K msg/s at 8
+connections, 22.3 K -> 32.0 K at 512 (uvloop: 46.8 K and 38.9 K; rloop
+51.6 K at 8). What remains is the copy out of the slot, and at high
+connection counts the slots themselves, one per connection where uvloop
+reads everything through a single buffer: rloop receives straight into
+the bytes object it delivers. Doing the same here means reading at
+dispatch rather than in the poll -- the readiness-native read path ADR-20
+sketched, which would also free an idle connection's posted buffer -- and
+is left for a change of its own.
+
+## ADR-35: The probe after a full read is adaptive (epoll)
+A read that fills its buffer is followed by an inline `recv` at the next
+post, on the reasoning that a full buffer means more is waiting
+(ADR-21). It also means a peer sending messages of exactly the buffer's
+size, one at a time -- and there every probe came back EAGAIN: a wasted
+syscall per message, for good. After two such misses in a row the probe is
+skipped and the receive parks; level-triggered epoll reports the socket at
+the next poll if data was there after all, so nothing can be lost, only
+found one poll later. One full read in sixteen is still probed, and a hit
+puts the socket back to probing every time, so a stream is recognised
+within sixteen reads. Worth about 1% on the 64 KiB echo -- a syscall, no
+more -- and nothing measurable elsewhere.
+
+A send of a single buffer -- most of them -- goes through `send()` rather
+than `sendmsg()`: the same call without the msghdr and iovec the kernel
+copies in and validates first.
