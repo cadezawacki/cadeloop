@@ -2685,3 +2685,368 @@ def test_create_server_rejects_a_connected_socket(loop):
     finally:
         client.close()
         srv.close()
+
+
+# --------------------------------------------------------------------- #
+# large reads                                                           #
+# --------------------------------------------------------------------- #
+#
+# On the readiness backend a plain protocol's read of 32 KiB or more stays
+# in its receive slot until the tick dispatches it, becomes a bytes object
+# there, and has its next receive posted after the delivery. These drive
+# that path through everything a protocol can do from inside
+# data_received, and check the stream each time: every byte, once, in
+# order. (Elsewhere the reads arrive as they always did, and the same
+# assertions hold.)
+
+LARGE_READ = 32 * 1024
+
+
+class _Collector(asyncio.Protocol):
+    """Collects what it receives; `on_data(self, data)` runs first."""
+
+    def __init__(self, done, on_data=None):
+        self.chunks = []
+        self.calls = 0
+        self.lost = []
+        self.done = done
+        self.on_data = on_data
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def data_received(self, data):
+        self.calls += 1
+        self.chunks.append(data)
+        if self.on_data is not None:
+            self.on_data(self, data)
+
+    def connection_lost(self, exc):
+        self.lost.append(exc)
+        if not self.done.done():
+            self.done.set_result(None)
+
+    def received(self):
+        return b"".join(self.chunks)
+
+
+async def _collecting_server(loop, make):
+    protos = []
+
+    def factory():
+        p = make()
+        protos.append(p)
+        return p
+
+    server = await loop.create_server(factory, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname(), protos
+
+
+def _send_all_and_finish(addr, payload, piece=256 * 1024):
+    """A blocking client, for a worker thread: send, then FIN."""
+    with socket.create_connection(addr) as s:
+        for off in range(0, len(payload), piece):
+            s.sendall(payload[off:off + piece])
+        s.shutdown(socket.SHUT_WR)
+        while s.recv(65536):
+            pass
+
+
+async def _settle(loop):
+    for _ in range(20):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+
+
+def test_bulk_receive_arrives_intact_in_large_reads(loop):
+    payload = os.urandom(8 * 1024 * 1024)
+
+    async def main():
+        done = loop.create_future()
+        server, addr, protos = await _collecting_server(loop, lambda: _Collector(done))
+        await loop.run_in_executor(None, _send_all_and_finish, addr, payload)
+        await asyncio.wait_for(done, 10)
+        p = protos[0]
+        assert p.received() == payload
+        assert max(len(c) for c in p.chunks) >= LARGE_READ, "no large read: the test proves nothing"
+        assert all(type(c) is bytes for c in p.chunks)
+        assert p.lost == [None]
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+    assert loop._core.stats()["stale_buffer_ids"] == 0
+
+
+def test_large_messages_echo_intact(loop):
+    """An echo of messages that fill the receive buffer exactly: each is
+    written back whole (and sent, and released) from inside
+    data_received, and the next receive is posted after it."""
+
+    class Echo(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def data_received(self, data):
+            self.transport.write(data)
+
+    async def main():
+        server = await loop.create_server(Echo, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()
+        conns = [await asyncio.open_connection(*addr) for _ in range(4)]
+
+        async def run(reader, writer, size):
+            for _ in range(40):
+                msg = os.urandom(size)
+                writer.write(msg)
+                await writer.drain()
+                assert await reader.readexactly(size) == msg
+            writer.close()
+            await writer.wait_closed()
+
+        sizes = (65536, 65536, 65537, 200_000)
+        runs = [run(r, w, n) for (r, w), n in zip(conns, sizes, strict=True)]
+        await asyncio.wait_for(asyncio.gather(*runs), 30)
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+    assert loop._core.stats()["stale_buffer_ids"] == 0
+
+
+def test_pausing_inside_every_large_read_loses_nothing(loop):
+    payload = os.urandom(4 * 1024 * 1024)
+
+    def pause_then_resume(p, data):
+        p.transport.pause_reading()
+        assert not p.transport.is_reading()
+        loop.call_soon(p.transport.resume_reading)
+
+    async def main():
+        done = loop.create_future()
+        server, addr, protos = await _collecting_server(loop, lambda: _Collector(done, pause_then_resume))
+        await loop.run_in_executor(None, _send_all_and_finish, addr, payload)
+        await asyncio.wait_for(done, 20)
+        p = protos[0]
+        assert p.received() == payload
+        assert max(len(c) for c in p.chunks) >= LARGE_READ
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_closing_inside_a_large_read_ends_the_stream_there(loop):
+    payload = os.urandom(2 * 1024 * 1024)
+    after_close = []
+
+    def close_on_large(p, data):
+        if p.transport.is_closing():
+            after_close.append(len(data))
+        elif len(data) >= LARGE_READ:
+            p.transport.close()
+
+    def client(addr):
+        try:
+            _send_all_and_finish(addr, payload)
+        except OSError:
+            pass  # the server hung up mid-stream, as intended
+
+    async def main():
+        done = loop.create_future()
+        server, addr, protos = await _collecting_server(loop, lambda: _Collector(done, close_on_large))
+        await loop.run_in_executor(None, client, addr)
+        await asyncio.wait_for(done, 10)
+        p = protos[0]
+        assert p.lost == [None], p.lost
+        assert not after_close, f"data_received after close(): {after_close}"
+        assert payload.startswith(p.received())
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_a_large_read_that_raises_closes_only_its_own_transport(loop):
+    payload = os.urandom(1024 * 1024)
+
+    def boom_on_large(p, data):
+        if p.tag == "bad" and len(data) >= LARGE_READ:
+            raise RuntimeError("protocol is confused now")
+
+    reported = []
+    loop.set_exception_handler(lambda lp, ctx: reported.append(ctx.get("message", "")))
+
+    def client(addr):
+        try:
+            _send_all_and_finish(addr, payload)
+        except OSError:
+            pass
+
+    async def main():
+        dones = [loop.create_future(), loop.create_future()]
+        tags = iter(("bad", "good"))
+
+        def make():
+            p = _Collector(dones[len(made)], boom_on_large)
+            p.tag = next(tags)
+            made.append(p)
+            return p
+
+        made = []
+        server, addr, protos = await _collecting_server(loop, make)
+        await loop.run_in_executor(None, client, addr)
+        await asyncio.wait_for(dones[0], 10)
+        await loop.run_in_executor(None, client, addr)
+        await asyncio.wait_for(dones[1], 10)
+        bad, good = protos
+        assert len(bad.lost) == 1 and isinstance(bad.lost[0], RuntimeError), bad.lost
+        assert any("protocol.data_received() call failed" in m for m in reported), reported
+        assert good.received() == payload and good.lost == [None]
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+
+
+@pytest.mark.parametrize("first", ["plain", "buffered"])
+def test_switching_protocol_kind_between_large_reads(loop, first):
+    """set_protocol() from inside a delivery: the reads already made, and
+    the ones after, go to whichever protocol is current, whole."""
+    payload = os.urandom(4 * 1024 * 1024)
+    got = bytearray()
+    kinds = []
+
+    class Plain(asyncio.Protocol):
+        def data_received(self, data):
+            kinds.append("plain")
+            got.extend(data)
+            if len(data) >= LARGE_READ and len(kinds) % 3 == 0:
+                state["transport"].set_protocol(Buffered())
+
+        def connection_lost(self, exc):
+            state["done"].set_result(exc)
+
+    class Buffered(asyncio.BufferedProtocol):
+        def __init__(self):
+            self.buf = bytearray(1 << 16)
+
+        def get_buffer(self, sizehint):
+            return self.buf
+
+        def buffer_updated(self, nbytes):
+            kinds.append("buffered")
+            got.extend(self.buf[:nbytes])
+            if nbytes >= LARGE_READ and len(kinds) % 3 == 0:
+                state["transport"].set_protocol(Plain())
+
+        def connection_lost(self, exc):
+            state["done"].set_result(exc)
+
+    state = {}
+
+    def factory():
+        p = Plain() if first == "plain" else Buffered()
+        return p
+
+    async def main():
+        state["done"] = loop.create_future()
+
+        class Entry(asyncio.Protocol):
+            def connection_made(self, transport):
+                state["transport"] = transport
+                transport.set_protocol(factory())
+
+        server = await loop.create_server(Entry, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()
+        await loop.run_in_executor(None, _send_all_and_finish, addr, payload)
+        assert await asyncio.wait_for(state["done"], 20) is None
+        assert bytes(got) == payload
+        assert {"plain", "buffered"} <= set(kinds), "the protocol never switched"
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+
+
+def test_a_large_read_survives_another_callback_cycling_its_transport(loop):
+    """Two connections whose large reads land in the same tick, each
+    protocol pausing and resuming the OTHER's transport from its own
+    data_received: the second one's read is still waiting to be delivered
+    at that moment, with its next receive not yet posted. It must arrive
+    once, ahead of everything read after it."""
+    first = [os.urandom(96 * 1024), os.urandom(96 * 1024)]
+    second = [os.urandom(96 * 1024), os.urandom(96 * 1024)]
+    protos = []
+
+    def cycle_the_other(p, data):
+        for other in protos:
+            if other is not p and other.transport is not None and not other.transport.is_closing():
+                other.transport.pause_reading()
+                other.transport.resume_reading()
+
+    async def main():
+        dones = [loop.create_future(), loop.create_future()]
+        made = []
+
+        def make():
+            p = _Collector(dones[len(made)], cycle_the_other)
+            made.append(p)
+            protos.append(p)
+            return p
+
+        server = await loop.create_server(make, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()
+        socks = [socket.create_connection(addr), socket.create_connection(addr)]
+        try:
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if len(protos) == 2:
+                    break
+            assert len(protos) == 2
+            # Peer address -> protocol, so each stream is checked against
+            # what its own client sent.
+            by_peer = {p.transport.get_extra_info("peername"): p for p in protos}
+            mine = [by_peer[s.getsockname()] for s in socks]
+
+            async def wait_for_bytes(n):
+                for _ in range(500):
+                    if all(len(p.received()) >= n for p in mine):
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError([len(p.received()) for p in mine])
+
+            # Both written before the loop polls again: one tick sees both.
+            for s, data in zip(socks, first, strict=True):
+                s.sendall(data)
+            await wait_for_bytes(96 * 1024)
+            for s, data in zip(socks, second, strict=True):
+                s.sendall(data)
+            await wait_for_bytes(192 * 1024)
+            for p, a, b in zip(mine, first, second, strict=True):
+                assert p.received() == a + b
+                assert max(len(c) for c in p.chunks) >= LARGE_READ
+        finally:
+            for s in socks:
+                s.close()
+        await asyncio.wait_for(asyncio.gather(*dones), 10)
+        server.close()
+        await server.wait_closed()
+        await _settle(loop)
+
+    loop.run_until_complete(main())
+    assert loop._core.stats()["buffers_in_use"] == 0
+    assert loop._core.stats()["stale_buffer_ids"] == 0

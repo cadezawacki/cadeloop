@@ -1156,3 +1156,117 @@ def test_a_receive_cancelled_after_its_wake_loses_no_message(loop, eager, cancel
     loop.run_until_complete(main())
     loop._core.listener_close(lid)
     assert got == [("cancelled",), "m1"], got
+
+
+# ---- outbound payloads: borrowed, and large ones sent by reference ----- #
+
+
+def _patterned(n, seed=0):
+    block = bytes((seed + i * 7 + (i >> 8) * 13) % 251 for i in range(4099))
+    return (block * (n // len(block) + 1))[:n]
+
+
+def test_outbound_messages_of_every_size_arrive_as_sent(loop):
+    """websocket.send builds its frame from the message's own storage, and
+    a bytes payload of 16 KiB or more goes out from the bytes object
+    itself behind a header-only buffer. Sizes on both sides of that
+    threshold and of each frame-length encoding, interleaved with text,
+    in one stream: any byte out of place shows."""
+    sizes = [0, 1, 125, 126, 16383, 16384, 65535, 65536, 70_001, 300_000]
+    texts = ["", "plain ascii", "naïve — ☃ \U0001f600", "x" * 20_000, "é" * 40_000]
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "websocket.accept"})
+        for i, n in enumerate(sizes):
+            await send({"type": "websocket.send", "bytes": _patterned(n, i)})
+            await send({"type": "websocket.send", "text": texts[i % len(texts)]})
+        await send({"type": "websocket.send", "bytes": bytearray(_patterned(70_000, 99))})
+        await send({"type": "websocket.send", "bytes": memoryview(_patterned(70_000, 98))})
+        await send({"type": "websocket.close", "code": 1000})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port)
+        assert head.startswith(b"HTTP/1.1 101")
+        got = []
+        while True:
+            fin, opcode, payload = await asyncio.wait_for(read_server_frame(reader), 10)
+            assert fin
+            if opcode == 0x8:
+                break
+            got.append((opcode, payload))
+        writer.close()
+        return got
+
+    got = loop.run_until_complete(main())
+    want = []
+    for i, n in enumerate(sizes):
+        want.append((0x2, _patterned(n, i)))
+        want.append((0x1, texts[i % len(texts)].encode()))
+    want.append((0x2, _patterned(70_000, 99)))
+    want.append((0x2, _patterned(70_000, 98)))
+    assert len(got) == len(want)
+    for i, (g, w) in enumerate(zip(got, want, strict=True)):
+        assert g[0] == w[0], f"message {i}: opcode {g[0]}"
+        assert g[1] == w[1], f"message {i}: {len(g[1])} bytes, expected {len(w[1])}"
+    loop._core.listener_close(lid)
+
+
+def test_large_outbound_messages_survive_a_slow_reader(loop):
+    """Large frames queue behind a client that reads slowly, each sent a
+    piece at a time from a bytes object the app no longer holds."""
+    count, size = 24, 200_000
+    digests = [hashlib.sha256(_patterned(size, i)).hexdigest() for i in range(count)]
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "websocket.accept"})
+        for i in range(count):
+            await send({"type": "websocket.send", "bytes": _patterned(size, i)})
+            gc.collect()
+        await send({"type": "websocket.close", "code": 1000})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, _head = await handshake(port)
+        seen = []
+        while True:
+            fin, opcode, payload = await asyncio.wait_for(read_server_frame(reader), 10)
+            if opcode == 0x8:
+                break
+            seen.append(hashlib.sha256(payload).hexdigest())
+            await asyncio.sleep(0.002)  # let the server's queue back up
+        writer.close()
+        return seen
+
+    assert loop.run_until_complete(main()) == digests
+    loop._core.listener_close(lid)
+
+
+def test_send_rejects_a_text_that_is_not_a_str(loop):
+    errors = []
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "websocket.accept"})
+        try:
+            await send({"type": "websocket.send", "text": b"bytes, not str"})
+        except TypeError as e:
+            errors.append(e)
+        await send({"type": "websocket.send", "text": "still usable"})
+        await send({"type": "websocket.close", "code": 1000})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, _head = await handshake(port)
+        _fin, opcode, payload = await asyncio.wait_for(read_server_frame(reader), 5)
+        writer.close()
+        return opcode, payload
+
+    assert loop.run_until_complete(main()) == (0x1, b"still usable")
+    assert errors, "a non-str text was accepted"
+    loop._core.listener_close(lid)

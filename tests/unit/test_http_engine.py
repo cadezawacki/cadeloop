@@ -3711,3 +3711,370 @@ def test_an_early_answer_to_an_upload_survives_the_close(loop):
     data = loop.run_until_complete(loop.run_in_executor(None, uploader))
     assert data.startswith(b"HTTP/1.1 413"), data[:80]
     loop._core.listener_close(lid)
+
+
+# --------------------------------------------------------------------- #
+# large response bodies, sent from the application's bytes object       #
+# --------------------------------------------------------------------- #
+#
+# A body of 16 KiB or more is not copied behind the head: the write queue
+# holds the application's bytes object and the kernel reads from it. Every
+# framing the engine produces has to come out byte for byte as it does for
+# a small body, so each is checked against bodies on both sides of the
+# threshold, with content in which a shifted, dropped or repeated block
+# would show.
+
+RETAIN_MIN = 16 * 1024
+
+
+def _patterned(n, seed=0):
+    block = bytes((seed + i * 7 + (i >> 8) * 13) % 251 for i in range(4099))
+    return (block * (n // len(block) + 1))[:n]
+
+
+def _dechunk(body):
+    """(payload, what follows the terminating chunk) of a chunked body."""
+    out = bytearray()
+    while True:
+        line, body = body.split(b"\r\n", 1)
+        size = int(line, 16)
+        if size == 0:
+            return bytes(out), body
+        out += body[:size]
+        assert body[size:size + 2] == b"\r\n", "chunk not closed by CRLF"
+        body = body[size + 2:]
+
+
+BODY_SIZES = [RETAIN_MIN - 1, RETAIN_MIN, 65536, 300_001]
+
+
+@pytest.mark.parametrize("size", BODY_SIZES)
+def test_large_body_with_generated_content_length(loop, size):
+    body = _patterned(size)
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"x-a", b"b")]})
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    headers = _parse_headers(resp.split(b"\r\n\r\n", 1)[0])
+    assert headers["content-length"] == str(size)
+    assert "transfer-encoding" not in headers
+    assert _body(resp) == body
+    loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize("size", BODY_SIZES)
+def test_large_chunks_keep_chunked_framing(loop, size):
+    parts = [_patterned(size, 1), b"small", _patterned(size + 1, 2), _patterned(size, 3)]
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        for part in parts[:-1]:
+            await send({"type": "http.response.body", "body": part, "more_body": True})
+        await send({"type": "http.response.body", "body": parts[-1]})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    headers = _parse_headers(resp.split(b"\r\n\r\n", 1)[0])
+    assert headers["transfer-encoding"] == "chunked"
+    payload, rest = _dechunk(_body(resp))
+    assert payload == b"".join(parts)
+    assert rest == b"\r\n", rest
+    # One chunk per message, sized as sent: the framing is not re-cut.
+    assert _body(resp).startswith(b"%x\r\n" % len(parts[0]))
+    loop._core.listener_close(lid)
+
+
+def test_large_chunks_then_an_empty_final_message(loop):
+    parts = [_patterned(40_000, 1), _patterned(70_000, 2)]
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        for part in parts:
+            await send({"type": "http.response.body", "body": part, "more_body": True})
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    payload, rest = _dechunk(_body(resp))
+    assert payload == b"".join(parts) and rest == b"\r\n"
+    loop._core.listener_close(lid)
+
+
+def test_large_body_with_declared_content_length_streams_raw(loop):
+    parts = [_patterned(50_000, 1), _patterned(20_000, 2), b"tail"]
+    total = sum(len(p) for p in parts)
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-length", str(total).encode())]})
+        for part in parts[:-1]:
+            await send({"type": "http.response.body", "body": part, "more_body": True})
+        await send({"type": "http.response.body", "body": parts[-1]})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    headers = _parse_headers(resp.split(b"\r\n\r\n", 1)[0])
+    assert headers["content-length"] == str(total) and "transfer-encoding" not in headers
+    assert _body(resp) == b"".join(parts)
+    loop._core.listener_close(lid)
+
+
+def test_large_body_shorter_than_declared_is_still_refused(loop):
+    errors = []
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-length", b"100000")]})
+        try:
+            await send({"type": "http.response.body", "body": _patterned(65536)})
+        except RuntimeError as e:
+            errors.append(str(e))
+            raise
+
+    lid, port = listen(loop, app)
+    loop.set_exception_handler(lambda lp, ctx: None)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", read_all=True))
+    assert errors and "shorter than the declared content-length" in errors[0], errors
+    # Nothing of the refused body went out under the declared length.
+    assert len(_body(resp)) < 65536 if b"\r\n\r\n" in resp else True
+    loop._core.listener_close(lid)
+
+
+def test_head_request_sends_no_bytes_of_a_large_body(loop):
+    body = _patterned(65536)
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"HEAD / HTTP/1.1\r\nHost: h\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        # The very next bytes are the GET's response, not a HEAD body.
+        nxt = await asyncio.wait_for(_read_one_response(reader), 5)
+        writer.close()
+        return head, nxt
+
+    head, nxt = loop.run_until_complete(main())
+    assert _parse_headers(head)["content-length"] == "65536"
+    assert nxt.startswith(b"HTTP/1.1 200") and _body(nxt) == body
+    loop._core.listener_close(lid)
+
+
+def test_large_body_and_trailers(loop):
+    body = _patterned(65536)
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
+        await send({"type": "http.response.body", "body": body})
+        await send({"type": "http.response.trailers", "headers": [(b"x-sum", b"abc")]})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\nTE: trailers\r\n\r\n"))
+    payload, rest = _dechunk(_body(resp))
+    assert payload == body
+    assert rest == b"x-sum: abc\r\n\r\n", rest
+    loop._core.listener_close(lid)
+
+
+def test_streamed_large_chunks_and_trailers(loop):
+    parts = [_patterned(30_000, 1), _patterned(30_000, 2)]
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
+        await send({"type": "http.response.body", "body": parts[0], "more_body": True})
+        await send({"type": "http.response.body", "body": parts[1]})
+        await send({"type": "http.response.trailers", "headers": [(b"x-sum", b"abc")]})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\nTE: trailers\r\n\r\n"))
+    payload, rest = _dechunk(_body(resp))
+    assert payload == b"".join(parts)
+    assert rest == b"x-sum: abc\r\n\r\n", rest
+    loop._core.listener_close(lid)
+
+
+def test_http10_large_stream_is_close_delimited(loop):
+    parts = [_patterned(40_000, 1), _patterned(40_000, 2)]
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": parts[0], "more_body": True})
+        await send({"type": "http.response.body", "body": parts[1]})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.0\r\n\r\n", read_all=True))
+    head, body = resp.split(b"\r\n\r\n", 1)
+    assert head.startswith(b"HTTP/1.0 200")
+    assert "transfer-encoding" not in _parse_headers(head)
+    assert body == b"".join(parts)
+    loop._core.listener_close(lid)
+
+
+def test_pipelined_large_responses_stay_whole_and_in_order(loop):
+    bodies = {
+        b"/a": _patterned(65536, 1),
+        b"/b": _patterned(20_000, 2),
+        b"/c": b"tiny",
+        b"/d": _patterned(65536, 4),
+    }
+
+    async def app(scope, receive, send):
+        body = bodies[scope["raw_path"]]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        order = [b"/a", b"/b", b"/c", b"/d", b"/a"]
+        writer.write(b"".join(b"GET %s HTTP/1.1\r\nHost: h\r\n\r\n" % p for p in order))
+        got = [await asyncio.wait_for(_read_one_response(reader), 5) for _ in order]
+        writer.close()
+        return order, got
+
+    order, got = loop.run_until_complete(main())
+    for path, resp in zip(order, got, strict=True):
+        assert _body(resp) == bodies[path], path
+    loop._core.listener_close(lid)
+
+
+def test_large_body_survives_a_slow_reader_and_the_app_letting_go(loop):
+    """The kernel takes a large body a piece at a time from a client that
+    reads slowly, long after the application has dropped its own reference
+    to it: the write queue's is what keeps the bytes alive, and each
+    partial send has to resume exactly where the last one stopped."""
+    import gc
+    import hashlib
+
+    sizes = [3 * 1024 * 1024 + 17, 2 * 1024 * 1024 + 1]
+    digests = [hashlib.sha256(_patterned(n, i)).hexdigest() for i, n in enumerate(sizes)]
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        for i, n in enumerate(sizes):
+            # No name keeps the body past the call.
+            await send({"type": "http.response.body", "body": _patterned(n, i), "more_body": True})
+            gc.collect()
+        await send({"type": "http.response.body", "body": b""})
+
+    lid, port = listen(loop, app)
+
+    def slow_client():
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024)
+        s.connect(("127.0.0.1", port))
+        try:
+            s.sendall(b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+            data = bytearray()
+            s.settimeout(10)
+            n = 0
+            while chunk := s.recv(8192):
+                data += chunk
+                n += 1
+                if n % 64 == 0:
+                    time.sleep(0.001)
+            return bytes(data)
+        finally:
+            s.close()
+
+    import time
+
+    resp = loop.run_until_complete(loop.run_in_executor(None, slow_client))
+    payload, rest = _dechunk(_body(resp))
+    assert rest == b"\r\n"
+    assert len(payload) == sum(sizes)
+    assert hashlib.sha256(payload[:sizes[0]]).hexdigest() == digests[0]
+    assert hashlib.sha256(payload[sizes[0]:]).hexdigest() == digests[1]
+    loop._core.listener_close(lid)
+
+
+@pytest.mark.parametrize("kind", ["bytearray", "memoryview", "subclass"])
+def test_large_body_of_another_type_is_sent_the_same(loop, kind):
+    data = _patterned(65536)
+
+    class MyBytes(bytes):
+        pass
+
+    def make():
+        if kind == "bytearray":
+            return bytearray(data)
+        if kind == "memoryview":
+            return memoryview(data)
+        return MyBytes(data)
+
+    async def app(scope, receive, send):
+        body = make()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+        if kind == "bytearray":
+            # What was sent is what the body held when send() was called.
+            body[:] = b"\x00" * len(body)
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"))
+    assert _body(resp) == data
+    loop._core.listener_close(lid)
+
+
+def _extra_refs(objs):
+    """References to each of `objs` beyond the list's own slot."""
+    probe = [object()]
+    base = [sys.getrefcount(o) for o in probe][0]
+    return [sys.getrefcount(o) - base for o in objs]
+
+
+def test_large_body_to_a_client_that_left_is_dropped_quietly(loop):
+    """The connection goes away with large bodies queued behind a client
+    that never reads: the write queue lets go of the bytes objects it
+    held, and the loop keeps serving."""
+    bodies = []
+    gone = []
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        if scope["raw_path"] == b"/ok":
+            await send({"type": "http.response.body", "body": b"fine"})
+            return
+        try:
+            for i in range(64):
+                bodies.append(_patterned(256 * 1024, i))
+                await send({"type": "http.response.body", "body": bodies[-1], "more_body": True})
+        except OSError:
+            gone.append(True)
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024)
+        s.setblocking(False)
+        await loop.sock_connect(s, ("127.0.0.1", port))
+        await loop.sock_sendall(s, b"GET /big HTTP/1.1\r\nHost: h\r\n\r\n")
+        await asyncio.sleep(0.3)  # the app parks on backpressure
+        # Backpressure parks the app behind the first body the kernel
+        # would not take whole; that one is the write queue's to keep.
+        held = _extra_refs(bodies)
+        assert any(held), f"nothing was queued: the test proves nothing ({held})"
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        s.close()  # RST
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if gone and not any(_extra_refs(bodies)):
+                break
+        return await _request(port, b"GET /ok HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    loop.set_exception_handler(lambda lp, ctx: None)
+    ok = loop.run_until_complete(main())
+    assert _body(ok) == b"fine"
+    assert gone, "the parked send() was never told the connection is gone"
+    held = _extra_refs(bodies)
+    assert not any(held), f"queued bodies still referenced after the connection died: {held}"
+    loop._core.listener_close(lid)

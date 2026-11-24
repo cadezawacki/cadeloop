@@ -97,8 +97,22 @@ pub const OP_PONG: u8 = 0xA;
 
 /// Encode one server frame (FIN set, unmasked).
 pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let n = payload.len();
-    let mut out = Vec::with_capacity(n + 10);
+    let mut out = Vec::with_capacity(payload.len() + 10);
+    push_frame_header(&mut out, opcode, payload.len());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The header alone of a server frame (FIN set, unmasked) carrying `n`
+/// payload bytes: for a payload that is sent from where it already is,
+/// right behind this, instead of being copied into the frame.
+pub fn frame_header(opcode: u8, n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    push_frame_header(&mut out, opcode, n);
+    out
+}
+
+fn push_frame_header(out: &mut Vec<u8>, opcode: u8, n: usize) {
     out.push(0x80 | (opcode & 0x0F));
     if n < 126 {
         out.push(n as u8);
@@ -109,8 +123,6 @@ pub fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         out.push(127);
         out.extend_from_slice(&(n as u64).to_be_bytes());
     }
-    out.extend_from_slice(payload);
-    out
 }
 
 /// Encode a close frame with a status code and (truncated) reason.
@@ -297,9 +309,7 @@ impl WsRx {
             return ParseOne::NeedMore;
         }
         let mut payload: Vec<u8> = b[off..off + len].to_vec();
-        for (i, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[i & 3];
-        }
+        unmask(&mut payload, mask);
         self.consumed = off + len;
 
         match opcode {
@@ -367,6 +377,26 @@ impl WsRx {
     }
 }
 
+/// XOR `data` with the 4-byte masking key, repeated (RFC 6455 5.3).
+///
+/// Eight bytes at a time, as whole words: a shape the compiler turns into
+/// vector XORs. The byte-at-a-time loop this replaces -- `*byte ^=
+/// mask[i & 3]` -- stayed scalar, one table lookup per byte, and was a
+/// third of the server's CPU on an echo of 64 KiB messages.
+fn unmask(data: &mut [u8], mask: [u8; 4]) {
+    let word = u64::from_ne_bytes([mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3]]);
+    let mut words = data.chunks_exact_mut(8);
+    for w in &mut words {
+        let v = u64::from_ne_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]) ^ word;
+        w.copy_from_slice(&v.to_ne_bytes());
+    }
+    // Each word started on a multiple of 8, so the tail starts on the key's
+    // first byte too.
+    for (i, byte) in words.into_remainder().iter_mut().enumerate() {
+        *byte ^= mask[i & 3];
+    }
+}
+
 pub fn valid_close_code(code: u16) -> bool {
     matches!(code, 1000..=1014 | 3000..=4999) && !matches!(code, 1004..=1006 | 1015)
 }
@@ -398,6 +428,42 @@ mod tests {
         out.extend_from_slice(&mask);
         out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
         out
+    }
+
+    #[test]
+    fn unmask_matches_the_rfc_definition_at_every_length() {
+        // RFC 6455 5.3: transformed-octet-i = original-octet-i XOR
+        // masking-key-octet-(i MOD 4). Every length through several words
+        // and their tails, and a few large ones.
+        let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+        for n in (0..=67).chain([255, 256, 257, 4096, 65535, 65536, 65537]) {
+            let plain: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+            let mut data = plain.clone();
+            unmask(&mut data, mask);
+            for (i, (&got, &was)) in data.iter().zip(&plain).enumerate() {
+                assert_eq!(got, was ^ mask[i % 4], "byte {i} of {n}");
+            }
+            unmask(&mut data, mask);
+            assert_eq!(data, plain, "masking twice restores {n} bytes");
+        }
+        // The RFC's own example (5.7): a masked "Hello".
+        let mut hello = [0x7fu8, 0x9f, 0x4d, 0x51, 0x58];
+        unmask(&mut hello, mask);
+        assert_eq!(&hello, b"Hello");
+    }
+
+    #[test]
+    fn frame_header_is_the_frame_less_its_payload() {
+        for n in [0usize, 1, 125, 126, 127, 0xFFFF, 0x10000, 300_000] {
+            let payload = vec![0xA5u8; n];
+            for opcode in [OP_TEXT, OP_BINARY] {
+                let whole = frame(opcode, &payload);
+                let header = frame_header(opcode, n);
+                assert_eq!(whole.len(), header.len() + n);
+                assert_eq!(&whole[..header.len()], header.as_slice(), "{n}-byte payload");
+                assert_eq!(&whole[header.len()..], payload.as_slice());
+            }
+        }
     }
 
     #[test]

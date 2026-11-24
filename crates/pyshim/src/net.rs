@@ -108,6 +108,21 @@ fn coalesce_tail(entry: &mut TransportEntry, data: &[u8]) -> bool {
 /// bulk transfers reach 64 KiB reads after two; small reads move it back.
 const RECV_CLASS_FIRST: SizeClass = SizeClass::S4K;
 
+/// A plain protocol's read at least this long stays in its receive slot
+/// until the tick dispatches it, and becomes a bytes object only then
+/// (as a BufferedProtocol's read is copied only then).
+///
+/// Smaller reads are turned into bytes as their completions are
+/// translated, which lets the receive re-post into the same slot. For
+/// large ones that meant a tick with N of them allocated N large objects
+/// back to back, before the first was delivered, and freed them together
+/// afterwards: memory the allocator had to find fresh every tick (and,
+/// past its trim threshold, hand back to the OS and fault in again) for
+/// copies that then landed cache-cold. Made one at a time, each is
+/// allocated, filled, delivered and -- for a protocol that does not keep
+/// it -- freed before the next, which then reuses the same warm block.
+const LARGE_READ_MIN: usize = 32 * 1024;
+
 /// The OS's message for `code` -- what `os.strerror()` (or, on Windows,
 /// a socket.error) says -- without the " (os error N)" suffix that Rust's
 /// `io::Error` display appends.
@@ -629,6 +644,12 @@ pub(crate) struct NetState {
     /// a Python protocol issuing many small `write()`s is exactly the
     /// case corking exists for.
     pub flush_immediately: bool,
+    /// The backend completes ops in user space (`IoBackend::completes_inline`;
+    /// epoll). Decides how a plain protocol's large reads are delivered
+    /// (`LARGE_READ_MIN`): what suits a backend whose receive only reads
+    /// inside a poll is not what suits one where the kernel fills a posted
+    /// buffer on its own, so the completion backends keep their path.
+    pub inline_backend: bool,
     /// HTTP `Date:` header cache (R-084): rebuilt when the unix second ticks.
     pub http_date_secs: u64,
     pub http_date_line: Vec<u8>,
@@ -815,10 +836,14 @@ pub(crate) enum NetEvent {
     },
     /// BufferedProtocol data: copy out of the retained slot in phase 2
     /// (get_buffer may run arbitrary Python, so it cannot run in-cell).
+    /// Also a plain protocol's large read (`LARGE_READ_MIN`), made into a
+    /// bytes object there; `repost` then says the next receive was left
+    /// for the dispatch to post, once this one has been delivered.
     BufData {
         tid: u64,
         slot: SlotId,
         len: usize,
+        repost: bool,
     },
     Eof {
         tid: u64,
@@ -1018,6 +1043,24 @@ fn settle_inline(py: Python<'_>, net: &mut NetState, backend: Backend<'_>) {
         }
         translate(py, net, backend, &staged);
         staged.clear();
+    }
+}
+
+/// Apply the completion of `tid`'s send now if the backend finished it
+/// inside the post (epoll's send at post time) -- that one completion
+/// only, unlike `settle_inline`. In-cell.
+///
+/// A large write is flushed as it is made, and on epoll the kernel has
+/// normally taken all of it by the time the post returns. The buffers it
+/// was sent from stayed queued until the completion was reaped a tick
+/// later all the same: for an echo of 64 KiB messages, every message
+/// received in one tick was held until the next, where one at a time
+/// would have let each be freed -- and its memory reused, still warm, for
+/// the following one -- as soon as its write returned.
+fn settle_own_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
+    let Some(op) = net.transports.get(&tid).and_then(|e| e.send_op) else { return };
+    if let Some(done) = backend.take_staged_op(op) {
+        translate(py, net, backend, &[done]);
     }
 }
 
@@ -1503,6 +1546,13 @@ pub(crate) fn http_enqueue_raw(
     if !coalesce_tail(entry, &data) {
         entry.wq.push_back(WriteBuf::Owned { data, off: 0 });
     }
+    http_flush_or_cork(py, net, backend, tid);
+}
+
+/// Send what an HTTP connection just queued, or leave it corked for the
+/// tick's flush (R-035). In-cell.
+fn http_flush_or_cork(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64) {
+    let Some(entry) = net.transports.get_mut(&tid) else { return };
     let no_send = entry.send_op.is_none();
     let big = entry.queued_bytes >= CORK_FLUSH_BYTES;
     let unscheduled = !entry.flush_scheduled;
@@ -1515,12 +1565,62 @@ pub(crate) fn http_enqueue_raw(
         if big || net.flush_immediately {
             flush_pending(py, net, backend, tid);
         } else if unscheduled {
-            if let Some(e) = net.transports.get_mut(&tid) {
-                e.flush_scheduled = true;
-            }
+            entry.flush_scheduled = true;
             net.flush_list.push(tid);
         }
     }
+}
+
+/// A response body at least this long is sent from the application's own
+/// `bytes` object instead of being copied behind the head
+/// (`http_enqueue_retained`).
+///
+/// Below it the copy is the cheaper choice: one buffer on the queue, one
+/// iovec in the send, and consecutive small responses still coalesce
+/// (`coalesce_tail`). At 64 KiB the copy -- and the buffer allocated to
+/// hold it -- was a tenth of the server's CPU per response.
+pub(crate) const HTTP_BODY_RETAIN_MIN: usize = 16 * 1024;
+
+/// [`http_enqueue`] for a response body that stays in the application's
+/// `bytes` object: `pre` (the head, a chunk-size line; may be empty), then
+/// the `len` bytes at `ptr` that `keep` owns, then `post` (a chunk's CRLF,
+/// the terminating chunk; may be empty) -- queued together, so one flush
+/// decision covers all three and a response still leaves in one send.
+/// In-cell. Plaintext connections only: TLS output is encrypted from a
+/// staging buffer, a copy by construction, and takes the copying path.
+///
+/// `keep` is the reference that pins `ptr` (bytes objects are immutable
+/// and never move); like every retained write it is released through the
+/// graveyard once the kernel has taken the bytes, never in the cell.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn http_enqueue_retained(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: Backend<'_>,
+    tid: u64,
+    pre: Vec<u8>,
+    keep: Py<PyAny>,
+    ptr: *const u8,
+    len: usize,
+    post: &[u8],
+) {
+    let body = WriteBuf::Bytes { _keep: keep, ptr, len, off: 0 };
+    let Some(entry) = net.transports.get_mut(&tid).filter(|e| !e.conn_lost && !e.closing) else {
+        net.graveyard_bufs.push(body); // ADR-5: not dropped in the cell
+        return;
+    };
+    debug_assert!(matches!(&entry.proto, ProtoKind::Http(c) if c.tls.is_none()));
+    entry.queued_bytes += pre.len() + len + post.len();
+    if !pre.is_empty() && !coalesce_tail(entry, &pre) {
+        entry.wq.push_back(WriteBuf::Owned { data: pre, off: 0 });
+    }
+    entry.wq.push_back(body);
+    if !post.is_empty() {
+        // A buffer of its own, which the next chunk's size line then
+        // coalesces onto: two queue entries a chunk, not three.
+        entry.wq.push_back(WriteBuf::Owned { data: post.to_vec(), off: 0 });
+    }
+    http_flush_or_cork(py, net, backend, tid);
 }
 
 // --------------------------------------------------------------------- //
@@ -2678,6 +2778,7 @@ fn on_recv_done(
 ) {
     let mut pipeline_pause = false;
     let mut paused_now = false;
+    let mut repost_at_dispatch = false;
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.recv_op == Some(op) {
         entry.recv_op = None;
@@ -2767,7 +2868,9 @@ fn on_recv_done(
     }
     match &mut entry.proto {
         ProtoKind::Py(p) => {
-            if p.data_received.is_some() {
+            let plain = p.data_received.is_some();
+            let large = plain && net.inline_backend && bytes as usize >= LARGE_READ_MIN;
+            if plain && !large {
                 // Plain Protocol: materialize bytes now (non-GC-tracked
                 // allocation, safe in-cell) and re-post into the SAME slot
                 // immediately so the kernel refills while Python processes.
@@ -2781,8 +2884,18 @@ fn on_recv_done(
                 // BufferedProtocol: the transport's slot reference transfers
                 // to the phase-2 event (released there after the copy); a
                 // fresh slot is acquired for the next read.
+                //
+                // A plain protocol's large read (LARGE_READ_MIN) travels
+                // the same way, and its next receive is posted by the
+                // dispatch, after the delivery: the slot is back in the
+                // pool by then and is the one that receive gets, so the
+                // connection keeps reading into the same warm buffer
+                // instead of alternating between two. (Nothing is lost by
+                // waiting: this backend reads only inside a poll, and the
+                // next poll comes after the dispatch either way.)
                 entry.recv_slot = None; // ref now owned by the BufData event
-                net.events.push(NetEvent::BufData { tid, slot, len: bytes as usize });
+                repost_at_dispatch = large;
+                net.events.push(NetEvent::BufData { tid, slot, len: bytes as usize, repost: large });
             }
         }
         ProtoKind::Http(conn) => {
@@ -2883,8 +2996,8 @@ fn on_recv_done(
             net.buffers.release(slot);
         }
     }
-    if pipeline_pause {
-        return; // budget spent; http_resume_reading re-posts
+    if pipeline_pause || repost_at_dispatch {
+        return; // budget spent: http_resume_reading re-posts; or the BufData dispatch does
     }
     post_recv(py, net, backend, tid);
 }
@@ -3198,6 +3311,50 @@ fn deliver_inbound(
     }
 }
 
+/// Deliver the `len` bytes a `BufData` event holds in `slot` to `tid`'s
+/// current protocol, and release the slot (the event's reference).
+///
+/// The slot is the event's until released, so its memory stays put while
+/// a buffered protocol's get_buffer/buffer_updated run. A plain protocol
+/// takes a bytes object instead: made in the same cell entry that routes
+/// the read, which can then give the slot back at once, before the
+/// protocol runs.
+fn deliver_slot(py: Python<'_>, core: &CoreLoop, tid: u64, slot: SlotId, len: usize) -> PyResult<()> {
+    let (route, src, payload) = core.with_net(|net, _| {
+        let src = net.buffers.slot_ptr(slot).cast_const();
+        let route = route_inbound(py, net, tid, src, len);
+        let payload = matches!(route, Inbound::Plain(_)).then(|| {
+            // SAFETY: `src` is the slot's `len` received bytes;
+            // bytes objects are not GC-tracked, so allocating
+            // one in the cell runs no Python.
+            let obj = unsafe { ffi::PyBytes_FromStringAndSize(src.cast(), len as ffi::Py_ssize_t) };
+            unsafe { Bound::from_owned_ptr_or_err(py, obj) }.map(Bound::unbind)
+        });
+        if !matches!(route, Inbound::Buffered(..)) {
+            net.buffers.release(slot);
+        }
+        (route, src, payload)
+    })?;
+    match (payload, &route) {
+        (Some(payload), _) => {
+            let payload = payload?;
+            // (the slot is gone: `src` no longer points at anything)
+            deliver_inbound(py, core, tid, route, Some(&payload), std::ptr::null(), 0)?;
+        }
+        (None, Inbound::Buffered(..)) => {
+            let res = deliver_inbound(py, core, tid, route, None, src, len);
+            core.with_net(|net, _| {
+                net.buffers.release(slot);
+            })?;
+            res?;
+        }
+        // Held (copied by route_inbound) or discarded: the slot
+        // went back above.
+        (None, _) => {}
+    }
+    Ok(())
+}
+
 /// The current protocol's `eof_received` and the transport, when the peer's
 /// EOF is to be delivered now: not after close() or abort(), and while
 /// reading is paused it is held instead (see `paused_eof`).
@@ -3268,17 +3425,15 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 })?;
                 core.drain_graveyards(py)?;
             }
-            NetEvent::BufData { tid, slot, len } => {
-                // The slot is the event's until released below, so its
-                // memory stays put across the protocol calls.
-                let (route, src) = core.with_net(|net, _| {
-                    let src = net.buffers.slot_ptr(slot).cast_const();
-                    (route_inbound(py, net, tid, src, len), src)
-                })?;
-                let res = deliver_inbound(py, core, tid, route, None, src, len);
-                core.with_net(|net, _| {
-                    net.buffers.release(slot);
-                })?;
+            NetEvent::BufData { tid, slot, len, repost } => {
+                let res = deliver_slot(py, core, tid, slot, len);
+                if repost {
+                    // Whatever the delivery did -- raised, paused or closed
+                    // the transport, or had its receive posted already by a
+                    // resume_reading() made in between: post_recv declines
+                    // every one of those itself.
+                    core.with_net(|net, reactor| post_recv(py, net, reactor.backend_mut(), tid))?;
+                }
                 res?;
             }
             NetEvent::Eof { tid } => {
@@ -4381,6 +4536,7 @@ impl Transport {
             if no_send {
                 if big {
                     flush_pending(py, net, reactor.backend_mut(), tid); // R-035 early flush
+                    settle_own_send(py, net, reactor.backend_mut(), tid);
                 } else if !scheduled {
                     // R-035 corking: coalesce writes within the tick.
                     if let Some(e) = net.transports.get_mut(&tid) {
