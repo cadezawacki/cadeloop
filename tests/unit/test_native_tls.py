@@ -125,6 +125,53 @@ def test_wss_over_native_tls(loop, certs):
     loop._core.listener_close(lid)
 
 
+def test_large_wss_frames_arrive_whole(loop, certs):
+    """Large outbound payloads -- response bodies and WebSocket frames --
+    are sent from the application's bytes object on a plaintext
+    connection. Under TLS they are encrypted from a staging buffer
+    instead, and must still arrive whole and in order."""
+    server_ctx, client_ctx = certs
+    sizes = (16384, 70_000, 5, 300_000)
+    payloads = [bytes((i * 31 + j) % 251 for j in range(n)) for i, n in enumerate(sizes)]
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "websocket.accept"})
+        for p in payloads:
+            await send({"type": "websocket.send", "bytes": p})
+        await send({"type": "websocket.close", "code": 1000})
+
+    lid, port = listen_tls(loop, app, server_ctx)
+
+    async def main():
+        import base64
+        import os
+
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", port, ssl=client_ctx, server_hostname="localhost"
+        )
+        key = base64.b64encode(os.urandom(16)).decode()
+        writer.write(
+            f"GET /ws HTTP/1.1\r\nhost: localhost\r\nupgrade: websocket\r\n"
+            f"connection: Upgrade\r\nsec-websocket-version: 13\r\n"
+            f"sec-websocket-key: {key}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        assert b"101" in head.split(b"\r\n", 1)[0]
+        got = []
+        while True:
+            _fin, op, payload = await asyncio.wait_for(read_server_frame(reader), 10)
+            if op == 0x8:
+                break
+            got.append(payload)
+        writer.close()
+        return got
+
+    assert loop.run_until_complete(main()) == payloads
+    loop._core.listener_close(lid)
+
+
 def test_plaintext_to_tls_port_is_dropped(loop, certs):
     server_ctx, _client_ctx = certs
     lid, port = listen_tls(loop, scope_echo_app, server_ctx)

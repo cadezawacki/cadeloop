@@ -1914,9 +1914,13 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         // extra memcpy per 16 KiB chunk of a streamed response.
         let body_obj = message.get_item(intern!(py, "body"))?;
         let owned: Vec<u8>;
+        let mut bytes_obj: Option<&Bound<'_, pyo3::types::PyBytes>> = None;
         let body: &[u8] = match &body_obj {
             Some(v) if !v.is_none() => match v.cast::<pyo3::types::PyBytes>() {
-                Ok(b) => b.as_bytes(),
+                Ok(b) => {
+                    bytes_obj = Some(b);
+                    b.as_bytes()
+                }
                 Err(_) => {
                     owned = v.extract()?;
                     &owned
@@ -1927,6 +1931,20 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
         core.with_net(|net, reactor| {
             let backend = reactor.backend_mut();
             let Some(conn) = net.http_conn_mut(tid) else { return Err(SendErr::Gone) };
+            // A large body is not copied at all: the head (and any chunk
+            // framing) is queued as before, and the kernel reads the body
+            // out of the application's own bytes object, which the write
+            // queue holds until it has (`http_enqueue_retained`). Copied
+            // behind the head, a 64 KiB response paid for a 64 KiB buffer
+            // and a memcpy into it -- a tenth of the server's CPU -- to
+            // carry bytes that were already sitting still in memory. Not
+            // under TLS, whose output is encrypted out of a staging buffer.
+            let retain = bytes_obj.filter(|_| body.len() >= net::HTTP_BODY_RETAIN_MIN && conn.tls.is_none());
+            // Set where a branch below leaves the body out of `out`, to be
+            // queued by reference behind it; `post` is what follows the
+            // body on the wire then (chunk framing).
+            let mut by_ref = false;
+            let mut post: &'static [u8] = b"";
             match conn.resp {
                 RespPhase::Idle => Err(SendErr::Proto("http.response.body before http.response.start")),
                 RespPhase::Done => Err(SendErr::Proto("http.response.body after the response completed")),
@@ -1937,7 +1955,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // First body chunk decides the framing (R-084).
                     let mut out = std::mem::take(&mut conn.resp_head);
                     // Framing headers and the chunk-size line need < 64.
-                    out.reserve(body.len() + 64);
+                    out.reserve(if retain.is_some() { 64 } else { body.len() + 64 });
                     let saw_length = conn.resp_started_with_length;
                     // A bodyless status must not carry body bytes AND must
                     // not carry framing headers: a client reading a 204/304
@@ -1966,7 +1984,11 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         announce_keep_alive_10(conn, &mut out);
                         out.extend_from_slice(b"\r\n");
                         if !head_req {
-                            out.extend_from_slice(body);
+                            if retain.is_some() {
+                                by_ref = true;
+                            } else {
+                                out.extend_from_slice(body);
+                            }
                         }
                         conn.resp_body_sent = if head_req { 0 } else { body.len() as u64 };
                         if let Some(e) = length_mismatch(conn, !more) {
@@ -1991,7 +2013,11 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         announce_keep_alive_10(conn, &mut out);
                         out.extend_from_slice(b"\r\n");
                         if !head_req {
-                            out.extend_from_slice(body);
+                            if retain.is_some() {
+                                by_ref = true;
+                            } else {
+                                out.extend_from_slice(body);
+                            }
                         }
                         conn.resp_body_sent = body.len() as u64;
                         if let Some(e) = length_mismatch(conn, false) {
@@ -2001,7 +2027,11 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                         conn.resp = RespPhase::Streaming;
                     } else {
                         out.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
-                        if !body.is_empty() {
+                        if retain.is_some() {
+                            push_chunk_size(&mut out, body.len());
+                            by_ref = true;
+                            post = b"\r\n";
+                        } else if !body.is_empty() {
                             push_chunk(&mut out, body);
                         }
                         conn.raw_stream = false;
@@ -2014,16 +2044,22 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                             RespPhase::Streaming
                         };
                     }
-                    net::http_enqueue(py, net, backend, tid, out);
+                    enqueue_body(py, net, backend, tid, out, retain.filter(|_| by_ref), post);
                     release_after_response(net, tid);
                     Ok(())
                 }
                 RespPhase::Streaming => {
                     let raw = conn.raw_stream;
                     let head_req = conn.active_head || conn.resp_bodyless || conn.resp_empty;
-                    let mut out = Vec::with_capacity(body.len() + 16);
+                    let mut out = Vec::with_capacity(if retain.is_some() { 16 } else { body.len() + 16 });
                     if head_req {
                         // body bytes suppressed
+                    } else if retain.is_some() {
+                        by_ref = true;
+                        if !raw {
+                            push_chunk_size(&mut out, body.len());
+                            post = b"\r\n";
+                        }
                     } else if raw {
                         out.extend_from_slice(body);
                     } else if !body.is_empty() {
@@ -2040,12 +2076,17 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                             conn.resp = RespPhase::AwaitingTrailers;
                         } else {
                             if !raw && !head_req {
-                                out.extend_from_slice(b"0\r\n\r\n");
+                                if by_ref {
+                                    // Behind the body, which `out` precedes.
+                                    post = b"\r\n0\r\n\r\n";
+                                } else {
+                                    out.extend_from_slice(b"0\r\n\r\n");
+                                }
                             }
                             conn.resp = RespPhase::Done;
                         }
                     }
-                    net::http_enqueue(py, net, backend, tid, out);
+                    enqueue_body(py, net, backend, tid, out, retain.filter(|_| by_ref), post);
                     release_after_response(net, tid);
                     Ok(())
                 }
@@ -2186,9 +2227,41 @@ fn length_mismatch(conn: &HttpConn, final_message: bool) -> Option<SendErr> {
 }
 
 fn push_chunk(out: &mut Vec<u8>, body: &[u8]) {
-    out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+    push_chunk_size(out, body.len());
     out.extend_from_slice(body);
     out.extend_from_slice(b"\r\n");
+}
+
+/// The chunk-size line that opens a chunk of `len` bytes.
+fn push_chunk_size(out: &mut Vec<u8>, len: usize) {
+    use std::io::Write;
+    // Writing to a Vec cannot fail.
+    let _ = write!(out, "{len:x}\r\n");
+}
+
+/// Queue one `http.response.body`'s wire bytes: `out`, then -- when the
+/// body is sent from the application's bytes object rather than copied
+/// into `out` -- that object's bytes, and `post` behind them. In-cell.
+fn enqueue_body(
+    py: Python<'_>,
+    net: &mut NetState,
+    backend: net::Backend<'_>,
+    tid: u64,
+    out: Vec<u8>,
+    by_ref: Option<&Bound<'_, pyo3::types::PyBytes>>,
+    post: &[u8],
+) {
+    match by_ref {
+        Some(b) => {
+            let data = b.as_bytes();
+            let keep = b.clone().into_any().unbind();
+            net::http_enqueue_retained(py, net, backend, tid, out, keep, data.as_ptr(), data.len(), post);
+        }
+        None => {
+            debug_assert!(post.is_empty());
+            net::http_enqueue(py, net, backend, tid, out);
+        }
+    }
 }
 
 /// Once the response is complete, receive() waiters parked beside it (a
@@ -2719,28 +2792,68 @@ fn ws_send(
             Ok(())
         }
         "websocket.send" => {
-            let payload: Vec<u8> = match message.get_item(intern!(py, "text"))? {
+            // The frame is built straight from the message's own storage
+            // (the str's UTF-8, the bytes object's buffer): extracting it
+            // into a String or a Vec first copied every message twice. A
+            // large bytes payload is not copied at all -- `large` keeps the
+            // object, `payload` is then the frame's header alone, and the
+            // kernel reads the rest from the object (as a large HTTP body
+            // is sent; `http_enqueue_retained`).
+            let text_obj = message.get_item(intern!(py, "text"))?;
+            let bytes_obj = message.get_item(intern!(py, "bytes"))?;
+            let mut large: Option<&Bound<'_, PyBytes>> = None;
+            let payload: Vec<u8> = match &text_obj {
                 Some(t) if !t.is_none() => {
-                    let s: String = t.extract()?;
-                    ws::frame(ws::OP_TEXT, s.as_bytes())
+                    let s = t.cast::<PyString>().map_err(PyErr::from)?;
+                    ws::frame(ws::OP_TEXT, s.to_str()?.as_bytes())
                 }
-                _ => match message.get_item(intern!(py, "bytes"))? {
-                    Some(b) if !b.is_none() => {
-                        let v: Vec<u8> = b.extract()?;
-                        ws::frame(ws::OP_BINARY, &v)
-                    }
+                _ => match &bytes_obj {
+                    Some(b) if !b.is_none() => match b.cast::<PyBytes>() {
+                        Ok(pb) if pb.as_bytes().len() >= net::HTTP_BODY_RETAIN_MIN => {
+                            large = Some(pb);
+                            ws::frame_header(ws::OP_BINARY, pb.as_bytes().len())
+                        }
+                        Ok(pb) => ws::frame(ws::OP_BINARY, pb.as_bytes()),
+                        Err(_) => {
+                            let v: Vec<u8> = b.extract()?;
+                            ws::frame(ws::OP_BINARY, &v)
+                        }
+                    },
                     _ => return Err(PyRuntimeError::new_err("websocket.send needs 'text' or 'bytes'")),
                 },
             };
             core.with_net(|net, reactor| {
                 let backend = reactor.backend_mut();
-                let state = net
-                    .http_conn_mut(tid)
-                    .and_then(|c| c.ws.as_ref())
-                    .map(|w| (w.accepted, w.closing, w.app_closed));
+                let state = net.http_conn_mut(tid).and_then(|c| {
+                    c.ws.as_ref().map(|w| (w.accepted, w.closing, w.app_closed, c.tls.is_some()))
+                });
                 match state {
-                    Some((true, false, _)) => {
-                        net::http_enqueue(py, net, backend, tid, payload);
+                    Some((true, false, _, tls)) => {
+                        match large {
+                            Some(pb) if !tls => {
+                                let data = pb.as_bytes();
+                                let keep = pb.clone().into_any().unbind();
+                                net::http_enqueue_retained(
+                                    py,
+                                    net,
+                                    backend,
+                                    tid,
+                                    payload,
+                                    keep,
+                                    data.as_ptr(),
+                                    data.len(),
+                                    b"",
+                                );
+                            }
+                            // TLS encrypts out of a staging buffer: the
+                            // frame goes there whole.
+                            Some(pb) => {
+                                let mut whole = payload;
+                                whole.extend_from_slice(pb.as_bytes());
+                                net::http_enqueue(py, net, backend, tid, whole);
+                            }
+                            None => net::http_enqueue(py, net, backend, tid, payload),
+                        }
                         Ok(())
                     }
                     // Closing without the app having closed it: the peer's
@@ -2751,7 +2864,7 @@ fn ws_send(
                     // connection is torn down. A RuntimeError here read as
                     // an application bug (Starlette maps only OSError to
                     // WebSocketDisconnect).
-                    Some((true, true, false)) => Err(SendErr::Gone),
+                    Some((true, true, false, _)) => Err(SendErr::Gone),
                     _ => Err(SendErr::Proto("websocket.send before accept or after close")),
                 }
             })?

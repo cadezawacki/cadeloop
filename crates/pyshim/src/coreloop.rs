@@ -806,6 +806,7 @@ impl CoreLoop {
         let timer_cancels = reactor.timer_cancel_counter();
         let mut net = NetState::default();
         net.buffers.set_commit_regions(reactor.backend_mut().registers_buffers());
+        net.inline_backend = reactor.backend_mut().completes_inline();
         Ok(CoreLoop {
             state: StateCell::new(LoopState { reactor, net, completions_scratch: Vec::with_capacity(512) }),
             xqueue,

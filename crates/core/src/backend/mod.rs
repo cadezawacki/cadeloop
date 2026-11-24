@@ -268,6 +268,28 @@ pub trait IoBackend {
         0
     }
 
+    /// Does this backend carry operations out itself, in user space -- the
+    /// syscall made when the op is posted, or inside a poll once the
+    /// descriptor is ready -- rather than hand them to the kernel to
+    /// complete on its own? True of the readiness backend (epoll): a send
+    /// there has normally finished by the time its post returns
+    /// (`take_staged_op`), and a parked receive reads nothing until a poll
+    /// finds its descriptor readable, however early it was posted.
+    fn completes_inline(&self) -> bool {
+        false
+    }
+
+    /// [`take_staged`](Self::take_staged) for one op: the completion of
+    /// `op`, if the backend is holding it in user space and it is the most
+    /// recent one staged -- which is where an op that completed inside the
+    /// `post_*` call that just returned it is. Lets the caller settle its
+    /// own send at once without also applying whatever else is staged.
+    /// `None` when there is nothing to take (always, for a backend whose
+    /// completions come from the kernel's queue).
+    fn take_staged_op(&mut self, _op: OpId) -> Option<Completion> {
+        None
+    }
+
     /// Can this backend possibly produce a completion right now -- any op
     /// in flight, readiness watch armed, or completion already staged?
     /// `false` lets the reactor elide zero-timeout kernel polls entirely

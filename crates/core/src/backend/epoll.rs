@@ -133,9 +133,50 @@ struct FdEntry {
     /// inline `recv` (it would EAGAIN). Mirrors the readiness-transport
     /// pattern aiofastnet/uvloop use (ADR-20).
     drained: bool,
+    /// The last recv filled its buffer, so more may be waiting and the
+    /// next `post_recv` probes for it with an inline `recv` -- unless
+    /// those probes have been coming up empty (`probe_misses`).
+    filled: bool,
+    /// Consecutive probes after a full read that found nothing (EAGAIN).
+    /// A full buffer usually means a stream with more behind it, but it
+    /// is also what a peer sending messages of exactly the buffer's size
+    /// produces, and there every probe is a wasted syscall: one per
+    /// message, for good. Past `PROBE_MISS_LIMIT` the probe is skipped
+    /// and the recv parks; level-triggered epoll reports the socket at
+    /// the next poll if data was there after all.
+    probe_misses: u8,
+    /// Probes skipped since the last one made (see `PROBE_EVERY`).
+    probe_skips: u8,
 }
 
+/// Probes after a full read that may come up empty in a row before they
+/// are skipped (`FdEntry::probe_misses`).
+const PROBE_MISS_LIMIT: u8 = 2;
+
+/// While probes are being skipped, one full read in this many is probed
+/// anyway: a hit means the traffic has turned into a stream, and resets
+/// the count.
+const PROBE_EVERY: u8 = 16;
+
 impl FdEntry {
+    /// Should the next `post_recv` park without first trying the `recv`?
+    /// Counts the probes it skips, so that one in `PROBE_EVERY` is made.
+    #[inline]
+    fn skip_probe(&mut self) -> bool {
+        if self.drained {
+            return true;
+        }
+        if !self.filled || self.probe_misses < PROBE_MISS_LIMIT {
+            return false;
+        }
+        self.probe_skips += 1;
+        if self.probe_skips >= PROBE_EVERY {
+            self.probe_skips = 0;
+            return false;
+        }
+        true
+    }
+
     fn interest(&self) -> u32 {
         let mut ev = 0u32;
         if self.read_op.is_some() || self.watch_r {
@@ -268,6 +309,8 @@ pub struct EpollBackend {
     inline_completions: Vec<Completion>,
     events: Vec<libc::epoll_event>,
     pub syscalls_saved_inline: u64,
+    /// Probes after a full read that found nothing (`FdEntry::probe_misses`).
+    pub recv_probe_misses: u64,
 }
 
 // SAFETY: thread-affine by the loop contract (see gil_boundary); raw fds
@@ -288,6 +331,7 @@ impl EpollBackend {
             inline_completions: Vec::with_capacity(32),
             events: vec![unsafe { zeroed() }; 1024],
             syscalls_saved_inline: 0,
+            recv_probe_misses: 0,
         })
     }
 
@@ -435,11 +479,19 @@ impl EpollBackend {
                 // without signal handling -- or an application that put
                 // SIGPIPE back to SIG_DFL to behave under `| head` -- was
                 // killed outright by a client disconnecting mid-response.
+                //
+                // One buffer -- most sends: a response, an echoed message --
+                // goes through send(), the same call without the msghdr and
+                // iovec the kernel otherwise copies in and validates first.
                 let mut msg: libc::msghdr = unsafe { zeroed() };
                 msg.msg_iov = iov.as_mut_ptr();
                 msg.msg_iovlen = cnt as _;
                 loop {
-                    let rc = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+                    let rc = if cnt == 1 {
+                        unsafe { libc::send(fd, iov[0].iov_base, iov[0].iov_len, libc::MSG_NOSIGNAL) }
+                    } else {
+                        unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) }
+                    };
                     if rc >= 0 {
                         *done += rc as u32;
                         // Any progress completes the op, a short count
@@ -566,6 +618,7 @@ impl EpollBackend {
                 // speculative recv that will EAGAIN (ADR-20).
                 if let Some(len) = recv_len {
                     entry.drained = os_error == 0 && bytes < len;
+                    entry.filled = os_error == 0 && bytes >= len;
                 }
             }
             // Lazy: leave the kernel mask armed — the transport re-posts
@@ -680,8 +733,9 @@ impl IoBackend for EpollBackend {
         // Drained socket (last recv came up short): the speculative inline
         // recv would EAGAIN — park directly. Level-triggered epoll covers
         // the race where data arrived in between: the next poll reports it
-        // immediately (ADR-20).
-        if self.fds.get(fd).is_some_and(|e| e.drained) {
+        // immediately (ADR-20). The same goes for a socket whose reads
+        // fill the buffer exactly and leave nothing behind (`probe_misses`).
+        if self.fds.get_mut(fd).is_some_and(FdEntry::skip_probe) {
             return self.park(id, fd, false);
         }
         match self.attempt(id) {
@@ -690,13 +744,23 @@ impl IoBackend for EpollBackend {
                 if err == 0 {
                     let entry = self.fds.entry(fd);
                     entry.drained = bytes < len;
+                    entry.filled = bytes >= len;
+                    entry.probe_misses = 0;
                 }
                 self.slab.complete(id);
                 self.slab.release(id);
                 self.inline_completions.push(Completion::Io { op: id, bytes, os_error: err });
                 Ok(id)
             }
-            None => self.park(id, fd, false),
+            None => {
+                if let Some(entry) = self.fds.get_mut(fd) {
+                    if entry.filled {
+                        entry.probe_misses = entry.probe_misses.saturating_add(1);
+                        self.recv_probe_misses += 1;
+                    }
+                }
+                self.park(id, fd, false)
+            }
         }
     }
 
@@ -954,6 +1018,17 @@ impl IoBackend for EpollBackend {
         n
     }
 
+    fn completes_inline(&self) -> bool {
+        true
+    }
+
+    fn take_staged_op(&mut self, op: OpId) -> Option<Completion> {
+        match self.inline_completions.last() {
+            Some(Completion::Io { op: staged, .. }) if *staged == op => self.inline_completions.pop(),
+            _ => None,
+        }
+    }
+
     fn set_wake_only(&mut self, fd: Option<RawSocket>) {
         self.fds.set_wake_fd(fd.map(|w| w as RawFd));
     }
@@ -1209,6 +1284,132 @@ mod tests {
         let out = drain(&mut b, Duration::ZERO);
         assert_eq!(out, vec![Completion::Io { op: op2, bytes: 4, os_error: 0 }]);
         unsafe { libc::close(accepted as RawFd) };
+    }
+
+    /// A backend with one accepted connection: (backend, its socket, the
+    /// client end).
+    fn connected() -> (EpollBackend, RawSocket, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let lfd = listener.into_raw_fd();
+        let mut b = EpollBackend::new().unwrap();
+        b.register_socket(lfd as RawSocket).unwrap();
+        b.post_accept(lfd as RawSocket).unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let out = drain(&mut b, Duration::from_secs(2));
+        let accepted = match out.as_slice() {
+            [Completion::Io { op, os_error: 0, .. }] => b.take_accept_socket(*op).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        b.register_socket(accepted).unwrap();
+        b.detach_socket(lfd as RawSocket);
+        unsafe { libc::close(lfd) };
+        (b, accepted, client)
+    }
+
+    /// One message of exactly the buffer's size per round trip, `n` times.
+    fn exact_fit_round_trips(b: &mut EpollBackend, s: RawSocket, client: &mut TcpStream, n: u8) {
+        let mut buf = [0u8; 8];
+        for i in 0..n {
+            let op = b.post_recv(s, buf.as_mut_ptr(), 8).unwrap();
+            client.write_all(&[i; 8]).unwrap();
+            let out = drain(b, Duration::from_secs(2));
+            assert_eq!(out, vec![Completion::Io { op, bytes: 8, os_error: 0 }]);
+            assert_eq!(buf, [i; 8]);
+        }
+    }
+
+    #[test]
+    fn exact_fit_reads_stop_probing() {
+        // Messages that fill the buffer exactly, one in flight at a time:
+        // every read is "full", and every probe after one finds nothing.
+        // It was made anyway, a wasted recv per message.
+        let (mut b, s, mut client) = connected();
+        exact_fit_round_trips(&mut b, s, &mut client, 100);
+        let most = PROBE_MISS_LIMIT as u64 + 100 / PROBE_EVERY as u64 + 1;
+        assert!(b.recv_probe_misses <= most, "{} of 100 probes made and missed", b.recv_probe_misses);
+        assert_eq!(b.syscalls_saved_inline, 0, "nothing was ever waiting");
+        unsafe { libc::close(s as RawFd) };
+    }
+
+    #[test]
+    fn a_skipped_probe_loses_nothing() {
+        // With probes being skipped, data that IS waiting behind a full
+        // read is reported by the next poll (level-triggered), not lost.
+        let (mut b, s, mut client) = connected();
+        exact_fit_round_trips(&mut b, s, &mut client, 8);
+        assert!(b.fds.get(s as RawFd).unwrap().probe_misses >= PROBE_MISS_LIMIT);
+        let mut buf = [0u8; 8];
+        let op = b.post_recv(s, buf.as_mut_ptr(), 8).unwrap();
+        client.write_all(&[1u8; 8]).unwrap();
+        client.write_all(&[2u8; 8]).unwrap();
+        let mut seen = Vec::new();
+        let mut op = Some(op);
+        while seen.len() < 16 {
+            for c in drain(&mut b, Duration::from_secs(2)) {
+                match c {
+                    Completion::Io { op: done, bytes, os_error: 0 } => {
+                        assert_eq!(Some(done), op.take());
+                        seen.extend_from_slice(&buf[..bytes as usize]);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            if op.is_none() && seen.len() < 16 {
+                // Parks without a probe (or probes and completes inline:
+                // either way the bytes arrive through a poll).
+                op = Some(b.post_recv(s, buf.as_mut_ptr(), 8).unwrap());
+            }
+        }
+        assert_eq!(seen, [[1u8; 8], [2u8; 8]].concat());
+        unsafe { libc::close(s as RawFd) };
+    }
+
+    #[test]
+    fn a_probe_that_hits_resumes_probing() {
+        // The traffic turns into a stream: the periodic probe finds data,
+        // and from then on every full read is followed by an inline one.
+        let (mut b, s, mut client) = connected();
+        exact_fit_round_trips(&mut b, s, &mut client, 8);
+        let chunks = 4 * PROBE_EVERY as usize;
+        client.write_all(&vec![9u8; 8 * chunks]).unwrap();
+        let mut buf = [0u8; 8];
+        let mut got = 0;
+        let mut op = b.post_recv(s, buf.as_mut_ptr(), 8).unwrap();
+        while got < chunks {
+            for c in drain(&mut b, Duration::from_secs(2)) {
+                assert_eq!(c, Completion::Io { op, bytes: 8, os_error: 0 });
+                got += 1;
+                if got < chunks {
+                    op = b.post_recv(s, buf.as_mut_ptr(), 8).unwrap();
+                }
+            }
+        }
+        // At most the first PROBE_EVERY reads went without a probe; the
+        // rest completed inline, one after another.
+        let inline = b.syscalls_saved_inline as usize;
+        assert!(inline >= chunks - PROBE_EVERY as usize - 1, "{inline} of {chunks} reads completed inline");
+        assert_eq!(b.fds.get(s as RawFd).unwrap().probe_misses, 0);
+        unsafe { libc::close(s as RawFd) };
+    }
+
+    #[test]
+    fn take_staged_op_takes_only_the_op_just_staged() {
+        let (mut b, s, mut client) = connected();
+        let data = b"hello".to_vec();
+        let send = b.post_send(s, &[IoSlice { ptr: data.as_ptr(), len: 5 }]).unwrap();
+        // The send completed inside post_send: its completion is staged,
+        // and is the latest one.
+        let other = OpId { index: send.index + 1, generation: send.generation };
+        assert_eq!(b.take_staged_op(other), None);
+        assert_eq!(b.take_staged_op(send), Some(Completion::Io { op: send, bytes: 5, os_error: 0 }));
+        assert_eq!(b.take_staged_op(send), None, "taken once");
+        assert!(drain(&mut b, Duration::ZERO).is_empty(), "and not delivered again by a poll");
+        let mut got = [0u8; 5];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello");
+        unsafe { libc::close(s as RawFd) };
     }
 
     #[test]

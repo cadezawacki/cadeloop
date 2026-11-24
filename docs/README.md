@@ -17,6 +17,15 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Bulk-data pass (on `claude/sleepy-ride-p2rndm`; profiled and measured on Linux/epoll against `33ff88c`, interleaved runs in one session)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Perf | `http.response.body` copied every body behind its head into one buffer -- an allocation and a memcpy per message, a tenth of the server's CPU at 64 KiB. A `bytes` body of 16 KiB or more is now queued by reference (the write queue holds the object, as `Transport.write()` does for large writes) with the head and chunk framing around it under one flush decision; every framing is byte-for-byte as before, TLS keeps the copy (ADR-33). 64 KiB responses 32.1 K -> 48.9 K req/s; 1 MiB streamed in 16 KiB chunks 2.2 K -> 2.8 K req/s (between +8% and +29% over three runs) | |
+> | Perf | WebSocket: unmasking ran a byte at a time (`byte ^= mask[i & 3]` stays scalar) and was a third of the server's CPU on 64 KiB frames -- now eight bytes at a time; `websocket.send` extracted each message into a `String`/`Vec` and then copied it into its frame -- the frame is built from the message's own storage, and a `bytes` payload of 16 KiB or more is sent by reference. Echo at 64 KiB 14.0 K -> 21.5 K msg/s, at 16 KiB 51.4 K -> 66.8 K msg/s | |
+> | Perf | epoll: a plain protocol's large reads were all turned into `bytes` while the tick's completions were translated, and (echoed) freed together a tick later, so every tick took fresh memory -- past glibc's trim threshold, handed back to the kernel and faulted in again -- for copies that landed cache-cold. Reads of 32 KiB and up now become `bytes` at dispatch, one at a time, with the next receive posted after the delivery (so each connection keeps one warm slot), and a write flushed as it is made has its send settled before `write()` returns (ADR-34). Echo of 64 KiB messages 38.2 K -> 43.6 K msg/s at 8 connections, 22.3 K -> 32.0 K msg/s at 512. The completion backends (IOCP, RIO) keep their path | |
+> | Perf | epoll: the inline `recv` that follows a full read came back EAGAIN on every message for a peer sending messages of exactly the buffer's size; after two misses in a row it is skipped (level-triggered epoll reports the socket at the next poll regardless), with one read in sixteen still probed so a stream is recognised (ADR-35). Single-buffer sends use `send()` instead of `sendmsg()` | |
+>
 > **Windows pass (on `claude/windows-perf-pass`; reproduced and verified natively on Windows 11 26200, CPython 3.11.9)**
 >
 > | Area | Fix | Commit |
