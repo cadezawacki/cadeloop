@@ -669,8 +669,8 @@ fills a posted buffer on its own, a receive posted early does overlap
 with the callbacks, and none of this has been measured on Windows.
 
 Echo of 64 KiB messages, measured as above: 38.2 K -> 43.6 K msg/s at 8
-connections, 22.3 K -> 32.0 K at 512 (uvloop: 46.8 K and 38.9 K; rloop
-51.6 K at 8). What remains is the copy out of the slot, and at high
+connections, 22.3 K -> 32.0 K at 512 (in the same runs, uvloop: 44.9 K
+and 38.9 K; rloop: 52.4 K at 8). What remains is the copy out of the slot, and at high
 connection counts the slots themselves, one per connection where uvloop
 reads everything through a single buffer: rloop receives straight into
 the bytes object it delivers. Doing the same here means reading at
