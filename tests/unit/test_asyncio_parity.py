@@ -2342,7 +2342,19 @@ def test_an_iterations_io_callbacks_run_before_its_due_timers(loop):
         await asyncio.sleep(0.01)
 
     loop.run_until_complete(asyncio.wait_for(main(), 10))
-    assert order == ["call_soon", "reader", "data_received", "timer"]
+    # What _run_once promises, on any loop: the callback the previous
+    # iteration queued, then this iteration's I/O, then the timer due.
+    assert order[0] == "call_soon" and order[-1] == "timer", order
+    assert sorted(order[1:-1]) == ["data_received", "reader"], order
+    # Which of the two I/O callbacks comes first is not asyncio's to promise:
+    # it is the order the selector reports the sockets in, and the stdlib's
+    # select()-based selector (the Windows one) walks a *set* of their
+    # handles, so it follows whatever numbers the OS handed out. Asserted
+    # for both loops, the stdlib half failed on one Windows image and not
+    # another. cadeloop's own order is fixed -- readiness watches, in the
+    # ready batch, ahead of the transport events -- and is checked as such.
+    if isinstance(loop, cadeloop.Loop):
+        assert order == ["call_soon", "reader", "data_received", "timer"]
 
 
 def test_data_wins_the_race_with_an_idle_timeout_due_in_its_iteration(loop):
