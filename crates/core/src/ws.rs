@@ -385,14 +385,13 @@ impl WsRx {
 /// third of the server's CPU on an echo of 64 KiB messages.
 fn unmask(data: &mut [u8], mask: [u8; 4]) {
     let word = u64::from_ne_bytes([mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3]]);
-    let mut words = data.chunks_exact_mut(8);
-    for w in &mut words {
-        let v = u64::from_ne_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]) ^ word;
-        w.copy_from_slice(&v.to_ne_bytes());
+    let (words, tail) = data.as_chunks_mut::<8>();
+    for w in words {
+        *w = (u64::from_ne_bytes(*w) ^ word).to_ne_bytes();
     }
     // Each word started on a multiple of 8, so the tail starts on the key's
     // first byte too.
-    for (i, byte) in words.into_remainder().iter_mut().enumerate() {
+    for (i, byte) in tail.iter_mut().enumerate() {
         *byte ^= mask[i & 3];
     }
 }
