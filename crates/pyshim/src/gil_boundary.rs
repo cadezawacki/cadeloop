@@ -33,6 +33,17 @@
 //!    through the cross-thread queue.
 //! 4. Cross-thread operations that never need the state (`stop`, `time`,
 //!    `is_running`, `is_closed`) use atomics only.
+//! 5. Commands on what the loop owns -- a transport's `close()`,
+//!    `abort()`, `write()`, `pause_reading()`..., a server's `close()`
+//!    -- are not the application's alone to make from the right thread:
+//!    the garbage collector runs finalizers on whichever thread it
+//!    happens to be collecting on, and asyncio's `StreamWriter.__del__`
+//!    closes the transport it held. Such a command made from another
+//!    thread while the loop runs, or inside a live borrow, is handed to
+//!    the loop's thread through the same queue as the scheduling calls
+//!    ([`StateCell::belongs_on_loop_thread`]), never refused: refused,
+//!    the finalizer's exception was printed and dropped, and the
+//!    connection it was closing stayed open for good.
 //!
 //! Why not a `Mutex`? Holding a lock across a GIL-released poll deadlocks
 //! with any GIL-holding thread that blocks on the same lock (poll thread
@@ -173,6 +184,24 @@ impl<S> StateCell<S> {
     /// debug-mode `_check_thread`).
     pub fn owned_by_other_thread(&self) -> bool {
         let owner = self.owner.load(Ordering::Acquire);
+        owner != 0 && owner != current_tid()
+    }
+
+    /// Does a command on something the loop owns -- a transport's
+    /// `close()`, `write()`, ... -- belong on the loop's thread rather
+    /// than here? Yes while the loop is running and the caller is another
+    /// thread (parked or not: the loop's thread is the one that runs
+    /// protocol callbacks, and commands taken in the order they were made
+    /// stay in that order only if one thread carries them out), and yes
+    /// inside a live borrow, where the state cannot be touched at all.
+    /// On the loop's own thread, outside every borrow, this is two loads
+    /// and a compare.
+    #[inline]
+    pub fn belongs_on_loop_thread(&self) -> bool {
+        if self.borrowed.load(Ordering::Relaxed) {
+            return true;
+        }
+        let owner = self.owner.load(Ordering::Relaxed);
         owner != 0 && owner != current_tid()
     }
 

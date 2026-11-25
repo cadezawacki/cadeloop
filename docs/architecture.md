@@ -64,6 +64,14 @@ allows (outside debug mode); `call_soon`, `call_soon_threadsafe`,
 or timer over the lock-free MPSC queue and waking it (R-022). `stop`, `time`
 and `is_running` touch only atomics.
 
+Commands on what the loop owns take the same queue whenever they are made
+off the loop's thread while it runs: a transport's `close`, `abort`,
+`write`, `write_eof`, `pause_reading` and `resume_reading`, and a server's
+`close`, are carried out on the loop's thread in the order they were made
+(ADR-36). Finalizers make such calls from wherever the garbage collector
+happens to run -- asyncio's `StreamWriter.__del__` closes its transport --
+so refusing them left connections open.
+
 ### Python-reference hygiene
 
 No Python reference is ever dropped inside the state critical section: a

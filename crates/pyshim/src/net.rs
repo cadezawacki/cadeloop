@@ -4158,6 +4158,118 @@ pub(crate) fn wire_http(
 // the Transport pyclass                                                 //
 // --------------------------------------------------------------------- //
 
+/// What a [`HandedOver`] carries out once it reaches the loop's thread.
+enum Command {
+    /// `write(data)`: `data` is a bytes object -- the caller's own, or a
+    /// copy taken when the call was made of anything that could change
+    /// under it afterwards.
+    Write(Py<PyAny>),
+    WriteEof,
+    PauseReading,
+    ResumeReading,
+    Close,
+    /// `abort()` / `_force_close(exc)`.
+    ForceClose(Option<Py<PyAny>>),
+    /// A datagram endpoint's `close()` / `abort()`; the id is its `did`.
+    DgramClose {
+        abort: bool,
+    },
+    /// A server's `close()`, one listener of it; the id is its `lid`.
+    ListenerClose,
+}
+
+/// A transport command made where it could not be carried out, on its way
+/// to the loop's thread: the callable [`CoreLoop::hand_over`] queues.
+///
+/// Commands arrive from other threads, and from inside the loop's own
+/// borrows, without the application having put them there: the garbage
+/// collector runs finalizers wherever it happens to be collecting, and
+/// asyncio's `StreamWriter.__del__` closes its transport -- through
+/// sslproto, for a TLS stream, which writes the close_notify and pauses
+/// or resumes reading on the way. Refusing those (gil_boundary, invariant
+/// 5) printed "Exception ignored in StreamWriter.__del__ ... Non-thread-
+/// safe operation" and left the connection open. And where an application
+/// does make them itself -- a main thread shutting down a loop that runs
+/// on another: `server.close()`, `transport.close()` -- asyncio takes the
+/// call; here it failed or not with whether the loop happened to be
+/// waiting for I/O at that instant, and a server's `close()` swallowed
+/// the failure and went on accepting. They are queued instead, in the
+/// order they were made, and run where every other transport call runs.
+///
+/// Named by id, not by object: by the time it runs the connection may be
+/// gone, and every command is then a no-op, as it is on a transport
+/// asyncio has already closed.
+#[pyclass(frozen, module = "cadeloop._core")]
+pub struct HandedOver {
+    core: Py<CoreLoop>,
+    id: u64,
+    command: Mutex<Option<Command>>,
+    name: &'static str,
+}
+
+#[pymethods]
+impl HandedOver {
+    fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(command) = self.command.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return Ok(());
+        };
+        let core = self.core.bind(py).get();
+        match command {
+            Command::DgramClose { abort } => return core.udp_close_here(py, self.id, abort),
+            Command::ListenerClose => return core.listener_close_here(py, self.id),
+            _ => {}
+        }
+        let transport = core.with_net(|net, _| {
+            net.transports.get(&self.id).and_then(|e| e.pyobj.as_ref()).map(|t| t.clone_ref(py))
+        })?;
+        let Some(transport) = transport else { return Ok(()) };
+        let transport = transport.bind(py).get();
+        match command {
+            Command::Write(data) => transport.write(py, data.into_bound(py)),
+            Command::WriteEof => transport.write_eof(py),
+            Command::PauseReading => transport.pause_reading(py),
+            Command::ResumeReading => transport.resume_reading(py),
+            Command::Close => transport.close(py),
+            Command::ForceClose(exc) => transport._force_close(py, exc.map(|e| e.into_bound(py))),
+            Command::DgramClose { .. } | Command::ListenerClose => Ok(()),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<cadeloop {}() handed to the loop thread>", self.name)
+    }
+}
+
+/// Queue `command` on `id` for the loop's thread (see [`HandedOver`]).
+#[cold]
+#[inline(never)]
+fn hand_over_command(
+    py: Python<'_>,
+    core: &Py<CoreLoop>,
+    id: u64,
+    command: Command,
+    name: &'static str,
+) -> PyResult<()> {
+    let call =
+        Py::new(py, HandedOver { core: core.clone_ref(py), id, command: Mutex::new(Some(command)), name })?;
+    core.bind(py).get().hand_over(py, call.bind(py).as_any(), crate::handles::CallArgs::Zero)
+}
+
+/// A datagram endpoint's close()/abort(), handed to the loop's thread.
+pub(crate) fn hand_over_dgram_close(
+    py: Python<'_>,
+    core: &Py<CoreLoop>,
+    did: u64,
+    abort: bool,
+) -> PyResult<()> {
+    hand_over_command(py, core, did, Command::DgramClose { abort }, if abort { "abort" } else { "close" })
+}
+
+/// The close of one of a server's listeners, handed to the loop's thread.
+pub(crate) fn hand_over_listener_close(py: Python<'_>, core: &Py<CoreLoop>, lid: u64) -> PyResult<()> {
+    hand_over_command(py, core, lid, Command::ListenerClose, "server close")
+}
+
 /// asyncio.Transport implementation backed by the native reactor.
 #[pyclass(frozen, module = "cadeloop._core")]
 pub struct Transport {
@@ -4235,6 +4347,24 @@ impl Transport {
 
     fn core_ref<'a>(&'a self, py: Python<'a>) -> &'a CoreLoop {
         self.core.bind(py).get()
+    }
+
+    /// If this caller is somewhere the command must not be carried out --
+    /// another thread while the loop runs, or inside a live borrow of its
+    /// state -- hand it to the loop's thread and say so (see
+    /// [`HandedOver`]). On the loop's own thread: two loads and a compare.
+    #[inline]
+    fn handed(
+        &self,
+        py: Python<'_>,
+        name: &'static str,
+        command: impl FnOnce() -> Command,
+    ) -> PyResult<bool> {
+        if !self.core_ref(py).belongs_on_loop_thread() {
+            return Ok(false);
+        }
+        hand_over_command(py, &self.core, self.tid, command(), name)?;
+        Ok(true)
     }
 
     /// Install (or clear) the protocol `get_protocol()` reports once the
@@ -4453,6 +4583,19 @@ impl Transport {
             // Bytes written now would land in the middle of the file.
             return Err(PyRuntimeError::new_err("unable to write; sendfile is in progress"));
         }
+        if core.belongs_on_loop_thread() {
+            // Not from here (see `HandedOver`). What is handed over is what
+            // the data held at this moment: a bytes object as it is, and a
+            // copy of anything its owner could change after this returns.
+            if bytes.as_ref().is_some_and(|b| b.as_bytes().is_empty()) {
+                return Ok(());
+            }
+            let snapshot = match &bytes {
+                Some(b) => b.as_any().clone(),
+                None => unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyBytes_FromObject(data.as_ptr()))? },
+            };
+            return hand_over_command(py, &self.core, self.tid, Command::Write(snapshot.unbind()), "write");
+        }
         // R-074 retention: exact bytes -> zero-copy retain; bytearray and
         // memoryview -> copy now. Small writes of either kind are copied in
         // the cell instead, onto the tail buffer where they can be
@@ -4604,6 +4747,9 @@ impl Transport {
     }
 
     fn write_eof(&self, py: Python<'_>) -> PyResult<()> {
+        if self.handed(py, "write_eof", || Command::WriteEof)? {
+            return Ok(());
+        }
         let core = self.core_ref(py);
         let tid = self.tid;
         let open = core.with_net(|net, reactor| {
@@ -4695,6 +4841,9 @@ impl Transport {
     // ---- read path -----------------------------------------------------
 
     fn pause_reading(&self, py: Python<'_>) -> PyResult<()> {
+        if self.handed(py, "pause_reading", || Command::PauseReading)? {
+            return Ok(());
+        }
         let core = self.core_ref(py);
         let tid = self.tid;
         let _ = tid;
@@ -4714,6 +4863,9 @@ impl Transport {
     }
 
     fn resume_reading(&self, py: Python<'_>) -> PyResult<()> {
+        if self.handed(py, "resume_reading", || Command::ResumeReading)? {
+            return Ok(());
+        }
         let core = self.core_ref(py);
         let tid = self.tid;
         core.with_net(|net, reactor| {
@@ -4750,6 +4902,12 @@ impl Transport {
     // ---- lifecycle -----------------------------------------------------
 
     pub(crate) fn close(&self, py: Python<'_>) -> PyResult<()> {
+        if self.handed(py, "close", || Command::Close)? {
+            // Closing from this moment, as far as anyone asking can tell
+            // (asyncio's close() has set `_closing` by the time it returns).
+            self.closing.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let core = self.core_ref(py);
         let tid = self.tid;
         core.with_net(|net, reactor| {
@@ -4799,6 +4957,12 @@ impl Transport {
     /// never closed anything.
     #[pyo3(signature = (exc=None))]
     fn _force_close(&self, py: Python<'_>, exc: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        if self.core_ref(py).belongs_on_loop_thread() {
+            let exc = exc.filter(|e| !e.is_none()).map(Bound::unbind);
+            hand_over_command(py, &self.core, self.tid, Command::ForceClose(exc), "abort")?;
+            self.closing.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let core = self.core_ref(py);
         let tid = self.tid;
         let reason = match exc {
@@ -4829,7 +4993,10 @@ impl Transport {
         let core = self.core_ref(py);
         let exact = core
             .try_with_net(|net, _| net.transports.get(&self.tid).is_none_or(|e| e.closing || e.conn_lost));
-        Ok(exact.unwrap_or_else(|| self.closing.load(Ordering::Relaxed)))
+        // The mirror answers when the state is out of reach, and is ahead
+        // of it in one case: a close() or abort() handed to the loop's
+        // thread and not carried out yet (see `HandedOver`).
+        Ok(exact.unwrap_or(false) || self.closing.load(Ordering::Relaxed))
     }
 
     // ---- protocol / introspection ---------------------------------------

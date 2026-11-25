@@ -3050,3 +3050,394 @@ def test_a_large_read_survives_another_callback_cycling_its_transport(loop):
     loop.run_until_complete(main())
     assert loop._core.stats()["buffers_in_use"] == 0
     assert loop._core.stats()["stale_buffer_ids"] == 0
+
+
+# --------------------------------------------------------------------- #
+# commands from other threads, and from finalizers                      #
+# --------------------------------------------------------------------- #
+#
+# The garbage collector runs finalizers on whichever thread it is
+# collecting on, and asyncio's own close what they held:
+# StreamWriter.__del__ calls transport.close() -- through sslproto, for a
+# TLS stream, which writes and pauses on the way. Applications make the
+# same calls on purpose when a main thread shuts down a loop running on
+# another. Such a command used to raise "Non-thread-safe operation ...
+# (the loop is waiting for I/O)" whenever the loop happened to be parked
+# in its poll, and the connection it was closing stayed open. It is
+# handed to the loop's thread instead, and carried out there, in order.
+
+
+async def _on_another_thread(loop, fn, *args):
+    """Run `fn(*args)` on a new thread while this loop waits for I/O;
+    return what it returned, or raise what it raised."""
+    done = loop.create_future()
+
+    def run():
+        time.sleep(0.05)  # the coroutine awaiting `done` has parked the loop
+        try:
+            outcome = (fn(*args), None)
+        except BaseException as exc:  # noqa: BLE001 - reported to the test
+            outcome = (None, exc)
+        loop.call_soon_threadsafe(done.set_result, outcome)
+
+    threading.Thread(target=run, daemon=True).start()
+    value, exc = await asyncio.wait_for(done, 10)
+    if exc is not None:
+        raise exc
+    return value
+
+
+@pytest.fixture()
+def unraisable(monkeypatch):
+    """What reached sys.unraisablehook: the "Exception ignored in ..." of
+    a finalizer that raised."""
+    seen = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda u: seen.append((u.object, u.exc_value)))
+    return seen
+
+
+class _Threads(asyncio.Protocol):
+    """Records the thread each protocol callback ran on."""
+
+    def __init__(self):
+        self.calls = []
+        self.data = bytearray()
+        self.lost = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        self.lost = asyncio.get_running_loop().create_future()
+
+    def data_received(self, data):
+        self.calls.append(("data_received", threading.get_ident()))
+        self.data += data
+
+    def eof_received(self):
+        self.calls.append(("eof_received", threading.get_ident()))
+
+    def pause_writing(self):
+        self.calls.append(("pause_writing", threading.get_ident()))
+
+    def resume_writing(self):
+        self.calls.append(("resume_writing", threading.get_ident()))
+
+    def connection_lost(self, exc):
+        self.calls.append(("connection_lost", threading.get_ident()))
+        self.lost.set_result(exc)
+
+
+async def _connected_pair(loop):
+    """A cadeloop transport and the plain socket at its other end."""
+    a, peer = socket.socketpair()
+    transport, protocol = await loop.create_connection(_Threads, sock=a)
+    return transport, protocol, peer
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_stream_writer_finalized_on_another_thread_closes_its_connection(loop, unraisable):
+    """The reported failure: the last reference to a StreamWriter dropped
+    by a thread other than the loop's, with the loop waiting for I/O.
+    StreamWriter.__del__ printed "Exception ignored ... RuntimeError:
+    Non-thread-safe operation" and the connection was never closed."""
+
+    async def main():
+        peer_saw_eof = loop.create_future()
+
+        async def handler(reader, writer):
+            data = await reader.read()
+            peer_saw_eof.set_result(data)
+            writer.close()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(*server.sockets[0].getsockname()[:2])
+        transport = writer.transport
+        holder = [writer]
+        del reader, writer
+
+        await _on_another_thread(loop, holder.clear)  # __del__ runs there
+        assert not unraisable, f"the finalizer raised: {unraisable}"
+        assert transport.is_closing()
+        assert await asyncio.wait_for(peer_saw_eof, 5) == b""
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_tls_stream_writer_finalized_on_another_thread_shuts_down(loop, unraisable):
+    """The same finalizer over TLS goes through sslproto's shutdown, which
+    writes the close_notify to the transport under it, and pauses or
+    resumes its reading, from the collecting thread. Refused, the stream
+    hung in mid-shutdown until sslproto's 30 s timeout."""
+    trustme = pytest.importorskip("trustme")
+    import ssl
+
+    ca = trustme.CA()
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ca.issue_cert("localhost", "127.0.0.1").configure_cert(server_ctx)
+    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ca.configure_trust(client_ctx)
+
+    async def main():
+        peer_saw_eof = loop.create_future()
+
+        async def handler(reader, writer):
+            assert await reader.readexactly(5) == b"hello"
+            writer.write(b"world")
+            await writer.drain()
+            peer_saw_eof.set_result(await reader.read())
+            writer.close()
+
+        server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=server_ctx)
+        addr = server.sockets[0].getsockname()
+        reader, writer = await asyncio.open_connection(
+            addr[0], addr[1], ssl=client_ctx, server_hostname="localhost"
+        )
+        writer.write(b"hello")
+        assert await reader.readexactly(5) == b"world"
+        holder = [writer]
+        del reader, writer
+
+        t0 = time.monotonic()
+        await _on_another_thread(loop, holder.clear)
+        assert not unraisable, f"the finalizer raised: {unraisable}"
+        assert await asyncio.wait_for(peer_saw_eof, 10) == b""
+        assert time.monotonic() - t0 < 5, "the TLS shutdown waited out a timeout"
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
+def test_commands_from_another_thread_are_carried_out_in_order_on_the_loop_thread(loop):
+    async def main():
+        transport, protocol, peer = await _connected_pair(loop)
+        loop_thread = threading.get_ident()
+        scratch = bytearray(b"mutable ")
+
+        def commands():
+            assert threading.get_ident() != loop_thread
+            transport.write(b"bytes ")
+            transport.write(scratch)
+            scratch[:] = b"XXXXXXXX"  # what was written is what it held then
+            transport.write(memoryview(b"view "))
+            transport.writelines([b"lines ", bytearray(b"too")])
+            transport.pause_reading()
+            transport.resume_reading()
+            transport.write(b"")
+            transport.write_eof()
+
+        await _on_another_thread(loop, commands)
+        peer.settimeout(5)
+        got = bytearray()
+        while chunk := peer.recv(4096):
+            got += chunk
+        assert bytes(got) == b"bytes mutable view lines too"
+        assert transport.is_reading()
+
+        # The transport still reads: its side was only half-closed.
+        peer.sendall(b"reply")
+        for _ in range(200):
+            if protocol.data == b"reply":
+                break
+            await asyncio.sleep(0.01)
+        assert protocol.data == b"reply"
+
+        assert await _on_another_thread(loop, lambda: (transport.close(), transport.is_closing())[1])
+        assert await asyncio.wait_for(protocol.lost, 5) is None
+        assert {tid for _name, tid in protocol.calls} == {loop_thread}, protocol.calls
+        peer.close()
+
+    loop.run_until_complete(main())
+
+
+def test_a_bad_write_from_another_thread_still_raises_there(loop):
+    """What a write() can tell from the call itself is still told to the
+    caller, not to the loop's exception handler a moment later."""
+
+    async def main():
+        transport, protocol, peer = await _connected_pair(loop)
+
+        def bad_type():
+            with pytest.raises(TypeError):
+                transport.write("text")
+            with pytest.raises(TypeError):
+                transport.writelines([b"fine", 5])
+
+        await _on_another_thread(loop, bad_type)
+        await _on_another_thread(loop, transport.write_eof)
+        await asyncio.sleep(0.05)
+
+        def after_eof():
+            with pytest.raises(RuntimeError, match="after write_eof"):
+                transport.write(b"late")
+
+        await _on_another_thread(loop, after_eof)
+        peer.settimeout(5)
+        assert peer.recv(100) == b"", "nothing of the refused writes went out"
+        transport.abort()
+        peer.close()
+
+    loop.run_until_complete(main())
+
+
+@pytest.mark.parametrize("how", ["abort", "force_close"])
+def test_abort_from_another_thread(loop, how):
+    async def main():
+        transport, protocol, peer = await _connected_pair(loop)
+        boom = OSError("handed over with the call")
+
+        def command():
+            if how == "abort":
+                transport.abort()
+            else:
+                transport._force_close(boom)
+            return transport.is_closing()
+
+        assert await _on_another_thread(loop, command), "not closing once abort() returned"
+        lost = await asyncio.wait_for(protocol.lost, 5)
+        assert lost is (None if how == "abort" else boom)
+        assert protocol.calls[-1] == ("connection_lost", threading.get_ident())
+        peer.close()
+
+    loop.run_until_complete(main())
+
+
+def test_flow_control_callbacks_of_a_write_from_another_thread_run_on_the_loop_thread(loop):
+    """A write past the high-water mark pauses the protocol. Made from
+    another thread it used to call pause_writing() on that thread -- or
+    raise, with the loop parked."""
+
+    async def main():
+        transport, protocol, peer = await _connected_pair(loop)
+        loop_thread = threading.get_ident()
+        chunk = b"x" * (1 << 20)
+
+        def flood():
+            for _ in range(64):
+                transport.write(chunk)
+
+        await _on_another_thread(loop, flood)
+        for _ in range(200):
+            if any(name == "pause_writing" for name, _tid in protocol.calls):
+                break
+            await asyncio.sleep(0.01)
+        assert ("pause_writing", loop_thread) in protocol.calls, protocol.calls
+        assert transport.get_write_buffer_size() > 0
+        transport.abort()
+        await asyncio.wait_for(protocol.lost, 5)
+        assert {tid for _name, tid in protocol.calls} == {loop_thread}, protocol.calls
+        peer.close()
+
+    loop.run_until_complete(main())
+
+
+def test_writes_from_another_thread_keep_their_order_while_the_loop_is_busy(loop):
+    """One thread's writes arrive as it made them, whether the loop was
+    parked, running callbacks or between the two when each was made."""
+    count, size = 4000, 257
+
+    async def main():
+        transport, protocol, peer = await _connected_pair(loop)
+        received = bytearray()
+        done = threading.Event()
+
+        def drain():
+            peer.settimeout(10)
+            try:
+                while len(received) < count * size:
+                    chunk = peer.recv(1 << 16)
+                    if not chunk:
+                        break  # closed under us: the test has failed already
+                    received.extend(chunk)
+            except OSError:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+
+        def writer():
+            for i in range(count):
+                transport.write(i.to_bytes(4, "big") * (size // 4) + b"\n")
+                if i % 500 == 0:
+                    time.sleep(0.003)  # let the loop park now and then
+
+        busy = True
+
+        async def churn():
+            while busy:
+                await asyncio.sleep(0)  # the loop runs, and yields the GIL
+
+        task = loop.create_task(churn())
+        fut = loop.run_in_executor(None, writer)
+        await asyncio.sleep(0.02)
+        busy = False  # ... and from here on it parks between events
+        await task
+        await fut
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+        expected = b"".join(i.to_bytes(4, "big") * (size // 4) + b"\n" for i in range(count))
+        assert bytes(received) == expected
+        transport.abort()
+        peer.close()
+
+    loop.run_until_complete(main())
+
+
+def test_debug_mode_takes_a_close_from_another_thread_too(loop, unraisable):
+    """Debug mode refuses call_soon() from another thread, as asyncio's
+    does; a finalizer's close() is not the application's mistake to be
+    told about, and goes the way call_soon_threadsafe() does."""
+    loop.set_debug(True)
+
+    async def main():
+        transport, protocol, peer = await _connected_pair(loop)
+        await _on_another_thread(loop, transport.close)
+        assert await asyncio.wait_for(protocol.lost, 5) is None
+        peer.close()
+
+    loop.run_until_complete(main())
+    assert not unraisable
+
+
+def test_datagram_close_from_another_thread(loop):
+    class Proto(asyncio.DatagramProtocol):
+        def __init__(self):
+            self.lost = asyncio.get_running_loop().create_future()
+            self.thread = None
+
+        def connection_lost(self, exc):
+            self.thread = threading.get_ident()
+            self.lost.set_result(exc)
+
+    async def main():
+        for how in ("close", "abort"):
+            transport, protocol = await loop.create_datagram_endpoint(Proto, local_addr=("127.0.0.1", 0))
+            await _on_another_thread(loop, getattr(transport, how))
+            assert transport.is_closing()
+            assert await asyncio.wait_for(protocol.lost, 5) is None
+            assert protocol.thread == threading.get_ident()
+
+    loop.run_until_complete(main())
+
+
+def test_server_closed_from_another_thread_stops_accepting(loop):
+    """Server.close() took the refusal for "the loop is already closed":
+    closed from another thread with the loop waiting for I/O, the server
+    reported itself closed and its port went on accepting connections."""
+
+    async def main():
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        addr = server.sockets[0].getsockname()[:2]
+        socket.create_connection(addr, timeout=5).close()  # it is listening
+
+        await _on_another_thread(loop, server.close)
+        await asyncio.wait_for(server.wait_closed(), 5)
+        await asyncio.sleep(0.05)
+        with pytest.raises(OSError):
+            await asyncio.wait_for(loop.run_in_executor(None, socket.create_connection, addr, 2), 5)
+        assert loop._core.listener_count() == 0
+
+    loop.run_until_complete(main())
