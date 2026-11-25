@@ -694,3 +694,51 @@ more -- and nothing measurable elsewhere.
 A send of a single buffer -- most of them -- goes through `send()` rather
 than `sendmsg()`: the same call without the msghdr and iovec the kernel
 copies in and validates first.
+
+## ADR-36: Commands on what the loop owns are handed to its thread
+ADR-29 let other threads into the loop whenever it was not parked, sent the
+scheduling calls through the cross-thread queue when it was, and had
+"anything else" raise asyncio's non-thread-safe error. Anything else
+included every transport method, on the reasoning that calling one from
+another thread is the application's mistake to be told about.
+
+It is not always the application's call. The garbage collector runs
+finalizers on whichever thread it is collecting on, and asyncio's
+`StreamWriter.__del__` closes the transport it held: a writer collected by
+a worker thread, with the loop waiting for I/O, printed "Exception ignored
+in StreamWriter.__del__ ... RuntimeError: Non-thread-safe operation (the
+loop is waiting for I/O...)" -- and the connection was never closed, since
+the object that was closing it had just gone. Over TLS the same finalizer
+runs sslproto's shutdown, which writes the close_notify to the transport
+under it and pauses or resumes its reading on the way. And the calls an
+application does make itself were refused or not according to whether the
+loop happened to be parked at that instant: `transport.close()` from a main
+thread shutting down a loop on another raised some of the time, and
+`Server.close()` wrapped its native close in `except RuntimeError: pass`
+("loop already closed"), so the server reported itself closed and its port
+went on accepting. asyncio takes all of these.
+
+A command on something the loop owns -- a stream transport's `close`,
+`abort`, `_force_close`, `write`, `writelines`, `write_eof`,
+`pause_reading` and `resume_reading`, a datagram transport's `close` and
+`abort`, a server's `close` -- made from another thread while the loop is
+running, or inside a live borrow of its state, is now handed to the loop's
+thread (`net::HandedOver`): queued the way `call_soon_threadsafe` queues,
+waking the loop if it is parked, and carried out in the order made. The
+test is the caller's thread, not whether the state happens to be
+reachable. Reachable, a write used to run on the calling thread, which put
+it ahead of an earlier one still waiting in the queue, and called
+`pause_writing()` or `connection_lost()` on a thread protocols never
+expect to be called on; with one thread carrying every command out, order
+holds and protocol callbacks stay where they belong. On the loop's own
+thread the check is two loads and a compare, and nothing else changes.
+
+What a call can tell from its arguments is still told to the caller: a
+`write()` of the wrong type raises there, as does one after
+`write_eof()`. A mutable buffer is copied when the call is made.
+`is_closing()` is true from the moment a handed-over `close()` returns.
+Configuration and queries that need the state -- `set_protocol`,
+`set_write_buffer_limits`, `get_protocol`, `is_reading` -- still raise
+from another thread while the loop is parked; those are not calls a
+finalizer makes, and the error's advice (`call_soon_threadsafe`) is right
+for them.
