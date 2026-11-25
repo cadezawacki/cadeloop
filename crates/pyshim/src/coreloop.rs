@@ -202,6 +202,44 @@ impl CoreLoop {
         self.state.with(|st| f(&mut st.net, &mut st.reactor))
     }
 
+    /// Is this caller somewhere a command on one of the loop's transports
+    /// must not be carried out -- another thread while the loop runs, or
+    /// inside a live borrow of its state (gil_boundary, invariant 5)? The
+    /// command then goes to [`CoreLoop::hand_over`].
+    #[inline]
+    pub(crate) fn belongs_on_loop_thread(&self) -> bool {
+        self.state.belongs_on_loop_thread()
+    }
+
+    /// Run `callback(*args)` on the loop's thread, behind everything
+    /// handed over before it, waking the loop if it is parked: what
+    /// `call_soon_threadsafe` does, for a call the loop itself has to
+    /// redirect. (No debug-mode thread check, as that method has none.)
+    pub(crate) fn hand_over(
+        &self,
+        py: Python<'_>,
+        callback: &Bound<'_, PyAny>,
+        args: CallArgs,
+    ) -> PyResult<()> {
+        let handle = self.make_handle(py, callback, args, None, "call_soon_threadsafe")?;
+        self.enqueue_soon(py, handle).map(drop)
+    }
+
+    /// `listener_close`, carried out on this thread.
+    pub(crate) fn listener_close_here(&self, py: Python<'_>, lid: u64) -> PyResult<()> {
+        self.with_net(|net, reactor| net::listener_teardown(net, reactor.backend_mut(), lid))?;
+        self.drain_graveyards(py)
+    }
+
+    /// `udp_close`, carried out on this thread.
+    pub(crate) fn udp_close_here(&self, py: Python<'_>, did: u64, abort: bool) -> PyResult<()> {
+        self.with_net(|net, reactor| {
+            net::udp_close(py, net, reactor.backend_mut(), did, abort);
+        })?;
+        self.drain_graveyards(py)?;
+        net::schedule_pending_lost(py, self)
+    }
+
     /// [`CoreLoop::with_net`] for read-only accessors that have an answer
     /// of their own when the state is out of reach -- another thread while
     /// the loop is parked in its poll, or a re-entered borrow
@@ -1371,13 +1409,16 @@ impl CoreLoop {
     }
 
     /// R-058 close/abort. close flushes queued sends; abort drops them.
+    /// From another thread while the loop runs, or inside a borrow of its
+    /// state, it is handed to the loop's thread, as a stream transport's
+    /// is (`net::HandedOver`).
     #[pyo3(signature = (did, abort=false))]
-    fn udp_close(&self, py: Python<'_>, did: u64, abort: bool) -> PyResult<()> {
-        self.with_net(|net, reactor| {
-            net::udp_close(py, net, reactor.backend_mut(), did, abort);
-        })?;
-        self.drain_graveyards(py)?;
-        net::schedule_pending_lost(py, self)
+    fn udp_close(slf: &Bound<'_, Self>, py: Python<'_>, did: u64, abort: bool) -> PyResult<()> {
+        let this = slf.get();
+        if this.belongs_on_loop_thread() {
+            return net::hand_over_dgram_close(py, slf.as_unbound(), did, abort);
+        }
+        this.udp_close_here(py, did, abort)
     }
 
     /// R-080 timeout sweep tick (armed as a coarse repeating timer by the
@@ -1479,9 +1520,18 @@ impl CoreLoop {
         started.map_err(net::io_error)
     }
 
-    fn listener_close(&self, py: Python<'_>, lid: u64) -> PyResult<()> {
-        self.with_net(|net, reactor| net::listener_teardown(net, reactor.backend_mut(), lid))?;
-        self.drain_graveyards(py)
+    /// From another thread while the loop runs, or inside a borrow of its
+    /// state, the close is handed to the loop's thread (`net::HandedOver`).
+    /// It used to raise there, and `Server.close()` took that for "the
+    /// loop is already closed": a server closed from the main thread, with
+    /// its loop waiting for I/O on another, reported itself closed and
+    /// went on accepting connections.
+    fn listener_close(slf: &Bound<'_, Self>, py: Python<'_>, lid: u64) -> PyResult<()> {
+        let this = slf.get();
+        if this.belongs_on_loop_thread() {
+            return net::hand_over_listener_close(py, slf.as_unbound(), lid);
+        }
+        this.listener_close_here(py, lid)
     }
 
     /// Graceful shutdown, phase 1 (R-092). Call after the listener is
