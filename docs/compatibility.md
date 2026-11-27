@@ -96,6 +96,13 @@ build, the other two the distribution's).
   3.13). `asyncio.Queue` works on a cadeloop loop as on any other.
 - A cadeloop transport is not an instance of `asyncio.Transport` (a native
   type cannot inherit from it), as with uvloop.
+- **A protocol installed with `set_protocol()` starts unpaused.** asyncio
+  keeps the paused flag on the transport, so a protocol swapped in while
+  the old one was paused is later sent a `resume_writing()` it never had a
+  `pause_writing()` for, and gets no `pause_writing()` when its own write
+  finds the buffer still over the mark. cadeloop keeps the two calls in
+  pairs per protocol, which is also what `start_tls()` on a busy transport
+  needs (sslproto's `resume_writing()` asserts that it was paused).
 
 Full requirement-by-requirement map:
 [requirements-traceability.md](requirements-traceability.md).

@@ -662,6 +662,10 @@ async def run_scenario(loop, sc, tls_ctxs=None):
         elif name == "peer_unstall":
             peer.stalled = False
         elif name == "peer_shutdown_wr":
+            # Recorded before the step, True or False, in both traces: a
+            # half-close with bytes the kernel had not yet taken throws
+            # those bytes away (see `_reconcile`).
+            trace.append(("peer_shut_with_unsent_data", peer.backlog() > 0))
             peer.shutdown_wr()
         elif name in ("peer_close", "peer_reset"):
             unread = peer.sent > _delivered(trace)
@@ -704,22 +708,47 @@ def _steps_before(trace, index):
     return [ev[1] for ev in trace[:index] if ev[0] == "step"]
 
 
-def _after_the_peer_left(trace):
+def _after_the_peer_left(trace, cut_short=()):
     """The trace without what a departed peer makes a matter of timing
-    (see `_reconcile`)."""
+    (see `_reconcile`). `cut_short`: which of the peer's half-closes, in
+    order, left unsent data behind in either trace."""
     out = []
     dead = unread = False
+    shuts = 0
     for ev in trace:
         if ev[0] == "step" and ev[1] in ("peer_close", "peer_reset"):
             dead = True
         elif ev == ("peer_left_unread_data", True):
             unread = True
+        elif ev[0] == "peer_shut_with_unsent_data":
+            unread = unread or (shuts < len(cut_short) and cut_short[shuts])
+            shuts += 1
+            continue  # the two traces may disagree on it; what follows is what matters
         if dead and ev[0].endswith(("pause_writing", "resume_writing")):
             continue
         if unread and ev[0].endswith("data"):
             continue
         out.append(ev)
     return out
+
+
+def _paused_set_protocol(trace):
+    """Where the first set_protocol() made on a paused transport is, or
+    None (see `_reconcile`)."""
+    paused = False
+    for i, ev in enumerate(trace):
+        if ev[0].endswith("pause_writing"):
+            paused = True
+        elif ev[0].endswith("resume_writing"):
+            paused = False
+        elif ev == ("call", "set_protocol") and paused:
+            return i
+    return None
+
+
+def _without_flow_control_after(trace, index):
+    return [ev for i, ev in enumerate(trace)
+            if i <= index or not ev[0].endswith(("pause_writing", "resume_writing"))]
 
 
 def _reconcile(ours, theirs):
@@ -743,6 +772,22 @@ def _reconcile(ours, theirs):
     * A peer that left while the transport had not read everything it
       sent: how much of the rest still arrives depends on what the kernel
       had accepted by then. The deliveries after that point are left out.
+      The same for a peer that half-closes with bytes of its own still
+      unsent (a paused transport, a full socket): the shutdown throws the
+      rest away, and how much had already crossed depends on how much room
+      the receiving side's reads had made -- cadeloop reads ahead of a
+      pause and the selector loop does not, which moved the cut by 164
+      bytes in one scenario and 64 KiB in another.
+    * set_protocol() on a transport whose protocol is paused. asyncio
+      keeps the paused flag on the transport, so the new protocol is later
+      sent a resume_writing() it never had a pause_writing() for, and gets
+      no pause_writing() when its own write finds the buffer still over
+      the mark. cadeloop starts a new protocol unpaused and keeps the two
+      calls in pairs per protocol (start_tls needs that: sslproto's
+      resume_writing asserts it was paused). From such a set_protocol()
+      on, pause_writing and resume_writing are left out of both traces;
+      test_set_protocol_does_not_carry_a_pause_over holds cadeloop to its
+      side of it.
     * After unsent data has been thrown away, or the connection has
       failed, how much the peer received is the kernel's business: the
       peer's record keeps its end state and drops the byte count.
@@ -766,7 +811,13 @@ def _reconcile(ours, theirs):
       stuck buffer without the TypeError.) 3.11 and 3.13 drop the data
       silently, and so does cadeloop on all three.
     """
-    ours, theirs = _after_the_peer_left(ours), _after_the_peer_left(theirs)
+    marks = [[ev[1] for ev in trace if ev[0] == "peer_shut_with_unsent_data"] for trace in (ours, theirs)]
+    cut_short = [x or y for x, y in zip(*marks, strict=False)]
+    ours, theirs = _after_the_peer_left(ours, cut_short), _after_the_peer_left(theirs, cut_short)
+    swapped = [i for i in (_paused_set_protocol(ours), _paused_set_protocol(theirs)) if i is not None]
+    if swapped:
+        ours = _without_flow_control_after(ours, min(swapped))
+        theirs = _without_flow_control_after(theirs, min(swapped))
     a, b = _first_error_loss(ours), _first_error_loss(theirs)
     if a != b:
         cut = min(i for i in (a, b) if i is not None)
