@@ -108,6 +108,69 @@ def test_worker_pool_balances_restarts_and_drains(tmp_path):
             proc.kill()
 
 
+TAP = """\
+import os
+def tap(records):
+    with open(os.environ["TAP_OUT"], "a") as f:
+        for client, method, target, status, duration_ms in records:
+            f.write(f"{os.getpid()} {method} {target.decode()} {status}\\n")
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="stops the server with SIGTERM")
+@pytest.mark.parametrize("workers", [1, 2])
+def test_native_access_log_and_tap_from_the_command_line(tmp_path, workers):
+    """`--access-log-file`, `--access-log-format` and `--access-log-tap`
+    end to end: every request is in the file as one JSON line, whichever
+    worker served it (they append to the one file), the tap named on the
+    command line saw each of them too, and a normal shutdown loses none."""
+    import json
+
+    (tmp_path / "mwapp.py").write_text(APP)
+    (tmp_path / "mwtap.py").write_text(TAP)
+    log, tapped = tmp_path / "access.jsonl", tmp_path / "tapped.txt"
+    port = _free_port()
+    env = dict(os.environ, TAP_OUT=str(tapped))
+    pkg = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), pkg, env.get("PYTHONPATH", "")])
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "cadeloop", "mwapp:app", "--port", str(port), "--workers", str(workers),
+            "--access-log-file", str(log), "--access-log-format", "json", "--access-log-tap", "mwtap:tap",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.time() + 10
+        warm = 0
+        while True:
+            try:
+                _get(port, timeout=1)
+                warm += 1
+                break
+            except Exception:  # noqa: BLE001 — startup poll
+                if time.time() > deadline:
+                    proc.kill()
+                    raise AssertionError(f"server never came up: {proc.stdout.read()[-2000:]}") from None
+                time.sleep(0.1)
+        pids = {_get(port).decode() for _ in range(40)}
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=15)
+        assert proc.returncode == 0, out[-2000:]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(records) == 40 + warm, len(records)
+    assert all(r["method"] == "GET" and r["target"] == "/" and r["status"] == 200 for r in records)
+    seen = [line.split() for line in tapped.read_text().splitlines()]
+    assert len(seen) == 40 + warm
+    assert {pid for pid, *_ in seen} >= pids  # each worker's tap ran in that worker
+
+
 async def _reject_port_zero_app(scope, receive, send):  # pragma: no cover - never runs
     pass
 

@@ -33,6 +33,9 @@ def test_defaults_match_spec():
     # punishes shared CPUs (see Config.pin).
     assert c.pin is False and c.grace == 10.0  # R-091/R-092
     assert c.access_log is False  # R-140
+    # The native access log is off until given somewhere to write, or a tap.
+    assert c.access_log_file is None and c.access_log_tap is None
+    assert c.access_log_format == "text"
 
 
 def test_latency_presets():
@@ -125,3 +128,16 @@ def test_negative_watermarks_are_rejected_not_deferred_to_an_overflow():
     with pytest.raises(ValueError, match="write_low_water must be <="):
         Config(write_low_water=100, write_high_water=10)
     assert Config(write_low_water=0, write_high_water=0)
+
+
+def test_native_access_log_settings_are_checked():
+    c = Config(access_log_file="-", access_log_format="json", access_log_tap="pkg.mod:tap")
+    assert (c.access_log_file, c.access_log_format, c.access_log_tap) == ("-", "json", "pkg.mod:tap")
+    with pytest.raises(ValueError, match="access_log_format"):
+        Config(access_log_format="xml")
+    with pytest.raises(TypeError, match="access_log_file"):
+        Config(access_log_file="")
+    with pytest.raises(TypeError, match="access_log_file"):
+        Config(access_log_file=True)
+    with pytest.raises(ValueError, match="module:callable"):
+        Config(access_log_tap="just_a_module")

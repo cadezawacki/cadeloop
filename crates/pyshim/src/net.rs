@@ -613,6 +613,9 @@ pub(crate) struct NetState {
     /// R-140 access-log sink (a Python callable) — None disables logging
     /// with a single branch on the request-completion path.
     pub access_sink: Option<Py<PyAny>>,
+    /// The native access log (`accesslog`): records formatted here, in
+    /// the cell, and written by a thread that never takes the GIL.
+    pub access: Option<Box<crate::accesslog::AccessLog>>,
     pub stats_bytes_rx: u64,
     pub stats_bytes_tx: u64,
     pub stats_conns_accepted: u64,

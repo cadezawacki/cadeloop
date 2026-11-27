@@ -7,6 +7,7 @@ are plain asyncio streams (which also exercises the M1 transport surface).
 import asyncio
 import json
 import os
+import re
 import socket
 import sys
 
@@ -1227,6 +1228,193 @@ def test_access_log_sink(loop):
     assert peer is not None and peer[0] == "127.0.0.1"
     assert dur >= 0.0
     loop._core.listener_close(lid)
+
+
+# The native access log (R-140): formatted in Rust, written by a thread
+# that never takes the GIL; and the tap, which hands the same records to
+# Python in batches.
+
+_TEXT_LINE = re.compile(
+    r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z 127\.0\.0\.1:\d+ "(GET|POST) (\S+)" (\d{3}) \d+\.\d\dms$'
+)
+
+
+async def _keepalive_requests(port, targets):
+    """Each target as its own request on one connection, answered in turn."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    for target in targets:
+        writer.write(b"GET " + target + b" HTTP/1.1\r\nhost: x\r\n\r\n")
+        resp = await asyncio.wait_for(_read_one_response(reader), 5)
+        assert b"200" in resp.split(b"\r\n", 1)[0]
+    writer.close()
+
+
+def test_native_access_log_writes_one_line_per_request(loop, tmp_path):
+    path = tmp_path / "access.log"
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.open_access_log(str(path), "text")
+    targets = [b"/hello?x=1", b"/a%20b", b"/third"]
+    loop.run_until_complete(_keepalive_requests(port, targets))
+    stats = loop.stats()
+    loop._core.close_access_log()  # waits for the writer
+    lines = path.read_text().splitlines()
+    assert len(lines) == 3, lines
+    for line, target in zip(lines, targets, strict=True):
+        m = _TEXT_LINE.match(line)
+        assert m, line
+        assert (m.group(1), m.group(2), m.group(3)) == ("GET", target.decode(), "200")
+    assert stats["access_log_records"] == 3 and stats["access_log_dropped"] == 0
+    assert "access_log_records" not in loop.stats()  # closed: no log, no counters
+    loop._core.listener_close(lid)
+
+
+def test_native_access_log_json(loop, tmp_path):
+    path = tmp_path / "access.jsonl"
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.open_access_log(str(path), "json")
+    loop.run_until_complete(_keepalive_requests(port, [b"/q?a=%22b%22", b"/back\\slash"]))
+    loop._core.close_access_log()
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["target"] for r in records] == ["/q?a=%22b%22", "/back\\slash"]
+    for r in records:
+        assert set(r) == {"ts", "client", "method", "target", "status", "duration_ms"}
+        assert r["method"] == "GET" and r["status"] == 200 and r["duration_ms"] >= 0
+        assert r["client"].startswith("127.0.0.1:") and r["ts"].endswith("Z")
+    loop._core.listener_close(lid)
+
+
+def test_native_access_log_appends_and_survives_reopening(loop, tmp_path):
+    """Two logs opened on one path in turn -- a restart, or two workers --
+    add to the file; neither truncates it."""
+    path = tmp_path / "access.log"
+    lid, port = listen(loop, echo_scope_app)
+    for target in (b"/first", b"/second"):
+        loop._core.open_access_log(str(path), "text")
+        loop.run_until_complete(_keepalive_requests(port, [target]))
+        loop._core.close_access_log()
+    lines = path.read_text().splitlines()
+    assert [(_TEXT_LINE.match(line) or [None] * 3)[2] for line in lines] == ["/first", "/second"]
+    loop._core.listener_close(lid)
+
+
+def test_access_log_tap_gets_a_tick_of_requests_at_a_time(loop):
+    batches = []
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.open_access_log(None, "text", batches.append)
+
+    async def main():
+        # Ten requests in one write: parsed together, answered in one or
+        # two ticks -- and the tap is called per tick, not per request.
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"".join(b"GET /p%d HTTP/1.1\r\nhost: x\r\n\r\n" % i for i in range(10)))
+        for _ in range(10):
+            await asyncio.wait_for(_read_one_response(reader), 5)
+        writer.close()
+        await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+    records = [r for batch in batches for r in batch]
+    assert [r[2] for r in records] == [b"/p%d" % i for i in range(10)]
+    assert len(batches) < 10, [len(b) for b in batches]
+    for client, method, target, status, dur_ms in records:
+        assert client[0] == "127.0.0.1" and isinstance(client[1], int)
+        assert method == "GET" and isinstance(target, bytes) and status == 200
+        assert isinstance(dur_ms, float) and dur_ms >= 0.0
+    assert all(isinstance(batch, list) for batch in batches)
+    loop._core.close_access_log()
+    loop._core.listener_close(lid)
+
+
+def test_access_log_tap_and_file_and_logging_sink_all_see_the_request(loop, tmp_path):
+    path = tmp_path / "access.log"
+    tapped, sunk = [], []
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.open_access_log(str(path), "json", tapped.extend)
+    loop._core.set_access_log(lambda *record: sunk.append(record))
+    loop.run_until_complete(_keepalive_requests(port, [b"/all"]))
+    loop.run_until_complete(asyncio.sleep(0.05))
+    loop._core.set_access_log(None)
+    loop._core.close_access_log()
+    assert [r[2] for r in tapped] == [b"/all"] == [r[2] for r in sunk]
+    assert tapped[0][:4] == sunk[0][:4]  # the same client, method, target, status
+    assert json.loads(path.read_text())["target"] == "/all"
+    loop._core.listener_close(lid)
+
+
+def test_close_delivers_the_taps_last_batch(loop):
+    """A request that finished in the tick the server stops in is still
+    handed to the tap: close flushes it instead of dropping it."""
+    tapped = []
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.open_access_log(None, "text", tapped.extend)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /last HTTP/1.1\r\nhost: x\r\n\r\n")
+        await asyncio.wait_for(_read_one_response(reader), 5)
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.close_access_log()
+    assert [r[2] for r in tapped] == [b"/last"]
+    loop._core.listener_close(lid)
+
+
+def test_a_failing_tap_is_reported_and_called_again(loop):
+    calls = []
+    reported = []
+    loop.set_exception_handler(lambda _loop, ctx: reported.append(ctx))
+
+    def tap(records):
+        calls.append(len(records))
+        raise RuntimeError("tap failed")
+
+    lid, port = listen(loop, echo_scope_app)
+    loop._core.open_access_log(None, "text", tap)
+
+    async def main():
+        for target in (b"/one", b"/two"):
+            await _keepalive_requests(port, [target])
+            await asyncio.sleep(0.05)
+
+    loop.run_until_complete(main())
+    assert calls == [1, 1]
+    assert len(reported) == 2 and all(isinstance(c["exception"], RuntimeError) for c in reported)
+    loop._core.close_access_log()
+    loop._core.listener_close(lid)
+
+
+def test_open_access_log_checks_its_arguments(loop, tmp_path):
+    with pytest.raises(ValueError, match="'text' or 'json'"):
+        loop._core.open_access_log(str(tmp_path / "x.log"), "xml")
+    with pytest.raises(ValueError, match="a file, a tap, or both"):
+        loop._core.open_access_log(None, "text")
+    with pytest.raises(TypeError, match="callable"):
+        loop._core.open_access_log(None, "text", "not callable")
+    with pytest.raises(OSError):
+        loop._core.open_access_log(str(tmp_path / "no" / "such" / "dir" / "x.log"), "text")
+    loop._core.close_access_log()  # nothing open: a no-op
+
+
+def test_a_loop_with_an_access_log_tap_is_collected(tmp_path):
+    """The tap is held next to the loop's own bound method -- a cycle
+    through the loop. The collector has to be able to see and break it,
+    for a loop that was never told to close its log."""
+    import gc
+    import weakref
+
+    class Marker:
+        pass
+
+    marker = Marker()
+    ref = weakref.ref(marker)
+    lp = cadeloop.new_event_loop()
+    lp._core.open_access_log(str(tmp_path / "a.log"), "text", lambda records, keep=marker: None)
+    del marker
+    lp.close()
+    del lp
+    gc.collect()
+    assert ref() is None
 
 
 def test_http_listen_fd_adopts_existing_listener(loop):

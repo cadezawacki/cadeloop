@@ -225,6 +225,19 @@ impl CoreLoop {
         self.enqueue_soon(py, handle).map(drop)
     }
 
+    /// Let go of a native access log, outside the state cell: its writer
+    /// gets a moment to write what it was handed (GIL released -- it may
+    /// be waiting on a disk), and the log's Python references are dropped
+    /// here, attached.
+    fn retire_access_log(&self, py: Python<'_>, old: Option<Box<crate::accesslog::AccessLog>>) {
+        if let Some(mut log) = old {
+            py.detach(|| {
+                log.finish();
+            });
+            drop(log);
+        }
+    }
+
     /// `listener_close`, carried out on this thread.
     pub(crate) fn listener_close_here(&self, py: Python<'_>, lid: u64) -> PyResult<()> {
         self.with_net(|net, reactor| net::listener_teardown(net, reactor.backend_mut(), lid))?;
@@ -441,6 +454,13 @@ impl CoreLoop {
                 let list = std::mem::take(&mut st.net.flush_list);
                 for tid in list {
                     net::flush_pending(py, &mut st.net, st.reactor.backend_mut(), tid);
+                }
+            }
+            // ...and hand the access-log lines of the requests it finished
+            // to the writer, before a park could sit on them.
+            if let Some(access) = st.net.access.as_mut() {
+                if access.has_lines() {
+                    access.hand_off();
                 }
             }
             st.reactor.prepare_tick();
@@ -1449,6 +1469,60 @@ impl CoreLoop {
         })
     }
 
+    /// R-140: start the native access log (`accesslog`). `path` is a file
+    /// to append to, or `-` for standard output; `tap` a callable given a
+    /// list of `(client, method, target, status, duration_ms)` once per
+    /// tick that finished a request. Either may be None, not both.
+    #[pyo3(signature = (path=None, format="text", tap=None))]
+    fn open_access_log(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        path: Option<&str>,
+        format: &str,
+        tap: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let format = crate::accesslog::Format::parse(format).ok_or_else(|| {
+            PyValueError::new_err(format!("access log format must be 'text' or 'json', got {format:?}"))
+        })?;
+        if path.is_none() && tap.is_none() {
+            return Err(PyValueError::new_err("the access log needs a file, a tap, or both"));
+        }
+        let tap = match tap {
+            Some(tap) => {
+                if !tap.is_callable() {
+                    return Err(PyTypeError::new_err("the access log tap must be callable"));
+                }
+                Some((tap.unbind(), slf.getattr(intern!(py, "_flush_access_tap"))?.unbind()))
+            }
+            None => None,
+        };
+        let log = crate::accesslog::AccessLog::open(path, format, tap).map_err(net::io_error)?;
+        let this = slf.get();
+        let old = this.with_net(|net, _| net.access.replace(Box::new(log)))?;
+        this.retire_access_log(py, old);
+        Ok(())
+    }
+
+    /// Stop the native access log: deliver the tap's last batch, hand the
+    /// writer what is left and wait (briefly) for it to be written.
+    fn close_access_log(&self, py: Python<'_>) -> PyResult<()> {
+        let flushed = self._flush_access_tap(py);
+        let old = self.with_net(|net, _| net.access.take())?;
+        self.retire_access_log(py, old);
+        flushed
+    }
+
+    /// Deliver the tap's batch. Scheduled by the first finished request of
+    /// a tick, so it runs once for all of that tick's requests.
+    fn _flush_access_tap(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self.with_net(|net, _| net.access.as_mut().and_then(|a| a.take_tap_batch(py)))?;
+        if let Some((tap, batch)) = taken {
+            let records = crate::accesslog::tap_argument(py, batch)?;
+            tap.call1(py, (records,))?;
+        }
+        Ok(())
+    }
+
     /// Adopt an existing listening socket fd (create_server(sock=...)).
     ///
     /// With `owner` (the caller's socket object, whose descriptor `fd` is)
@@ -2011,6 +2085,10 @@ impl CoreLoop {
             visit.call(snap)?;
         }
         if let Some(st) = self.state.peek_for_gc() {
+            // The access log's tap comes with this loop's own bound method.
+            if let Some(access) = st.net.access.as_ref() {
+                access.visit_refs(&visit)?;
+            }
             for h in st.reactor.pending_iter() {
                 h.get().visit_refs(&visit)?;
             }
@@ -2029,6 +2107,9 @@ impl CoreLoop {
             return;
         }
         self.snaps.clear(py);
+        if let Ok(access) = self.state.with(|st| st.net.access.take()) {
+            self.retire_access_log(py, access);
+        }
         let Ok(handles) = self.state.with(|st| {
             let mut out: Vec<HandleRef> = st.reactor.clear_pending();
             out.extend(st.net.readers.drain().map(|(_, h)| HandleRef(h)));
@@ -2120,6 +2201,14 @@ impl CoreLoop {
         d.set_item("precise_parks", stats.precise_parks)?;
         d.set_item("ready_len", ready)?;
         d.set_item("timers_len", timers)?;
+        // The native access log: requests recorded, and records lost to a
+        // writer that fell behind or a tap that could not be called.
+        if let Some((records, dropped)) =
+            self.with_net(|net, _| net.access.as_ref().map(|a| (a.total_records, a.total_dropped())))?
+        {
+            d.set_item("access_log_records", records)?;
+            d.set_item("access_log_dropped", dropped)?;
+        }
         d.set_item("connections", netstats.0)?;
         d.set_item("listeners", netstats.1)?;
         d.set_item("buffers_in_use", netstats.2)?;

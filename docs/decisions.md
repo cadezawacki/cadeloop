@@ -742,3 +742,51 @@ Configuration and queries that need the state -- `set_protocol`,
 from another thread while the loop is parked; those are not calls a
 finalizer makes, and the error's advice (`call_soon_threadsafe`) is right
 for them.
+
+## ADR-37: The access log is written without the interpreter
+R-140's access log calls a Python sink once per finished request; the sink
+appends to a deque and a daemon thread turns each record into a
+`logger.info()`. That keeps a blocking handler off the loop thread, but not
+off the GIL: the writer needs it for every `LogRecord`, every format and
+every handler call, and takes it from the loop to get it. Measured on the
+plain-text benchmark (one worker, 64 connections, loopback): 136k
+requests/s without the log, 26k with it logging to a file -- 37 us of
+logging for a request that costs 7.
+
+The log can be written with no Python at all, because everything in a
+record is already native: the method is a static string, the target the
+parser's own bytes, the status and the duration numbers. `accesslog`
+(`cadeloop_core`, so it is tested without an interpreter) formats a
+finished request straight into a byte buffer inside the state cell -- text,
+or one JSON object per line -- and the tick's first phase hands the buffer
+to a writer thread that owns the file and never takes the GIL. 128k
+requests/s with it on: half a microsecond a request.
+
+The decisions inside that:
+
+- **A thread, not an inline write.** A regular file takes a write into the
+  page cache in microseconds, but standard output may be a pipe to
+  something slow, and a disk can stall. The loop never waits on either.
+- **Bounded, and honest about it.** What the writer has not written is
+  capped at 8 MiB; past that, records are dropped and counted and the count
+  is written into the log when the writer catches up (and reported by
+  `stats()`), as the logging path does.
+- **Whole lines per write, appended.** Several workers share a file without
+  a lock, and a rotator's rename is noticed by comparing the path's file
+  with the open one once a second.
+- **Escaped.** A target is the client's bytes: anything outside printable
+  ASCII, and the quote and backslash, are written as escapes, so a request
+  cannot forge a second line or a status.
+- **Opt-in beside the logging path, not instead of it.** `access_log=True`
+  keeps its meaning and its handlers; `access_log_file` is the new setting.
+
+Python still gets the records, through the *tap*: a callable given the
+finished requests as a list of tuples -- the logging sink's five values --
+once per tick rather than once per request. The first request to finish in
+a tick schedules the delivery as an ordinary loop callback, so it runs
+after everything else that tick finishes, and a tap that raises is reported
+like any callback. Measured with a tap that counts: 140k requests/s, inside
+the noise of no logging. The tap's callable is stored next to the loop's
+own bound method, which is a reference cycle through the loop, so
+`__traverse__` reports both and `__clear__` lets the log go.
+

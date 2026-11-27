@@ -11,7 +11,7 @@ import os
 import sys
 import typing
 
-from .config import _GC_MODES, Config
+from .config import _ACCESS_LOG_FORMATS, _GC_MODES, Config
 from .server import _check_app_spec, _worker_count, load_app, serve
 
 # Distinguishes "flag absent" from "--flag none" for the int|None options.
@@ -48,7 +48,7 @@ def _port(text: str) -> int:
 
 # String-valued fields with a closed set of values: argparse rejects a typo
 # with the list of choices instead of a Config traceback.
-_CHOICES = {"gc_mode": _GC_MODES}
+_CHOICES = {"gc_mode": _GC_MODES, "access_log_format": _ACCESS_LOG_FORMATS}
 
 
 def _add_config_args(parser: argparse.ArgumentParser) -> list[str]:

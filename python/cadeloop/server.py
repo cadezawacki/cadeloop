@@ -390,6 +390,7 @@ def serve(
     ssl=None,
     latency_mode: str = "balanced",
     access_log: bool = False,
+    access_log_tap=None,
     **cfg,
 ):
     """Serve an ASGI 3.0 application on the native HTTP engine (R-101).
@@ -398,7 +399,22 @@ def serve(
     handler). ``app`` may be a callable or a ``"module:attribute"`` spec.
     ``workers`` > 1 forks a supervised worker pool (§8, R-090..R-093);
     ``workers=0`` means one per CPU the process may run on.
+
+    ``access_log_tap``: a callable (or its ``"module:callable"`` spec)
+    given, once per loop tick, the list of requests that finished in it
+    as ``(client, method, target, status, duration_ms)`` tuples.
     """
+    tap = None
+    if access_log_tap is not None:
+        if isinstance(access_log_tap, str):
+            cfg["access_log_tap"] = access_log_tap
+        elif callable(access_log_tap):
+            tap = access_log_tap
+        else:
+            raise TypeError(
+                "access_log_tap must be a callable or a 'module:callable' string, "
+                f"got {type(access_log_tap).__name__}"
+            )
     config = Config(
         workers=workers,
         backend=backend,
@@ -406,6 +422,17 @@ def serve(
         access_log=access_log,
         **cfg,
     )
+    if tap is not None:
+        # Carried on the Config object, which every worker entry point is
+        # handed: a forked worker inherits the callable as it is. It is
+        # not a field, so it is not in what a spawned worker is sent (see
+        # the spawn-model check below).
+        config._access_log_tap = tap
+    if config.access_log_file not in (None, "-"):
+        # Fail here, before any worker starts or the application's
+        # startup runs, if the log cannot be written where it was asked.
+        with open(config.access_log_file, "ab"):
+            pass
     if ssl is not None:
         import ssl as _ssl_mod
 
@@ -440,6 +467,12 @@ def serve(
                 "workers > 1 with ssl requires the fork worker model "
                 "(an SSLContext cannot cross a spawn boundary); run one "
                 "worker or terminate TLS upstream"
+            )
+        if tap is not None:
+            raise ValueError(
+                f"workers={n} on this platform needs access_log_tap as a "
+                "'module:callable' string, not a callable -- spawned workers "
+                "import it, as they import the app"
             )
         if app_spec is not None:
             # Fork-free model (R-090): the supervisor owns the listener and
@@ -691,6 +724,7 @@ def _serve_single(
     lids = []
     stats_lid = None
     access_log = None
+    native_log = False
     hook = None
     installed_signals = []
     prior_handlers: dict = {}
@@ -743,6 +777,7 @@ def _serve_single(
             if config.access_log:
                 access_log = _AccessLog(logging.getLogger("cadeloop.access"))
                 hook.attach_access_log(access_log)
+            native_log = _open_native_access_log(loop, config)
             if config.stats_endpoint is not None and worker_id in (None, 0):
                 stats_lid, _ = _start_stats_endpoint(loop, config.stats_endpoint, worker_id)
             _arm_timeout_sweep(loop, config)
@@ -808,6 +843,8 @@ def _serve_single(
                 hook.stop()
             if access_log is not None:
                 access_log.close()
+            if native_log:
+                _close_native_access_log(loop)
             shutdown.phase = "closing"
             if not shutdown.abandoned:
                 # Whatever is left of `grace`: a fixed 10s cut a slow hook
@@ -1082,6 +1119,28 @@ def _start_stats_endpoint(loop, port: int, worker_id):
     lid, bound, _fd = loop._core.http_listen("127.0.0.1", port, stats_app, loop, max_body=0)
     logger.info("cadeloop stats endpoint on http://127.0.0.1:%s", bound[1])
     return lid, bound[1]
+
+
+def _open_native_access_log(loop, config: Config) -> bool:
+    """Start the native access log if the config asks for one: a file the
+    engine writes itself, a tap, or both. True if it was started."""
+    tap = getattr(config, "_access_log_tap", None)
+    if tap is None and config.access_log_tap is not None:
+        tap = load_app(config.access_log_tap)  # any "module:attribute"
+        if not callable(tap):
+            raise TypeError(f"access_log_tap {config.access_log_tap!r} is not callable")
+    if config.access_log_file is None and tap is None:
+        return False
+    loop._core.open_access_log(config.access_log_file, config.access_log_format, tap)
+    return True
+
+
+def _close_native_access_log(loop) -> None:
+    """Deliver the tap's last batch and let the writer finish the file."""
+    try:
+        loop._core.close_access_log()
+    except Exception:  # the tap's own failure must not undo the shutdown
+        logger.exception("access log tap raised while the server was stopping")
 
 
 class _RequestHook:

@@ -7,6 +7,7 @@
 //! testable on any host platform even though the shipping backends (IOCP,
 //! RIO) are Windows-only.
 
+pub mod accesslog;
 pub mod backend;
 pub mod buffers;
 pub mod http;

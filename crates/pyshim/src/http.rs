@@ -196,6 +196,9 @@ pub(crate) struct HttpConn {
     pub(crate) log_target: Vec<u8>,
     pub(crate) log_status: u16,
     pub(crate) log_start_ns: u64,
+    /// The peer as the native access log prints it (`ip:port`), worked out
+    /// at the connection's first logged request; empty until then.
+    pub(crate) log_client: Box<str>,
     // --- R-087 WebSocket mode -----------------------------------------
     /// Socket bytes received after an upgrade head, before (or while) the
     /// WS session runs — fed to the frame parser on accept.
@@ -354,6 +357,7 @@ impl HttpConn {
             log_target: Vec::new(),
             log_status: 0,
             log_start_ns: 0,
+            log_client: "".into(),
             ws_trailing: Vec::new(),
             ws: None,
             tls: None,
@@ -3167,7 +3171,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         ran += 1;
         // Pop the next request only when no request is active.
         let next = core.with_net(|net, reactor| {
-            let logging = net.access_sink.is_some();
+            let logging = net.access_sink.is_some() || net.access.is_some();
             let now_ns = reactor.time_cached();
             let conn = net.http_conn_mut(tid)?;
             if conn.active {
@@ -3569,7 +3573,7 @@ fn fail_request(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> PyResu
                 net::http_close_after_write(py, net, backend, tid);
                 log
             })?;
-            emit_access_record(py, log);
+            emit_access_record(py, core, log);
             core.drain_graveyards(py)
         }
         Some(_) => {
@@ -3587,13 +3591,25 @@ fn fail_request(py: Python<'_>, core: &CoreLoop, tid: u64, epoch: u64) -> PyResu
 /// the record fields are reset for the next request.
 type AccessRecord = (Py<PyAny>, Option<Py<PyAny>>, &'static str, Vec<u8>, u16, f64);
 
+/// What a finished request leaves to do outside the cell: the logging
+/// path's sink to call with its record, and -- when this request opened
+/// a batch for the native log's tap -- the method that delivers it, to
+/// schedule.
+struct Logged {
+    python: Option<AccessRecord>,
+    tap_flush: Option<Py<PyAny>>,
+}
+
 fn take_access_record(
     py: Python<'_>,
     net: &mut crate::net::NetState,
     tid: u64,
     now_ns: u64,
-) -> Option<AccessRecord> {
-    net.access_sink.as_ref()?;
+) -> Option<Logged> {
+    if net.access_sink.is_none() && net.access.is_none() {
+        return None;
+    }
+    let socket = net.transports.get(&tid).map(|e| e.socket);
     let conn = net.http_conn_mut(tid)?;
     if conn.log_method.is_empty() {
         return None;
@@ -3603,15 +3619,50 @@ fn take_access_record(
     let target = std::mem::take(&mut conn.log_target);
     let status = conn.log_status;
     let dur_ms = now_ns.saturating_sub(conn.log_start_ns) as f64 / 1e6;
-    let (peer, _local) = net.peer_local(py, tid);
-    Some((net.access_sink.as_ref().unwrap().clone_ref(py), peer, method, target, status, dur_ms))
+    let mut tap_flush = None;
+    if net.access.is_some() {
+        // The native log: formatted here, no Python object made or freed.
+        let mut client =
+            net.http_conn_mut(tid).map(|c| std::mem::take(&mut c.log_client)).unwrap_or_default();
+        if client.is_empty() {
+            let addr = socket.and_then(|s| match cadeloop_core::netsys::peername_any(s) {
+                Ok(cadeloop_core::netsys::Addr::Inet(a)) => Some(a),
+                _ => None,
+            });
+            client = crate::accesslog::client_text(addr);
+        }
+        let peer = net.transports.get(&tid).and_then(|e| e.peername.as_ref());
+        if let Some(access) = net.access.as_mut() {
+            tap_flush = access.record(py, &client, peer, method, &target, status, dur_ms);
+        }
+        if let Some(conn) = net.http_conn_mut(tid) {
+            conn.log_client = client;
+        }
+    }
+    let python = match net.access_sink.as_ref() {
+        Some(sink) => {
+            let sink = sink.clone_ref(py);
+            let (peer, _local) = net.peer_local(py, tid);
+            Some((sink, peer, method, target, status, dur_ms))
+        }
+        None => None,
+    };
+    Some(Logged { python, tap_flush })
 }
 
 /// Emit outside the state cell: the sink is arbitrary Python (R-140).
-fn emit_access_record(py: Python<'_>, rec: Option<AccessRecord>) {
-    if let Some((sink, peer, method, target, status, dur_ms)) = rec {
+fn emit_access_record(py: Python<'_>, core: &CoreLoop, logged: Option<Logged>) {
+    let Some(Logged { python, tap_flush }) = logged else { return };
+    if let Some((sink, peer, method, target, status, dur_ms)) = python {
         let target = pyo3::types::PyBytes::new(py, &target);
         if let Err(e) = sink.call1(py, (peer, method, target, status, dur_ms)) {
+            e.write_unraisable(py, None);
+        }
+    }
+    if let Some(flush) = tap_flush {
+        // Runs at the next tick, after every request this one finishes:
+        // the tap is called once for all of them.
+        if let Err(e) = core.hand_over(py, flush.bind(py), crate::handles::CallArgs::Zero) {
             e.write_unraisable(py, None);
         }
     }
@@ -3680,7 +3731,7 @@ pub(crate) fn finish_request(py: Python<'_>, core: &CoreLoop, tid: u64) -> PyRes
         }
         (waiters, ws_code, log)
     })?;
-    emit_access_record(py, log);
+    emit_access_record(py, core, log);
     core.drain_graveyards(py)?;
     for fut in waiters {
         let fut = fut.bind(py);

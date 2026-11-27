@@ -17,6 +17,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Native access log (on `claude/sleepy-ride-p2rndm`; measured on Linux/epoll, one worker, 64 connections)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Perf | The access log cost five times the request it logged: a Python sink call per request, then a `LogRecord`, a format and a handler call on a writer thread that needs the GIL for all of it -- 136k requests/s without the log, 26k with it. `access_log_file` (a path, or `-`) writes it without the interpreter: formatted in the state cell into a buffer, handed once a tick to a thread that never takes the GIL; text or JSON lines, appended in whole-line writes so workers can share a file, bounded at 8 MiB behind with drops counted in the log and in `stats()`, reopened after a rotation. 128k requests/s with it on. `access_log_tap` hands the same records to Python as one list per tick instead of one call per request (140k requests/s with a counting tap). `access_log=True` and its `logging` handlers are unchanged (ADR-37) | |
+>
 > **Generated differential scenarios (on `claude/sleepy-ride-p2rndm`; Linux)**
 >
 > | Area | Fix | Commit |

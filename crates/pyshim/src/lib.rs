@@ -1,5 +1,6 @@
 //! `cadeloop._core` — the PyO3 extension module (L2 bindings).
 
+mod accesslog;
 mod coreloop;
 mod ctxsnap;
 mod fastqueue;

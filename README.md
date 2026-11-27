@@ -884,7 +884,8 @@ your code calls `loop.stop()`.
 
 ```python
 cadeloop.serve(app, host="127.0.0.1", port=8000, *, workers=1, backend="auto",
-               ssl=None, latency_mode="balanced", access_log=False, **settings)
+               ssl=None, latency_mode="balanced", access_log=False,
+               access_log_tap=None, **settings)
 ```
 
 | argument | default | meaning |
@@ -945,7 +946,10 @@ Values are checked when the server starts, before anything binds or runs.
 
 | setting | default | meaning |
 |---|---|---|
-| `access_log` | `False` | Log each request on the `cadeloop.access` logger, from a background thread that never blocks the loop. Nothing shows until logging is configured at INFO, for example with `logging.basicConfig(level=logging.INFO)`. |
+| `access_log` | `False` | Log each request on the `cadeloop.access` logger, from a background thread that never blocks the loop. Nothing shows until logging is configured at INFO, for example with `logging.basicConfig(level=logging.INFO)`. Your handlers, formatters and filters apply; it is also the expensive way to log (see below). |
+| `access_log_file` | `None` | Write the access log natively instead: a path to append to, or `-` for standard output. See [the native access log](#the-native-access-log). |
+| `access_log_format` | `"text"` | The native log's format: `"text"` or `"json"`. |
+| `access_log_tap` | `None` | A callable, or its `"module:callable"` name, handed the finished requests in batches. See [the native access log](#the-native-access-log). |
 | `stats_endpoint` | `None` | A port on which to serve `loop.stats()` as JSON, on `127.0.0.1` only. In a multi-worker server, one worker answers, and the payload says which. |
 | `dns_cache` | `True` | Cache `getaddrinfo()` answers for outgoing connections your app makes. On by default for servers, unlike loop mode. |
 | `dns_cache_ttl` | `5.0` | Seconds a cached answer is kept. |
@@ -956,6 +960,71 @@ Values are checked when the server starts, before anything binds or runs.
 |---|---|---|
 | `loopback_fast_path` | `True` | `SIO_LOOPBACK_FAST_PATH` on loopback sockets. |
 | `rio_cq_size`, `rio_rq_recv`, `rio_rq_send` | `65536`, `32`, `32` | Queue sizes for the experimental RIO backend. |
+
+### The native access log
+
+`access_log=True` goes through Python's `logging`: a `LogRecord`, a format
+and a handler call for every request, all of it needing the GIL. On the
+plain-text benchmark that costs more than five times the request it logs
+(136k requests/s with no log, 26k with it; one worker, Linux, loopback).
+
+`access_log_file` writes the log from Rust instead. A finished request is
+formatted straight into a buffer, and once per loop tick the buffer goes to
+a writer thread that never touches the interpreter, so a slow disk or a full
+pipe cannot stall the loop or your application. The same benchmark runs at
+128k requests/s with it on.
+
+```python
+cadeloop.serve(app, access_log_file="access.log")                    # text
+cadeloop.serve(app, access_log_file="-", access_log_format="json")   # stdout
+```
+
+```text
+2026-11-27T15:38:01.123Z 127.0.0.1:41692 "GET /items?page=2" 200 0.42ms
+```
+
+```json
+{"ts":"2026-11-27T15:38:01.123Z","client":"127.0.0.1:41692","method":"GET","target":"/items?page=2","status":200,"duration_ms":0.42}
+```
+
+What to know:
+
+- Times are UTC. Bytes in the target that are not printable ASCII are
+  written as `\xNN` (text) or `\u00NN` (JSON), so a request cannot forge a
+  line.
+- The file is opened for appending and each write is whole lines, so
+  several workers can share one file. A file that a log rotator renames or
+  removes is reopened under the same name within a second.
+- Lines reach the writer once per tick and the file as fast as it takes
+  them. If the writer falls more than 8 MiB behind, new records are dropped
+  and counted, and the count is written into the log when it catches up.
+  `loop.stats()` reports `access_log_records` and `access_log_dropped`.
+- A process killed outright loses the lines of its last tick; a normal
+  shutdown writes everything.
+- It does not go through `logging`, so handlers and filters do not apply.
+  `access_log=True` still does, and both can be on at once.
+
+To get the records in Python without paying for a call per request, give
+`access_log_tap` a callable. It is called on the loop thread, once per tick
+that finished any request, with a list of `(client, method, target, status,
+duration_ms)` tuples: `client` is the peer's `(host, port)` or `None`,
+`target` is `bytes`. It works with or without a file.
+
+```python
+def tap(records):
+    for client, method, target, status, duration_ms in records:
+        latency.observe(duration_ms)
+        if status >= 500:
+            errors.inc()
+
+cadeloop.serve(app, access_log_file="access.log", access_log_tap=tap)
+```
+
+Keep the tap short, or hand the list to a thread: it runs between requests.
+An exception it raises goes to the loop's exception handler and the next
+batch is delivered as usual. With `workers > 1` on Windows, name it as a
+string (`"mymodule:tap"`), since spawned workers import it the way they
+import the app.
 
 ### The `cadeloop` command
 

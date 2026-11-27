@@ -27,6 +27,7 @@ LATENCY_PRESETS = {"throughput": 0, "balanced": 20, "spin": 200}
 # raise before binding (Codex review, PR #1).
 _BACKENDS = ("auto", "iocp", "rio", "epoll")
 _GC_MODES = ("default", "freeze", "disable")  # R-075
+_ACCESS_LOG_FORMATS = ("text", "json")  # R-140, the native access log
 
 _BOOL_FIELDS = ("loopback_fast_path", "tfo", "dns_cache", "eager_tasks", "pin", "access_log")
 _USIZE_MAX = sys.maxsize * 2 + 1
@@ -134,6 +135,16 @@ class Config:
     grace: float = 10.0  # R-092 graceful drain seconds
     # --- misc ----------------------------------------------------------------
     access_log: bool = False  # R-140
+    # R-140, the native access log: written from Rust by a thread that
+    # never takes the GIL, instead of through the logging module (which
+    # costs several times the request it logs). A path to append to, or
+    # "-" for standard output. Independent of `access_log`: both can be on.
+    access_log_file: str | None = None
+    access_log_format: str = "text"
+    # A "module:callable" called once per loop tick with a list of the
+    # requests that finished in it, as (client, method, target, status,
+    # duration_ms) tuples. serve() also takes the callable itself.
+    access_log_tap: str | None = None
     # R-141: serve stats() as JSON on 127.0.0.1:<port>. Bound by one
     # worker only (see server._start_stats_endpoint) -- the payload names
     # which. None disables it.
@@ -175,6 +186,20 @@ class Config:
             raise ValueError(
                 f"gc_mode must be one of {_GC_MODES}, got {self.gc_mode!r}"
             )
+        if self.access_log_format not in _ACCESS_LOG_FORMATS:
+            raise ValueError(
+                f"access_log_format must be one of {_ACCESS_LOG_FORMATS}, got {self.access_log_format!r}"
+            )
+        for field in ("access_log_file", "access_log_tap"):
+            value = getattr(self, field)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise TypeError(f"{field} must be a non-empty str or None, got {value!r}")
+        if self.access_log_tap is not None:
+            module, sep, attr = self.access_log_tap.partition(":")
+            if not sep or not module or not attr:
+                raise ValueError(
+                    f"access_log_tap must be 'module:callable', got {self.access_log_tap!r}"
+                )
         if self.spin_us is None:
             self.spin_us = LATENCY_PRESETS[self.latency_mode]
         if self.adaptive_spin is None:
