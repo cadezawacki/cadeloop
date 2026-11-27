@@ -13,6 +13,7 @@ def test_defaults_match_spec():
     assert c.rio_rq_recv == 32 and c.rio_rq_send == 32  # R-042
     assert c.loopback_fast_path is True and c.tfo is False  # R-038
     assert c.dns_cache is True  # R-055
+    assert c.resolver_threads == 16  # ADR-44
     assert c.eager_tasks is True  # R-056
     assert c.gc_mode == "freeze" and c.warmup == 1000  # R-075
     assert c.max_header_bytes == 64 * 1024  # R-080

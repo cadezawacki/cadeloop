@@ -1092,3 +1092,63 @@ once a minute, naming the setting. A stall of that length was otherwise
 invisible: nothing in the access log or the loop's counters says the
 process stopped.
 
+## ADR-44: Name lookups: threads of their own, one lookup per name; the OS resolver stays
+`loop.getaddrinfo()` is `socket.getaddrinfo()` on a thread. Until now the
+thread was one of the default executor's, as in asyncio -- an earlier
+review asked for exactly that, so that `set_default_executor()` governs
+lookups too. The cost of that arrangement is that lookups share a queue
+with whatever the application runs there: `asyncio.to_thread()`,
+`run_in_executor(None, ...)`, and the libraries built on them. With 64
+blocking calls of 200 ms queued on an 8-thread executor, one lookup --
+and the outgoing connection waiting for it -- took 1,591 ms. The lookup
+itself took a fraction of a millisecond.
+
+`resolver_threads=N` (16 in `serve()`, 0 in a `Loop()` built directly,
+the same split as `dns_cache`) gives lookups their own
+`ThreadPoolExecutor`. Threads start as concurrent lookups need them, so an
+application that resolves one upstream has one. On top of it, calls for
+the same `(host, port, family, type, proto, flags)` while a lookup is in
+flight share that lookup:
+
+- each caller awaits the shared future through `asyncio.shield()`, so one
+  caller's cancellation is its own -- the lookup goes on for the others,
+  and still fills the cache if all of them left;
+- each gets its own list (the entries are tuples; nothing can be changed
+  under another caller);
+- a failure is raised to every waiter and not cached. If nobody is left
+  to raise it to, it is dropped quietly -- it is not an unhandled
+  exception;
+- `close()` drops lookups that are still queued and does not wait for the
+  one a thread is in the middle of.
+
+| | default executor | resolver threads |
+|---|---:|---:|
+| one lookup behind 64 queued blocking calls of 200 ms | 1,591 ms | 0.5 ms |
+| 200 concurrent lookups of one name, resolver answering in 20 ms | 512 ms, 200 lookups | 22 ms, 1 lookup |
+
+What was not built, and why:
+
+- **A resolver of our own** (a DNS client in Rust). The time in a lookup
+  is the round trip to the DNS server; ours would not be shorter. And it
+  would stop being the machine's resolver: no hosts file, no search
+  domains, no NSS modules or systemd-resolved on Linux, no NRPT rules,
+  DNS suffixes or VPN split DNS on Windows, each of which someone's
+  deployment depends on.
+- **Windows' asynchronous `GetAddrInfoExW`.** It would free the thread a
+  lookup occupies while it waits. With threads that do nothing else, what
+  that buys is the case of more than `resolver_threads` *different* names
+  being resolved at the same moment, which raising the setting also
+  handles. Against it: `socket.getaddrinfo()` does more than call the
+  system -- IDNA encoding of the name, numeric and service-name ports,
+  flag and family translation, the exact shape of each sockaddr tuple
+  (scope ids included), and the mapping of failures to `socket.gaierror`
+  codes that libraries match on. A second implementation of all that, in
+  unsafe code, for one platform, is a compatibility risk with nothing
+  measurable on the other side. If a Windows deployment shows lookups
+  queueing with `resolver_threads` raised (`dns_lookups` against wall
+  time says so), this is the next step.
+
+The default executor remains the right place for lookups in a program
+that wants them governed by its own executor; that is `resolver_threads=0`
+and it is what `Loop()` does.
+

@@ -711,6 +711,7 @@ def _serve_single(
         rio_rq_send=config.rio_rq_send,
         dns_cache=config.dns_cache,
         dns_cache_ttl=config.dns_cache_ttl,
+        resolver_threads=config.resolver_threads,
         tfo=config.tfo,
         loopback_fast_path=config.loopback_fast_path,
         # False means "not asked for": the environment may still turn it on.
@@ -1202,7 +1203,7 @@ def _start_stats_endpoint(loop, port: int, worker_id):
         if scope["type"] != "http":
             return
         await receive()
-        payload = dict(loop._core.stats())
+        payload = dict(loop.stats())
         payload["worker"] = 0 if worker_id is None else worker_id
         watch = getattr(loop, "_gc_watch", None)
         if watch is not None:

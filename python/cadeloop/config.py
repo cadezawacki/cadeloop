@@ -54,6 +54,7 @@ _INT_FIELDS = {
     "max_headers": (1, _USIZE_MAX),
     "max_url": (1, _USIZE_MAX),
     "warmup": (0, None),
+    "resolver_threads": (0, 1024),
     "workers": (0, None),
     "spin_us": (0, 2**64 - 1),
     "write_high_water": (0, _USIZE_MAX),
@@ -111,6 +112,11 @@ class Config:
     # AbstractEventLoop contract (real asyncio.getaddrinfo never caches).
     dns_cache: bool = True
     dns_cache_ttl: float = 5.0  # documented: RFC TTLs ignored
+    # ADR-44: lookups on up to this many threads of their own (started as
+    # lookups need them), one per name at a time, instead of in the
+    # default executor behind the application's blocking calls. 0 is
+    # asyncio's arrangement, and what a Loop() built directly does.
+    resolver_threads: int = 16
     # --- tasks / GC -------------------------------------------------------
     eager_tasks: bool = True  # R-056 / §16 (switchable interop escape hatch)
     gc_mode: str = "freeze"  # R-075 server default

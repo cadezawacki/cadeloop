@@ -17,6 +17,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Name lookups (on `claude/sleepy-ride-p2rndm`)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Net | `loop.getaddrinfo()` ran in the default executor, behind whatever the application had queued there: one lookup behind 64 blocking calls of 200 ms waited 1,591 ms, and the outgoing connection with it. `resolver_threads` (16 in `serve()`, 0 in a plain `Loop()`, which keeps asyncio's arrangement) gives lookups threads of their own, started as needed: 0.5 ms. Concurrent lookups of one name share one lookup -- 200 at once against a 20 ms resolver: 22 ms and 1 lookup instead of 512 ms and 200 -- with each caller's cancellation its own, failures raised to every waiter and not cached. The resolver stays the operating system's; a DNS client of our own and Windows' `GetAddrInfoExW` were considered and not built (ADR-44) | `pending` |
+>
 > **Garbage collection (on `claude/sleepy-ride-p2rndm`; measured on Linux, FastAPI, one worker)**
 >
 > | Area | Fix | Commit |

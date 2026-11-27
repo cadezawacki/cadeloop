@@ -16,6 +16,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import errno
+import functools
 import io
 import os
 import signal as signal_module
@@ -85,11 +86,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         rio_rq_send: int = 32,
         dns_cache: bool = False,
         dns_cache_ttl: float = 5.0,
+        resolver_threads: int = 0,
         tfo: bool = False,
         loopback_fast_path: bool = True,
         adaptive_spin: bool = True,
         native_tls: bool | None = None,
     ):
+        # Checked before anything is built: there is no half-made loop to
+        # take apart when it is wrong.
+        if isinstance(resolver_threads, bool) or not isinstance(resolver_threads, int):
+            raise TypeError(f"resolver_threads must be an int, got {resolver_threads!r}")
+        if resolver_threads < 0:
+            raise ValueError("resolver_threads must be >= 0")
         # Backend resolution: explicit arg > CADELOOP_BACKEND env (lets the
         # whole test/bench suite run against a chosen backend, e.g. "rio"
         # on Windows) > "auto".
@@ -170,7 +178,6 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             "is_running": core.is_running,
             "is_closed": core.is_closed,
             "get_debug": core.get_debug,
-            "stats": core.stats,  # R-103
         }
         cls = type(self)
         overridden = {n for n in natives if getattr(cls, n) is not getattr(Loop, n)}
@@ -197,6 +204,14 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # asked for otherwise.
         self._dns_cache_enabled = dns_cache
         self._dns_cache_ttl = dns_cache_ttl
+        # ADR-44. 0: lookups run in the default executor, as asyncio's do.
+        # N: on up to N threads of their own, one lookup per name at a time.
+        self._resolver_threads = resolver_threads
+        self._resolver = None  # the pool, made by the first lookup
+        self._dns_inflight: dict = {}
+        self._dns_lookups = 0
+        self._dns_coalesced = 0
+        self._dns_cache_hits = 0
         self._asyncgens = weakref.WeakSet()
         self._asyncgens_shutdown_called = False
         self._coroutine_origin_tracking_enabled = False
@@ -387,6 +402,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         if self._default_executor is not None:
             self._default_executor.shutdown(wait=False)
             self._default_executor = None
+        if self._resolver is not None:
+            # Lookups still queued have nobody left to answer to; one a
+            # thread is in the middle of runs to its end, as it would in
+            # the default executor.
+            self._resolver.shutdown(wait=False, cancel_futures=True)
+            self._resolver = None
+        self._dns_inflight.clear()
         self._core.close()
 
     def _check_closed(self):
@@ -494,7 +516,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return self._core.get_debug()
 
     def stats(self):
-        return self._core.stats()
+        stats = self._core.stats()  # R-103
+        stats["dns_lookups"] = self._dns_lookups
+        stats["dns_coalesced"] = self._dns_coalesced
+        stats["dns_cache_hits"] = self._dns_cache_hits
+        return stats
 
     def _rebind_task_fastpath(self):
         """(Re)install the native create_task/create_future fast paths.
@@ -550,25 +576,77 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             raise TypeError("executor must be ThreadPoolExecutor instance")
         self._default_executor = executor
 
-    # Lookups run in the default executor, as asyncio's do, so that
-    # set_default_executor() governs them too (a private pool ignored it:
-    # an application sizing or instrumenting its executor saw no DNS
-    # work there). Callers skip them altogether for numeric hosts
-    # (TcpSurface._ensure_resolved).
+    # Where a lookup runs (ADR-44). With resolver_threads=0, a plain
+    # Loop()'s default: in the default executor, as asyncio's do, so that
+    # set_default_executor() governs them too (an application sizing or
+    # instrumenting its executor sees its DNS work there). With
+    # resolver_threads=N, serve()'s default: on up to N threads that do
+    # nothing else, so a lookup never waits behind the application's own
+    # blocking calls -- an executor whose threads are all inside database
+    # queries would otherwise hold every new outgoing connection until one
+    # returned -- and concurrent lookups of one name are one lookup.
+    # Either way the answer is the operating system's (getaddrinfo: hosts
+    # file, search domains, split DNS), and callers skip it altogether for
+    # numeric hosts (TcpSurface._ensure_resolved).
 
     async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
         key = (host, port, family, type, proto, flags)
         if self._dns_cache_enabled:
             hit = self._dns_cache.get(key)
             if hit is not None and hit[0] > self.time():
+                self._dns_cache_hits += 1
                 return hit[1]
+        if self._resolver_threads:
+            shared = self._dns_inflight.get(key)
+            if shared is None:
+                shared = self._start_lookup(key)
+            else:
+                self._dns_coalesced += 1
+            # shield: a caller that is cancelled leaves the lookup to the
+            # others waiting for it. Each gets a list of its own.
+            result = await asyncio.shield(shared)
+            # (`type` is this function's own parameter.)
+            return list(result) if isinstance(result, list) else result
+        self._dns_lookups += 1
         getaddr_func = self._getaddrinfo_debug if self.get_debug() else socket.getaddrinfo
         result = await self.run_in_executor(None, getaddr_func, host, port, family, type, proto, flags)
+        self._remember_lookup(key, result)
+        return result
+
+    def _remember_lookup(self, key, result):
         if self._dns_cache_enabled:
             if len(self._dns_cache) > 1024:
                 self._dns_cache.clear()
             self._dns_cache[key] = (self.time() + self._dns_cache_ttl, result)
-        return result
+
+    def _resolver_pool(self):
+        self._check_closed()
+        pool = self._resolver
+        if pool is None:
+            # Threads start as lookups need them, and stay.
+            pool = self._resolver = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._resolver_threads, thread_name_prefix="cadeloop-dns"
+            )
+        return pool
+
+    def _start_lookup(self, key):
+        getaddr_func = self._getaddrinfo_debug if self.get_debug() else socket.getaddrinfo
+        shared = futures.wrap_future(self._resolver_pool().submit(getaddr_func, *key), loop=self)
+        self._dns_lookups += 1
+        self._dns_inflight[key] = shared
+        # Added before any waiter's callback, so it runs before they do: a
+        # caller that looks the name up again the moment it has its answer
+        # finds the cache filled, or starts a fresh lookup -- never this
+        # finished one.
+        shared.add_done_callback(functools.partial(self._lookup_finished, key))
+        return shared
+
+    def _lookup_finished(self, key, shared):
+        if self._dns_inflight.get(key) is shared:
+            del self._dns_inflight[key]
+        # A failure is each waiter's to raise, and is not remembered.
+        if not shared.cancelled() and shared.exception() is None:
+            self._remember_lookup(key, shared.result())
 
     def _getaddrinfo_debug(self, host, port, family, type, proto, flags):
         # base_events' debug-mode lookup log. Runs in the executor, so it
@@ -595,6 +673,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return addrinfo
 
     async def getnameinfo(self, sockaddr, flags=0):
+        if self._resolver_threads:
+            pool = self._resolver_pool()
+            return await futures.wrap_future(pool.submit(socket.getnameinfo, sockaddr, flags), loop=self)
         return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
 
     async def shutdown_default_executor(self):

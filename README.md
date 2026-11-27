@@ -797,6 +797,7 @@ server has its own settings, some with different names or defaults (see
 | `accept_pool` | `64` | Accepts kept ready per listening socket. Raise it if a burst of new connections makes `stats()["accept_starved"]` climb. |
 | `dns_cache` | `False` | Cache `getaddrinfo()` answers. Off by default, as in asyncio. |
 | `dns_cache_ttl` | `5.0` | How long a cached DNS answer is kept, in seconds. The record's own TTL is not used. |
+| `resolver_threads` | `0` | `0`: name lookups run in the default executor, as in asyncio. `N`: on up to `N` threads of their own, and coroutines asking for the same name at once share one lookup. See [name lookups](#name-lookups). |
 | `tfo` | `False` | TCP Fast Open on listening sockets. |
 | `native_tls` | `None` | Use cadeloop's own TLS layer for `create_connection(ssl=...)`, `create_server(ssl=...)` and `start_tls()` instead of the standard library's. `None` reads `CADELOOP_NATIVE_TLS` (`1` turns it on), else off. See [native TLS for your own connections](#native-tls-for-your-own-connections). |
 | `loopback_fast_path` | `True` | Windows `SIO_LOOPBACK_FAST_PATH` on loopback sockets. Only matters for traffic within one machine. |
@@ -891,6 +892,7 @@ serves the same dict as JSON.
 | `pipeline_pauses` | Times the HTTP server stopped reading a connection because too many pipelined requests were queued. |
 | `ops_by_target` | Kernel operations in flight, by kind (`recv`, `send`, `accept`, `connect`, `dgram`, `pipe`). A stuck server shows up here first. |
 | `foreign_completions` | Windows: completion packets that did not belong to a live operation of this loop, for example another process's I/O on a socket handle shared with it. They are dropped and counted. Always 0 on Linux. |
+| `dns_lookups`, `dns_coalesced`, `dns_cache_hits` | Name lookups sent to the operating system's resolver, calls that joined a lookup of the same name already in flight (`resolver_threads`), and calls answered from the cache (`dns_cache`). |
 | `stale_buffer_ids`, `unreaped_ops` | Leak checks. Both should always be 0. |
 
 ---
@@ -993,6 +995,7 @@ Values are checked when the server starts, before anything binds or runs.
 | `stats_endpoint` | `None` | A port on which to serve `loop.stats()` as JSON, on `127.0.0.1` only. In a multi-worker server, one worker answers, and the payload says which. |
 | `dns_cache` | `True` | Cache `getaddrinfo()` answers for outgoing connections your app makes. On by default for servers, unlike loop mode. |
 | `dns_cache_ttl` | `5.0` | Seconds a cached answer is kept. |
+| `resolver_threads` | `16` | Threads that do nothing but name lookups, started as lookups need them. A lookup then never waits behind your app's blocking calls, and requests asking for the same name at once share one lookup. `0` runs lookups in the default executor, as loop mode does. See [name lookups](#name-lookups). |
 | `native_tls` | `False` | Use cadeloop's own TLS layer for the TLS connections your app opens (`create_connection(ssl=...)`, `start_tls()`); see [native TLS for your own connections](#native-tls-for-your-own-connections). Does not change `ssl=` on the server itself. |
 
 #### Windows only
@@ -1253,6 +1256,7 @@ server creates.
 | write backpressure | `high_water`, `low_water` | `write_high_water`, `write_low_water` | `--write-high-water`, `--write-low-water` |
 | ready accepts per listener | `accept_pool` | `accept_pool` | `--accept-pool` |
 | DNS cache | `dns_cache` (off) | `dns_cache` (on) | `--dns-cache` |
+| Resolver threads | `resolver_threads` (0) | `resolver_threads` (16) | `--resolver-threads` |
 | TCP Fast Open | `tfo` | `tfo` | `--tfo` |
 | native TLS for connections the app opens | `native_tls` (off) | `native_tls` (off) | `--native-tls` |
 | everything HTTP: limits, timeouts, workers, logging | not applicable | see [settings](#settings) | |
@@ -1371,6 +1375,40 @@ The three numbers in each list are for young, middle and full collections
 (that payload is the `refreeze` row above, counted from startup).
 A full collection that stops a worker for more than 50 ms is also logged
 as a warning on the `cadeloop` logger, at most once a minute.
+
+### Name lookups
+
+Connecting to a host by name — an HTTP client calling another service, a
+database driver — starts with a lookup, and the operating system's
+resolver blocks while it answers. asyncio runs it on a thread of the
+loop's default executor: the same threads that run `asyncio.to_thread()`
+and `run_in_executor(None, ...)`. When all of them are inside your own
+blocking calls (database queries, say), a lookup waits for one to come
+back, and so does the connection that needs it.
+
+A cadeloop server gives lookups threads of their own (`resolver_threads`,
+16 at most, started only as lookups need them), and when several requests
+ask for the same name at once, makes one lookup and gives each the
+answer. The answer is still the operating system's: the hosts file,
+search domains and VPN DNS behave as they do for any other program.
+
+| situation | lookups in the default executor | resolver threads |
+|---|---:|---:|
+| One lookup, made while 64 blocking calls of 200 ms are queued on the executor | waits 1,591 ms | 0.5 ms |
+| 200 requests look up the same name at once; the resolver takes 20 ms | 512 ms until the last has its answer; 200 lookups | 22 ms; 1 lookup |
+
+(Linux, 4 cores, default executor of 8 threads;
+`bench/micro/dns_lookups.py`.) A lookup that succeeds also fills the
+`dns_cache`; one that fails is raised to everyone who was waiting for it
+and is not remembered. `loop.stats()` counts all three: `dns_lookups`,
+`dns_coalesced`, `dns_cache_hits`.
+
+With `resolver_threads=0` lookups go back to the default executor. Choose
+that if you install an executor of your own with `set_default_executor()`
+and want name lookups to run in it too. A `cadeloop.Loop()` you build
+yourself does that unless told otherwise, as asyncio does. FastAPI's and
+Starlette's plain `def` routes are not part of this either way: they run
+on anyio's threads, not the loop's executor.
 
 ### Accepting large uploads
 
