@@ -956,7 +956,7 @@ Values are checked when the server starts, before anything binds or runs.
 | `immediate_flush` | from `latency_mode` | Send each response as soon as it is ready, instead of batching a connection's writes until the end of the loop's tick. On only for `"spin"`. |
 | `backend` | `"auto"` | The I/O backend, as in loop mode. `"rio"` also needs `CADELOOP_ALLOW_EXPERIMENTAL_RIO=1`. |
 | `eager_tasks` | `True` | Start each request's handler immediately, inside the tick that parsed the request. Turn off if a library expects tasks to start later. |
-| `gc_mode` | `"freeze"` | `"freeze"` calls `gc.freeze()` after startup and again after `warmup` requests, so the garbage collector stops re-scanning objects that live for the whole run. `"default"` leaves the collector alone; `"disable"` turns it off. |
+| `gc_mode` | `"freeze"` | `"freeze"` calls `gc.freeze()` after startup and again after `warmup` requests, so the garbage collector stops re-scanning objects that live for the whole run. `"refreeze"` also does it after any full collection that took over 10 ms. `"default"` leaves the collector alone; `"disable"` turns it off. See [garbage collection](#garbage-collection). |
 | `warmup` | `1000` | With `gc_mode="freeze"`, the number of requests to serve before the second freeze. `0` freezes only at startup. |
 
 #### Requests and connections
@@ -1297,6 +1297,80 @@ cadeloop main:app --spin-us 200 --no-adaptive-spin --no-immediate-flush
 Measure on your own hardware before choosing `spin`. On Linux loopback,
 sending responses immediately cost throughput and CPU (numbers in
 [docs/ops.md](docs/ops.md#write-policy)).
+
+### Garbage collection
+
+Python frees most objects the moment nothing refers to them. The garbage
+collector exists for the rest, objects that refer to each other in a
+cycle, and it finds them by walking objects: often the newest ones, now
+and then (a *full* collection) all of them. A full collection stops the
+worker for as long as the walk takes. `gc_mode` decides which objects the
+collector never walks again:
+
+| `gc_mode` | what it does | choose it when |
+|---|---|---|
+| `"freeze"` (default) | Calls `gc.freeze()` once the app has started and again after `warmup` requests. Everything alive then is left out of every later collection. | Almost always. |
+| `"refreeze"` | The same, and again after any full collection that took more than 10 ms: whatever survived it is live, so the next one skips it. | The app builds large long-lived state after startup: a cache that fills, a dataset loaded on first use. |
+| `"default"` | Leaves the collector as Python configured it. | You manage the collector yourself. |
+| `"disable"` | Turns the collector off. Fastest, and any reference cycle the app creates is never freed. | Short-lived workers, or an app you know creates no cycles. |
+
+What that is worth depends on what handlers allocate. Measured with a
+FastAPI app on one worker (Linux, 4 cores), 20 seconds at a fixed request
+rate:
+
+| workload | `gc_mode` | median | p99 | time in the collector | full collections |
+|---|---|---:|---:|---:|---|
+| A JSON response through a pydantic model, 5,000 requests/s | any of the four | 0.7 ms | 2.3–2.7 ms | 0.0% | none (two young ones in 100,000 requests) |
+| A handler that builds 5,000 records (what a database query returns), 100 requests/s | `default` | 11.0 ms | 38.8 ms | 26.5% | 233, about 17 ms each |
+| | `freeze` | 6.8 ms | 11.0 ms | 5.3% | 233, about 0.3 ms each |
+| | `disable` | 6.4 ms | 9.7 ms | 0% | — |
+| The same, in an app that built 400,000 objects while importing | `default` | 537 ms | 2,449 ms | 56% | 107, about 93 ms each |
+| | `freeze` | 6.7 ms | 9.8 ms | 5.2% | 232, about 0.3 ms each |
+| The same, with those 400,000 objects built after startup instead | `freeze` | 115 ms | 331 ms | 49% | 130, about 68 ms each |
+| | `refreeze` | 7.1 ms | 26.5 ms | 5.9% | 233, about 0.4 ms each (the longest, 11 ms) |
+| | `disable` | 6.0 ms | 9.6 ms | 0% | — |
+| The same, and each request replaces 200 of those objects (a cache with turnover) | `freeze` | 1,611 ms | 4,698 ms | 57% | 121, about 82 ms each |
+| | `refreeze` | 7.4 ms | 21.2 ms | 13.9% | 234, about 5 ms each |
+
+In the rows where the collector took half the time, the server could not
+keep up with 100 requests/s; latency there is time spent waiting in line,
+and it varies from run to run. In short:
+
+- **Ordinary handlers never meet the collector.** What a request creates
+  is freed as the request ends, and no mode changes anything.
+- **The default pays for itself the moment a handler builds a few
+  thousand objects**: it is the difference between 17 ms and 0.3 ms per
+  full collection, twelve times a second.
+- **State built after startup is not frozen**, and from about 100,000
+  objects of it, full collections are the largest cost in the process.
+  `"refreeze"` removes it. So does building that state before the server
+  starts (at import, or in the lifespan's startup), which costs nothing.
+
+`"refreeze"` is not the default because freezing has a price: a frozen
+object that later becomes garbage *as part of a reference cycle* is never
+freed. Objects freed the ordinary way still are, frozen or not: in the
+last row of the table 2,000 requests replaced 400,000 cache entries, and
+the process ended with the same number of objects it began with. An app
+whose long-lived structures point at each other in cycles and are
+regularly thrown away would grow instead.
+
+Every mode times the collector. A server started with `--stats-endpoint`
+reports it under `gc`:
+
+```json
+"gc": {
+  "collections": [28980, 2633, 238],
+  "pause_ms_total": [531.958, 570.863, 169.611],
+  "pause_ms_longest": [3.986, 3.021, 13.899],
+  "refreezes": 3,
+  "frozen_objects": 449513
+}
+```
+
+The three numbers in each list are for young, middle and full collections
+(that payload is the `refreeze` row above, counted from startup).
+A full collection that stops a worker for more than 50 ms is also logged
+as a warning on the `cadeloop` logger, at most once a minute.
 
 ### Accepting large uploads
 

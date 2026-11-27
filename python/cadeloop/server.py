@@ -735,6 +735,7 @@ def _serve_single(
     # can put it back exactly -- and only what WE changed.
     gc_was_enabled = gc.isenabled()
     gc_froze = False
+    gc_watch = None
     try:
         # Stop signals are handled from the start, so one that lands during
         # lifespan startup lets the startup finish and then shuts down
@@ -786,6 +787,8 @@ def _serve_single(
                 stats_lid, _ = _start_stats_endpoint(loop, config.stats_endpoint, worker_id)
             _arm_timeout_sweep(loop, config)
             gc_froze = _gc_after_startup(config, inherited=gc_inherited)
+            gc_watch = _GcWatch(loop, refreeze=gc_froze and config.gc_mode == "refreeze")
+            loop._gc_watch = gc_watch
             if gc_froze and config.warmup > 0:
                 hook.count_requests(config.warmup, _freeze_warm_heap)
             hook.start()
@@ -868,6 +871,8 @@ def _serve_single(
             # every object alive at startup permanently uncollectable for
             # the rest of that process -- including the caller's, and
             # including cycles created before serve() and dropped after it.
+            if gc_watch is not None:
+                gc_watch.close()
             if gc_froze:
                 gc.unfreeze()
             if gc_was_enabled and not gc.isenabled():
@@ -918,7 +923,7 @@ def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
     already in the permanent generation, the collection here only walks
     what the worker allocated itself.
     """
-    if config.gc_mode == "freeze":
+    if config.gc_mode in ("freeze", "refreeze"):
         gc.collect()
         # gc.unfreeze() is all-or-nothing, so it cannot separate our
         # startup heap from a permanent generation the caller built
@@ -939,6 +944,104 @@ def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
         gc.collect()
         gc.disable()
     return False
+
+
+class _GcWatch:
+    """Times every garbage collection of the process, and with
+    ``gc_mode="refreeze"`` keeps the old generation out of the next ones.
+
+    What it is for, in numbers measured on this server (ADR-43; one
+    worker, a handler building 5,000 records per request, 100 requests/s):
+
+    * A handler that allocates and frees -- the ordinary case -- hardly
+      involves the collector at all: 100,000 FastAPI requests ran two
+      generation-0 passes, because reference counting frees what a
+      request made and the collector's counter never climbs.
+    * A handler that builds thousands of objects runs young collections
+      (about 5% of its time), and a full one about ten times a second. A
+      full collection walks every tracked object that is not frozen.
+      With 400,000 objects built *after* startup -- a cache, a loaded
+      dataset -- each took 70-95 ms: half the CPU in the collector, and a
+      median latency of 115 ms where it should be 7.
+
+    ``freeze`` (the default) freezes what exists at startup and after
+    ``warmup`` requests, which covers state built by then. ``refreeze``
+    also freezes after any full collection that took longer than
+    ``SLOW``: what survived a full collection is live, so it joins the
+    permanent generation and the next full collection walks only what
+    was made since. Same workload: median 7.1 ms, 6% of time in the
+    collector. The price is the one ``gc.freeze()`` always has, paid
+    again each time: a reference cycle among frozen objects that later
+    dies is never reclaimed (objects freed by reference counting -- most
+    -- still are). That is why it is a choice and not the default.
+
+    The timings are kept in every mode and served with the stats; a full
+    collection slower than ``WARN`` is also logged, at most once a
+    minute, since it is a pause of the whole worker that nothing else
+    reports.
+    """
+
+    SLOW = 0.010
+    WARN = 0.050
+    WARN_EVERY = 60.0
+
+    def __init__(self, loop, *, refreeze: bool):
+        self._loop = loop
+        self._refreeze = refreeze
+        self._started = 0.0
+        self._warned = float("-inf")  # time.monotonic() of the last warning
+        self.collections = [0, 0, 0]
+        self.seconds = [0.0, 0.0, 0.0]
+        self.longest = [0.0, 0.0, 0.0]
+        self.refreezes = 0
+        gc.callbacks.append(self._on_gc)
+
+    def close(self) -> None:
+        with contextlib.suppress(ValueError):
+            gc.callbacks.remove(self._on_gc)
+
+    def _on_gc(self, phase, info) -> None:
+        # Runs on whichever thread's allocation started the collection,
+        # inside it: keep to arithmetic, and hand anything else to the
+        # loop's thread.
+        if phase == "start":
+            self._started = time.perf_counter()
+            return
+        took = time.perf_counter() - self._started
+        gen = info["generation"]
+        self.collections[gen] += 1
+        self.seconds[gen] += took
+        if took > self.longest[gen]:
+            self.longest[gen] = took
+        if gen == 2 and took >= self.SLOW:
+            with contextlib.suppress(RuntimeError):  # the loop is closed
+                self._loop.call_soon_threadsafe(self._after_slow_full_collection, took)
+
+    def _after_slow_full_collection(self, took: float) -> None:
+        if self._refreeze:
+            # Everything that survived it is live: out of the collector's
+            # way, so the next full collection does not walk it again.
+            gc.freeze()
+            self.refreezes += 1
+            return
+        now = time.monotonic()
+        if took >= self.WARN and now - self._warned >= self.WARN_EVERY:
+            self._warned = now
+            logger.warning(
+                "a full garbage collection paused this worker for %.0f ms. It walks every "
+                "tracked object created since startup; gc_mode='refreeze' keeps what survives "
+                "one out of the next (see the README on garbage collection)",
+                took * 1e3,
+            )
+
+    def snapshot(self) -> dict:
+        return {
+            "collections": list(self.collections),
+            "pause_ms_total": [round(s * 1e3, 3) for s in self.seconds],
+            "pause_ms_longest": [round(s * 1e3, 3) for s in self.longest],
+            "refreezes": self.refreezes,
+            "frozen_objects": gc.get_freeze_count(),
+        }
 
 
 def _freeze_warm_heap() -> None:
@@ -1101,6 +1204,9 @@ def _start_stats_endpoint(loop, port: int, worker_id):
         await receive()
         payload = dict(loop._core.stats())
         payload["worker"] = 0 if worker_id is None else worker_id
+        watch = getattr(loop, "_gc_watch", None)
+        if watch is not None:
+            payload["gc"] = watch.snapshot()
         body = json.dumps(payload).encode()
         await send(
             {
@@ -1916,7 +2022,7 @@ def _freeze_for_fork(config: Config) -> bool:
     gc_mode='default'). Frozen here, the inherited objects sit in the
     permanent generation, which no collection in a worker touches.
     """
-    if config.gc_mode not in ("freeze", "disable") or gc.get_freeze_count():
+    if config.gc_mode not in ("freeze", "refreeze", "disable") or gc.get_freeze_count():
         return False  # 'default' opts out; an existing freeze is the caller's
     gc.collect()
     gc.freeze()

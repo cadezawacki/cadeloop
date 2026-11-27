@@ -1585,3 +1585,158 @@ def test_s30_worker_exit_statuses_are_decoded_in_logs():
     assert _describe_status(256) == "exit code 1"
     assert _describe_status(9) == "killed by SIGKILL"
     assert "unknown" in _describe_status(None)
+
+
+# --------------------------------------------------------------------- #
+# Garbage collection: pause statistics and gc_mode="refreeze" (R-075)   #
+# --------------------------------------------------------------------- #
+
+
+def _a_loop():
+    import gc
+
+    if gc.get_freeze_count():
+        pytest.skip("test needs a clean permanent generation")
+    lp = cadeloop.new_event_loop()
+    asyncio.set_event_loop(lp)
+    return lp
+
+
+def test_gc_watch_times_every_collection():
+    import gc
+
+    from cadeloop.server import _GcWatch
+
+    lp = _a_loop()
+    watch = _GcWatch(lp, refreeze=False)
+    try:
+        gc.collect(0)
+        gc.collect(1)
+        gc.collect(2)
+        snap = watch.snapshot()
+        assert all(n >= 1 for n in snap["collections"]), snap
+        assert all(ms > 0 for ms in snap["pause_ms_total"]), snap
+        assert all(a <= b for a, b in zip(snap["pause_ms_longest"], snap["pause_ms_total"], strict=True))
+        assert snap["refreezes"] == 0
+    finally:
+        watch.close()
+    counted = list(watch.collections)
+    gc.collect()
+    assert watch.collections == counted  # closed: no longer listening
+    asyncio.set_event_loop(None)
+    lp.close()
+
+
+def test_gc_mode_refreeze_freezes_what_survives_a_slow_full_collection():
+    """A full collection walks everything that is not frozen. After one
+    that was slow, "refreeze" moves the survivors to the permanent
+    generation -- on the loop's thread, not inside the collection -- so
+    the next one does not walk them again."""
+    import gc
+
+    from cadeloop.server import _GcWatch
+
+    lp = _a_loop()
+    watch = _GcWatch(lp, refreeze=True)
+    watch.SLOW = 0.0  # every full collection counts as slow here
+    kept = [{"n": i, "tags": [i]} for i in range(5000)]
+    try:
+        assert gc.get_freeze_count() == 0
+        gc.collect(0)  # a young collection is never a reason to freeze
+        lp.run_until_complete(asyncio.sleep(0))
+        assert gc.get_freeze_count() == 0 and watch.refreezes == 0
+        gc.collect(2)
+        assert gc.get_freeze_count() == 0  # not from inside the collection
+        lp.run_until_complete(asyncio.sleep(0))
+        assert watch.refreezes == 1
+        assert gc.get_freeze_count() >= 2 * len(kept)
+        assert watch.snapshot()["frozen_objects"] == gc.get_freeze_count()
+    finally:
+        watch.close()
+        gc.unfreeze()
+        asyncio.set_event_loop(None)
+        lp.close()
+
+
+def test_a_slow_full_collection_is_logged_once_a_minute(caplog):
+    import gc
+    import logging
+
+    from cadeloop.server import _GcWatch
+
+    lp = _a_loop()
+    watch = _GcWatch(lp, refreeze=False)
+    watch.SLOW = watch.WARN = 0.0
+    try:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                gc.collect(2)
+                lp.run_until_complete(asyncio.sleep(0))
+        warnings = [r.getMessage() for r in caplog.records if "full garbage collection" in r.getMessage()]
+        assert len(warnings) == 1 and "gc_mode='refreeze'" in warnings[0]
+        assert gc.get_freeze_count() == 0  # it reports; it does not freeze
+    finally:
+        watch.close()
+        asyncio.set_event_loop(None)
+        lp.close()
+
+
+def test_gc_mode_refreeze_in_a_running_server_and_its_stats():
+    """End to end: state built by a request, a full collection that has to
+    walk it, and the next one that does not -- with the collector's
+    timings served by the stats endpoint."""
+    import gc
+    import json
+
+    if gc.get_freeze_count():
+        pytest.skip("test needs a clean permanent generation")
+    cache = []
+    seen = {}
+
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        await receive()
+        if scope["path"] == "/grow":
+            cache.extend({"id": i, "tags": [i]} for i in range(250_000))
+            gc.collect()  # the full collection that finds 500,000 new objects
+        elif scope["path"] == "/again":
+            started = time.perf_counter()
+            gc.collect()
+            seen["second"] = time.perf_counter() - started
+        elif scope["path"] == "/stop":
+            asyncio.get_running_loop().stop()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    port, stats_port = _free_port(), _free_port()
+    config = cadeloop.Config(grace=0.0, warmup=0, gc_mode="refreeze", stats_endpoint=stats_port)
+    t, result = _serve_in_thread(app, config, port=port)
+    try:
+        _wait_up(port)
+        before = json.loads(_get(stats_port))["gc"]
+        _get(port, "/grow", timeout=30)
+        _get(port, "/again", timeout=30)
+        after = json.loads(_get(stats_port))["gc"]
+        try:
+            _get(port, "/stop", timeout=3)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        t.join(30)
+    assert before["refreezes"] == 0, before
+    assert after["refreezes"] >= 1, after
+    assert after["frozen_objects"] - before["frozen_objects"] >= 500_000, (before, after)
+    assert after["collections"][2] >= before["collections"][2] + 2
+    assert after["pause_ms_longest"][2] >= 10, after  # the one that walked the new state
+    assert seen["second"] < after["pause_ms_longest"][2] / 1e3 / 2, (seen, after)
+    assert gc.get_freeze_count() == 0, "serve() must still unfreeze on the way out"
+
+
+def test_gc_mode_refreeze_is_a_setting_and_a_flag():
+    from cadeloop.config import Config
+
+    assert Config(gc_mode="refreeze").gc_mode == "refreeze"
+    with pytest.raises(ValueError, match="gc_mode"):
+        Config(gc_mode="sometimes")
+

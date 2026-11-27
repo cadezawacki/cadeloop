@@ -26,7 +26,7 @@ LATENCY_PRESETS = {"throughput": 0, "balanced": 20, "spin": 200}
 # non-Windows platforms; rejecting it here made that flag always
 # raise before binding (Codex review, PR #1).
 _BACKENDS = ("auto", "iocp", "rio", "epoll")
-_GC_MODES = ("default", "freeze", "disable")  # R-075
+_GC_MODES = ("default", "freeze", "refreeze", "disable")  # R-075
 _ACCESS_LOG_FORMATS = ("text", "json")  # R-140, the native access log
 
 _BOOL_FIELDS = (

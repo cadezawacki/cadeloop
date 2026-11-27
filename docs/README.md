@@ -17,6 +17,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Garbage collection (on `claude/sleepy-ride-p2rndm`; measured on Linux, FastAPI, one worker)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Perf | Measured what the collector costs a server before changing anything: nothing for ordinary handlers (two young collections per 100,000 requests), 5% for a handler building 5,000 records, and half the worker's time -- 68-93 ms full collections several times a second, median latency 115 ms instead of 7 -- once 400,000 objects exist that the startup freeze did not see. `gc_mode="refreeze"` freezes again after any full collection of 10 ms or more: median 7.1 ms, 5.9% in the collector; with turnover in that state, 7.4 ms against 1.6 s. Opt-in, because a frozen object that later dies in a reference cycle is never reclaimed. Every mode now reports the collector's pauses in the stats endpoint (`gc`) and logs a full collection of 50 ms or more. Collecting at idle and raising thresholds were measured and rejected (ADR-43) | `pending` |
+>
 > **Sending files (on `claude/sleepy-ride-p2rndm`; measured on Linux, one worker, loopback)**
 >
 > | Area | Fix | Commit |

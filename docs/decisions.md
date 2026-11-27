@@ -1019,3 +1019,76 @@ Cost, JSON text echoed (inflate on the way in, deflate on the way out):
 default because that CPU is the loop's: it is worth spending only where
 bandwidth is what is scarce.
 
+## ADR-43: The garbage collector: measured first, then `gc_mode="refreeze"`
+The plan was to move collections to moments when the loop is idle. The
+measurements came first, and they changed the plan. FastAPI on one worker,
+20 seconds at a fixed rate, every collection timed through `gc.callbacks`:
+
+| workload | `gc_mode` | median | p99 | in the collector | full collections |
+|---|---|---:|---:|---:|---|
+| pydantic JSON response, 5,000 requests/s | any | 0.7 ms | 2.3-2.7 ms | 0.0% | none; two young ones per 100,000 requests |
+| handler building 5,000 records, 100 requests/s | `default` | 11.0 ms | 38.8 ms | 26.5% | 233 x 17 ms |
+| | `freeze` | 6.8 ms | 11.0 ms | 5.3% | 233 x 0.3 ms |
+| | `disable` | 6.4 ms | 9.7 ms | 0% | -- |
+| + 400,000 objects built at import | `default` | 537 ms | 2,449 ms | 56% | 107 x 93 ms |
+| | `freeze` | 6.7 ms | 9.8 ms | 5.2% | 232 x 0.3 ms |
+| + 400,000 objects built after startup | `freeze` | 115 ms | 331 ms | 49% | 130 x 68 ms |
+| | `refreeze` | 7.1 ms | 26.5 ms | 5.9% | 233 x 0.4 ms, longest 11 ms |
+| | `disable` | 6.0 ms | 9.6 ms | 0% | -- |
+| the same, 200 of them replaced per request | `freeze` | 1,611 ms | 4,698 ms | 57% | 121 x 82 ms |
+| | `refreeze` | 7.4 ms | 21.2 ms | 13.9% | 234 x 5 ms |
+
+(Where the collector took half the time the server fell behind the rate,
+so those latencies are queueing and differ between runs -- 64 to 335 ms
+median for the seventh row across four runs. The share of time and the
+length of a collection do not.)
+
+What they say:
+
+- **An ordinary handler never reaches the collector.** Reference counting
+  frees what a request made; the allocation counter that triggers a young
+  collection (700 more container objects alive than at the last one) does
+  not climb. There is nothing here to schedule, in any mode.
+- **A handler that builds thousands of objects triggers full collections
+  by itself**, about twelve a second at 100 requests/s: its records
+  survive the young collections that run while it is still building them,
+  are promoted, and count toward the next full one. What a full collection
+  costs is what it has to walk.
+- **Moving collections to idle moments would not have helped.** The cost
+  is the length of the walk, not its timing: at 49% of the worker's time
+  there is no idle moment to move it to, and a 68 ms walk run "between
+  requests" is still 68 ms in which no request is answered. A prototype
+  that collected generation 0 from a 2 ms timer left both the number and
+  the length of the collections where they were (row seven: 130 full
+  collections of 64 ms, against 130 of 68 ms).
+- **Raising the thresholds** (`gc.set_threshold(50000, 20, 10)`) made the
+  collector vanish from this workload, and is not offered: it only
+  postpones the same walk, and holds cyclic garbage for that long.
+
+So the mechanism the default already uses is extended instead. `freeze`
+moves everything alive at startup (and again after `warmup` requests) to
+the permanent generation, which no collection walks: rows two and five.
+State built later is outside it: row seven. `gc_mode="refreeze"` freezes
+again after any full collection that took 10 ms or more -- what survived a
+full collection is live, and the next one walks only what was made since.
+The freeze runs as a loop callback, not inside the collection that
+prompted it (`gc.freeze()` moves the generations' lists, which the
+collector is in the middle of using).
+
+It is a choice and not the default because of what freezing gives up: a
+frozen object that later becomes unreachable *in a reference cycle* is
+never reclaimed. Reference counting still frees everything else, frozen or
+not -- in the last row 430,000 frozen cache entries were replaced and
+freed, and the object count ended where it began -- but an application
+that keeps building long-lived cyclic structures and discarding them would
+grow under `refreeze` where it would not under `freeze`. The startup
+freeze has the same property and has been the default since R-075; the
+difference is how much, and how often.
+
+In every mode the server now keeps the collector's timings (count, total
+and longest pause per generation, refreezes, frozen objects: the stats
+endpoint's `gc`), and logs a full collection of 50 ms or more, at most
+once a minute, naming the setting. A stall of that length was otherwise
+invisible: nothing in the access log or the loop's counters says the
+process stopped.
+
