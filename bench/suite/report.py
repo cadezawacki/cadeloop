@@ -852,6 +852,71 @@ def readme_specs(rows, idle, timers, sched, P):
     return specs
 
 
+def timers_markdown(timers, loops):
+    """bench/suite/latency.py's results as a table: overshoot of
+    asyncio.sleep(d), median / p99, with the median's interval when the
+    loops were measured in several processes."""
+    cols = [("0.0005", "sleep(0.5 ms)"), ("0.001", "sleep(1 ms)"), ("0.005", "sleep(5 ms)"),
+            ("0.01", "sleep(10 ms)"), ("0.05", "sleep(50 ms)"), ("busy-0.001", "busy, 1 ms")]
+    nproc = max((len(t["0.001"].get("p50_runs", [])) for t in timers.values()), default=0)
+
+    def cell(entry, fmt, unit, scale=1.0):
+        def num(v):
+            return fmt.format(v * scale).replace("-0.00", "+0.00")  # no negative zero
+
+        text = num(entry["p50"])
+        runs = entry.get("p50_runs")
+        if runs and len(runs) > 1:
+            lo, hi, _cover = median_ci(runs)
+            text += f" [{num(lo)}, {num(hi)}]"
+        return f"{text} / {num(entry['p99']).lstrip('+')} {unit}"
+
+    lines = ["\n## Timers and wake-ups\n"]
+    how = (f"the median over {nproc} fresh processes per loop, the loops taking turns, with the "
+           f"{median_ci(list(range(nproc)))[2] * 100:.0f}% confidence interval of that median in brackets"
+           if nproc > 1 else "one process per loop")
+    lines.append("How late `asyncio.sleep(d)` returned on an idle loop, median / p99 over 200 sleeps (40 at 10 ms "
+                 f"and 50 ms): {how}. A negative figure is a sleep that returned early. `busy` is a 1 ms sleep "
+                 "while another task keeps the loop running short callbacks; `cross-thread` is a "
+                 "`call_soon_threadsafe()` from another thread into a sleeping loop.\n")
+    lines.append("| loop | " + " | ".join(label for _, label in cols) + " | cross-thread |")
+    lines.append("|---|" + "---|" * (len(cols) + 1))
+    for srv in loops:
+        t = timers.get(srv)
+        if not t:
+            continue
+        cells = [cell(t[key], "{:+.2f}", "ms") for key, _ in cols]
+        cells.append(cell(t["xthread"], "{:.0f}", "µs", 1e3))
+        lines.append(f"| {tname(srv, False)} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def sched_markdown(sched, loops):
+    """bench/harness's scheduling results as a table: the median of the
+    runs with its interval."""
+    nruns = max(len((x or {}).get("runs", [])) for res in sched.values() for x in res.values())
+    cover = median_ci(list(range(nruns)))[2] * 100 if nruns > 1 else 0
+    what = f"{cover:.0f}% confidence interval" if cover >= 95 else "slowest and fastest run"
+    lines = ["\n## Scheduling microbenchmarks\n"]
+    lines.append(f"Millions of operations per second: the median of {nruns} runs (a fresh process per run, "
+                 f"the loops taking turns), with its {what}.\n")
+    lines.append("| benchmark | " + " | ".join(loops) + " |")
+    lines.append("|---|" + "---|" * len(loops))
+    for bench, res in sched.items():
+        cells = []
+        for lp in loops:
+            entry = res.get(lp) or {}
+            v = entry.get("median_ops_per_sec")
+            if not v:
+                cells.append("hung")
+                continue
+            runs = entry.get("runs") or []
+            lo, hi, _cover = median_ci(runs) if len(runs) > 1 else (entry.get("min", v), entry.get("max", v), 0)
+            cells.append(f"{v / 1e6:.3f} ({lo / 1e6:.3f}–{hi / 1e6:.3f})")
+        lines.append(f"| `{bench}` | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
@@ -926,6 +991,10 @@ def main():
         md.append(f"| {disp(r['server'])} | {r['held']} | {r['per_conn_private_kib']:.1f} KiB "
                   f"| {r['per_conn_ws_kib']:.1f} KiB | {r['per_conn_handles']:.2f} "
                   f"| {r['after_close_private_mib']:.0f} MiB |")
+    if timers:
+        md.append(timers_markdown(timers, P["loops"]))
+    if sched:
+        md.append(sched_markdown(sched, P["sched"]))
     if a.markdown:
         with open(a.markdown, "w", encoding="utf-8") as f:
             f.write("\n".join(md) + "\n")
