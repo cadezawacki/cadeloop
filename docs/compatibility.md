@@ -16,7 +16,7 @@ usage documentation is in the [README](../README.md).
 | Subprocess (`create_subprocess_exec` / `shell`) | ✅ POSIX; Windows pipes in progress |
 | Drop-in with uvicorn, aiohttp | ✅ interop-tested |
 | CPython asyncio conformance suite | ✅ runs against the stdlib's own tests |
-| RIO backend (`backend="rio"`) | 🔶 implemented; blocked on an OS-level RIO failure on the test machine — `auto` stays on IOCP |
+| RIO backend (`backend="rio"`) | 🔶 experimental, and stopped: it has not worked on any Windows machine tested, for reasons inside Windows. `auto` never selects it; IOCP is the Windows backend |
 | Native `loop.sendfile` | 🔶 `sock_sendfile` fallback works |
 | ASGI extensions | ✅ `http.response.trailers`, `http.response.pathsend` (Starlette/FastAPI `FileResponse` uses it) |
 

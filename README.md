@@ -793,7 +793,7 @@ server has its own settings, some with different names or defaults (see
 
 | argument | default | what it does |
 |---|---|---|
-| `backend` | `None` | The I/O backend: `"auto"`, `"iocp"`, `"rio"` or `"epoll"`. `None` reads the `CADELOOP_BACKEND` environment variable, else uses `"auto"`, which picks IOCP on Windows and epoll on Linux. `"rio"` is experimental and warns. |
+| `backend` | `None` | The I/O backend: `"auto"`, `"iocp"`, `"rio"` or `"epoll"`. `None` reads the `CADELOOP_BACKEND` environment variable, else uses `"auto"`, which picks IOCP on Windows and epoll on Linux. `"rio"` is experimental and warns: it has not worked on any Windows machine tested, for reasons inside Windows, and `"auto"` never selects it. |
 | `spin_us` | `20` | How many microseconds the loop keeps checking for new work before it sleeps. More spinning lowers wake-up latency and costs CPU. `0` turns it off. |
 | `adaptive_spin` | `True` | Spin only while spins are catching work, and skip it while they aren't ([how it decides](docs/learn/3-inside-cadeloop.md#spin-then-park)). `False` spins before every sleep. |
 | `high_water` | `65536` | Bytes a transport may queue before it asks the protocol to pause writing (`pause_writing()`, `drain()` waits). |

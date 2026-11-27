@@ -22,8 +22,9 @@ Under your code, cadeloop has four layers:
   by other threads, and the rules for when to wait and for how long. It
   knows nothing about Python.
 - **The backends** talk to the OS: IOCP on Windows, epoll on Linux, and RIO
-  (Windows' registered I/O), which is experimental and needs an explicit
-  opt-in.
+  (Windows' registered I/O), which is experimental, needs an explicit
+  opt-in, and is not being developed further: it has not worked on any
+  Windows machine it was tried on, for reasons inside Windows.
 
 ## One tick, step by step
 

@@ -1227,3 +1227,32 @@ Found on the way, and fixed for every version:
 3.14 is not attempted: it removes the child watchers the POSIX subprocess
 support is built on, and deprecates the policy system.
 
+## ADR-46: RIO: work stopped; `auto` is IOCP for good
+The Registered I/O backend (ADR-9's hybrid: accepts, connects and watches
+on IOCP, receives and sends through per-socket request queues) is
+implemented, unit-tested where it is pure bookkeeping, and
+compile-checked for Windows. What it never got is a Windows machine it
+works on. On one (Windows 11 Insider 26200.9168) the OS's RIO subsystem
+does not initialize: every kernel-touching entry point returns WSAEFAULT
+for calls that pass no pointer, from a verified, unhooked `mswsock.dll`
+(`crates/core/examples/rio_probe.rs`). On the others it initializes and
+the data path stalls, with the backend's countermeasures in place. The
+plan had been to validate it on hardware and then let `backend="auto"`
+probe RIO first.
+
+That plan is withdrawn. The failures are inside Windows, where nothing in
+this project can reach them, and a backend that cannot be run cannot be
+validated, benchmarked or maintained honestly. So:
+
+- `auto` selects IOCP on Windows and will not select or probe RIO.
+- `backend="rio"` remains, explicit and experimental: `Loop(backend="rio")`
+  warns, and `Config`/`serve()` also require
+  `CADELOOP_ALLOW_EXPERIMENTAL_RIO=1`. Anyone with hardware it works on
+  can still try it; the probe and bisect tools stay.
+- No further work is planned on it, and nothing else is designed around
+  it. IOCP is the Windows backend, and what every Windows number in this
+  repository measures.
+
+If a Windows release fixes RIO, the gate is what it always was: the full
+test sweep and the benchmarks on real hardware, before `auto` changes.
+

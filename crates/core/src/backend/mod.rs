@@ -405,10 +405,11 @@ impl Default for BackendOptions {
 /// Instantiate the platform backend.
 ///
 /// On Windows: `"rio"` builds the Registered I/O hybrid (R-040..R-044).
-/// `"auto"` resolves to IOCP for now — the RIO machinery is implemented
-/// and compile-verified, but its behavioral validation is the remaining
-/// M3 Windows-hardware gate; auto flips to probe-RIO-first once that
-/// lands. On other platforms every kind resolves to the dev backend so
+/// `"auto"` resolves to IOCP, and that is settled: RIO has not worked on
+/// any Windows machine it was run on (the OS's RIO subsystem fails to
+/// initialize, or the data path stalls), work on it has stopped, and it
+/// stays an explicit experimental choice that `auto` never selects or
+/// probes (docs/roadmap.md, M3). On other platforms every kind resolves to the dev backend so
 /// loop-semantics tests run unmodified everywhere.
 pub fn create(kind: BackendKind, opts: &BackendOptions) -> io::Result<Box<dyn IoBackend + Send>> {
     #[cfg(windows)]

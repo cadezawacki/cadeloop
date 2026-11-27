@@ -104,9 +104,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         if backend is None:
             backend = os.environ.get("CADELOOP_BACKEND", "auto")
         if backend == "rio":
-            # R-020: 'auto' deliberately avoids RIO until it's validated on
-            # real hardware (docs/roadmap.md M3) — an explicit request gets
-            # a loud, dismissible warning rather than a silent footgun.
+            # R-020: 'auto' never selects RIO -- it has not worked on any
+            # Windows machine it was run on, for reasons inside Windows,
+            # and work on it has stopped (docs/roadmap.md M3). An explicit
+            # request gets a loud, dismissible warning rather than a
+            # silent footgun.
             # cadeloop.Config/serve() additionally require
             # CADELOOP_ALLOW_EXPERIMENTAL_RIO=1 for this exact reason; this
             # low-level constructor stays unblocked for RIO diagnosis

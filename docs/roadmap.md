@@ -116,19 +116,25 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       refusal, §16), cancel-via-close translated to OPERATION_ABORTED
       (R-037 parity). Pure-Rust bookkeeping (region map, staging ledger,
       CQ ledger) unit-tested on Linux; FFI glue compile-verified via the
-      msvc cross-check. `backend="rio"` selects it; `auto` stays IOCP
-      until the item below
-- [ ] RIO behavioral validation + benchmarks on Windows hardware (the
-      gate for flipping `auto` to probe-RIO-first) — in progress across
-      two machines. Machine 1 (Win11 Insider 26200.9168): the OS RIO
-      subsystem itself fails to initialize (rio_probe.rs has the full
-      diagnosis; validate.ps1 gates RIO steps in 2s). Machine 2: RIO
-      constructs in full-notify mode but the data path stalled on the
-      first run; the backend now carries stall countermeasures (50ms
-      watchdog park cap while ops are in flight, RIONotify-failure
-      downgrade to `rio-polling`) plus `stats()` diagnosis counters,
-      and tools/windows/rio_bisect.py localizes any remaining stall
-      per-machinery in ~30s
+      msvc cross-check. `backend="rio"` selects it; `auto` is IOCP and
+      stays IOCP (next item)
+- [x] RIO: **stopped -- blocked by the operating system.** Validating it
+      on Windows hardware was the gate for letting `auto` try RIO first.
+      It has not worked on any Windows machine it was run on: on one
+      (Win11 Insider 26200.9168) the OS RIO subsystem fails to initialize
+      at all (every kernel-touching entry point returns WSAEFAULT;
+      rio_probe.rs has the full diagnosis), on the others it constructs
+      and then stalls in the data path, with the backend's own
+      countermeasures in place (50ms watchdog park cap while ops are in
+      flight, RIONotify-failure downgrade to `rio-polling`). The fault is
+      below anything this project can change, so:
+      `auto` will not select or probe RIO; `backend="rio"` stays as an
+      explicit, experimental choice (it warns, and `serve()` also wants
+      `CADELOOP_ALLOW_EXPERIMENTAL_RIO=1`) for anyone who wants to try it
+      on their own machines; no further work is planned on it. The
+      diagnosis tools stay (crates/core/examples/rio_probe.rs,
+      tools/windows/rio_smoke.py, rio_bisect.py). IOCP is the Windows
+      backend, and what every Windows benchmark here measures
 - [x] Fork-free worker model (Windows flavor, §8): supervisor binds one
       listener and hands it to spawned workers — WSADuplicateSocketW
       (socket.share over stdin) on win32, fd inheritance on POSIX so the

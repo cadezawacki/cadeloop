@@ -21,10 +21,10 @@ methodology: [benchmarks.md](benchmarks.md).*
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Compat | CPython 3.12 and 3.13 are supported next to 3.11, a wheel for each. Where the three versions' asyncio differ -- `wait_closed()`, `writelines()`, error wording, exception-handler context, child-exit timing, empty datagrams, `serve_forever()` closing clients, `cleanup_socket` -- cadeloop does what the running interpreter's asyncio does: compile-time in the extension (PyO3's version cfgs), two constants in the Python layer. Newer arguments and methods (`shutdown_default_executor(timeout)`, `all_errors`, `keep_alive`, `cleanup_socket`, `Server.close_clients()`) are taken on every version. Each version's own CPython asyncio suite passes against it, and CI builds and tests all three on Linux and Windows (ADR-45) | `pending` |
-> | Server | `gc_mode="freeze"`, the default, silently did nothing on 3.12: its collector keeps 375 immortal objects in the permanent generation, which was taken for a freeze the caller owned | `pending` |
-> | Net | A datagram send that failed while the endpoint was closing was never reported to `error_received` (the endpoint was gone before the queued report was dispatched); after `abort()` nothing is reported, as before | `pending` |
-> | Net | A failed `create_connection()` left its exception in a reference cycle (lists held by frames its traceback keeps alive), so it and those frames waited for the cyclic collector | `pending` |
+> | Compat | CPython 3.12 and 3.13 are supported next to 3.11, a wheel for each. Where the three versions' asyncio differ -- `wait_closed()`, `writelines()`, error wording, exception-handler context, child-exit timing, empty datagrams, `serve_forever()` closing clients, `cleanup_socket` -- cadeloop does what the running interpreter's asyncio does: compile-time in the extension (PyO3's version cfgs), two constants in the Python layer. Newer arguments and methods (`shutdown_default_executor(timeout)`, `all_errors`, `keep_alive`, `cleanup_socket`, `Server.close_clients()`) are taken on every version. Each version's own CPython asyncio suite passes against it, and CI builds and tests all three on Linux and Windows (ADR-45) | `3f56b8f` |
+> | Server | `gc_mode="freeze"`, the default, silently did nothing on 3.12: its collector keeps 375 immortal objects in the permanent generation, which was taken for a freeze the caller owned | `3f56b8f` |
+> | Net | A datagram send that failed while the endpoint was closing was never reported to `error_received` (the endpoint was gone before the queued report was dispatched); after `abort()` nothing is reported, as before | `3f56b8f` |
+> | Net | A failed `create_connection()` left its exception in a reference cycle (lists held by frames its traceback keeps alive), so it and those frames waited for the cyclic collector | `3f56b8f` |
 >
 > **Name lookups (on `claude/sleepy-ride-p2rndm`)**
 >
@@ -393,8 +393,10 @@ WebSockets, the native HTTP/ASGI engine (Starlette/FastAPI verified),
 multi-worker serving on both process models, and POSIX subprocess are
 all implemented and tested. The Windows IOCP backend is
 hardware-validated (full test sweep + benchmarks); the M3 Registered
-I/O backend awaits a machine whose OS RIO subsystem works (see the
-Windows benchmarks section). Remaining: Windows subprocess pipes, PGO
+I/O backend is stopped -- it has not worked on any Windows machine it was
+run on, for reasons inside Windows -- and stays an explicit experimental
+option that `auto` never selects (see the Windows benchmarks section and
+[roadmap.md](roadmap.md)). Remaining: Windows subprocess pipes, PGO
 wheels, docs floor, and the two-machine acceptance runs. Full R-xxx
 map: [docs/requirements-traceability.md](requirements-traceability.md).
 
@@ -409,7 +411,7 @@ map: [docs/requirements-traceability.md](requirements-traceability.md).
 | WebSockets (RFC 6455 on the native engine) | ✅ tested (handshake/frames/close vs hand-rolled RFC client; Starlette WebSocketRoute) |
 | UDP datagram endpoints (`create_datagram_endpoint`) | ✅ tested (native recv_from/send_to on both backends) |
 | Multi-worker (`--workers N`) | ✅ tested (fork + SO_REUSEPORT on POSIX; spawn + shared listener — WSADuplicateSocketW on Windows, fd-passing e2e test) |
-| RIO backend (`backend="rio"`: CQ/RQ, registered buffers, staging) | 🔶 implemented; blocked by an OS-level RIO failure on the test machine (Win11 beta 26200) — `auto` stays IOCP; see Windows benchmarks |
+| RIO backend (`backend="rio"`: CQ/RQ, registered buffers, staging) | 🔶 experimental, and stopped: blocked by OS-level RIO failures on every Windows machine tested — `auto` never selects it; see Windows benchmarks |
 | Subprocess + pipes (`create_subprocess_exec/shell`) | ✅ tested on POSIX (Windows: M5, IOCP named pipes) |
 | Native `loop.sendfile` | M1-Windows (`sock_sendfile` fallback ✅) |
 
@@ -603,8 +605,14 @@ native-x64 process. The full diagnosis lives in
 [`crates/core/examples/rio_probe.rs`](../crates/core/examples/rio_probe.rs)
 (run it on any Windows box for a verdict in seconds). `backend="auto"`
 stays on IOCP; the validation orchestrator detects the condition in 2s
-and skips RIO steps. Behavioral validation waits for a stable x64 build
-(23H2/24H2 or Server).
+and skips RIO steps.
+
+On the other Windows machines it was tried on, RIO initializes and then
+stalls in the data path. With no machine on which it works, and the
+cause below anything this project can change, work on RIO has stopped:
+`auto` will not select or probe it, and `backend="rio"` remains for
+anyone who wants to try it on their own hardware, as an explicit,
+experimental choice.
 
 ## Architecture
 
