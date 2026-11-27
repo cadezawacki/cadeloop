@@ -17,6 +17,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Measured and not built**
+>
+> | Area | Finding | Commit |
+> |---|---|---|
+> | Perf | Receiving straight into the `bytes` object instead of into a pooled buffer and copying: the copy is 12% of a 64 KiB echo's CPU, but what replaces it -- the kernel's copy landing in a cold, newly allocated object, and shrinking it after a short read -- leaves between 6% faster and 7% slower (`bench/micro/recv_modes.py`). Not worth a second kind of buffer in the receive path, and not possible on IOCP without pinning an object per idle connection (ADR-40) | |
+>
 > **Request headers (on `claude/sleepy-ride-p2rndm`; measured on Linux, pipelined so the kernel is out of the picture)**
 >
 > | Area | Fix | Commit |

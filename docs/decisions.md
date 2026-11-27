@@ -894,3 +894,36 @@ head. A vectorised header scanner would cut most of that, and would also
 replace the one strict, widely reviewed component that decides where a
 request ends. Not a trade to make for the difference.
 
+## ADR-40: Receiving straight into the bytes object: measured, not built
+A stream transport receives into a pooled buffer and copies what arrived
+into the `bytes` it hands the protocol (ADR-34 made that copy happen at
+dispatch, into a warm block). On a 64 KiB echo that memmove is 12% of the
+server's CPU, 9% at 16 KiB, which is where the plan came from: allocate
+the object first, receive into it, and skip the copy.
+
+The share of a profile is not the saving. Two things replace the copy.
+The kernel's own copy, which used to land in a buffer that is always in
+cache, lands in a newly allocated object that is not; and a read is as
+long as the peer's segments happened to make it, so the object is usually
+too big and has to be shrunk. `bench/micro/recv_modes.py` isolates the
+trade with nothing of cadeloop in it -- `sock.recv(65536)` against
+`sock.recv_into(warm)` plus `bytes(view[:n])`:
+
+| sender's chunks | protocol keeps | time per 64 KiB received, direct vs warm buffer + copy |
+|---|---|---|
+| 64 KiB | nothing | 30.1 us vs 32.1 us (-6.0%) |
+| 64 KiB | the last 64 chunks | 31.2 us vs 31.8 us (-1.9%) |
+| 16 KiB | nothing | 33.4 us vs 33.1 us (+1.0%) |
+| 16 KiB | the last 64 chunks | 30.8 us vs 28.8 us (+7.1%) |
+
+Six percent of the receive side at best, when reads fill the buffer and
+the protocol drops them at once; a loss when they do not. Against that:
+the receive completion path is the most load-bearing function in the
+transport (pause and hold, lingering closes, the op's own reference to its
+buffer, three protocol kinds), the change would add a second kind of
+buffer to all of it, and it could only be done for the readiness backend
+-- on IOCP a posted receive pins its buffer until data arrives, so every
+idle connection would hold an object, which is the per-connection memory
+ADR-22 removed. Not built. A `BufferedProtocol` already receives with one
+copy, into its own buffer, for a protocol that wants that.
+
