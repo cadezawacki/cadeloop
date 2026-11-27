@@ -1130,4 +1130,339 @@ mod tests {
         let lines = [&b"foo"[..], &b"permessage-deflate"[..]];
         assert_eq!(negotiate_deflate(lines.into_iter()).as_deref(), Some(base));
     }
+
+    /// Properties, over generated input: what the fixed cases above pin
+    /// down at chosen points, these hold everywhere the generator reaches.
+    mod props {
+        use super::*;
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        const BASE: &str = "permessage-deflate; server_no_context_takeover; client_no_context_takeover";
+
+        /// A frame with every header bit in the caller's hands.
+        fn raw_frame(first: u8, masked: bool, mask: [u8; 4], payload: &[u8]) -> Vec<u8> {
+            let n = payload.len();
+            let m = if masked { 0x80 } else { 0 };
+            let mut out = vec![first];
+            if n < 126 {
+                out.push(m | n as u8);
+            } else if n <= 0xFFFF {
+                out.push(m | 126);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            } else {
+                out.push(m | 127);
+                out.extend_from_slice(&(n as u64).to_be_bytes());
+            }
+            if masked {
+                out.extend_from_slice(&mask);
+                out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
+            } else {
+                out.extend_from_slice(payload);
+            }
+            out
+        }
+
+        fn payload() -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                4 => "[ -~]{0,40}".prop_map(String::into_bytes),
+                2 => "\\PC{0,40}".prop_map(String::into_bytes),
+                3 => vec(any::<u8>(), 0..300),
+                // Either side of where the length field goes from 16 to 64 bits.
+                1 => vec(any::<u8>(), 65_000..66_000),
+            ]
+        }
+
+        /// One data message in one to four frames, sometimes with a ping
+        /// between the fragments (which a peer may send). Frame by frame,
+        /// so the test knows where each starts.
+        fn message() -> impl Strategy<Value = Vec<Vec<u8>>> {
+            (
+                any::<bool>(),
+                prop::bool::weighted(0.25),
+                prop::bool::weighted(0.8),
+                payload(),
+                vec(any::<prop::sample::Index>(), 0..3),
+                any::<[u8; 4]>(),
+                prop::bool::weighted(0.3),
+            )
+                .prop_map(|(text, rsv1, valid, p, cuts, mask, ping)| {
+                    // Most text messages are text; the rest are whatever bytes came.
+                    let p =
+                        if text && valid { String::from_utf8_lossy(&p).into_owned().into_bytes() } else { p };
+                    let mut ends: Vec<usize> = cuts.iter().map(|c| c.index(p.len() + 1)).collect();
+                    ends.sort_unstable();
+                    ends.push(p.len());
+                    let last = ends.len() - 1;
+                    let mut out = Vec::new();
+                    let mut start = 0;
+                    for (i, end) in ends.into_iter().enumerate() {
+                        let opcode = match (i, text) {
+                            (0, true) => OP_TEXT,
+                            (0, false) => OP_BINARY,
+                            _ => OP_CONT,
+                        };
+                        let bits =
+                            if i == last { 0x80 } else { 0 } | if i == 0 && rsv1 { RSV1 } else { 0 } | opcode;
+                        out.push(raw_frame(bits, true, mask, &p[start..end]));
+                        if ping && i != last {
+                            out.push(raw_frame(0x80 | OP_PING, true, mask, b"still here"));
+                        }
+                        start = end;
+                    }
+                    out
+                })
+        }
+
+        /// A piece of a client's stream: mostly whole messages, now and
+        /// then a control frame, a close, a frame with arbitrary header
+        /// bits, or bytes that are no frame at all.
+        fn piece() -> impl Strategy<Value = Vec<Vec<u8>>> {
+            let control = (
+                prop_oneof![Just(OP_PING), Just(OP_PONG)],
+                prop::bool::weighted(0.95),
+                vec(any::<u8>(), 0..130),
+                any::<[u8; 4]>(),
+            )
+                .prop_map(|(op, fin, p, mask)| raw_frame(if fin { 0x80 } else { 0 } | op, true, mask, &p));
+            let close = (
+                proptest::option::of(prop_oneof![
+                    Just(1000u16),
+                    Just(1001),
+                    Just(1005),
+                    Just(3000),
+                    Just(4999),
+                    any::<u16>()
+                ]),
+                payload(),
+                any::<[u8; 4]>(),
+            )
+                .prop_map(|(code, reason, mask)| {
+                    let mut p = Vec::new();
+                    if let Some(code) = code {
+                        p.extend_from_slice(&code.to_be_bytes());
+                        p.extend_from_slice(&reason[..reason.len().min(60)]);
+                    }
+                    raw_frame(0x80 | OP_CLOSE, true, mask, &p)
+                });
+            let odd = (any::<u8>(), any::<bool>(), vec(any::<u8>(), 0..200), any::<[u8; 4]>())
+                .prop_map(|(first, masked, p, mask)| raw_frame(first, masked, mask, &p));
+            prop_oneof![
+                12 => message(),
+                3 => control.prop_map(|frame| vec![frame]),
+                1 => close.prop_map(|frame| vec![frame]),
+                1 => odd.prop_map(|frame| vec![frame]),
+                1 => vec(any::<u8>(), 0..24).prop_map(|bytes| vec![bytes]),
+            ]
+        }
+
+        fn events(wire: &[u8], cuts: &[usize], max: usize, deflate: bool) -> Vec<WsEvent> {
+            let mut rx = WsRx::new(max);
+            if deflate {
+                rx.allow_deflate();
+            }
+            let mut out = Vec::new();
+            let mut at = 0;
+            for &cut in cuts {
+                rx.push(&wire[at..cut], &mut out);
+                at = cut;
+            }
+            rx.push(&wire[at..], &mut out);
+            out
+        }
+
+        fn sorted_cuts(cuts: &[prop::sample::Index], len: usize) -> Vec<usize> {
+            let mut cuts: Vec<usize> = cuts.iter().map(|c| c.index(len + 1)).collect();
+            cuts.sort_unstable();
+            cuts
+        }
+
+        /// Bytes that compress in every way a message might: not at all,
+        /// by repetition, as text, and a thousandfold.
+        fn body() -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                3 => vec(any::<u8>(), 0..2000),
+                3 => (vec(any::<u8>(), 1..40), 1usize..400).prop_map(|(unit, n)| unit.repeat(n)),
+                3 => "[a-z\" :,{}0-9]{0,3000}".prop_map(String::into_bytes),
+                1 => (any::<u8>(), 0usize..200_000).prop_map(|(b, n)| vec![b; n]),
+            ]
+        }
+
+        proptest! {
+            /// What a stream means does not depend on how the network cut
+            /// it up: one read, any reads, a read ending at every byte of
+            /// every frame's header, or a byte at a time give the same
+            /// events. (A read boundary inside a length field or a mask is
+            /// where a streaming parser goes wrong.)
+            #[test]
+            fn a_stream_reads_the_same_however_it_is_cut(
+                pieces in vec(piece(), 0..8),
+                cuts in vec(any::<prop::sample::Index>(), 0..12),
+                max in prop_oneof![3 => Just(1usize << 20), 1 => 0usize..400],
+                deflate in any::<bool>(),
+            ) {
+                let frames: Vec<Vec<u8>> = pieces.into_iter().flatten().collect();
+                let wire = frames.concat();
+                let whole = events(&wire, &[], max, deflate);
+                let cut = events(&wire, &sorted_cuts(&cuts, wire.len()), max, deflate);
+                prop_assert_eq!(&whole, &cut);
+                // The longest header is 14 bytes: 2, an 8-byte length, the mask.
+                let mut in_headers = Vec::new();
+                let mut start = 0;
+                for frame in &frames {
+                    in_headers.extend((start..start + frame.len().min(16)).filter(|&at| at < wire.len()));
+                    start += frame.len();
+                }
+                prop_assert_eq!(&whole, &events(&wire, &in_headers, max, deflate));
+                if wire.len() <= 4096 {
+                    let each: Vec<usize> = (1..wire.len()).collect();
+                    prop_assert_eq!(&whole, &events(&wire, &each, max, deflate));
+                }
+                // The stream ends at a close or a failure, and only there.
+                for (i, ev) in whole.iter().enumerate() {
+                    let ends = matches!(ev, WsEvent::Fail(..) | WsEvent::Close(..));
+                    prop_assert!(!ends || i == whole.len() - 1, "event after the end: {:?}", whole);
+                    match ev {
+                        WsEvent::Text(s) => prop_assert!(s.len() <= max),
+                        WsEvent::Binary(b) | WsEvent::Ping(b) => prop_assert!(b.len() <= max),
+                        WsEvent::Deflated { payload, .. } => {
+                            prop_assert!(deflate, "a compressed message nobody negotiated");
+                            prop_assert!(payload.len() <= max);
+                        }
+                        WsEvent::Close(code, _) => prop_assert!(*code == 1005 || valid_close_code(*code)),
+                        WsEvent::Fail(code, _) => prop_assert!(matches!(code, 1002 | 1007 | 1009)),
+                        WsEvent::Pong => {}
+                    }
+                }
+            }
+
+            /// Whatever is compressed comes back, the size limit is exact,
+            /// and one compressor and one decompressor serve message after
+            /// message (nothing carries over between them).
+            #[test]
+            fn what_is_deflated_inflates_to_itself(first in body(), second in body()) {
+                let mut deflater = Deflater::new();
+                let mut inflater = Inflater::new();
+                for message in [&first, &second, &first] {
+                    let packed = deflater.message(message);
+                    let unpacked = inflater.message(&packed, message.len());
+                    prop_assert_eq!(unpacked.as_ref(), Ok(message));
+                    if !message.is_empty() {
+                        prop_assert_eq!(
+                            inflater.message(&packed, message.len() - 1),
+                            Err((1009, "message too big"))
+                        );
+                    }
+                }
+            }
+
+            /// A compressed payload is the peer's to write. Nothing it can
+            /// hold makes the decompressor panic, spin, or hand back more
+            /// than the limit -- and the decompressor is fit for the next
+            /// message afterwards.
+            #[test]
+            fn inflating_anything_is_bounded(
+                data in vec(any::<u8>(), 0..2000),
+                max in 0usize..5000,
+            ) {
+                let mut inflater = Inflater::new();
+                match inflater.message(&data, max) {
+                    Ok(out) => prop_assert!(out.len() <= max),
+                    Err((code, _)) => prop_assert!(code == 1007 || code == 1009),
+                }
+                let packed = Deflater::new().message(b"the next message");
+                prop_assert_eq!(inflater.message(&packed, 16), Ok(b"the next message".to_vec()));
+            }
+
+            /// The same for a real message that was damaged on the way:
+            /// bytes changed, and cut short.
+            #[test]
+            fn inflating_a_damaged_message_is_bounded(
+                message in body(),
+                damage in vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
+                keep in any::<prop::sample::Index>(),
+                max in prop_oneof![Just(1usize << 20), 0usize..3000],
+            ) {
+                let mut packed = Deflater::new().message(&message);
+                if !packed.is_empty() {
+                    for (at, byte) in &damage {
+                        let at = at.index(packed.len());
+                        packed[at] = *byte;
+                    }
+                }
+                packed.truncate(keep.index(packed.len() + 1).max(packed.len() / 2));
+                let mut inflater = Inflater::new();
+                match inflater.message(&packed, max) {
+                    Ok(out) => prop_assert!(out.len() <= max),
+                    Err((code, _)) => prop_assert!(code == 1007 || code == 1009),
+                }
+            }
+
+            /// The extension header is the client's to write, too: any
+            /// bytes are answered with nothing or with one of the two
+            /// responses there are, and a window size is only echoed when
+            /// the client named one.
+            #[test]
+            fn negotiation_answers_anything_safely(
+                values in vec(prop_oneof![
+                    vec(any::<u8>(), 0..60),
+                    vec(prop::sample::select(vec![
+                        "permessage-deflate", "PERMESSAGE-DEFLATE", ";", ",", "=", " ", "\t", "\"",
+                        "client_max_window_bits", "server_max_window_bits", "client_no_context_takeover",
+                        "server_no_context_takeover", "15", "8", "7", "16", "015", "x", "",
+                    ]), 0..14).prop_map(|words| words.concat().into_bytes()),
+                ], 0..4),
+            ) {
+                let answer = negotiate_deflate(values.iter().map(Vec::as_slice));
+                if let Some(answer) = answer {
+                    let echoed = format!("{BASE}; server_max_window_bits=15");
+                    prop_assert!(answer == BASE || answer == echoed, "{}", answer);
+                    let named = values.iter().any(|v| {
+                        v.to_ascii_lowercase().windows(22).any(|w| w == b"server_max_window_bits")
+                    });
+                    prop_assert!(answer == BASE || named);
+                }
+            }
+
+            /// Every offer the documentation says is honoured, is: the
+            /// legal parameters in any order, any letter case, any legal
+            /// spacing, with or without quotes around a value.
+            #[test]
+            fn every_legal_offer_is_taken(
+                order in Just(vec![0usize, 1, 2, 3]).prop_shuffle(),
+                take in vec(any::<bool>(), 4),
+                client_bits in proptest::option::of(8u8..=15),
+                quoted in any::<bool>(),
+                upper in any::<bool>(),
+                pad in "[ \t]{0,3}",
+                before in prop::sample::select(vec!["", "x-webkit-deflate-frame, ", "permessage-deflate; mystery=1,"]),
+            ) {
+                let mut offer = format!("{before}{pad}permessage-deflate{pad}");
+                let mut wants_echo = false;
+                for which in order {
+                    if !take[which] {
+                        continue;
+                    }
+                    let param = match which {
+                        0 => "server_no_context_takeover".to_string(),
+                        1 => "client_no_context_takeover".to_string(),
+                        2 => match client_bits {
+                            Some(bits) if quoted => format!("client_max_window_bits=\"{bits}\""),
+                            Some(bits) => format!("client_max_window_bits{pad}={pad}{bits}"),
+                            None => "client_max_window_bits".to_string(),
+                        },
+                        _ => {
+                            wants_echo = true;
+                            "server_max_window_bits=15".to_string()
+                        }
+                    };
+                    offer.push_str(&format!(";{pad}{param}{pad}"));
+                }
+                let offer = if upper { offer.to_ascii_uppercase() } else { offer };
+                let answer = negotiate_deflate(std::iter::once(offer.as_bytes()));
+                let expected = if wants_echo { format!("{BASE}; server_max_window_bits=15") } else { BASE.to_string() };
+                prop_assert_eq!(answer, Some(expected), "offer {:?}", offer);
+            }
+        }
+    }
 }

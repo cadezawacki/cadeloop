@@ -467,4 +467,143 @@ mod tests {
         assert!(chunk.contains("/later"));
         assert_eq!(log.dropped, 0);
     }
+
+    /// Properties, over generated input: the target is the one field of a
+    /// record a client writes, byte for byte.
+    mod props {
+        use super::*;
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        fn line(format: Format, target: &[u8]) -> Vec<u8> {
+            let mut log = LineLog::open(None, format).unwrap();
+            log.format_line(
+                Duration::new(1_795_793_881, 123_000_000),
+                "127.0.0.1:41692",
+                "GET",
+                target,
+                200,
+                0.125,
+            );
+            log.lines
+        }
+
+        /// Targets as an attacker would write them: any bytes, with the
+        /// ones that mean something to a log line well represented.
+        fn target() -> impl Strategy<Value = Vec<u8>> {
+            vec(
+                prop_oneof![
+                    4 => any::<u8>(),
+                    2 => prop::sample::select(b"\"\\\r\n\t\x00\x1b\x7f {}:,/xu".to_vec()),
+                    2 => 0x20u8..0x7f,
+                ],
+                0..200,
+            )
+        }
+
+        /// Undo the text format's `\xNN`. None for anything it would not
+        /// have written.
+        fn unescape_text(field: &[u8]) -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut rest = field;
+            while let [b, tail @ ..] = rest {
+                match (b, tail) {
+                    (b'\\', [b'x', hi, lo, tail @ ..]) => {
+                        out.push(u8::from_str_radix(std::str::from_utf8(&[*hi, *lo]).ok()?, 16).ok()?);
+                        rest = tail;
+                    }
+                    (b'\\' | b'"', _) => return None,
+                    _ => {
+                        out.push(*b);
+                        rest = tail;
+                    }
+                }
+            }
+            Some(out)
+        }
+
+        /// Read the inside of a JSON string back to the bytes it stands
+        /// for (code points up to U+00FF, one byte each). None if it is
+        /// not the inside of a JSON string.
+        fn unescape_json(field: &[u8]) -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut rest = field;
+            while let [b, tail @ ..] = rest {
+                match (b, tail) {
+                    (b'\\', [c @ (b'"' | b'\\'), tail @ ..]) => {
+                        out.push(*c);
+                        rest = tail;
+                    }
+                    (b'\\', [b'u', b'0', b'0', hi, lo, tail @ ..]) => {
+                        out.push(u8::from_str_radix(std::str::from_utf8(&[*hi, *lo]).ok()?, 16).ok()?);
+                        rest = tail;
+                    }
+                    (b'\\' | b'"', _) => return None,
+                    _ => {
+                        out.push(*b);
+                        rest = tail;
+                    }
+                }
+            }
+            Some(out)
+        }
+
+        proptest! {
+            /// A text record is one line of printable ASCII whatever the
+            /// target holds; its fixed fields are where they always are;
+            /// and the quoted field reads back to exactly the bytes sent.
+            /// A request cannot write a second record, or a status.
+            #[test]
+            fn a_text_record_is_one_line_and_loses_nothing(target in target()) {
+                let line = line(Format::Text, &target);
+                let before = b"2026-11-27T15:38:01.123Z 127.0.0.1:41692 \"GET ";
+                let after = b"\" 200 0.12ms\n";
+                prop_assert!(line.starts_with(before) && line.ends_with(after));
+                prop_assert!(line[..line.len() - 1].iter().all(|b| (0x20..0x7f).contains(b)));
+                let field = &line[before.len()..line.len() - after.len()];
+                prop_assert_eq!(unescape_text(field), Some(target));
+            }
+
+            /// A JSON record is one line holding one object, in printable
+            /// ASCII, whatever the target holds; the target string reads
+            /// back to exactly the bytes sent, and cannot close itself to
+            /// add a key.
+            #[test]
+            fn a_json_record_is_one_object_and_loses_nothing(target in target()) {
+                let line = line(Format::Json, &target);
+                let before =
+                    b"{\"ts\":\"2026-11-27T15:38:01.123Z\",\"client\":\"127.0.0.1:41692\",\"method\":\"GET\",\"target\":\"";
+                let after = b"\",\"status\":200,\"duration_ms\":0.12}\n";
+                prop_assert!(line.starts_with(before) && line.ends_with(after));
+                prop_assert!(line[..line.len() - 1].iter().all(|b| (0x20..0x7f).contains(b)));
+                let field = &line[before.len()..line.len() - after.len()];
+                prop_assert_eq!(unescape_json(field), Some(target));
+            }
+
+            /// Any second of the next few thousand years is a real date:
+            /// the fields are in range, and counting the days back gives
+            /// the second it came from.
+            #[test]
+            fn every_second_is_a_real_date(secs in 0u64..200_000_000_000) {
+                let stamp = date_time(secs);
+                let text = std::str::from_utf8(&stamp).unwrap();
+                let num = |range: std::ops::Range<usize>| text[range].parse::<u64>().unwrap();
+                let (year, month, day) = (num(0..4), num(5..7), num(8..10));
+                let (hour, minute, second) = (num(11..13), num(14..16), num(17..19));
+                prop_assert_eq!(&text[4..5], "-");
+                prop_assert_eq!(&text[10..11], "T");
+                let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+                let lengths = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                prop_assert!((1..=12).contains(&month));
+                prop_assert!(day >= 1 && day <= lengths[month as usize - 1]);
+                prop_assert!(hour < 24 && minute < 60 && second < 60);
+                // Days since 1970, counted the slow way.
+                let mut days = (1970..year).map(|y| {
+                    if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 }
+                }).sum::<u64>();
+                days += lengths[..month as usize - 1].iter().sum::<u64>() + day - 1;
+                prop_assert_eq!(days * 86_400 + hour * 3600 + minute * 60 + second, secs);
+            }
+        }
+    }
 }
