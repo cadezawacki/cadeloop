@@ -17,6 +17,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Request headers (on `claude/sleepy-ride-p2rndm`; measured on Linux, pipelined so the kernel is out of the picture)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Perf | A request with a browser's eighteen extra headers cost twice a bare one (5.8 us of server CPU against 3.0). The parser grew every header's name and value from nothing and reallocated its header list three or four times per request; the list is now sized from the connection's previous request and each name and value gets one allocation of its exact length. 5.37 us from 5.80 with nineteen headers (-7.5%; +10% requests/s), -6% with nine, unchanged with one. A cache of the scope's `(name, value)` tuples was built first and measured slower -- 2% fewer instructions, 3-7% more CPU, since pymalloc's free list already is that cache -- and is not in the tree (ADR-39) | |
+>
 > **Native TLS for the loop's own transports (on `claude/sleepy-ride-p2rndm`; measured on Linux/epoll, one worker, 64 connections)**
 >
 > | Area | Fix | Commit |

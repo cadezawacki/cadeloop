@@ -154,6 +154,11 @@ struct Acc {
     limits: Limits,
     url: Vec<u8>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// How many headers the connection's previous request had: what the
+    /// list is sized for up front. A client repeats its header set, and a
+    /// list grown from nothing was reallocated (and its entries moved)
+    /// three or four times on the way to a browser's eighteen.
+    last_headers: usize,
     field: Vec<u8>,
     value: Vec<u8>,
     in_value: bool,
@@ -252,8 +257,20 @@ unsafe extern "C" fn on_header_field(p: *mut Llhttp, at: *const c_char, len: usi
     if a.headers.len() >= a.limits.max_headers {
         return a.fail(431, "too many headers");
     }
-    a.field.extend_from_slice(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), len) });
+    push_piece(&mut a.field, unsafe { std::slice::from_raw_parts(at.cast::<u8>(), len) });
     0
+}
+
+/// Append a piece of a header's name or value. llhttp nearly always
+/// delivers each whole, so the first piece is given exactly its size --
+/// one allocation of the right length, instead of the generic growth path
+/// starting from nothing.
+#[inline]
+fn push_piece(buf: &mut Vec<u8>, piece: &[u8]) {
+    if buf.capacity() == 0 {
+        *buf = Vec::with_capacity(piece.len());
+    }
+    buf.extend_from_slice(piece);
 }
 
 unsafe extern "C" fn on_header_value(p: *mut Llhttp, at: *const c_char, len: usize) -> c_int {
@@ -263,12 +280,16 @@ unsafe extern "C" fn on_header_value(p: *mut Llhttp, at: *const c_char, len: usi
     if a.header_bytes > a.limits.max_header_bytes {
         return a.fail(431, "headers too large");
     }
-    a.value.extend_from_slice(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), len) });
+    push_piece(&mut a.value, unsafe { std::slice::from_raw_parts(at.cast::<u8>(), len) });
     0
 }
 
 unsafe extern "C" fn on_message_begin(p: *mut Llhttp) -> c_int {
-    unsafe { acc(p) }.in_head = true;
+    let a = unsafe { acc(p) };
+    a.in_head = true;
+    if a.headers.capacity() == 0 {
+        a.headers.reserve_exact(a.last_headers.clamp(8, 64));
+    }
     0
 }
 
@@ -329,6 +350,7 @@ unsafe extern "C" fn on_message_complete(p: *mut Llhttp) -> c_int {
     // The body arrived with (or before) any interim response could matter.
     a.owes_continue = false;
     a.expecting_body = false;
+    a.last_headers = a.headers.len();
     a.completed.push_back(Request {
         method: method_name,
         upgrade,
@@ -414,6 +436,7 @@ impl HttpParser {
             limits,
             url: Vec::new(),
             headers: Vec::new(),
+            last_headers: 0,
             field: Vec::new(),
             value: Vec::new(),
             in_value: false,

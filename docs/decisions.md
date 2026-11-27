@@ -858,3 +858,39 @@ It ships off by default (`Loop(native_tls=True)`, `Config.native_tls`,
 this has none; the tests say they agree, and a release as an option is how
 that gets confirmed before it becomes what everyone runs.
 
+## ADR-39: Request headers: fewer allocations in the parser, and no object cache
+A request with a browser's header set costs twice what a bare one does:
+3.0 us of server CPU for `GET /` with a Host header alone, 5.8 us with
+eighteen more (pipelined, so the kernel is out of the picture). Counted in
+instructions, each header is about 1,100 in the engine -- llhttp's
+byte-at-a-time state machine, two `Vec`s grown from nothing for the name
+and the value, a list of them that is reallocated and moved three or four
+times on its way to nineteen entries -- and about 500 in the interpreter
+for the two `bytes` and the tuple the scope gets.
+
+The plan was to cache those three objects: a fixed-size table of recently
+seen `(name, value)` tuples, handed out again instead of rebuilt, with
+values kept only for a list of header names that carry no credentials. It
+was built and measured, and it made things slower: 2% fewer instructions,
+because the allocator calls it saved are real, and 3-7% more CPU per
+request, because what it saved was nearly free. A small `bytes` or a
+two-tuple comes off pymalloc's free list and goes back to it; the block a
+request frees is the block the next one gets, still in the first-level
+cache. A table of older objects is a set of cache lines that are not. An
+object cache has to beat an allocator that is already a perfect cache for
+this pattern, and it cannot. It is not in the tree.
+
+What is: the parser sizes its header list from the connection's previous
+request (a client repeats its header set; eight for the first request, at
+most 64 reserved), and gives each name and value one allocation of exactly
+its length instead of the generic growth path. Same data structures, same
+objects in the scope, nothing kept between requests. Nineteen headers:
+53.3k instructions a request from 56.6k, 5.37 us from 5.80 (-7.5%), and
+10% more requests a second on the pipelined benchmark; eight headers, -6%;
+one header, no change.
+
+What is left is llhttp itself, about 9 instructions per byte of request
+head. A vectorised header scanner would cut most of that, and would also
+replace the one strict, widely reviewed component that decides where a
+request ends. Not a trade to make for the difference.
+
