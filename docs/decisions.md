@@ -1228,7 +1228,7 @@ Found on the way, and fixed for every version:
 support is built on, and deprecates the policy system.
 
 ## ADR-46: RIO: work stopped; `auto` is IOCP for good
-The Registered I/O backend (ADR-9's hybrid: accepts, connects and watches
+The Registered I/O backend (ADR-23's hybrid: accepts, connects and watches
 on IOCP, receives and sends through per-socket request queues) is
 implemented, unit-tested where it is pure bookkeeping, and
 compile-checked for Windows. What it never got is a Windows machine it
