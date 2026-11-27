@@ -746,6 +746,22 @@ def _paused_set_protocol(trace):
     return None
 
 
+def _without_the_stuck_buffers_pauses(trace):
+    """A 3.12 asyncio trace without the pause_writing/resume_writing its
+    dead transport's stuck buffer causes (see `_reconcile`)."""
+    out = []
+    lost = stuck = False
+    for ev in trace:
+        if ev[0].endswith("connection_lost"):
+            lost = True
+        elif lost and ev == ("call", "writelines"):
+            stuck = True
+        if stuck and ev[0].endswith(("pause_writing", "resume_writing")):
+            continue
+        out.append(ev)
+    return out
+
+
 def _without_flow_control_after(trace, index):
     return [ev for i, ev in enumerate(trace)
             if i <= index or not ev[0].endswith(("pause_writing", "resume_writing"))]
@@ -809,7 +825,11 @@ def _reconcile(ours, theirs):
       then reports that size for good. (An early 3.12 clears the method
       in close() instead, so there a transport lost to an error gets the
       stuck buffer without the TypeError.) 3.11 and 3.13 drop the data
-      silently, and so does cadeloop on all three.
+      silently, and so does cadeloop on all three. The stuck buffer has
+      two more echoes: abort() finds "unsent data" to throw away on a
+      connection that was lost long before, and a later
+      set_write_buffer_limits() below its size calls pause_writing() on
+      whatever protocol the dead transport holds. Both are left out.
     """
     marks = [[ev[1] for ev in trace if ev[0] == "peer_shut_with_unsent_data"] for trace in (ours, theirs)]
     cut_short = [x or y for x, y in zip(*marks, strict=False)]
@@ -845,6 +865,8 @@ def _reconcile(ours, theirs):
     ours = [peer_record(ev) for ev in ours]
     theirs = [peer_record(ev) for ev in theirs]
 
+    if sys.version_info[:2] == (3, 12):
+        theirs = _without_the_stuck_buffers_pauses(theirs)
     lost = gone = stuck_buffer = False
     for i, ev in enumerate(theirs):
         if ev[0].endswith("connection_lost"):
@@ -859,7 +881,9 @@ def _reconcile(ours, theirs):
             writelines_312 = lost_writelines_312 and ev == ("raised", "TypeError")
             dead_socket = gone and ev == ("raised", "OSError") and theirs[i - 1] == ("call", "write_eof")
             stuck_buffer = stuck_buffer or lost_writelines_312
-            stuck_size = stuck_buffer and ev[0] == "returned" and theirs[i - 1] == ("call", "buffer_size")
+            stuck_size = (
+                stuck_buffer and ev[0] == "returned" and theirs[i - 1][1] in ("buffer_size", "abort")
+            )
             if stdlib_accident or writelines_312 or stuck_size or dead_socket:
                 theirs[i] = ours[i]
     return ours, theirs
