@@ -1538,6 +1538,84 @@ def test_set_protocol_does_not_carry_a_pause_over(cade_loop):
     loop.run_until_complete(main())
 
 
+def test_resume_writing_comes_before_a_close_that_finds_the_queue_drained(loop):
+    """What sslproto's shutdown does under backpressure, without TLS: a
+    write large enough to pause the protocol, close() one callback later,
+    and a trailer written from resume_writing() -- sslproto's close_notify,
+    which it holds back while paused. The peer empties its socket between
+    the write and the close, so the rest of the queue leaves the moment it
+    is next offered and close() finds nothing left to wait for.
+
+    asyncio calls resume_writing from the write that drained the buffer,
+    before anything else can look at the transport. cadeloop delivers it as
+    an event a moment later, and a close() arriving in between took the
+    transport for idle and tore it down: the protocol was never resumed
+    and the trailer never sent. Over TLS that is a session ended by a bare
+    FIN, which a strict client reports as truncation -- one run in fifteen
+    of test_tls_close_notify_survives_write_backpressure on a busy machine,
+    every run here."""
+    size = 4 << 20
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    received = bytearray()
+
+    def drain(peer, quiet):
+        """Read until nothing has arrived for `quiet` seconds."""
+        last = time.monotonic()
+        while time.monotonic() - last < quiet:
+            try:
+                chunk = peer.recv(1 << 20)
+            except BlockingIOError:
+                time.sleep(0.0002)
+                continue
+            received.extend(chunk)
+            last = time.monotonic()
+
+    class Sender(asyncio.Protocol):
+        def __init__(self):
+            self.events = []
+            self.lost = loop.create_future()
+
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def pause_writing(self):
+            self.events.append("pause")
+
+        def resume_writing(self):
+            self.events.append("resume")
+            self.transport.write(b"TRAILER")
+
+        def connection_lost(self, exc):
+            self.events.append("lost")
+            self.lost.set_result(exc)
+
+    async def main():
+        transport, proto = await loop.create_connection(Sender, "127.0.0.1", listener.getsockname()[1])
+        peer, _ = listener.accept()
+        peer.setblocking(False)
+        transport.write(b"x" * size)
+        assert proto.events == ["pause"], "the write was meant to fill the socket"
+        drain(peer, 0.002)
+        loop.call_soon(transport.close)  # as sslproto's _on_shutdown_complete does
+        assert await asyncio.wait_for(proto.lost, 10) is None
+        peer.setblocking(True)
+        peer.settimeout(10)
+        while chunk := peer.recv(1 << 20):
+            received.extend(chunk)
+        peer.close()
+        return proto
+
+    try:
+        proto = loop.run_until_complete(main())
+    finally:
+        listener.close()
+    assert proto.events == ["pause", "resume", "lost"]
+    assert len(received) == size + 7
+    assert bytes(received[-7:]) == b"TRAILER"
+
+
 # --------------------------------------------------------------------- #
 # 17. resolution                                                        #
 # --------------------------------------------------------------------- #

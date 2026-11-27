@@ -310,6 +310,13 @@ pub(crate) struct TransportEntry {
     low_water: usize,
     reading_paused: bool,
     proto_paused: bool,
+    /// A `ResumeWriting` event for this transport is queued and not yet
+    /// dispatched. asyncio calls resume_writing from the write that
+    /// drained the buffer, so by the time anything else looks at the
+    /// transport the protocol has had its say; here the call waits for
+    /// the event, and until it has been made the transport must not be
+    /// taken for idle (see `maybe_finish_shutdown`).
+    resume_pending: bool,
     closing: bool,
     conn_lost: bool,
     eof_wanted: bool,
@@ -1094,6 +1101,19 @@ fn settle_own_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid
 fn maybe_finish_shutdown(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, tid: u64, drained: bool) {
     let Some(entry) = net.transports.get_mut(&tid) else { return };
     if entry.send_op.is_some() || !entry.wq.is_empty() || entry.conn_lost {
+        return;
+    }
+    if entry.resume_pending {
+        // The queue is empty, but the protocol has not yet been told it
+        // may write again, and what it writes then still belongs ahead of
+        // the close: sslproto's close_notify, held back while the
+        // transport was over its high-water mark, goes out exactly there.
+        // A close() that found the queue drained in this window tore the
+        // transport down as idle and the TLS session ended with a bare
+        // FIN -- one run in fifteen of the parity test on a loaded
+        // machine, whenever the last send completed inside close()'s own
+        // settle or just before it. The event's dispatch finishes the job
+        // (`finish_after_resume`).
         return;
     }
     if entry.eof_wanted && !entry.eof_sent {
@@ -3193,6 +3213,7 @@ fn on_send_done(
         entry.proto_paused = false;
         if let ProtoKind::Py(p) = &entry.proto {
             let resume_writing = p.resume_writing.clone_ref(py);
+            entry.resume_pending = true;
             net.events.push(NetEvent::ResumeWriting { tid, resume_writing });
             resuming = true;
         }
@@ -3555,11 +3576,13 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                 // and not to a protocol set_protocol() installed since,
                 // which starts unpaused. (A closing transport still gets
                 // it while its output drains, as in asyncio.)
-                let owed = core.with_net(|net, _| match net.transports.get(&tid) {
-                    Some(e) if !e.conn_lost => {
-                        matches!(&e.proto, ProtoKind::Py(p) if p.resume_writing.is(&resume_writing))
+                let owed = core.with_net(|net, _| match net.transports.get_mut(&tid) {
+                    Some(e) => {
+                        e.resume_pending = false;
+                        !e.conn_lost
+                            && matches!(&e.proto, ProtoKind::Py(p) if p.resume_writing.is(&resume_writing))
                     }
-                    _ => false,
+                    None => false,
                 })?;
                 let res = if owed {
                     report_flow_control_error(py, core, tid, resume_writing.call0(py), RESUME_WRITING_FAILED)
@@ -4093,6 +4116,7 @@ pub(crate) fn wire_stream(
                 low_water: low,
                 reading_paused: false,
                 proto_paused: false,
+                resume_pending: false,
                 closing: false,
                 conn_lost: false,
                 eof_wanted: false,
@@ -4185,6 +4209,7 @@ pub(crate) fn wire_http(
                 low_water: low,
                 reading_paused: false,
                 proto_paused: false,
+                resume_pending: false,
                 closing: false,
                 conn_lost: false,
                 eof_wanted: false,
