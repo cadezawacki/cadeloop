@@ -165,32 +165,40 @@ def summarize(runs: list[dict], key: str) -> dict:
     }
 
 
-def bench_sched(loops: list[str], scale: int) -> dict:
+def bench_sched(loops: list[str], scale: int, measured: int = MEASURED) -> dict:
+    """Each benchmark on each loop, a fresh process per run.
+
+    The loops take turns: one run of each per round, the order rotated a
+    place every round, so that a machine that speeds up or slows down
+    while a benchmark is being measured does so for all of them and not
+    for whichever loop's runs happened to come last."""
     results: dict = {}
     for bench in SCHED_BENCHES:
-        results[bench] = {}
-        for loop in loops:
-            runs = []
-            failed = False
-            for i in range(WARMUP + MEASURED):
+        runs: dict[str, list] = {loop: [] for loop in loops}
+        failed: set[str] = set()
+        for i in range(WARMUP + measured):
+            for loop in loops[i % len(loops):] + loops[: i % len(loops)]:
+                if loop in failed:
+                    continue
                 cmd = [sys.executable, str(SCHED), "--loop", loop, "--bench", bench]
                 if scale:
                     cmd += ["--scale", str(scale)]
                 r = run_json(cmd)
                 if r is None:
-                    failed = True
-                    break
-                if i >= WARMUP:
-                    runs.append(r["ops_per_sec"])
-            if failed:
+                    failed.add(loop)
+                elif i >= WARMUP:
+                    runs[loop].append(r["ops_per_sec"])
+        results[bench] = {}
+        for loop in loops:
+            if loop in failed:
                 print(f"  {bench:24s} {loop:10s} FAILED", flush=True)
                 results[bench][loop] = None
                 continue
             entry = {
-                "median_ops_per_sec": statistics.median(runs),
-                "min": min(runs),
-                "max": max(runs),
-                "runs": runs,
+                "median_ops_per_sec": statistics.median(runs[loop]),
+                "min": min(runs[loop]),
+                "max": max(runs[loop]),
+                "runs": runs[loop],
             }
             results[bench][loop] = entry
             print(
@@ -322,12 +330,18 @@ def main() -> int:
     parser.add_argument("--msgs", type=int, default=2000)
     parser.add_argument("--seconds", type=float, default=3.0)
     parser.add_argument("--out", default="bench-results.json")
+    parser.add_argument(
+        "--measured", type=int, default=MEASURED,
+        help="sched: measured runs per benchmark and loop (default 5; 9 gives a 96%% interval "
+             "for the median that survives one stray run on either side)",
+    )
     args = parser.parse_args()
 
     loops = [x.strip() for x in args.loops.split(",") if x.strip()]
-    print(f"suite={args.suite} warmup={WARMUP} measured={MEASURED}")
+    measured = args.measured if args.suite == "sched" else MEASURED
+    print(f"suite={args.suite} warmup={WARMUP} measured={measured}")
     if args.suite == "sched":
-        results = bench_sched(loops, args.scale)
+        results = bench_sched(loops, args.scale, measured)
     elif args.suite == "echo":
         results = bench_echo(loops, args.conns, args.size, args.msgs)
     else:
@@ -339,7 +353,7 @@ def main() -> int:
         "python": sys.version,
         "platform": sys.platform,
         "warmup": WARMUP,
-        "measured": MEASURED,
+        "measured": measured,
         "params": {
             "conns": args.conns,
             "size": args.size,

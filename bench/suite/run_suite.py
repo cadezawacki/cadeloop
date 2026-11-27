@@ -14,6 +14,24 @@ is a launcher whose CHILD is the interpreter, and spawn-model workers are
 grandchildren. Contender order rotates every rep. Every run is one JSON
 line in DIR/runs.jsonl, kept whole (histograms included): nothing is
 averaged away here; report.py aggregates.
+
+Suites: http, ws, tls, echo (the bare ASGI app and a bare protocol), app
+(the FastAPI app: JSON, a sync handler, file responses), log (plaintext
+with each server's access log on), tlsecho (TLS at the loop level), idle,
+overload.
+
+How much the numbers can be trusted is measured, not assumed:
+
+* `--pkg control=DIR --pkg candidate=DIR` with the SAME directory runs
+  one build under two names. Whatever separates the two is the suite's
+  own resolution on this machine, and report.py prints it.
+* `--reps` is the number of fresh-process runs per cell; report.py turns
+  them into a confidence interval for the median. `--rep-offset` continues
+  the numbering and the rotation when a session is run in several pieces.
+* Every run records the time the hypervisor took from this VM while it
+  ran (`steal`), and the load generator's own CPU time, so a run that was
+  disturbed, or one limited by the load generator and not by the server,
+  can be told apart from a slow server.
 """
 
 from __future__ import annotations
@@ -119,6 +137,26 @@ HTTP_WORKLOADS = [
 ]
 
 
+# The FastAPI app (fapp.py), on every HTTP contender.
+APP_WORKLOADS = [
+    ("fastapi-json-c64", ["-path", "/model", "-c", "64"]),
+    ("fastapi-sync-c64", ["-path", "/sync", "-c", "64"]),
+    ("fastapi-file64k-c64", ["-path", "/file64k", "-c", "64", "-expect-len", "65536"]),
+    ("fastapi-file1m-c16", ["-path", "/file1m", "-c", "16", "-expect-len", "1048576"]),
+]
+
+
+def host_steal() -> float | None:
+    """Seconds of CPU the hypervisor has withheld from this machine since
+    boot (Linux guests; None elsewhere)."""
+    try:
+        with open("/proc/stat") as f:
+            fields = f.readline().split()
+        return int(fields[8]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError, AttributeError):
+        return None
+
+
 # ---- server lifecycle ------------------------------------------------------
 
 class Server:
@@ -157,6 +195,15 @@ class Server:
             if self.probe == "echo":
                 s.sendall(b"ping")
                 return s.recv(16) == b"ping"
+            if self.probe == "tlsecho":
+                import ssl
+
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with ctx.wrap_socket(s) as tls:
+                    tls.sendall(b"ping")
+                    return tls.recv(16) == b"ping"
             if self.tls:
                 import ssl
 
@@ -194,6 +241,10 @@ class Server:
 LOADGEN = None
 # Extra loadgen flags for every run (--loadgen-procs).
 LOADGEN_ARGS: list[str] = []
+LOADGEN_PROCS = 0
+# Added to every rep number: the numbering and the rotation continue
+# across the invocations of one session (--rep-offset).
+REP_OFFSET = 0
 OUT = None
 
 
@@ -212,11 +263,14 @@ def run_load(server: Server, args, duration, warmup, extra_meta):
     tcp0 = procstat.tcp_stats()
     th = threading.Thread(target=sample, daemon=True)
     cmd = [LOADGEN, "-port", str(server.port), "-d", str(duration), "-warmup", str(warmup), *LOADGEN_ARGS, *args]
+    steal0 = host_steal()
     t0 = time.perf_counter()
     th.start()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + warmup + 60)
     stop.set()
     th.join()
+    wall = time.perf_counter() - t0
+    steal1 = host_steal()
     tcp1 = procstat.tcp_stats()
     res = None
     if "RESULT " in proc.stdout:
@@ -229,7 +283,12 @@ def run_load(server: Server, args, duration, warmup, extra_meta):
         "loadgen_exit": proc.returncode,
         "loadgen_stderr": proc.stderr[-2000:],
         "server_alive_after": server.alive(),
-        "wall_s": time.perf_counter() - t0,
+        "wall_s": wall,
+        # Share of the machine's CPU time the hypervisor withheld while
+        # this run was going: a disturbed run announces itself here.
+        "steal_pct": (steal1 - steal0) / (wall * (os.cpu_count() or 1)) * 100
+        if steal0 is not None and steal1 is not None and wall > 0 else None,
+        "loadgen_procs": LOADGEN_PROCS or None,
         "tcp_delta": {k: tcp1[k] - tcp0[k] for k in ("InSegs", "OutSegs", "RetransSegs", "EstabResets", "AttemptFails")},
         "tcp_after": {k: tcp1[k] for k in ("CurrEstab", "NumConns")},
         "samples": samples,
@@ -287,20 +346,60 @@ def with_server(label, args, pkg, kind, probe, tls, fn):
 
 # ---- suites ----------------------------------------------------------------
 
-def suite_http(pkgs, reps, dur, warm, workloads=None):
-    cons = http_contenders(pkgs)
-    wl = [w for w in HTTP_WORKLOADS if not workloads or w[0] in workloads]
-    for rep in range(reps):
+def run_matrix(suite, cons, workloads, reps, dur, warm, *, mode, kind="http", probe="http", tls=None):
+    """Every workload against every contender, `reps` times: a fresh
+    server per (contender, rep), its workloads back to back, and the
+    order of contenders rotated one place each rep."""
+    if not cons or not workloads:
+        return
+    for rep in range(REP_OFFSET, REP_OFFSET + reps):
         order = cons[rep % len(cons):] + cons[:rep % len(cons)]
-        print(f"[http rep {rep}]", flush=True)
+        print(f"[{suite} rep {rep}]", flush=True)
         for label, args, pkg in order:
-            def body(s, mem0, label=label):
-                for name, la in wl:
+            def body(s, mem0, rep=rep):
+                for name, la in workloads:
                     if not s.alive():
                         break
-                    run_load(s, ["-mode", "http", *la], dur, warm,
-                             {"suite": "http", "workload": name, "rep": rep, "mem_idle": mem0})
-            with_server(label, args, pkg, "http", "http", None, body)
+                    run_load(s, ["-mode", mode, *la], dur, warm,
+                             {"suite": suite, "workload": name, "rep": rep, "mem_idle": mem0})
+            with_server(label, args, pkg, kind, probe, tls, body)
+
+
+def suite_http(pkgs, reps, dur, warm, workloads=None):
+    wl = [w for w in HTTP_WORKLOADS if not workloads or w[0] in workloads]
+    run_matrix("http", http_contenders(pkgs), wl, reps, dur, warm, mode="http")
+
+
+def suite_app(pkgs, reps, dur, warm, workloads=None):
+    """The FastAPI app on every HTTP contender."""
+    cons = [(label, [*args, "--app", "fapp"], pkg) for label, args, pkg in http_contenders(pkgs)]
+    wl = [w for w in APP_WORKLOADS if not workloads or w[0] in workloads]
+    run_matrix("app", cons, wl, reps, dur, warm, mode="http")
+
+
+def suite_log(pkgs, reps, dur, warm):
+    """Plaintext with the access log on: each server's own, written the
+    way it writes it by default (stdout, which the runner sends to a
+    file), and cadeloop's two -- the native one to a file, and the one
+    through Python's `logging`."""
+    cons = []
+    for label, args, pkg in http_contenders(pkgs):
+        if label.startswith("cadeloop["):
+            path = os.path.join(OUT, f"access-{label[9:-1]}.log")
+            cons.append((label, [*args, "--access-log", path], pkg))
+        else:
+            cons.append((label, [*args, "--access-log", "stdout"], pkg))
+    if not CADELOOP_ONLY or ONLY:
+        cand = pkgs.get("candidate", next(iter(pkgs.values())))
+        cons.insert(len(pkgs), ("cadeloop+logging", ["--impl", "cadeloop", "--pylog"], cand))
+        cons = only(cons)
+    wl = [("log-plaintext-c64", ["-path", "/", "-c", "64", "-expect-body", "Hello, World!"])]
+    run_matrix("log", cons, wl, reps, dur, warm, mode="http")
+    # A log is rewritten by every fresh server of a contender; what the
+    # last one left is of no further use.
+    for name in os.listdir(OUT):
+        if name.startswith("access-") and name.endswith(".log"):
+            os.remove(os.path.join(OUT, name))
 
 
 def suite_tls(pkgs, reps, dur, warm, cert):
@@ -309,17 +408,9 @@ def suite_tls(pkgs, reps, dur, warm, cert):
     cons += [("uvicorn+asyncio", ["--impl", "uvicorn", "--loop", "asyncio"], cand),
              (f"uvicorn+{ALT_LOOP}", ["--impl", "uvicorn", "--loop", ALT_LOOP], cand)]
     cons += linux_extras(cand)
-    cons = only(cons)
     wl = [("tls-plaintext-c64", ["-path", "/", "-c", "64", "-tls", "-expect-len", "13"]),
           ("tls-churn-c16", ["-path", "/", "-c", "16", "-tls", "-churn", "-expect-len", "13"])]
-    for rep in range(reps):
-        print(f"[tls rep {rep}]", flush=True)
-        for label, args, pkg in cons[rep % len(cons):] + cons[:rep % len(cons)]:
-            def body(s, mem0):
-                for name, la in wl:
-                    run_load(s, ["-mode", "http", *la], dur, warm,
-                             {"suite": "tls", "workload": name, "rep": rep, "mem_idle": mem0})
-            with_server(label, args, pkg, "http", "http", cert, body)
+    run_matrix("tls", only(cons), wl, reps, dur, warm, mode="http", tls=cert)
 
 
 def suite_ws(pkgs, reps, dur, warm):
@@ -329,39 +420,42 @@ def suite_ws(pkgs, reps, dur, warm):
              (f"uvicorn+{ALT_LOOP}", ["--impl", "uvicorn", "--loop", ALT_LOOP], cand),
              ("hypercorn+asyncio", ["--impl", "hypercorn", "--loop", "asyncio"], cand)]
     cons += linux_extras(cand)
-    cons = only(cons)
-    wl = [("ws-64b-c1", ["-c", "1", "-size", "64"]),
-          ("ws-64b-c64", ["-c", "64", "-size", "64"]),
-          ("ws-16k-c16", ["-c", "16", "-size", "16384"]),
-          ("ws-stream-1k-w32-c16", ["-c", "16", "-size", "1024", "-window", "32"])]
-    for rep in range(reps):
-        print(f"[ws rep {rep}]", flush=True)
-        for label, args, pkg in cons[rep % len(cons):] + cons[:rep % len(cons)]:
-            def body(s, mem0):
-                for name, la in wl:
-                    run_load(s, ["-mode", "ws", "-path", "/ws", *la], dur, warm,
-                             {"suite": "ws", "workload": name, "rep": rep, "mem_idle": mem0})
-            with_server(label, args, pkg, "http", "http", None, body)
+    wl = [("ws-64b-c1", ["-path", "/ws", "-c", "1", "-size", "64"]),
+          ("ws-64b-c64", ["-path", "/ws", "-c", "64", "-size", "64"]),
+          ("ws-16k-c16", ["-path", "/ws", "-c", "16", "-size", "16384"]),
+          ("ws-256k-c8", ["-path", "/ws", "-c", "8", "-size", "262144"]),
+          ("ws-stream-1k-w32-c16", ["-path", "/ws", "-c", "16", "-size", "1024", "-window", "32"])]
+    run_matrix("ws", only(cons), wl, reps, dur, warm, mode="ws")
 
 
-def suite_echo(pkgs, reps, dur, warm):
+def echo_contenders(pkgs):
     cons = [(f"cadeloop[{n}]", ["--loop", "cadeloop"], p) for n, p in pkgs.items()]
     anyp = next(iter(pkgs.values()))
     loops = ("asyncio", "winloop", "rsloop") if WINDOWS else ("asyncio", "uvloop", "rloop", "rsloop")
-    cons += [(f"{l}", ["--loop", l], anyp) for l in loops]
-    cons = only(cons)
+    return cons + [(f"{l}", ["--loop", l], anyp) for l in loops]
+
+
+def suite_echo(pkgs, reps, dur, warm):
     wl = [("echo-1k-c1", ["-c", "1", "-size", "1024"]),
           ("echo-1k-c64", ["-c", "64", "-size", "1024"]),
           ("echo-1k-w16-c64", ["-c", "64", "-size", "1024", "-window", "16"]),
           ("echo-64k-c8", ["-c", "8", "-size", "65536"])]
-    for rep in range(reps):
-        print(f"[echo rep {rep}]", flush=True)
-        for label, args, pkg in cons[rep % len(cons):] + cons[:rep % len(cons)]:
-            def body(s, mem0):
-                for name, la in wl:
-                    run_load(s, ["-mode", "echo", *la], dur, warm,
-                             {"suite": "echo", "workload": name, "rep": rep, "mem_idle": mem0})
-            with_server(label, args, pkg, "echo", "echo", None, body)
+    run_matrix("echo", only(echo_contenders(pkgs)), wl, reps, dur, warm, mode="echo", kind="echo", probe="echo")
+
+
+def suite_tlsecho(pkgs, reps, dur, warm, cert):
+    """TLS at the loop level: the same echo protocol behind
+    `create_server(ssl=...)` on every loop -- what a database driver's or
+    an HTTP client's TLS connections ride on. cadeloop twice: the standard
+    library's sslproto on its transports (the default), and its native
+    port of it (`native_tls=True`)."""
+    # rloop is left out: its create_server() does not take ssl=.
+    cons = [c for c in echo_contenders(pkgs) if c[0] != "rloop"]
+    cand = pkgs.get("candidate", next(iter(pkgs.values())))
+    cons.insert(len(pkgs), ("cadeloop+native-tls", ["--loop", "cadeloop", "--native-tls"], cand))
+    wl = [("tlsecho-1k-c64", ["-c", "64", "-size", "1024", "-tls"]),
+          ("tlsecho-16k-c16", ["-c", "16", "-size", "16384", "-tls"])]
+    run_matrix("tlsecho", only(cons), wl, reps, dur, warm, mode="echo", kind="echo", probe="tlsecho", tls=cert)
 
 
 def suite_idle(pkgs, counts):
@@ -452,10 +546,15 @@ def main():
     ap.add_argument("--loadgen-procs", type=int, default=0,
                     help="cap the load generator's OS threads (GOMAXPROCS); 0 leaves Go's default. "
                          "On a small machine this keeps it from taking the server's cores.")
+    ap.add_argument("--rep-offset", type=int, default=0,
+                    help="number the reps from here: continues a session run in several pieces "
+                         "(same --out), rotation included")
     a = ap.parse_args()
-    global CADELOOP_ONLY
+    global CADELOOP_ONLY, LOADGEN_PROCS, REP_OFFSET
     LOADGEN = a.loadgen
+    REP_OFFSET = a.rep_offset
     if a.loadgen_procs:
+        LOADGEN_PROCS = a.loadgen_procs
         LOADGEN_ARGS.extend(["-procs", str(a.loadgen_procs)])
     OUT = a.out
     CADELOOP_ONLY = a.cadeloop_only
@@ -470,7 +569,15 @@ def main():
         ident = os.path.join(p, "IDENTITY.txt")
         meta["pkgs"][n] = {"path": p, "identity": open(ident).read() if os.path.exists(ident) else None}
     meta["versions"] = contender_versions()
-    with open(os.path.join(OUT, "meta.json"), "w") as f:
+    # One meta.json per session: a later piece of it (--rep-offset) adds
+    # its command line and leaves the rest as the first piece wrote it.
+    meta_path = os.path.join(OUT, "meta.json")
+    if a.rep_offset and os.path.exists(meta_path):
+        with open(meta_path) as f:
+            first = json.load(f)
+        first.setdefault("argv_continued", []).append(sys.argv)
+        meta = first
+    with open(meta_path, "w") as f:
         json.dump(meta, f, indent=1)
     wl = [w for w in a.workloads.split(",") if w]
     for suite in a.suite.split(","):
@@ -482,10 +589,18 @@ def main():
             suite_ws(pkgs, a.reps, a.duration, a.warmup)
         elif suite == "tls":
             suite_tls(pkgs, a.reps, a.duration, a.warmup, a.cert)
+        elif suite == "app":
+            suite_app(pkgs, a.reps, a.duration, a.warmup, wl)
+        elif suite == "log":
+            suite_log(pkgs, a.reps, a.duration, a.warmup)
+        elif suite == "tlsecho":
+            suite_tlsecho(pkgs, a.reps, a.duration, a.warmup, a.cert)
         elif suite == "idle":
             suite_idle(pkgs, [int(x) for x in a.idle_counts.split(",")])
         elif suite == "overload":
             suite_overload(pkgs, a.overload_contenders.split(","))
+        else:
+            raise SystemExit(f"unknown suite {suite!r}")
 
 
 if __name__ == "__main__":

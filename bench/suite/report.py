@@ -5,9 +5,26 @@
       [--timers TIMERS.json] [--sched SCHED.json] [--platform windows|linux]
 
 Percentiles are taken from the MERGED histogram of every rep's
-observations, never averaged across reps. Throughput is the median rep;
-its min-max spread is kept so noise is visible. Server CPU per operation
-is the median rep's (user + kernel) over the measured window.
+observations, never averaged across reps. Throughput is the median rep.
+Server CPU per operation is the median rep's (user + kernel) over the
+measured window.
+
+How far a number can be trusted is reported with it:
+
+* Every median comes with a confidence interval (`median_ci`): the
+  distribution-free one from the order statistics of the reps, at 95% or
+  better when there are enough reps to reach it (six), and the whole
+  range with its true, lower coverage when there are not.
+* A table's places are shared when two intervals overlap: the runs have
+  not told those two apart (`tables.mark_ranks`).
+* When the runs include the same build under two names
+  (`cadeloop[control]` and `cadeloop[candidate]`), the differences between
+  the two are reported as the suite's resolution: no difference between
+  two servers smaller than that means anything.
+* A cell is flagged when the load generator used 90% or more of the CPU
+  it was allowed, since the number is then the load generator's limit,
+  not the server's; and each cell carries the most CPU time the
+  hypervisor withheld during any of its runs.
 """
 
 from __future__ import annotations
@@ -48,6 +65,9 @@ COLORS = {
         "uvicorn[standard]": "#2a78d6",
         "granian": "#b8338a",
         "rloop": "#eda100",
+        # TLS at the loop level: cadeloop's native TLS takes the blue
+        # (uvicorn[standard] is never in a loop chart).
+        "cadeloop, native TLS": "#2a78d6",
     },
     "dark": {
         "cadeloop": "#1aa39a",
@@ -64,11 +84,18 @@ COLORS = {
         "uvicorn[standard]": "#3987e5",
         "granian": "#d661ad",
         "rloop": "#c98500",
+        "cadeloop, native TLS": "#3987e5",
     },
 }
 
 # Raw run labels -> what the published tables call them.
-DISPLAY = {"cadeloop[candidate]": "cadeloop", "cadeloop[baseline]": "cadeloop 1.0.1"}
+DISPLAY = {"cadeloop[candidate]": "cadeloop", "cadeloop[baseline]": "cadeloop 1.0.1",
+           "cadeloop[control]": "cadeloop (control)", "cadeloop+native-tls": "cadeloop, native TLS",
+           "cadeloop+logging": "cadeloop, logging module"}
+
+# A load generator at or above this share of the CPU it was allowed is the
+# limit of the run, not the server.
+CLIENT_LIMITED = 0.90
 
 
 def disp(server):
@@ -95,6 +122,39 @@ def quantile(hist: dict, q: float) -> float:
         if seen >= rank:
             return upper / 1e3
     return max(hist) / 1e3
+
+
+def median_ci(values, level=0.95):
+    """A confidence interval for the median of the population `values`
+    were drawn from: (low, high, coverage).
+
+    Distribution-free. Between the k-th smallest and the k-th largest of n
+    independent runs the true median lies with probability
+    1 - 2 * P(Binomial(n, 1/2) <= k - 1), whatever the runs' distribution
+    -- no normality, which throughput on a shared machine does not have.
+    The narrowest such pair whose coverage is at least `level` is returned:
+    [x2, x8] of nine runs (96.1%), the whole range of six (96.9%). Fewer
+    than six runs cannot reach 95%; then it is the whole range, with the
+    coverage it really has (75% for three), so nothing is overstated.
+    """
+    xs = sorted(values)
+    n = len(xs)
+    if n < 2:
+        return (xs[0], xs[0], 0.0) if xs else (None, None, 0.0)
+    best = (xs[0], xs[-1], 1 - 2 * 0.5 ** n)
+    below = 0.0  # P(Binomial(n, 1/2) <= k - 1)
+    for k in range(1, n // 2 + 1):
+        below += math.comb(n, k - 1) * 0.5 ** n
+        cover = 1 - 2 * below
+        if cover < level:
+            break
+        best = (xs[k - 1], xs[n - k], cover)
+    return best
+
+
+def _ci(values):
+    lo, hi, _cover = median_ci(values)
+    return [lo, hi]
 
 
 def aggregate(runs):
@@ -129,9 +189,31 @@ def aggregate(runs):
                     server_closes += v
                     continue
                 errors[k] += v
+        lo, hi, cover = median_ci(rates)
+        # The load generator's CPU over the measured window, as a share of
+        # what it was allowed (its thread cap, else the machine).
+        client = []
+        for r in rs:
+            res = r["result"]
+            spent = sum((res.get("client_cpu_s") or {}).values())
+            procs = r.get("loadgen_procs") or res.get("config", {}).get("procs") or 0
+            if procs and res.get("measured_s"):
+                client.append(spent / (procs * res["measured_s"]))
+        steal = [r["steal_pct"] for r in rs if r.get("steal_pct") is not None]
+        peaks = [r["server_mem_peak"]["private"] / 2**20 for r in rs if r.get("server_mem_peak")]
         out.append({
             "suite": suite, "workload": wl, "server": server, "reps": len(rs),
             "rate_median": statistics.median(rates), "rate_min": min(rates), "rate_max": max(rates),
+            "rates": sorted(rates), "rate_ci_lo": lo, "rate_ci_hi": hi, "rate_ci_level": cover,
+            "rate_cv_pct": statistics.stdev(rates) / statistics.mean(rates) * 100 if len(rates) > 1 else None,
+            "p50_ci_us": _ci([r["result"]["latency_us"]["p50"] for r in rs]),
+            "p99_ci_us": _ci([r["result"]["latency_us"]["p99"] for r in rs]),
+            "p999_ci_us": _ci([r["result"]["latency_us"]["p999"] for r in rs]),
+            "cpu_ci_us_per_op": _ci([c["us_per_op"] for c in cpu]) if cpu else None,
+            "peak_private_ci_mib": _ci(peaks) if peaks else None,
+            "client_util": statistics.median(client) if client else None,
+            "client_limited": bool(client) and statistics.median(client) >= CLIENT_LIMITED,
+            "steal_pct_max": max(steal) if steal else None,
             "p50_us": quantile(hist, 0.5), "p99_us": quantile(hist, 0.99), "p999_us": quantile(hist, 0.999),
             "max_us": max(r["result"]["latency_us"]["max"] for r in rs),
             "ok_total": sum(r["result"]["ok"] for r in rs),
@@ -190,35 +272,98 @@ def us(v):
     return f"{v / 1e3:.2f} ms" if v >= 1000 else f"{v:.0f} µs"
 
 
+def ci_label(rows):
+    """What the interval column is: "96% CI" when every cell reached it,
+    "range" (with the coverage it has) when the runs were too few."""
+    covers = sorted({round(r["rate_ci_level"] * 100) for r in rows if r.get("reps", 0) > 1})
+    if not covers:
+        return "range"
+    if covers[0] >= 95:
+        return f"{covers[0]}% CI" if len(covers) == 1 else f"≥{covers[0]}% CI"
+    return f"range ({covers[0]}% CI)" if len(covers) == 1 else "range"
+
+
 def table(rows, suite, workloads, servers):
     lines = []
     for wl in workloads:
-        sel = [r for r in rows if r["suite"] == suite and r["workload"] == wl]
-        sel.sort(key=lambda r: servers.index(r["server"]) if r["server"] in servers else 99)
+        sel = [r for r in rows if r["suite"] == suite and r["workload"] == wl and r["server"] in servers]
+        sel.sort(key=lambda r: servers.index(r["server"]))
         if not sel:
             continue
         lines.append(f"\n**{wl}**\n")
-        lines.append("| server | per s (median, min–max) | p50 | p99 | p99.9 | server CPU / op "
-                     "| peak private | handles | threads | errors |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        lines.append(f"| server | per s (median) | {ci_label(sel)} | runs | p50 | p99 | p99.9 | server CPU / op "
+                     "| peak private | handles | threads | errors | notes |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r in sel:
-            if r["server"] not in servers:
-                continue
             cpu = r["server_cpu_us_per_op"]
             peak = r["server_peak_private_mib"]
+            notes = []
+            if r.get("client_limited"):
+                notes.append(f"load generator at {r['client_util'] * 100:.0f}% of its CPU: a lower bound")
+            if r.get("server_died"):
+                notes.append("server died")
             lines.append(
-                f"| {disp(r['server'])} | {k(r['rate_median'])} ({k(r['rate_min'])}–{k(r['rate_max'])}) "
-                f"| {us(r['p50_us'])} | {us(r['p99_us'])} | {us(r['p999_us'])} "
+                f"| {disp(r['server'])} | {k(r['rate_median'])} | {k(r['rate_ci_lo'])}–{k(r['rate_ci_hi'])} "
+                f"| {r['reps']} | {us(r['p50_us'])} | {us(r['p99_us'])} | {us(r['p999_us'])} "
                 f"| {f'{cpu:.1f} µs' if cpu is not None else '–'} "
                 f"| {f'{peak:.0f} MiB' if peak else '–'} "
-                f"| {r['server_peak_handles'] or '–'} | {r['server_peak_threads'] or '–'} | {r['error_total']} |")
+                f"| {r['server_peak_handles'] or '–'} | {r['server_peak_threads'] or '–'} | {r['error_total']} "
+                f"| {'; '.join(notes)} |")
     return "\n".join(lines)
+
+
+def resolution(rows):
+    """The same build measured twice (`cadeloop[control]` against
+    `cadeloop[candidate]`): what separates the two is noise, so it is the
+    smallest difference between two servers that these runs can show."""
+    idx = {(r["suite"], r["workload"], r["server"]): r for r in rows}
+    cells = []
+    for (suite, wl, server), cand in idx.items():
+        ctrl = idx.get((suite, wl, "cadeloop[control]"))
+        if server != "cadeloop[candidate]" or ctrl is None:
+            continue
+        mean = (cand["rate_median"] + ctrl["rate_median"]) / 2
+        cells.append({
+            "suite": suite, "workload": wl,
+            "candidate": cand["rate_median"], "control": ctrl["rate_median"],
+            "diff_pct": (cand["rate_median"] - ctrl["rate_median"]) / mean * 100,
+            "intervals_overlap": cand["rate_ci_lo"] <= ctrl["rate_ci_hi"] and ctrl["rate_ci_lo"] <= cand["rate_ci_hi"],
+        })
+    if not cells:
+        return None
+    diffs = sorted(abs(c["diff_pct"]) for c in cells)
+    return {
+        "cells": cells, "n": len(cells),
+        "abs_diff_median_pct": statistics.median(diffs),
+        "abs_diff_p90_pct": diffs[min(len(diffs) - 1, math.ceil(0.9 * len(diffs)) - 1)],
+        "abs_diff_max_pct": diffs[-1],
+        "told_apart": sum(1 for c in cells if not c["intervals_overlap"]),
+    }
+
+
+def spread(rows, servers=None):
+    """How much one run differs from the next, over the cells of a session:
+    the coefficient of variation of the per-run rates, and the half-width
+    of the median's interval, both as percentages."""
+    sel = [r for r in rows if r.get("rate_cv_pct") is not None and (servers is None or r["server"] in servers)]
+    if not sel:
+        return None
+    cv = sorted(r["rate_cv_pct"] for r in sel)
+    half = sorted((r["rate_ci_hi"] - r["rate_ci_lo"]) / 2 / r["rate_median"] * 100 for r in sel if r["rate_median"])
+    return {"cells": len(sel), "cv_median_pct": statistics.median(cv), "cv_p90_pct": cv[math.ceil(0.9 * len(cv)) - 1],
+            "ci_half_width_median_pct": statistics.median(half),
+            "ci_half_width_p90_pct": half[math.ceil(0.9 * len(half)) - 1]}
 
 
 # ---- charts -------------------------------------------------------------------
 
-def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt, story="cadeloop"):
-    """Rows = groups (workloads), one thin bar per server; one shared axis."""
+def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt, story="cadeloop",
+                 interval_of=None):
+    """Rows = groups (workloads), one thin bar per server; one shared axis.
+
+    `interval_of(group, server)`, when given, returns the (low, high)
+    confidence interval of a bar's value, drawn as a whisker across the
+    bar's end: two bars whose whiskers overlap have not been told apart."""
     for mode in ("light", "dark"):
         ink = INK[mode]
         colors = COLORS[mode]
@@ -238,7 +383,13 @@ def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt
         vals = [v for v in (value_of(g, s) for g in groups for s in servers) if v is not None]
         if not vals:
             return
-        vmax = max(vals) or 1
+
+        def whisker(g, s):
+            iv = interval_of(g, s) if interval_of else None
+            return iv if iv and iv[0] is not None and iv[1] > iv[0] else None
+
+        highs = [iv[1] for iv in (whisker(g, s) for g in groups for s in servers) if iv]
+        vmax = max(vals + highs) or 1
         h = top + len(groups) * (len(servers) * (bar + gap) + group_air) + 24
         p = svg_open(width, h, ink)
         p.append(f'<text x="24" y="34" font-size="16" font-weight="600" fill="{ink["primary"]}">{title}</text>')
@@ -258,10 +409,25 @@ def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt
                 if v is not None:
                     w = v / vmax * plot_w
                     p.append(hbar(label_w, y, w, colors[disp(s)], ink["surface"]))
+                    end = w
+                    iv = whisker(g, s)
+                    if iv:
+                        # The interval of the median: a hairline with end
+                        # caps in the text ink, on a surface-colored halo
+                        # so it reads across the bar's own fill.
+                        x0, x1 = label_w + iv[0] / vmax * plot_w, label_w + iv[1] / vmax * plot_w
+                        cy = y + bar / 2
+                        d = (f"M{x0:.1f},{cy:.1f} H{x1:.1f} M{x0:.1f},{cy - 3:.1f} V{cy + 3:.1f} "
+                             f"M{x1:.1f},{cy - 3:.1f} V{cy + 3:.1f}")
+                        p.append(f'<path d="{d}" fill="none" stroke="{ink["surface"]}" stroke-width="3.5" '
+                                 f'stroke-linecap="round"/>')
+                        p.append(f'<path d="{d}" fill="none" stroke="{ink["primary"]}" stroke-width="1.25" '
+                                 f'stroke-linecap="round"/>')
+                        end = max(w, x1 - label_w)
                     # Every bar when there are few enough to label without
                     # clutter; otherwise the story series (tables carry all).
                     if disp(s) == story or len(servers) <= 4:
-                        p.append(f'<text x="{label_w + w + 6:.1f}" y="{y + bar - 3}" font-size="11" '
+                        p.append(f'<text x="{label_w + end + 6:.1f}" y="{y + bar - 3}" font-size="11" '
                                  f'fill="{ink["secondary"]}">{unit_fmt(v)}</text>')
                 y += bar + gap
             y += group_air
@@ -337,19 +503,27 @@ PLATFORMS = {
         "tls": ["cadeloop[candidate]", "uvicorn+winloop", "uvicorn+asyncio"],
         "echo": ["cadeloop[candidate]", "winloop", "rsloop", "asyncio"],
         "overload": ["cadeloop[candidate]", "uvicorn+cadeloop", "uvicorn+winloop", "uvicorn+asyncio"],
+        "tlsecho": ["cadeloop[candidate]", "cadeloop+native-tls", "winloop", "rsloop", "asyncio"],
         "loops": ["cadeloop[candidate]", "winloop", "asyncio"],
         "sched": ["cadeloop", "winloop", "rsloop", "asyncio"],
     },
+    # Linux series orders: cadeloop, the uvicorn setups, then the other
+    # servers. With granian next to cadeloop, as these lists once had it,
+    # the two bars are one color to a deuteranope (teal and magenta, CVD
+    # ΔE 5.2 light and 2.4 dark); in this order every adjacent pair of
+    # every chart clears ΔE 9.7 under protan and deutan simulation and 15
+    # for normal vision, in both themes (the dataviz palette checker).
     "linux": {
         "tag": "linux", "name": "Linux",
-        "http": ["cadeloop[candidate]", "granian", "uvicorn[standard]", "uvicorn+cadeloop", "uvicorn+uvloop",
-                 "uvicorn+asyncio", "hypercorn+asyncio"],
-        "ws": ["cadeloop[candidate]", "granian", "uvicorn[standard]", "uvicorn+uvloop", "uvicorn+asyncio",
+        "http": ["cadeloop[candidate]", "uvicorn[standard]", "uvicorn+uvloop", "uvicorn+asyncio",
+                 "uvicorn+cadeloop", "granian", "hypercorn+asyncio"],
+        "ws": ["cadeloop[candidate]", "uvicorn[standard]", "uvicorn+uvloop", "uvicorn+asyncio", "granian",
                "hypercorn+asyncio"],
-        "tls": ["cadeloop[candidate]", "granian", "uvicorn[standard]", "uvicorn+uvloop", "uvicorn+asyncio"],
+        "tls": ["cadeloop[candidate]", "uvicorn[standard]", "uvicorn+uvloop", "uvicorn+asyncio", "granian"],
         "echo": ["cadeloop[candidate]", "uvloop", "rloop", "rsloop", "asyncio"],
-        "overload": ["cadeloop[candidate]", "granian", "uvicorn[standard]", "uvicorn+cadeloop", "uvicorn+uvloop",
-                     "uvicorn+asyncio"],
+        "tlsecho": ["cadeloop[candidate]", "cadeloop+native-tls", "uvloop", "rsloop", "asyncio"],
+        "overload": ["cadeloop[candidate]", "uvicorn[standard]", "uvicorn+uvloop", "uvicorn+asyncio",
+                     "uvicorn+cadeloop", "granian"],
         "loops": ["cadeloop[candidate]", "uvloop", "rloop", "rsloop", "asyncio"],
         "sched": ["cadeloop", "uvloop", "rloop", "rsloop", "asyncio"],
     },
@@ -360,7 +534,11 @@ HTTP_LABELS = [("plaintext-c64", "plaintext"), ("plaintext-c1", "plaintext, 1 co
                ("upload16k-c64", "16 KiB upload"), ("sleep1ms-c64", "1 ms await"),
                ("churn-c16", "conn per request (16)"), ("pipelined16-c64", "pipelined ×16")]
 WS_LABELS = [("ws-64b-c1", "64 B, 1 connection"), ("ws-64b-c64", "64 B, 64 connections"),
-             ("ws-16k-c16", "16 KiB, 16 connections"), ("ws-stream-1k-w32-c16", "1 KiB stream, 32 in flight ×16")]
+             ("ws-16k-c16", "16 KiB, 16 connections"), ("ws-256k-c8", "256 KiB, 8 connections"),
+             ("ws-stream-1k-w32-c16", "1 KiB stream, 32 in flight ×16")]
+APP_LABELS = [("fastapi-json-c64", "JSON, async def"), ("fastapi-sync-c64", "JSON, def (worker thread)"),
+              ("fastapi-file64k-c64", "FileResponse, 64 KiB"), ("fastapi-file1m-c16", "FileResponse, 1 MiB (16 conns)")]
+TLSECHO_LABELS = [("tlsecho-1k-c64", "1 KiB, 64 connections"), ("tlsecho-16k-c16", "16 KiB, 16 connections")]
 TLS_LABELS = [("tls-plaintext-c64", "plaintext, 64 keep-alive conns"),
               ("tls-churn-c16", "new connection per request (16)")]
 ECHO_LABELS = [("echo-1k-c1", "1 KiB, 1 connection"), ("echo-1k-c64", "1 KiB, 64 connections"),
@@ -371,8 +549,27 @@ def tname(server, as_server=True):
     """A server's name in the README tables."""
     if server == "cadeloop[candidate]":
         return "cadeloop serve()" if as_server else "cadeloop"
-    return {"cadeloop[baseline]": "cadeloop (baseline)", "hypercorn+asyncio": "hypercorn"}.get(
-        server, server.replace("+", " + "))
+    return {"cadeloop[baseline]": "cadeloop (baseline)", "hypercorn+asyncio": "hypercorn",
+            "cadeloop+native-tls": "cadeloop, native TLS",
+            "cadeloop+logging": "cadeloop serve(), logging module"}.get(server, server.replace("+", " + "))
+
+
+def runs_phrase(rows, suite):
+    """"median of 9 runs", from the runs a suite's cells actually have."""
+    reps = sorted({r["reps"] for r in rows if r["suite"] == suite})
+    if not reps:
+        return "median of the runs"
+    return f"median of {reps[0]} runs" if len(reps) == 1 else f"median of {reps[0]}–{reps[-1]} runs"
+
+
+def ties_note(rows, suite):
+    """The footnote that says what a shared place means."""
+    sel = [r for r in rows if r["suite"] == suite and r.get("reps", 0) > 1]
+    if not sel:
+        return None
+    cover = min(r["rate_ci_level"] for r in sel) * 100
+    interval = f"{cover:.0f}% confidence intervals" if cover >= 95 else "ranges over the runs"
+    return f"A place is shared when the {interval} of two medians overlap: the runs did not tell those two apart."
 
 
 def shown(text):
@@ -408,46 +605,116 @@ def readme_specs(rows, idle, timers, sched, P):
     def ok(r):
         return r is not None and not r["error_total"] and not r["server_died"]
 
-    def by_workload(suite, labels, cons, with_p99, as_server):
-        body, vals = [], []
+    def interval(r, key="rate"):
+        """A cell's confidence interval, or None when one run made it."""
+        if r is None or r.get("reps", 0) < 2:
+            return None
+        if key == "rate":
+            return (r["rate_ci_lo"], r["rate_ci_hi"])
+        pair = r.get(key)
+        return tuple(pair) if pair and pair[0] is not None else None
+
+    def by_workload(suite, labels, cons, with_p99, as_server, names=None):
+        body, vals, ivs, limited = [], [], [], False
         for wl, label in labels:
-            cells, vs = [], []
+            cells, vs, iv = [], [], []
+            if not any((suite, wl, srv) in idx for srv in cons):
+                continue  # a workload these runs do not have (an older session)
             for srv in cons:
                 r = idx.get((suite, wl, srv))
                 if r is None:
                     cells.append({"text": "–"})
                     vs.append(None)
+                    iv.append(None)
                     continue
-                cell = {"text": kfmt(r["rate_median"]) + ("" if ok(r) else " *")}
+                mark = "" if ok(r) else " *"
+                if ok(r) and r.get("client_limited"):
+                    mark, limited = " ≥", True
+                cell = {"text": kfmt(r["rate_median"]) + mark}
                 if with_p99:
                     cell["sub"] = us(r["p99_us"])
                 cells.append(cell)
                 vs.append(shown(cell["text"]) if ok(r) else None)
+                iv.append(interval(r) if ok(r) else None)
             body.append({"label": label, "cells": cells})
             vals.append(vs)
-        mark_ranks(body, True, vals, axis="row")
-        return {"columns": ["workload"] + [tname(c, as_server) for c in cons], "rows": body}
+            ivs.append(iv)
+        mark_ranks(body, True, vals, axis="row", intervals=ivs)
+        notes = [n for n in [ties_note(rows, suite)] if n]
+        if limited:
+            notes.append("≥: the load generator was at its own CPU limit, so the server can do at least this.")
+        names = names or {}
+        return {"columns": ["workload"] + [names.get(c, tname(c, as_server)) for c in cons], "rows": body,
+                **({"notes": notes} if notes else {})}
 
     specs[f"bench-{tag}-table-http"] = {
         "title": f"HTTP requests per second · {plat}",
-        "subtitle": "64 keep-alive connections unless noted · one worker per server · median of 3 runs",
+        "subtitle": f"64 keep-alive connections unless noted · one worker per server · {runs_phrase(rows, 'http')}",
         **by_workload("http", HTTP_LABELS, P["http"], False, True)}
     specs[f"bench-{tag}-table-ws"] = {
-        "title": f"WebSocket echo · {plat}", "subtitle": "messages per second, p99 round trip in small type",
+        "title": f"WebSocket echo · {plat}",
+        "subtitle": f"messages per second, p99 round trip in small type · {runs_phrase(rows, 'ws')}",
         **by_workload("ws", WS_LABELS, P["ws"], True, False)}
     specs[f"bench-{tag}-table-tls"] = {
         "title": f"TLS · {plat}",
-        "subtitle": "requests per second, p99 in small type · every server uses Python's ssl module, "
-                    "except granian (Rust)" if "granian" in P["tls"] else
-                    "requests per second, p99 in small type · Python's ssl module in every server",
+        "subtitle": ("requests per second, p99 in small type · every server uses Python's ssl module, "
+                     "except granian (Rust)" if "granian" in P["tls"] else
+                     "requests per second, p99 in small type · Python's ssl module in every server")
+                    + f" · {runs_phrase(rows, 'tls')}",
         **by_workload("tls", TLS_LABELS, P["tls"], True, False)}
     specs[f"bench-{tag}-table-echo"] = {
         "title": f"TCP echo, the loop alone · {plat}",
-        "subtitle": "the same asyncio.Protocol on every loop · messages per second, p99 in small type",
+        "subtitle": "the same asyncio.Protocol on every loop · messages per second, p99 in small type · "
+                    + runs_phrase(rows, "echo"),
         **by_workload("echo", ECHO_LABELS, P["echo"], True, False)}
+    if any(r["suite"] == "app" for r in rows):
+        specs[f"bench-{tag}-table-app"] = {
+            "title": f"A FastAPI app · {plat}",
+            "subtitle": "requests per second, p99 in small type · 64 connections unless noted · "
+                        + runs_phrase(rows, "app"),
+            **by_workload("app", APP_LABELS, P["http"], True, True)}
+    if any(r["suite"] == "tlsecho" for r in rows):
+        specs[f"bench-{tag}-table-tlsecho"] = {
+            "title": f"TLS echo, the loop alone · {plat}",
+            "subtitle": "the same asyncio.Protocol behind create_server(ssl=...) · messages per second, "
+                        f"p99 in small type · {runs_phrase(rows, 'tlsecho')}",
+            **by_workload("tlsecho", TLSECHO_LABELS, [c for c in P["tlsecho"] if any(
+                (r["suite"], r["server"]) == ("tlsecho", c) for r in rows)], True, False,
+                names={"cadeloop[candidate]": "cadeloop, stdlib TLS"})}
+
+    # The access log: what turning it on costs each server.
+    if any(r["suite"] == "log" for r in rows):
+        body, vals, ivs = [], [], []
+        cons = [P["http"][0], "cadeloop+logging", *P["http"][1:]]
+        for srv in cons:
+            on = idx.get(("log", "log-plaintext-c64", srv))
+            # The logging-module variant is the same server as cadeloop's
+            # first row with the log off.
+            off = idx.get(("http", "plaintext-c64", P["http"][0] if srv == "cadeloop+logging" else srv))
+            if not on or not off:
+                continue
+            cpu = on["server_cpu_us_per_op"]
+            label = "cadeloop serve(), native log" if srv == P["http"][0] else tname(srv)
+            body.append({"label": label, "cells": [
+                {"text": kfmt(off["rate_median"])}, {"text": kfmt(on["rate_median"]), "sub": us(on["p99_us"])},
+                {"text": f"{on['rate_median'] / off['rate_median'] * 100:.0f}%"},
+                {"text": f"{cpu:.1f} µs" if cpu is not None else "–"}]})
+            vals.append([None, shown(kfmt(on["rate_median"])), shown(body[-1]["cells"][2]["text"]),
+                         shown(body[-1]["cells"][3]["text"])])
+            ivs.append([None, interval(on), None, interval(on, "cpu_ci_us_per_op")])
+        mark_ranks(body, [None, True, True, False], vals, axis="col", intervals=ivs)
+        specs[f"bench-{tag}-table-log"] = {
+            "title": f"With the access log on · {plat}",
+            "subtitle": "plaintext, 64 connections · each server's own access log, written to a file · "
+                        + runs_phrase(rows, "log"),
+            "columns": ["server", "log off", "log on", "kept", "CPU / request, log on"],
+            "rows": body,
+            "notes": [n for n in [ties_note(rows, "log"),
+                                  "kept: requests per second with the log on, as a share of the same server "
+                                  "with it off."] if n]}
 
     # Plaintext in detail: one row per server, ranked per column.
-    body, vals = [], []
+    body, vals, ivs = [], [], []
     for srv in P["http"]:
         r = idx.get(("http", "plaintext-c64", srv))
         if not r:
@@ -458,13 +725,19 @@ def readme_specs(rows, idle, timers, sched, P):
             {"text": us(r["p999_us"])}, {"text": f"{cpu:.1f} µs" if cpu is not None else "–"},
             {"text": f"{peak:.0f} MiB" if peak else "–"}, {"text": str(r["server_peak_threads"] or "–")}]})
         vals.append([shown(c["text"]) for c in body[-1]["cells"]])
+        # The percentiles shown come from the merged histogram; whether
+        # two servers' are apart is judged on the per-run percentiles.
+        ivs.append([interval(r), interval(r, "p50_ci_us"), interval(r, "p99_ci_us"), interval(r, "p999_ci_us"),
+                    interval(r, "cpu_ci_us_per_op"), interval(r, "peak_private_ci_mib"), None])
     # Threads describe a design rather than score one: never ranked.
-    mark_ranks(body, [True, False, False, False, False, False, None], vals, axis="col")
+    mark_ranks(body, [True, False, False, False, False, False, None], vals, axis="col", intervals=ivs)
+    note = ties_note(rows, "http")
     specs[f"bench-{tag}-table-plaintext"] = {
         "title": f"Plaintext HTTP in detail · {plat}",
-        "subtitle": "64 connections · CPU is user + kernel time of the server's processes per request",
+        "subtitle": "64 connections · CPU is user + kernel time of the server's processes per request · "
+                    + runs_phrase(rows, "http"),
         "columns": ["server", "req/s", "p50", "p99", "p99.9", "CPU / request", "peak memory", "threads"],
-        "rows": body}
+        "rows": body, **({"notes": [note]} if note else {})}
 
     # Idle connections, at the largest count measured.
     if idle:
@@ -501,44 +774,77 @@ def readme_specs(rows, idle, timers, sched, P):
             "rows": body, **({"notes": notes} if notes else {})}
 
     if timers:
-        body, vals = [], []
+        body, vals, ivs = [], [], []
+
+        def runs_interval(entry, scale=1.0):
+            """The interval of a loop's median over its processes (in the
+            unit the cell shows), when it was measured in several."""
+            runs = entry.get("p50_runs")
+            if not runs or len(runs) < 2:
+                return None
+            lo, hi, _cover = median_ci(runs)
+            return (lo * scale, hi * scale)
+
         for srv in P["loops"]:
             t = timers.get(srv)
             if not t:
                 continue
-            cells, vs = [], []
+            cells, vs, iv = [], [], []
             for d in ("0.001", "0.005", "0.01"):
                 cells.append({"text": f"+{t[d]['p50']:.2f} / {t[d]['p99']:.2f} ms"})
                 vs.append(shown(cells[-1]["text"]))
+                iv.append(runs_interval(t[d]))  # milliseconds, as the cell's first number
             x = t["xthread"]
             cells.append({"text": f"{x['p50'] * 1e3:.0f} / {x['p99'] * 1e3:.0f} µs"})
             vs.append(shown(cells[-1]["text"]))
+            iv.append(runs_interval(x, 1e3))  # the cell shows microseconds
             body.append({"label": tname(srv, False), "cells": cells})
             vals.append(vs)
-        mark_ranks(body, False, vals, axis="col")
+            ivs.append(iv)
+        mark_ranks(body, False, vals, axis="col", intervals=ivs)
+        nproc = max((len(t[d].get("p50_runs", [])) for t in timers.values() for d in ("0.001",)), default=0)
+        notes = ["Places go by the median in each column."]
+        if nproc > 1:
+            notes = [f"Each figure is the median over {nproc} fresh processes per loop. Places go by the median in "
+                     "each column, and are shared when its confidence intervals overlap."]
         specs[f"bench-{tag}-table-timers"] = {
             "title": f"Timers and wake-ups · {plat}",
             "subtitle": "how late asyncio.sleep(d) returns on an idle loop (median / p99) · "
                         "call_soon_threadsafe() into a sleeping loop",
             "columns": ["loop", "sleep(1 ms)", "sleep(5 ms)", "sleep(10 ms)", "cross-thread wake-up"],
-            "rows": body, "notes": ["Places go by the median in each column."]}
+            "rows": body, "notes": notes}
 
     if sched:
-        body, vals = [], []
+        body, vals, ivs = [], [], []
+        covers = []
         for bench, res in sched.items():
-            cells, vs = [], []
+            cells, vs, iv = [], [], []
             for lp in P["sched"]:
-                v = (res.get(lp) or {}).get("median_ops_per_sec")
+                entry = res.get(lp) or {}
+                v = entry.get("median_ops_per_sec")
                 cells.append({"text": f"{v / 1e6:.3f}" if v else "hung"})
                 vs.append(shown(cells[-1]["text"]))
+                runs = entry.get("runs") or []
+                if v and len(runs) > 1:
+                    lo, hi, cover = median_ci(runs)
+                    iv.append((lo / 1e6, hi / 1e6))  # the unit the cell shows
+                    covers.append(cover)
+                else:
+                    iv.append(None)
             body.append({"label": bench, "label_code": True, "cells": cells})
             vals.append(vs)
-        mark_ranks(body, True, vals, axis="row")
+            ivs.append(iv)
+        mark_ranks(body, True, vals, axis="row", intervals=ivs)
         nruns = max(len((x or {}).get("runs", [])) for res in sched.values() for x in res.values())
+        note = None
+        if covers:
+            cover = min(covers) * 100
+            interval = f"{cover:.0f}% confidence intervals" if cover >= 95 else "ranges over the runs"
+            note = f"A place is shared when the {interval} of two medians overlap: the runs did not tell those two apart."
         specs[f"bench-{tag}-table-sched"] = {
             "title": f"Scheduling microbenchmarks · {plat}",
             "subtitle": f"millions of operations per second · median of {nruns} runs, a fresh process each",
-            "columns": ["benchmark"] + P["sched"], "rows": body}
+            "columns": ["benchmark"] + P["sched"], "rows": body, **({"notes": [note]} if note else {})}
     return specs
 
 
@@ -562,8 +868,11 @@ def main():
     meta = [json.load(open(os.path.join(d, "meta.json"))) for d in a.dirs]
     timers = json.load(open(a.timers)) if a.timers else None
     sched = json.load(open(a.sched))["results"] if a.sched else None
+    res = resolution(rows)
+    noise = spread(rows)
     with open(a.summary, "w") as f:
-        json.dump({"meta": meta, "rows": rows, "idle": idle, "timers": timers}, f, indent=1)
+        json.dump({"meta": meta, "rows": rows, "idle": idle, "timers": timers, "resolution": res,
+                   "spread": noise}, f, indent=1)
 
     plat = a.platform or ("windows" if meta[0].get("platform", "").startswith("Windows") else "linux")
     P = {k: list(v) if isinstance(v, list) else v for k, v in PLATFORMS[plat].items()}
@@ -573,14 +882,38 @@ def main():
     tag, plat_name = P["tag"], P["name"]
     only = {x for x in a.only_charts.split(",") if x}
 
-    md = ["## HTTP"]
+    md = []
+    if noise:
+        md.append("## How far to trust these numbers\n")
+        md.append(f"Across {noise['cells']} cells, one run differs from the next by "
+                  f"{noise['cv_median_pct']:.1f}% (coefficient of variation; {noise['cv_p90_pct']:.1f}% at the "
+                  f"90th percentile of cells). The interval of a median is ±{noise['ci_half_width_median_pct']:.1f}% "
+                  f"of it at the median cell and ±{noise['ci_half_width_p90_pct']:.1f}% at the 90th percentile.")
+    if res:
+        md.append(f"\nThe same cadeloop build was measured twice, under two names, in all {res['n']} workloads. "
+                  f"The two medians differ by {res['abs_diff_median_pct']:.1f}% at the median workload, "
+                  f"{res['abs_diff_p90_pct']:.1f}% at the 90th percentile and {res['abs_diff_max_pct']:.1f}% at "
+                  f"most; their intervals fail to overlap in {res['told_apart']} of {res['n']}. A difference "
+                  "between two servers smaller than that is not one these runs can show.\n")
+        md.append("| suite | workload | candidate | control | difference | intervals overlap |")
+        md.append("|---|---|---|---|---|---|")
+        for c in sorted(res["cells"], key=lambda c: (c["suite"], c["workload"])):
+            md.append(f"| {c['suite']} | {c['workload']} | {k(c['candidate'])} | {k(c['control'])} "
+                      f"| {c['diff_pct']:+.1f}% | {'yes' if c['intervals_overlap'] else 'no'} |")
+    md.append("\n## HTTP")
     md.append(table(rows, "http", [w for w, _ in __import__("run_suite").HTTP_WORKLOADS], P["http"]))
+    md.append("\n## A FastAPI app")
+    md.append(table(rows, "app", [w for w, _ in APP_LABELS], P["http"]))
+    md.append("\n## Plaintext with the access log on")
+    md.append(table(rows, "log", ["log-plaintext-c64"], [P["http"][0], "cadeloop+logging", *P["http"][1:]]))
     md.append("\n## WebSocket")
     md.append(table(rows, "ws", [w for w, _ in WS_LABELS], P["ws"]))
     md.append("\n## TLS")
     md.append(table(rows, "tls", [w for w, _ in TLS_LABELS], P["tls"]))
     md.append("\n## TCP echo (raw asyncio.Protocol)")
     md.append(table(rows, "echo", [w for w, _ in ECHO_LABELS], P["echo"]))
+    md.append("\n## TLS echo (raw asyncio.Protocol behind create_server(ssl=...))")
+    md.append(table(rows, "tlsecho", [w for w, _ in TLSECHO_LABELS], P["tlsecho"]))
     md.append("\n## Idle keep-alive connections\n")
     md.append("| server | connections | private / conn | working set / conn | handles / conn | private after close |")
     md.append("|---|---|---|---|---|---|")
@@ -613,26 +946,63 @@ def main():
             r = idx.get((suite, g[0], s))
             return r["rate_median"] if r else None
 
+        def rate_ci(g, s, suite="http"):
+            r = idx.get((suite, g[0], s))
+            return (r["rate_ci_lo"], r["rate_ci_hi"]) if r and r["reps"] > 1 else None
+
         def cpu(g, s, suite="http"):
             r = idx.get((suite, g[0], s))
             return r["server_cpu_us_per_op"] if r else None
 
+        def cpu_ci(g, s, suite="http"):
+            r = idx.get((suite, g[0], s))
+            return tuple(r["cpu_ci_us_per_op"]) if r and r["reps"] > 1 and r.get("cpu_ci_us_per_op") else None
+
+        def runs_and_interval(suite):
+            """"median of 9 runs with its 96% confidence interval"."""
+            sel = [r for r in rows if r["suite"] == suite and r["reps"] > 1]
+            if not sel:
+                return runs_phrase(rows, suite)
+            cover = min(r["rate_ci_level"] for r in sel) * 100
+            what = f"its {cover:.0f}% confidence interval" if cover >= 95 else "the range of the runs"
+            return f"{runs_phrase(rows, suite)} with {what}"
+
         chart("http", f"HTTP/1.1 requests per second ({plat_name})",
-              "64 keep-alive connections (16 for conn-per-request); median of 3 runs; higher is better",
-              hw, P["http"], rate, lambda v: f"{v / 1e3:.1f}K")
+              f"64 keep-alive connections (16 for conn per request) · {runs_and_interval('http')} · higher is better",
+              hw, P["http"], rate, lambda v: f"{v / 1e3:.1f}K", interval_of=rate_ci)
         chart("http-cpu", f"Server CPU per request ({plat_name})",
-              "user + kernel time of the server's processes / successful requests; lower is better",
-              hw, P["http"], cpu, lambda v: f"{v:.1f} µs")
+              "user + kernel time of the server's processes / successful requests · "
+              f"{runs_and_interval('http')} · lower is better",
+              hw, P["http"], cpu, lambda v: f"{v:.1f} µs", interval_of=cpu_ci)
         ww = [("ws-64b-c1", "64 B, 1 conn"), ("ws-64b-c64", "64 B, 64 conns"), ("ws-16k-c16", "16 KiB, 16 conns"),
-              ("ws-stream-1k-w32-c16", "1 KiB stream")]
+              ("ws-256k-c8", "256 KiB, 8 conns"), ("ws-stream-1k-w32-c16", "1 KiB stream")]
+        ww = [g for g in ww if any(("ws", g[0], s) in idx for s in P["ws"])]
         chart("ws", f"WebSocket echo messages per second ({plat_name})",
-              "ping-pong except 1 KiB stream (32 in flight per connection); higher is better",
-              ww, P["ws"], lambda g, s: rate(g, s, "ws"), lambda v: f"{v / 1e3:.0f}K")
+              f"ping-pong except 1 KiB stream (32 in flight per connection) · {runs_and_interval('ws')} · "
+              "higher is better",
+              ww, P["ws"], lambda g, s: rate(g, s, "ws"), lambda v: f"{v / 1e3:.0f}K",
+              interval_of=lambda g, s: rate_ci(g, s, "ws"))
         ew = [("echo-1k-c1", "1 KiB, 1 conn"), ("echo-1k-c64", "1 KiB, 64 conns"),
               ("echo-1k-w16-c64", "1 KiB, 16 in flight"), ("echo-64k-c8", "64 KiB, 8 conns")]
         chart("echo", f"TCP echo messages per second ({plat_name})",
-              "same asyncio.Protocol on every loop; higher is better",
-              ew, P["echo"], lambda g, s: rate(g, s, "echo"), lambda v: f"{v / 1e3:.0f}K")
+              f"same asyncio.Protocol on every loop · {runs_and_interval('echo')} · higher is better",
+              ew, P["echo"], lambda g, s: rate(g, s, "echo"), lambda v: f"{v / 1e3:.0f}K",
+              interval_of=lambda g, s: rate_ci(g, s, "echo"))
+        if any(r["suite"] == "app" for r in rows):
+            aw = [("fastapi-json-c64", "JSON, async def"), ("fastapi-sync-c64", "JSON, def"),
+                  ("fastapi-file64k-c64", "file, 64 KiB"), ("fastapi-file1m-c16", "file, 1 MiB")]
+            chart("app", f"A FastAPI app: requests per second ({plat_name})",
+                  f"pydantic response model; FileResponse · {runs_and_interval('app')} · higher is better",
+                  aw, P["http"], lambda g, s: rate(g, s, "app"), lambda v: f"{v / 1e3:.1f}K",
+                  interval_of=lambda g, s: rate_ci(g, s, "app"))
+        if any(r["suite"] == "tlsecho" for r in rows):
+            tw = [("tlsecho-1k-c64", "1 KiB, 64 conns"), ("tlsecho-16k-c16", "16 KiB, 16 conns")]
+            tcons = [c for c in P["tlsecho"] if any(("tlsecho", g[0], c) in idx for g in tw)]
+            chart("tlsecho", f"TLS echo messages per second ({plat_name})",
+                  f"create_server(ssl=...); cadeloop with the stdlib's TLS (default) and its own · "
+                  f"{runs_and_interval('tlsecho')}",
+                  tw, tcons, lambda g, s: rate(g, s, "tlsecho"), lambda v: f"{v / 1e3:.0f}K",
+                  interval_of=lambda g, s: rate_ci(g, s, "tlsecho"))
         iw = sorted({(r["workload"], f"{r['requested']} idle") for r in idle}, key=lambda g: int(g[1].split()[0]))
         iidx = {(r["workload"], r["server"]): r for r in idle}
         mem_word = "private bytes" if tag == "win" else "unique memory (USS)"

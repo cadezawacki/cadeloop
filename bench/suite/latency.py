@@ -78,29 +78,61 @@ loop.close()
 """
 
 
+def combine(reps):
+    """One loop's result over several fresh processes: each figure is the
+    median of the processes' own (their p50s, their p99s), the largest of
+    their maxima, and the per-process values kept beside it (`*_runs`) for
+    whoever wants the spread."""
+    import statistics
+
+    if len(reps) == 1:
+        return reps[0]
+    out = {}
+    for key in reps[0]:
+        parts = [r[key] for r in reps]
+        out[key] = {
+            "p50": statistics.median(p["p50"] for p in parts),
+            "p99": statistics.median(p["p99"] for p in parts),
+            "max": max(p["max"] for p in parts),
+            "n": sum(p["n"] for p in parts),
+            "p50_runs": sorted(p["p50"] for p in parts),
+            "p99_runs": sorted(p["p99"] for p in parts),
+        }
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pkg", action="append", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--reps", type=int, default=1,
+                    help="fresh processes per loop, the loops taking turns (default 1)")
     a = ap.parse_args()
     pkgs = dict(p.split("=", 1) for p in a.pkg)
     runs = [(f"cadeloop[{n}]", "cadeloop", p) for n, p in pkgs.items()]
     anyp = next(iter(pkgs.values()))
     others = ("winloop", "asyncio") if os.name == "nt" else ("uvloop", "rloop", "rsloop", "asyncio")
     runs += [(name, name, anyp) for name in others]
+    parts: dict = {label: [] for label, _kind, _pkg in runs}
+    for rep in range(a.reps):
+        for label, kind, pkg in runs[rep % len(runs):] + runs[: rep % len(runs)]:
+            env = dict(os.environ, PYTHONPATH=pkg)
+            env.pop("CADELOOP_COARSE_TIMERS", None)
+            p = subprocess.run([sys.executable, "-c", PROBE, kind], env=env, capture_output=True, text=True,
+                               timeout=600)
+            if "RESULT " not in p.stdout:
+                print(label, "FAILED", p.stderr[-1000:])
+                continue
+            parts[label].append(json.loads(p.stdout.split("RESULT ", 1)[1]))
     out = {}
-    for label, kind, pkg in runs:
-        env = dict(os.environ, PYTHONPATH=pkg)
-        env.pop("CADELOOP_COARSE_TIMERS", None)
-        p = subprocess.run([sys.executable, "-c", PROBE, kind], env=env, capture_output=True, text=True, timeout=600)
-        if "RESULT " not in p.stdout:
-            print(label, "FAILED", p.stderr[-1000:])
+    for label, _kind, _pkg in runs:
+        if not parts[label]:
             continue
-        out[label] = json.loads(p.stdout.split("RESULT ", 1)[1])
-        r = out[label]
+        out[label] = r = combine(parts[label])
         print(f"{label:<22} sleep(1ms) +{r['0.001']['p50']:.2f}/{r['0.001']['p99']:.2f} ms  "
               f"sleep(5ms) +{r['0.005']['p50']:.2f} ms  busy +{r['busy-0.001']['p50']:.2f} ms  "
-              f"xthread {r['xthread']['p50'] * 1e3:.0f}/{r['xthread']['p99'] * 1e3:.0f} us", flush=True)
+              f"xthread {r['xthread']['p50'] * 1e3:.0f}/{r['xthread']['p99'] * 1e3:.0f} us"
+              + (f"  ({len(parts[label])} processes)" if len(parts[label]) > 1 else ""), flush=True)
     with open(a.out, "w") as f:
         json.dump(out, f, indent=1)
 

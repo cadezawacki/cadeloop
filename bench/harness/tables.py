@@ -230,7 +230,8 @@ def write(spec: dict, path_base: str) -> None:
 
 
 def mark_ranks(rows: list[dict], higher_is_better: bool | None | list[bool | None],
-               values: list[list[float | None]], axis: str = "row") -> None:
+               values: list[list[float | None]], axis: str = "row",
+               intervals: list[list[tuple[float, float] | None]] | None = None) -> None:
     """Set `rank` 1, 2 or 3 on the three best cells of every row (axis="row")
     or every column (axis="col"). `values` parallels the cells; a None value
     is never ranked. `higher_is_better` is one flag, or one per row/column,
@@ -239,7 +240,16 @@ def mark_ranks(rows: list[dict], higher_is_better: bool | None | list[bool | Non
     Places work as medals do: equal values share a place and the next place
     is skipped (two firsts, then a third). The last place never gets a
     badge, so a row of two or three marks only its leaders, and when most
-    of a row or column ties for first, nothing in it is marked."""
+    of a row or column ties for first, nothing in it is marked.
+
+    `intervals`, when given, parallels `values` with a (low, high)
+    confidence interval per cell (None where there is none). A cell is then
+    behind another only if the other's whole interval is better than its
+    own: two cells whose intervals overlap have not been told apart by the
+    measurement, and share the place. Without an interval on both sides the
+    values themselves decide, as before -- and two cells that show the same
+    value always share a place, whatever their intervals: a reader cannot
+    be asked to see a difference the table does not print."""
     lines = range(len(rows)) if axis == "row" else range(len(values[0]))
     for i in lines:
         hib = higher_is_better[i] if isinstance(higher_is_better, list) else higher_is_better
@@ -247,20 +257,34 @@ def mark_ranks(rows: list[dict], higher_is_better: bool | None | list[bool | Non
             continue
         if axis == "row":
             cells, vals = rows[i]["cells"], values[i]
+            ivs = intervals[i] if intervals is not None else None
         else:
             cells, vals = [r["cells"][i] for r in rows], [v[i] for v in values]
+            ivs = [iv[i] for iv in intervals] if intervals is not None else None
         present = [v for v in vals if v is not None]
         if len(set(present)) < 2:
             continue  # nothing to pick between
-        best, worst = (max(present), min(present)) if hib else (min(present), max(present))
-        if present.count(best) * 2 > len(present):
+        worst = min(present) if hib else max(present)
+
+        def beaten_by(j, o):
+            """Is cell j clearly behind cell o?"""
+            if vals[o] == vals[j]:
+                return False
+            if ivs is not None and ivs[j] is not None and ivs[o] is not None:
+                return ivs[o][0] > ivs[j][1] if hib else ivs[o][1] < ivs[j][0]
+            return vals[o] > vals[j] if hib else vals[o] < vals[j]
+
+        places = {
+            j: 1 + sum(1 for o, ov in enumerate(vals) if ov is not None and o != j and beaten_by(j, o))
+            for j, v in enumerate(vals) if v is not None
+        }
+        if sum(1 for p in places.values() if p == 1) * 2 > len(present):
             continue  # most of them tie: no one stands out
-        for cell, v in zip(cells, vals, strict=True):
-            if v is None or v == worst:
+        for j, cell in enumerate(cells):
+            if vals[j] is None or vals[j] == worst:
                 continue
-            place = 1 + sum(1 for o in present if (o > v if hib else o < v))
-            if place <= 3:
-                cell["rank"] = place
+            if places[j] <= 3:
+                cell["rank"] = places[j]
 
 
 RAW = "https://raw.githubusercontent.com/cadezawacki/cadeloop/main/"
