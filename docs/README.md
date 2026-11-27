@@ -17,6 +17,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Sending files (on `claude/sleepy-ride-p2rndm`; measured on Linux, one worker, loopback)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Perf | Starlette's and FastAPI's `FileResponse` read the file 64 KiB at a time, a worker-thread hop for the open, each read and the close: 285 requests/s for a 1 MiB file. The engine now declares the ASGI Path Send extension, so the framework sends the path (`http.response.pathsend`) and the server sends the file, through the ordinary body path -- pieces queued by reference, small files read in one piece on the loop thread, large ones 1 MiB at a time on a pool of their own. 16 KiB 1,243 -> 4,536 requests/s, 64 KiB 1,038 -> 3,949, 1 MiB 285 -> 1,181, 10 MiB 37 -> 183; the same over TLS and on Windows, no application change (ADR-41) | |
+>
 > **Measured and not built**
 >
 > | Area | Finding | Commit |

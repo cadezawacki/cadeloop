@@ -927,3 +927,46 @@ idle connection would hold an object, which is the per-connection memory
 ADR-22 removed. Not built. A `BufferedProtocol` already receives with one
 copy, into its own buffer, for a protocol that wants that.
 
+## ADR-41: Path Send: the file goes through the body path, read by the server
+Starlette's `FileResponse` (so FastAPI's, and `StaticFiles`) reads the
+file it is sending 64 KiB at a time with `anyio.open_file`, which is a hop
+to a worker thread and back for the open, for every read and for the
+close -- about 0.1 ms each, on a loop that can serve a request in a
+hundredth of that. A 1 MiB file was 285 requests/s on one worker.
+
+The ASGI *Path Send* extension exists for this: a server that lists
+`http.response.pathsend` in `scope["extensions"]` is sent the file's path
+instead of its contents, and `FileResponse` uses it whenever it is listed.
+The engine now lists it. What it does with the message is deliberately
+plain: `HttpSend` returns an awaitable (`server._send_file`) that reads
+the file and passes the contents to the same `send` as ordinary
+`http.response.body` messages.
+
+- **Why not `sendfile(2)` / `TransmitFile`.** Zero-copy would take the
+  file out of the write queue's model: a third kind of queued item whose
+  sending is the backend's (an overlapped TransmitFile on IOCP, a
+  readiness-driven sendfile on epoll), with its own partial-progress,
+  cancellation and TLS-fallback paths, in the part of the engine where a
+  mistake truncates responses. Going through the body path instead means
+  framing, the declared content-length check, HEAD suppression, write
+  backpressure and TLS are the code every response already uses, a piece
+  of 16 KiB or more is queued by reference rather than copied (ADR-33),
+  and the same code runs on Linux and Windows. What it costs is the copy
+  out of the page cache, which is small against what was removed.
+- **Where the read runs.** A file up to 256 KiB is read whole on the loop
+  thread: one read of something almost certainly cached, cheaper than the
+  hand-off that would avoid it. Larger files are read 1 MiB at a time on a
+  thread pool of their own (not the loop's default executor, which an
+  application may have filled with blocking work), so a cold or slow disk
+  cannot stall other requests; at 1 MiB a piece the hand-off is noise.
+- **The descriptor outlives a read in flight.** If the request is
+  cancelled, or the client leaves, while a thread is in `read()`, the file
+  is closed by that read's completion, not under it -- a descriptor closed
+  under a read can be handed to another file before the read returns.
+
+Measured with Starlette's `FileResponse`, one worker, loopback: 16 KiB
+1,243 -> 4,536 requests/s, 64 KiB 1,038 -> 3,949, 1 MiB 285 -> 1,181,
+10 MiB 37 -> 183. Range requests do not use the extension (the framework
+answers them itself), and zero-copy remains possible later for plaintext
+connections if file serving ever dominates a workload.
+

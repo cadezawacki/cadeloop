@@ -1123,6 +1123,71 @@ def _start_stats_endpoint(loop, port: int, worker_id):
     return lid, bound[1]
 
 
+# ASGI Path Send (`http.response.pathsend`). A file up to this size is read
+# whole, on the loop thread: one read of something almost certainly in the
+# page cache, cheaper than the thread hand-off that would avoid it.
+_SEND_FILE_INLINE = 256 * 1024
+# Anything larger is read this much at a time on a thread of its own pool,
+# so that a file that is not in the cache -- or lives on a slow or network
+# disk -- never stalls the loop. One megabyte makes the hand-off (about
+# 0.1 ms) small against the read and the send it buys.
+_SEND_FILE_CHUNK = 1024 * 1024
+_send_file_pool = None
+_send_file_pool_pid = None
+
+
+def _file_reader():
+    """The threads that read large files being sent. Their own pool, not
+    the loop's default executor: an application that fills that with
+    blocking work should not thereby stall its downloads."""
+    global _send_file_pool, _send_file_pool_pid
+    if _send_file_pool is None or _send_file_pool_pid != os.getpid():  # a forked worker makes its own
+        from concurrent.futures import ThreadPoolExecutor
+
+        _send_file_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cadeloop-file")
+        _send_file_pool_pid = os.getpid()
+    return _send_file_pool
+
+
+async def _send_file(send, path) -> None:
+    """Send the file at ``path`` as the response body: what the engine's
+    ``send`` does with an ``http.response.pathsend`` message.
+
+    The contents go out as ordinary ``http.response.body`` messages
+    through the same ``send``, so framing, the check against a declared
+    content-length, write backpressure and TLS are the ones every body
+    gets; each piece is queued by reference, not copied.
+    """
+    file = open(path, "rb", buffering=0)  # noqa: ASYNC230 - see _SEND_FILE_INLINE
+    reading = None
+    try:
+        size = os.fstat(file.fileno()).st_size
+        if size <= _SEND_FILE_INLINE:
+            await send({"type": "http.response.body", "body": file.read(size) if size else b""})
+            return
+        loop = asyncio.get_running_loop()
+        pool = _file_reader()
+        remaining = size
+        while True:
+            reading = pool.submit(file.read, min(_SEND_FILE_CHUNK, remaining))
+            chunk = await asyncio.wrap_future(reading, loop=loop)
+            reading = None
+            remaining -= len(chunk)
+            last = remaining <= 0 or not chunk
+            await send({"type": "http.response.body", "body": chunk, "more_body": not last})
+            if last:
+                return
+    finally:
+        if reading is not None and not reading.done():
+            # Cancelled, or the client left, while a thread is still in
+            # read(): the descriptor must outlive that call. Closed under
+            # it, its number could be handed to another file before the
+            # read returned.
+            reading.add_done_callback(lambda _f: file.close())
+        else:
+            file.close()
+
+
 def _open_native_access_log(loop, config: Config) -> bool:
     """Start the native access log if the config asks for one: a file the
     engine writes itself, a tap, or both. True if it was started."""

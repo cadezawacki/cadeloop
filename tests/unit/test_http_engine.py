@@ -1417,6 +1417,213 @@ def test_a_loop_with_an_access_log_tap_is_collected(tmp_path):
     assert ref() is None
 
 
+# ASGI Path Send (`http.response.pathsend`): the application names a file
+# and the server sends it.
+
+
+def _pathsend_app(path, *, declare_length=True, status=200):
+    async def app(scope, receive, send):
+        assert "http.response.pathsend" in scope["extensions"]
+        headers = [(b"content-type", b"application/octet-stream")]
+        if declare_length:
+            headers.append((b"content-length", str(os.path.getsize(path)).encode()))
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.pathsend", "path": str(path)})
+
+    return app
+
+
+def _payload(resp):
+    """A response's body with any chunked framing taken off."""
+    head, body = resp.split(b"\r\n\r\n", 1)
+    if b"transfer-encoding: chunked" not in head.lower():
+        return body
+    out = bytearray()
+    while True:
+        line, body = body.split(b"\r\n", 1)
+        size = int(line, 16)
+        if size == 0:
+            return bytes(out)
+        out += body[:size]
+        body = body[size + 2 :]
+
+
+async def _get_twice(port, target=b"/"):
+    """The same request twice on one connection: the response bodies."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    bodies = []
+    for _ in range(2):
+        writer.write(b"GET " + target + b" HTTP/1.1\r\nhost: x\r\n\r\n")
+        bodies.append(_payload(await asyncio.wait_for(_read_one_response(reader), 20)))
+    writer.close()
+    return bodies
+
+
+# Empty, one byte, read whole on the loop thread, exactly at that limit,
+# just past it (the first size read on a worker thread), and several
+# chunks of that.
+@pytest.mark.parametrize("size", [0, 1, 70_000, 256 * 1024, 256 * 1024 + 1, 3 * 1024 * 1024 + 17])
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_pathsend_sends_the_file_and_keeps_the_connection(loop, tmp_path, size, declare_length):
+    payload = os.urandom(size)
+    path = tmp_path / "blob.bin"
+    path.write_bytes(payload)
+    lid, port = listen(loop, _pathsend_app(path, declare_length=declare_length))
+    bodies = loop.run_until_complete(_get_twice(port))
+    assert bodies == [payload, payload]
+    loop._core.listener_close(lid)
+
+
+def test_pathsend_takes_a_path_object_and_answers_head_without_a_body(loop, tmp_path):
+    payload = os.urandom(50_000)
+    path = tmp_path / "blob.bin"
+    path.write_bytes(payload)
+
+    async def app(scope, receive, send):
+        headers = [(b"content-length", str(len(payload)).encode())]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.pathsend", "path": path})  # os.PathLike
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"HEAD / HTTP/1.1\r\nhost: x\r\n\r\nGET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        assert b"content-length: 50000" in head.lower()
+        # No body followed the HEAD: the next bytes are the GET's response.
+        assert _body(await asyncio.wait_for(_read_one_response(reader), 5)) == payload
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+
+def test_pathsend_of_a_missing_file_raises_in_the_application(loop, tmp_path):
+    seen = []
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        try:
+            await send({"type": "http.response.pathsend", "path": str(tmp_path / "nope.bin")})
+        except FileNotFoundError as exc:
+            seen.append(exc)
+            await send({"type": "http.response.body", "body": b"gone"})
+
+    lid, port = listen(loop, app)
+    resp = loop.run_until_complete(_request(port, b"GET / HTTP/1.1\r\nhost: x\r\n\r\n"))
+    assert len(seen) == 1 and _body(resp) == b"gone"
+    loop._core.listener_close(lid)
+
+
+def test_pathsend_checks_its_message_and_its_place_in_the_response(loop, tmp_path):
+    path = tmp_path / "blob.bin"
+    path.write_bytes(b"x" * 10)
+    errors = []
+
+    async def app(scope, receive, send):
+        try:
+            if scope["path"] == "/no-path":
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.pathsend"})
+            elif scope["path"] == "/before-start":
+                await send({"type": "http.response.pathsend", "path": str(path)})
+            else:  # a declared length the file does not have
+                headers = [(b"content-length", b"3")]
+                await send({"type": "http.response.start", "status": 200, "headers": headers})
+                await send({"type": "http.response.pathsend", "path": str(path)})
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            raise
+
+    lid, port = listen(loop, app)
+    loop.set_exception_handler(lambda *_: None)
+    for target in (b"/no-path", b"/before-start", b"/wrong-length"):
+        request = b"GET " + target + b" HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+        loop.run_until_complete(_request(port, request, read_all=True))
+    assert "missing 'path'" in errors[0]
+    assert "before http.response.start" in errors[1]
+    assert "content-length" in errors[2]
+    loop._core.listener_close(lid)
+
+
+def test_a_client_leaving_mid_file_releases_the_file(loop, tmp_path):
+    """The response is abandoned partway: the application's send() raises,
+    and the file is closed -- by the read still running on a worker thread
+    if there is one, not out from under it."""
+    path = tmp_path / "big.bin"
+    path.write_bytes(os.urandom(24 * 1024 * 1024))
+    outcome = loop.create_future()
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        try:
+            await send({"type": "http.response.pathsend", "path": str(path)})
+        except BaseException as exc:
+            outcome.set_result(type(exc))
+            raise
+        outcome.set_result(None)
+
+    lid, port = listen(loop, app)
+    loop.set_exception_handler(lambda *_: None)
+
+    def open_files():
+        fds = "/proc/self/fd"
+        return sum(1 for f in os.listdir(fds) if os.path.realpath(f"{fds}/{f}") == str(path))
+
+    async def main():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        await reader.readexactly(100_000)  # some of it has arrived
+        writer.transport.abort()
+        assert await asyncio.wait_for(outcome, 10) is ConnectionResetError
+        for _ in range(100):
+            if not os.path.isdir("/proc/self/fd") or open_files() == 0:
+                break
+            await asyncio.sleep(0.02)
+        if os.path.isdir("/proc/self/fd"):
+            assert open_files() == 0
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+
+def test_starlette_file_response_goes_through_pathsend(loop, tmp_path, monkeypatch):
+    """Starlette's FileResponse uses Path Send when the server declares
+    it, instead of reading the file 64 KiB at a time through anyio's
+    worker threads -- no application change involved."""
+    pytest.importorskip("starlette.applications")
+    import anyio
+    from starlette.applications import Starlette
+    from starlette.responses import FileResponse
+    from starlette.routing import Route
+
+    payload = os.urandom(2_500_000)
+    path = tmp_path / "blob.bin"
+    path.write_bytes(payload)
+    opened = []
+    real_open_file = anyio.open_file
+
+    async def spying_open_file(*args, **kwargs):
+        opened.append(args)
+        return await real_open_file(*args, **kwargs)
+
+    monkeypatch.setattr(anyio, "open_file", spying_open_file)
+
+    async def serve_file(request):
+        return FileResponse(str(path), media_type="application/octet-stream")
+
+    lid, port = listen(loop, Starlette(routes=[Route("/file", serve_file)]))
+    bodies = loop.run_until_complete(_get_twice(port, b"/file"))
+    assert bodies == [payload, payload]
+    assert opened == []  # Starlette never opened the file itself
+    # A range request is Starlette's own to answer, piece by piece.
+    request = b"GET /file HTTP/1.1\r\nhost: x\r\nrange: bytes=10-19\r\n\r\n"
+    ranged = loop.run_until_complete(_request(port, request))
+    assert ranged.startswith(b"HTTP/1.1 206") and _body(ranged) == payload[10:20]
+    loop._core.listener_close(lid)
+
+
 def test_http_listen_fd_adopts_existing_listener(loop):
     # The spawn worker model's adopt path (R-090): the engine takes over
     # an already-bound, already-listening socket. Platform-neutral half

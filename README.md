@@ -1122,6 +1122,35 @@ The server speaks HTTP/1.1 only, so it sets the context's ALPN list to
 `http/1.1`; otherwise a client could agree on HTTP/2 during the handshake
 and then have every request rejected.
 
+### Sending files
+
+`FileResponse` and `StaticFiles` in Starlette and FastAPI are faster on
+cadeloop without any change to your app. The server implements the ASGI
+*Path Send* extension, so the framework hands it a file path and cadeloop
+sends the file, where it would otherwise read the file itself, 64 KiB at a
+time, with a hop to a worker thread for every piece.
+
+| `FileResponse`, one worker, Linux, loopback | read by the framework | sent by cadeloop |
+|---|---|---|
+| 16 KiB file | 1,240 requests/s | 4,540 requests/s |
+| 64 KiB file | 1,040 requests/s | 3,950 requests/s |
+| 1 MiB file | 285 requests/s | 1,180 requests/s |
+| 10 MiB file | 37 requests/s | 183 requests/s |
+
+Files up to 256 KiB are read in one piece on the loop thread; larger ones
+are read 1 MiB at a time on a small thread pool of their own, so a file
+that is not in the page cache, or sits on a slow disk, does not stall other
+requests. It works the same over HTTPS and on Windows. Range requests are
+still answered by the framework.
+
+Without a framework, send the message yourself after the response start:
+
+```python
+await send({"type": "http.response.start", "status": 200,
+            "headers": [(b"content-length", str(os.path.getsize(path)).encode())]})
+await send({"type": "http.response.pathsend", "path": path})
+```
+
 ### WebSockets
 
 WebSocket connections reach your app as `websocket` scopes, as in any ASGI

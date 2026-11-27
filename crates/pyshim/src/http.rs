@@ -733,6 +733,11 @@ fn build_scope<'py>(
         // one would have leaked just as far.
         let exts = PyDict::new(py);
         exts.set_item(intern!(py, "http.response.trailers"), PyDict::new(py))?;
+        // Path Send: the application names a file and the server sends it
+        // (`pathsend`, below). Starlette's FileResponse and StaticFiles
+        // use it whenever it is declared; without it they read the file
+        // 64 KiB at a time through worker threads.
+        exts.set_item(intern!(py, "http.response.pathsend"), PyDict::new(py))?;
         scope.set_item(intern!(py, "extensions"), exts)?;
     }
     scope.set_item(
@@ -1465,19 +1470,22 @@ pub struct HttpSend {
 
 #[pymethods]
 impl HttpSend {
-    fn __call__(&self, py: Python<'_>, message: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
-        let core = self.core.bind(py).get();
+    fn __call__(slf: &Bound<'_, Self>, py: Python<'_>, message: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        let this = slf.get();
+        let core = this.core.bind(py).get();
         // Refuse a send() from a request that has already finished: its
         // response is complete, and the bytes would otherwise land in the
         // CURRENT request's response stream (verified: a retained send from
         // request 1 spliced `<LEAK>` into request 2's chunked body).
         let stale = core.with_net(|net, _| {
-            net.http_conn_mut(self.tid).map(|c| c.req_epoch != self.epoch).unwrap_or(true)
+            net.http_conn_mut(this.tid).map(|c| c.req_epoch != this.epoch).unwrap_or(true)
         })?;
         if stale {
             return Err(send_err(SendErr::Gone));
         }
-        process_send(py, core, self.tid, &message)?;
+        if process_send(py, core, this.tid, &message)? == Sent::FileToSend {
+            return pathsend(py, slf, &message);
+        }
 
         // R-084 write backpressure. Returning an already-completed
         // awaitable unconditionally meant a streaming app whose only
@@ -1485,7 +1493,7 @@ impl HttpSend {
         // stream against a slow client -- the loop monopolised, the queue
         // unbounded, and the configured watermarks never applied to the
         // ASGI producer the way they apply to a Python protocol.
-        let (tid, epoch) = (self.tid, self.epoch);
+        let (tid, epoch) = (this.tid, this.epoch);
         let over = core.with_net(|net, _| {
             // A non-eager request's Task runs on past its response out of
             // the engine's sight (the eager driver is released where it
@@ -1505,7 +1513,7 @@ impl HttpSend {
         if !over {
             return Ok(completed(py).clone_ref(py).into_any());
         }
-        let pyloop = core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.pyloop.clone_ref(py)))?;
+        let pyloop = core.with_net(|net, _| net.http_conn_mut(this.tid).map(|c| c.pyloop.clone_ref(py)))?;
         let Some(pyloop) = pyloop else {
             return Ok(completed(py).clone_ref(py).into_any());
         };
@@ -1518,7 +1526,7 @@ impl HttpSend {
         // done() is a Python call, so the queue is taken out of the cell,
         // filtered here and put back in one uninterrupted stretch of
         // loop-thread code, as HttpReceive does with its waiters.
-        let parked = core.with_net(|net, _| net.http_conn_mut(self.tid).map(|c| c.take_drain_waiters()))?;
+        let parked = core.with_net(|net, _| net.http_conn_mut(this.tid).map(|c| c.take_drain_waiters()))?;
         let live: VecDeque<Py<PyAny>> = parked
             .unwrap_or_default()
             .into_iter()
@@ -1531,7 +1539,7 @@ impl HttpSend {
         let store = fut.clone().unbind();
         // Both go back out of the closure when the connection is gone, so
         // no reference drops in-cell (ADR-5).
-        let unstored = core.with_net(move |net, _| match net.http_conn_mut(self.tid) {
+        let unstored = core.with_net(move |net, _| match net.http_conn_mut(this.tid) {
             Some(conn) => {
                 conn.drain_waiters = live;
                 conn.drain_waiters.push_back(store);
@@ -1747,7 +1755,7 @@ fn is_field_vchar(b: u8) -> bool {
 }
 
 /// R-086 protocol violations raise RuntimeError).
-fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, PyDict>) -> PyResult<()> {
+fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, PyDict>) -> PyResult<Sent> {
     let mtype: Bound<'_, PyAny> = message
         .get_item(intern!(py, "type"))?
         .ok_or_else(|| PyRuntimeError::new_err("ASGI message missing 'type'"))?;
@@ -1756,7 +1764,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
 
     let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
     if is_ws {
-        return ws_send(py, core, tid, kind, message);
+        return ws_send(py, core, tid, kind, message).map(|()| Sent::Done);
     }
 
     if kind == "http.response.start" {
@@ -1904,7 +1912,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             Ok(())
         })?
         .map_err(send_err)?;
-        return Ok(());
+        return Ok(Sent::Done);
     }
 
     if kind == "http.response.body" {
@@ -2097,7 +2105,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             }
         })?
         .map_err(send_err)?;
-        return Ok(());
+        return Ok(Sent::Done);
     }
 
     if kind == "http.response.trailers" {
@@ -2160,10 +2168,43 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
             Ok(())
         })?
         .map_err(send_err)?;
-        return Ok(());
+        return Ok(Sent::Done);
     }
 
+    if kind == "http.response.pathsend" {
+        return Ok(Sent::FileToSend);
+    }
     Err(PyRuntimeError::new_err(format!("unsupported ASGI message type: {mtype}")))
+}
+
+/// What `process_send` did with a message.
+#[derive(PartialEq, Eq)]
+enum Sent {
+    /// Handled: validated, serialized, queued.
+    Done,
+    /// An `http.response.pathsend`: the caller sends the file.
+    FileToSend,
+}
+
+/// `cadeloop.server._send_file`, looked up once.
+static SEND_FILE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// ASGI Path Send (`http.response.pathsend`): the response body is the
+/// file at `path`.
+///
+/// Returns the awaitable that sends it. The sending itself is the
+/// facade's `_send_file`, which reads the file and hands its contents to
+/// this same callable as ordinary `http.response.body` messages: framing,
+/// the declared-length check, HEAD suppression, TLS and write
+/// backpressure are then the ones every body goes through, and a body of
+/// 16 KiB or more is queued by reference, not copied (ADR-33).
+fn pathsend(py: Python<'_>, send: &Bound<'_, HttpSend>, message: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+    let path = message
+        .get_item(intern!(py, "path"))?
+        .ok_or_else(|| PyRuntimeError::new_err("http.response.pathsend missing 'path'"))?;
+    let helper = SEND_FILE
+        .get_or_try_init(py, || py.import("cadeloop.server")?.getattr("_send_file").map(Bound::unbind))?;
+    helper.call1(py, (send, path))
 }
 
 /// Fields RFC 7230 4.1.2 forbids in a trailer section.

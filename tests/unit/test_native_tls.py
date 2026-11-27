@@ -445,3 +445,38 @@ def test_silent_tls_connection_is_torn_down_at_head_timeout(loop, certs):
 
     loop.run_until_complete(main())
     loop._core.listener_close(lid)
+
+
+def test_pathsend_over_tls(loop, certs, tmp_path):
+    """ASGI Path Send on an HTTPS listener: the file goes through the
+    engine's TLS like any body, large enough here to be read in chunks."""
+    import os
+
+    server_ctx, client_ctx = certs
+    payload = os.urandom(2 * 1024 * 1024 + 5)
+    path = tmp_path / "blob.bin"
+    path.write_bytes(payload)
+
+    async def app(scope, receive, send):
+        assert scope["scheme"] == "https" and "http.response.pathsend" in scope["extensions"]
+        headers = [(b"content-length", str(len(payload)).encode())]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.pathsend", "path": str(path)})
+
+    lid, port = listen_tls(loop, app, server_ctx)
+
+    async def main():
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", port, ssl=client_ctx, server_hostname="localhost"
+        )
+        for _ in range(2):  # and the connection is still good afterwards
+            writer.write(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+            assert head.startswith(b"HTTP/1.1 200")
+            assert await asyncio.wait_for(reader.readexactly(len(payload)), 20) == payload
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+

@@ -18,6 +18,7 @@ usage documentation is in the [README](../README.md).
 | CPython asyncio conformance suite | ✅ runs against the stdlib's own tests |
 | RIO backend (`backend="rio"`) | 🔶 implemented; blocked on an OS-level RIO failure on the test machine — `auto` stays on IOCP |
 | Native `loop.sendfile` | 🔶 `sock_sendfile` fallback works |
+| ASGI extensions | ✅ `http.response.trailers`, `http.response.pathsend` (Starlette/FastAPI `FileResponse` uses it) |
 
 Full requirement-by-requirement map:
 [requirements-traceability.md](requirements-traceability.md).
