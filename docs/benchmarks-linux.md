@@ -1,6 +1,6 @@
 # Linux benchmark results: full tables
 
-Every server and workload from the Linux run summarised in the
+Every server and workload from the Linux run summarized in the
 [README](../README.md#linux-epoll), with all columns. Method and machine:
 [benchmarks.md](benchmarks.md#linux-environment); raw data:
 [bench/baselines/linux-2026-10/](../bench/baselines/linux-2026-10/).

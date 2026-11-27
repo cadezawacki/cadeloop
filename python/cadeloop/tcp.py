@@ -1271,7 +1271,7 @@ class TcpSurface:
             pass
         else:
             # A connection already queued takes this fast path, which must
-            # normalise the socket exactly as the deferred path does: an
+            # normalize the socket exactly as the deferred path does: an
             # accepted socket does NOT inherit the listener's nonblocking
             # flag on Linux, so a later `await loop.sock_recv(conn, ...)`
             # would run a blocking recv() and freeze the whole loop.

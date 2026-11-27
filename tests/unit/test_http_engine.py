@@ -1703,7 +1703,7 @@ def test_valid_response_headers_still_pass(loop):
 @pytest.mark.parametrize("status", [204, 304])
 def test_bodyless_status_suppresses_body_and_framing(loop, status):
     """RFC 7230 3.3.2: a 204/304 response carries no body and no framing
-    headers. Emitting either desynchronises a keep-alive stream, because
+    headers. Emitting either desynchronizes a keep-alive stream, because
     the client starts reading the NEXT response immediately. Reported by
     Codex review on PR #1."""
 
@@ -1738,7 +1738,7 @@ def test_bodyless_status_suppresses_body_and_framing(loop, status):
     assert b"content-length" not in first.lower()
     assert b"transfer-encoding" not in first.lower()
     assert b"junk" not in first
-    # The second response is intact, i.e. the stream never desynchronised.
+    # The second response is intact, i.e. the stream never desynchronized.
     assert b"200" in second.split(b"\r\n", 1)[0]
     assert body == b"second"
     loop._core.listener_close(lid)
@@ -1855,7 +1855,7 @@ def test_app_supplied_transfer_encoding_is_stripped(loop):
 )
 def test_declared_content_length_is_enforced(loop, chunks, label):
     """R-084: a body that disagrees with the declared content-length
-    desynchronises a keep-alive stream — the client reads into the next
+    desynchronizes a keep-alive stream — the client reads into the next
     response or treats the surplus as one. Reported by Codex review on
     PR #1."""
 
@@ -2157,7 +2157,7 @@ def test_informational_status_is_rejected(loop):
 def test_app_content_length_stripped_from_204(loop):
     """HTTP forbids Content-Length on a 204. Suppressing only the
     GENERATED framing was not enough — an app-supplied header was still
-    copied through, and a client honouring it reads the next keep-alive
+    copied through, and a client honoring it reads the next keep-alive
     response's bytes as this one's body. Reported by Codex review on PR #1."""
 
     async def app(scope, receive, send):
@@ -2316,7 +2316,7 @@ def test_shutdown_drains_the_in_flight_response(loop):
     """SIGTERM stops run_forever; going straight from there to
     loop.close() cancelled the in-flight write, so a client that had
     already been promised a content-length got a truncated body. The
-    configured grace was honoured between workers but never inside one."""
+    configured grace was honored between workers but never inside one."""
     from cadeloop.server import _drain_connections
 
     body = b"x" * 5000
@@ -2653,7 +2653,7 @@ def test_205_frames_its_empty_payload(loop):
         w.write(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n")
         await w.drain()
         first = await asyncio.wait_for(_read_one_response(r), 5.0)
-        # Same connection: a mis-framed 205 desynchronises this.
+        # Same connection: a mis-framed 205 desynchronizes this.
         w.write(b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
         await w.drain()
         second = await asyncio.wait_for(_read_one_response(r), 5.0)
@@ -2664,13 +2664,13 @@ def test_205_frames_its_empty_payload(loop):
     assert first.startswith(b"HTTP/1.1 205"), first[:40]
     assert b"content-length: 0" in first.lower(), first
     assert b"should not be sent" not in first, first
-    assert second.startswith(b"HTTP/1.1 205"), f"keep-alive desynchronised: {second[:60]!r}"
+    assert second.startswith(b"HTTP/1.1 205"), f"keep-alive desynchronized: {second[:60]!r}"
     loop._core.listener_close(lid)
 
 
 def test_204_stays_self_framing(loop):
     """The 205 change must not give 204 a content-length: rule 1 makes it
-    self-framing and a framing header there is what desynchronises."""
+    self-framing and a framing header there is what desynchronizes."""
 
     async def app(scope, receive, send):
         await receive()
@@ -3487,7 +3487,7 @@ def test_a_cancel_scope_knows_its_own_cancellation_at_a_checkpoint(loop, eager):
     Task.cancel(msg) was given. The eager driver latched a cancel that
     found nothing awaited -- a checkpoint, sleep(0), an uncontended Lock --
     without its message and delivered a bare CancelledError, which the
-    cancel scope did not recognise as its own: it escaped the `with`
+    cancel scope did not recognize as its own: it escaped the `with`
     block, and a FastAPI route under move_on_after() answered 500."""
     anyio = pytest.importorskip("anyio")
     out = []

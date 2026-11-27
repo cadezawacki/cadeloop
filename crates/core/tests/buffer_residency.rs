@@ -41,7 +41,7 @@ fn acquired_slots_are_not_resident_until_written() {
     assert_eq!(resident_pages(pool.slot_ptr(slot), 65536), 1);
     let rest: usize =
         ids.iter().filter(|&&id| id != slot).map(|&id| resident_pages(pool.slot_ptr(id), 65536)).sum();
-    assert_eq!(rest, 0, "writing one slot faulted in its neighbours");
+    assert_eq!(rest, 0, "writing one slot faulted in its neighbors");
 
     for id in ids {
         pool.release(id);

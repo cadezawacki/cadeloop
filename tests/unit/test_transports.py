@@ -1871,7 +1871,7 @@ def test_close_restores_signal_disposition():
     """A handler left installed by close() points the signal module at a
     _dispatch that returns immediately once the loop is closed, so the
     signal is silently swallowed for the rest of the process instead of
-    resuming default behaviour. Reported by Codex review on PR #1 (twice)."""
+    resuming default behavior. Reported by Codex review on PR #1 (twice)."""
     import signal as signal_module
 
     before = signal_module.getsignal(signal_module.SIGUSR1)
@@ -1885,7 +1885,7 @@ def test_close_restores_signal_disposition():
     signal_module.signal(signal_module.SIGUSR1, before)
 
 
-def test_sendfile_fallback_honours_offset_zero(loop, tmp_path):
+def test_sendfile_fallback_honors_offset_zero(loop, tmp_path):
     """The seek was guarded by `if offset:`, so the default offset=0 sent
     from the file's CURRENT position on any fallback path (BytesIO, SSL,
     Windows) while the native path sent from byte zero — the same call

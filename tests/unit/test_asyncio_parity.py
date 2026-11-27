@@ -1,12 +1,12 @@
-"""Behaviour cadeloop must share with the stdlib asyncio loop.
+"""Behavior cadeloop must share with the stdlib asyncio loop.
 
 Found by differential testing against CPython 3.11's selector loop (and
-uvloop as a second opinion). Each test states the asyncio behaviour; the
+uvloop as a second opinion). Each test states the asyncio behavior; the
 `loop` fixture runs it on cadeloop AND on asyncio's own loop, so a test
-that only passes on cadeloop is a test of the wrong behaviour. Tests that
+that only passes on cadeloop is a test of the wrong behavior. Tests that
 need cadeloop internals use `cade_loop` instead.
 
-asyncio's behaviour is the running interpreter's: where 3.12 or 3.13
+asyncio's behavior is the running interpreter's: where 3.12 or 3.13
 changed something, the test says so (`PY312`, `PY313`) and expects of both
 loops what that version does.
 """

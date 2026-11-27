@@ -230,7 +230,7 @@ def test_cancel_after_fire_reports_no_tombstone(loop):
 
 
 # --------------------------------------------------------------------- #
-# process-level behaviour (subprocesses)                                #
+# process-level behavior (subprocesses)                                #
 # --------------------------------------------------------------------- #
 
 

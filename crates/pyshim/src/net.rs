@@ -1485,7 +1485,7 @@ const CLOSE_REAP_BUDGET: Duration = Duration::from_millis(5);
 /// same evidence as during a tick -- its completion came back. Guards
 /// whose completion does not arrive inside the budget stay put and are
 /// freed when the state (and with it the backend) drops, which is the
-/// pre-existing behaviour. Nothing is freed early on any path.
+/// pre-existing behavior. Nothing is freed early on any path.
 ///
 /// In-cell, and Python-free: `translate` only moves refs into `events` /
 /// the graveyards, which close drains afterwards.
@@ -1806,7 +1806,7 @@ fn on_dgram_send_done(
 }
 
 /// Post queued datagrams until one is actually in flight or the queue is
-/// empty, then honour a deferred close.
+/// empty, then honor a deferred close.
 ///
 /// A synchronous `post_send_to` failure is a per-packet error, not an
 /// endpoint failure -- but it also means no completion is coming for that

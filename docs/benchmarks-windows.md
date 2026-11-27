@@ -1,6 +1,6 @@
 # Windows benchmark results: full tables
 
-Every server and workload from the Windows run summarised in the
+Every server and workload from the Windows run summarized in the
 [README](../README.md#windows-11-iocp), with all columns. Method:
 [benchmarks.md](benchmarks.md#windows-environment); data:
 [bench/baselines/windows-2026-10/](../bench/baselines/windows-2026-10/).

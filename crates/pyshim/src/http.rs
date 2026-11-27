@@ -106,7 +106,7 @@ pub(crate) struct HttpConn {
     /// The zero-length chunk that introduces the trailer section has
     /// been written, so further trailer messages append fields only.
     pub(crate) trailers_started: bool,
-    /// `http.response.start` set `trailers: True`. Only honoured when the
+    /// `http.response.start` set `trailers: True`. Only honored when the
     /// response is genuinely chunked -- HTTP/1.1 carries trailers in the
     /// chunked terminator and nowhere else, so a caller-framed or
     /// close-delimited response has no place to put them.
@@ -1710,7 +1710,7 @@ fn strip_userinfo(authority: &[u8]) -> &[u8] {
 /// framing of one.
 /// Statuses whose response is terminated by the end of the headers no
 /// matter what the headers say (RFC 7230 3.3.3 rule 1): they carry no
-/// body *and* need no framing header, so emitting one desynchronises a
+/// body *and* need no framing header, so emitting one desynchronizes a
 /// keep-alive stream.
 ///
 /// 205 is deliberately absent. It also carries no content, but it is not
@@ -1872,7 +1872,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // HTTP forbids Content-Length on a 204 (and on 1xx).
                     // Suppressing only the GENERATED framing was not
                     // enough: an app-supplied header was still copied
-                    // through, and a client honouring it reads the next
+                    // through, and a client honoring it reads the next
                     // keep-alive response's bytes as this one's body.
                     //
                     // NOT 304: RFC 7232 4.1 explicitly PERMITS
@@ -2018,7 +2018,7 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
                     // A bodyless status must not carry body bytes AND must
                     // not carry framing headers: a client reading a 204/304
                     // starts the next response immediately, so a stray
-                    // content-length/chunked header (or body) desynchronises
+                    // content-length/chunked header (or body) desynchronizes
                     // the keep-alive stream.
                     let bodyless = conn.resp_bodyless;
                     let empty = conn.resp_empty;
@@ -2297,7 +2297,7 @@ fn announce_keep_alive_10(conn: &HttpConn, out: &mut Vec<u8>) {
 /// a cosmetic error: on a keep-alive connection a short body makes the
 /// client read the start of the NEXT response as this one's body, and a
 /// long one makes the surplus look like a new response. Either way the
-/// stream is desynchronised, which is the request-smuggling shape.
+/// stream is desynchronized, which is the request-smuggling shape.
 fn length_mismatch(conn: &HttpConn, final_message: bool) -> Option<SendErr> {
     if conn.active_head || conn.resp_bodyless || conn.resp_empty {
         // No body goes on the wire, and for these the declared length
@@ -2839,7 +2839,7 @@ fn ws_send(
                         return Err(PyRuntimeError::new_err(
                             "websocket.accept may not set 'sec-websocket-extensions'; the \
                              server negotiates extensions itself (permessage-deflate, with \
-                             the ws_compression setting), and a client that honoured an \
+                             the ws_compression setting), and a client that honored an \
                              application's header would be disconnected for setting a \
                              reserved bit",
                         ));
@@ -3998,7 +3998,7 @@ pub struct AppTask {
     /// The message of the cancel() that latched `must_cancel`
     /// (Task._cancel_message). anyio tells its own cancellations from
     /// anyone else's by it: delivered as a bare CancelledError, a
-    /// cancel scope hit at a checkpoint did not recognise its own
+    /// cancel scope hit at a checkpoint did not recognize its own
     /// cancel and let it escape the `with` block.
     cancel_msg: Option<Py<PyAny>>,
     /// Task._num_cancels_requested: what cancelling() reports and

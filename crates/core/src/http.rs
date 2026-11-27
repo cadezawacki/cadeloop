@@ -325,7 +325,7 @@ unsafe extern "C" fn on_headers_complete(p: *mut Llhttp) -> c_int {
             }
         }
     }
-    // Otherwise the expectation is honoured: the caller writes the
+    // Otherwise the expectation is honored: the caller writes the
     // interim response, because it owns the wire.
     if minor >= 1 && a.expects_continue() {
         a.owes_continue = true;
@@ -469,7 +469,7 @@ impl HttpParser {
         // WITHOUT refreshing `error_pos` (it short-circuits on the stored
         // error), so the old code then read `error_pos` -- a pointer into a
         // PREVIOUS feed's buffer -- and `offset_from`'d it against THIS
-        // buffer: undefined behaviour, and in practice a garbage split that
+        // buffer: undefined behavior, and in practice a garbage split that
         // dropped or truncated the first client frame to arrive in a later
         // recv. Nothing resumes an upgraded parser (we never call
         // llhttp_resume_after_upgrade), so skip it entirely.

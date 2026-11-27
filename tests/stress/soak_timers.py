@@ -87,7 +87,7 @@ def main() -> int:
     import cadeloop
 
     loop = cadeloop.new_event_loop()
-    # Set for real after warmup: initialising it here made warmup eat into
+    # Set for real after warmup: initializing it here made warmup eat into
     # the requested duration (a 30s run measured 20s, a 600s nightly 540s,
     # and anything under the 3s warmup floor measured nothing at all).
     deadline = float("inf")

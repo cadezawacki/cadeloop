@@ -174,7 +174,7 @@ pub fn afd_outcome(status: i32, events: u32, read: bool, write: bool) -> PollOut
     }
 }
 
-// ---- slot quarantine (W1 defence) --------------------------------------- //
+// ---- slot quarantine (W1 defense) --------------------------------------- //
 
 /// Slots retired WITHOUT a port completion -- inline successes under
 /// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, synchronous failures -- held off
@@ -186,7 +186,7 @@ pub fn afd_outcome(status: i32, events: u32, read: bool, write: bool) -> PollOut
 /// LIFO, so the next post reuses the slot, and the stray packet then
 /// "completes" that live op -- whose buffers are released while the kernel
 /// still owns them. Held, the slot is still Completed when such a packet
-/// arrives, so it is recognised, counted and dropped instead.
+/// arrives, so it is recognized, counted and dropped instead.
 ///
 /// A packet for a synchronous completion is queued before the issuing call
 /// returns, so once a dequeue comes back short of a full batch, every id
@@ -335,7 +335,7 @@ impl<S> SocketPool<S> {
 
 // ---- retry-on-failure lazy init ----------------------------------------- //
 
-/// `OnceLock::get_or_init` for a fallible initialiser that caches only
+/// `OnceLock::get_or_init` for a fallible initializer that caches only
 /// success. Caching the `io::Result` itself made one transient failure (a
 /// probe socket refused at a descriptor limit, say) permanent for the
 /// whole process.
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(cell.get().is_none(), "the failure must not stick");
         assert_eq!(*get_or_try_init(&cell, || Ok(7)).unwrap(), 7);
-        // Once set, the initialiser never runs again.
+        // Once set, the initializer never runs again.
         assert_eq!(*get_or_try_init(&cell, || panic!("re-ran")).unwrap(), 7);
     }
 }

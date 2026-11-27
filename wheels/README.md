@@ -5,7 +5,7 @@
 They were built before the pyo3 0.24.2 → 0.29.2 upgrade
 (RUSTSEC-2026-0176, RUSTSEC-2026-0177) and before several correctness
 fixes in `config.py` / `loop.py` / `server.py`, so installing them
-delivered stale behaviour *and* the known-vulnerable native dependency
+delivered stale behavior *and* the known-vulnerable native dependency
 while looking like the reviewed source. Committed binaries drift from the
 tree silently — the tree is the source of truth, so they are gone rather
 than refreshed by hand.

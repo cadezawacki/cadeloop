@@ -3,7 +3,7 @@
 `Loop(native_tls=True)` puts cadeloop's Rust port of asyncio's sslproto
 between an application's protocol and the transport, for
 create_connection / create_server / start_tls. What it shares with
-sslproto is tested where sslproto's behaviour is: test_asyncio_parity.py
+sslproto is tested where sslproto's behavior is: test_asyncio_parity.py
 runs its TLS cases on this loop as a third column, test_differential.py
 runs generated scripts over it against asyncio, and CPython's own
 test_sslproto and test_ssl run against it in CI. This module holds what

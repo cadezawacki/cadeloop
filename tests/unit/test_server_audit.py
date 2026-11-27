@@ -644,7 +644,7 @@ def test_s15_the_supervisor_reaps_only_its_own_children(tmp_path):
 
 
 # --------------------------------------------------------------------- #
-# S6, S12, S13, S22: pool behaviour                                      #
+# S6, S12, S13, S22: pool behavior                                      #
 # --------------------------------------------------------------------- #
 
 
@@ -796,7 +796,7 @@ def test_s5_a_stalled_spawn_worker_blocks_neither_accepting_nor_shutdown(tmp_pat
             t0 = time.monotonic()
             srv.proc.send_signal(signal.SIGINT)
             srv.wait(30)
-            assert time.monotonic() - t0 < 10, "shutdown did not honour grace=2.0"
+            assert time.monotonic() - t0 < 10, "shutdown did not honor grace=2.0"
         finally:
             try:
                 os.kill(stalled, signal.SIGCONT)
@@ -1518,7 +1518,7 @@ def test_s24_config_rejects_wrong_types_and_native_overflows(kwargs, exc):
         cadeloop.Config(**kwargs)
 
 
-def test_s24_config_normalises_numbers():
+def test_s24_config_normalizes_numbers():
     c = cadeloop.Config(grace=3, workers=2)
     assert c.grace == 3.0 and isinstance(c.grace, float) and c.workers == 2
 

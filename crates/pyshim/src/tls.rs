@@ -10,7 +10,7 @@
 //! and a 256 KiB receive buffer, zero-filled, per connection.
 //!
 //! This module is the same state machine with the same observable
-//! behaviour -- the same states, the same callbacks in the same order, the
+//! behavior -- the same states, the same callbacks in the same order, the
 //! same exceptions and the same exception-handler reports -- driving the
 //! same objects: the interpreter's own `SSLObject` over a pair of
 //! `MemoryBIO`s, made by the caller's own `SSLContext`. Certificate

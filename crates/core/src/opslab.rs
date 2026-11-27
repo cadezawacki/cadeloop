@@ -134,7 +134,7 @@ impl<D> OpSlab<D> {
     /// `cancel_connect` -- and the whole point of the generation check is
     /// that a stale or bogus id resolves to `None`. Indexing directly
     /// panicked BEFORE that check could run, turning "id I do not
-    /// recognise" into a crash. The modulo is always in range, so only
+    /// recognize" into a crash. The modulo is always in range, so only
     /// the chunk lookup needs checking.
     #[inline]
     fn slot(&self, index: u32) -> Option<&OpSlot<D>> {
@@ -474,7 +474,7 @@ mod adr25_ptr_screen {
         let ids: Vec<OpId> = (0..CHUNK * 2 + 5).map(|_| s.post(OpKind::Send)).collect();
         for id in ids {
             let p = (&mut s.get_mut(id).unwrap().data) as *mut u64 as *const u8;
-            assert!(s.contains_data_ptr(p), "own data pointer must be recognised");
+            assert!(s.contains_data_ptr(p), "own data pointer must be recognized");
         }
     }
 
@@ -516,7 +516,7 @@ mod adr25_ptr_screen {
     }
 
     #[test]
-    fn still_recognises_slots_after_growth_and_reuse() {
+    fn still_recognizes_slots_after_growth_and_reuse() {
         let mut s = slab();
         let first = s.post(OpKind::Accept);
         let p_first = (&mut s.get_mut(first).unwrap().data) as *mut u64 as *const u8;

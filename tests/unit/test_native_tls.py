@@ -192,7 +192,7 @@ def test_plaintext_to_tls_port_is_dropped(loop, certs):
 def test_tls_parse_error_answered_in_pipeline_order(loop, certs):
     """Parity with the plaintext path: a request that completed ahead of
     malformed bytes in the same TLS record is answered before the 400,
-    not dropped in its favour. Reported on PR #1."""
+    not dropped in its favor. Reported on PR #1."""
     server_ctx, client_ctx = certs
     lid, port = listen_tls(loop, scope_echo_app, server_ctx)
 

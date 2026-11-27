@@ -947,7 +947,7 @@ def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
         # themselves. Freezing anyway and skipping the unfreeze -- which
         # is what this did when the restore was first added -- just moves
         # the leak: our objects join theirs and stay there. With no way to
-        # undo it, the honest choice is not to do it: skip the optimisation
+        # undo it, the honest choice is not to do it: skip the optimization
         # and leave the caller's policy alone.
         if inherited or not _caller_froze_the_heap():
             gc.freeze()
@@ -1084,7 +1084,7 @@ def _drain_connections(loop, grace, shutdown=None):
 
     ``loop.close()`` cancels every pending operation, so going straight
     there from ``run_forever()`` truncated whatever was mid-response --
-    ``grace`` was honoured between *workers* but never inside one. The
+    ``grace`` was honored between *workers* but never inside one. The
     listener is already closed when this runs, so the connection set only
     shrinks: the native side ends keep-alive on every connection (each
     then closes as its response completes), closes the ones that are idle

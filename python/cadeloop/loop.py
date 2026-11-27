@@ -60,7 +60,7 @@ def _not_yet(feature: str, key: str):
     )
 
 
-# asyncio's own, not a copy of it: anyio recognises the task
+# asyncio's own, not a copy of it: anyio recognizes the task
 # run_until_complete() drives -- its "root task", which it pools the
 # worker threads behind to_thread.run_sync under -- by this very function
 # (uvloop's by module name). With an identical copy, no task was ever the
@@ -185,7 +185,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         overridden = {n for n in natives if getattr(cls, n) is not getattr(Loop, n)}
         if overridden & {"time", "call_at"}:
             # asyncio's call_later is call_at(time() + delay): an override
-            # of either must be honoured by it too.
+            # of either must be honored by it too.
             overridden.add("call_later")
         for name, native in natives.items():
             if name not in overridden:
@@ -391,7 +391,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         # down. Leaving handlers installed pointed the signal module at a
         # _dispatch that returns immediately once the loop is closed, so
         # SIGINT/SIGTERM were silently swallowed for the rest of the
-        # process instead of resuming default behaviour -- and the closed
+        # process instead of resuming default behavior -- and the closed
         # loop stayed referenced from the signal module. Matches what the
         # stdlib Unix loop does in its own close().
         for sig in list(self._signal_handlers):
@@ -493,7 +493,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         if cls.time is Loop.time and cls.call_at is Loop.call_at:
             return self._fast_call_later(delay, callback, *args, context=context)
         # asyncio's own definition, so an overridden time() or call_at()
-        # is honoured.
+        # is honored.
         timer = self.call_at(self.time() + delay, callback, *args, context=context)
         if timer._source_traceback:
             del timer._source_traceback[-1]

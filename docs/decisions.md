@@ -687,7 +687,7 @@ syscall per message, for good. After two such misses in a row the probe is
 skipped and the receive parks; level-triggered epoll reports the socket at
 the next poll if data was there after all, so nothing can be lost, only
 found one poll later. One full read in sixteen is still probed, and a hit
-puts the socket back to probing every time, so a stream is recognised
+puts the socket back to probing every time, so a stream is recognized
 within sixteen reads. Worth about 1% on the 64 KiB echo -- a syscall, no
 more -- and nothing measurable elsewhere.
 

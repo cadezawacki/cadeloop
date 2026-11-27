@@ -189,10 +189,10 @@ const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 /// Choose among a client's `Sec-WebSocket-Extensions` offers (one header
 /// value per item; each may hold several comma-separated offers). Returns
 /// the value of the response header for the first `permessage-deflate`
-/// offer this implementation can honour, or None to negotiate nothing --
+/// offer this implementation can honor, or None to negotiate nothing --
 /// which is always a legal answer.
 ///
-/// Honoured: any offer whose parameters are `client_max_window_bits`
+/// Honored: any offer whose parameters are `client_max_window_bits`
 /// (with or without a value), `client_no_context_takeover`,
 /// `server_no_context_takeover`, and `server_max_window_bits=15`. An offer
 /// that asks the server for a smaller window is passed over (the
@@ -1107,7 +1107,7 @@ mod tests {
         let echoed = format!("{base}; server_max_window_bits=15");
         assert_eq!(offer("permessage-deflate; server_max_window_bits=15"), Some(echoed.clone()));
         assert_eq!(offer("permessage-deflate; server_max_window_bits=\"15\""), Some(echoed));
-        // A smaller server window cannot be honoured: that offer is
+        // A smaller server window cannot be honored: that offer is
         // passed over, and a later one that can be is taken.
         assert_eq!(offer("permessage-deflate; server_max_window_bits=10"), None);
         assert_eq!(
@@ -1424,7 +1424,7 @@ mod tests {
                 }
             }
 
-            /// Every offer the documentation says is honoured, is: the
+            /// Every offer the documentation says is honored, is: the
             /// legal parameters in any order, any letter case, any legal
             /// spacing, with or without quotes around a value.
             #[test]

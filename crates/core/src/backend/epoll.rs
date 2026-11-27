@@ -475,7 +475,7 @@ impl EpollBackend {
                 }
                 // sendmsg(MSG_NOSIGNAL), not writev: a write to a socket the
                 // peer has reset raises SIGPIPE, and only Python's own
-                // startup ignores that signal. An embedder that initialised
+                // startup ignores that signal. An embedder that initialized
                 // without signal handling -- or an application that put
                 // SIGPIPE back to SIG_DFL to behave under `| head` -- was
                 // killed outright by a client disconnecting mid-response.
