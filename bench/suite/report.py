@@ -610,7 +610,11 @@ def readme_specs(rows, idle, timers, sched, P):
         if r is None or r.get("reps", 0) < 2:
             return None
         if key == "rate":
-            return (r["rate_ci_lo"], r["rate_ci_hi"])
+            # A rate the load generator capped is a lower bound: the server
+            # can do at least this, and the runs do not say how much more.
+            # Open above, the interval can put the cell ahead of a server
+            # it clearly beat and never behind one.
+            return (r["rate_ci_lo"], math.inf if r.get("client_limited") else r["rate_ci_hi"])
         pair = r.get(key)
         return tuple(pair) if pair and pair[0] is not None else None
 

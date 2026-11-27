@@ -62,6 +62,17 @@ def test_cells_that_show_the_same_value_share_a_place_whatever_their_intervals()
     assert _ranks([21, 21, 30, 40, 50], hib=False, ivs=ivs) == [1, 1, 3, None, None]
 
 
+def test_a_lower_bound_is_never_placed_behind():
+    # Two cells capped by the load generator (open above), one that was not.
+    # Neither capped cell is behind the other, whatever the values; a capped
+    # cell is ahead of a server whose whole interval it cleared; and a server
+    # that measured higher than a capped cell is not thereby ahead of it.
+    inf = math.inf
+    assert _ranks([380, 350, 200, 90, 50], ivs=[(370, inf), (340, inf), (190, 210), (80, 95), (45, 55)]) == [
+        1, 1, 3, None, None]
+    assert _ranks([300, 320, 100, 50], ivs=[(290, inf), (310, 330), (90, 110), (45, 55)]) == [1, 1, 3, None]
+
+
 def test_most_cells_tied_within_their_intervals_marks_nothing():
     ivs = [(90, 110), (88, 108), (85, 111), (10, 20)]
     assert _ranks([100, 98, 97, 15], ivs=ivs) == [None] * 4
