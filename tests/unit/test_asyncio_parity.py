@@ -1231,6 +1231,43 @@ def test_introspection_during_and_after_connection_lost(loop):
     loop.run_until_complete(main())
 
 
+def test_limits_and_socket_outlive_the_connection(loop):
+    """Found by the generated scenarios (test_differential.py). asyncio's
+    transport goes on answering once its connection is lost: with the
+    write-buffer limits it was given -- and it takes new ones -- and with
+    its TransportSocket, closed by then, even if nobody had asked for it
+    while the connection was up. cadeloop answered (0, 0), ignored the new
+    limits, and had no socket to show."""
+
+    async def main():
+        lost = loop.create_future()
+
+        class P(asyncio.Protocol):
+            def connection_lost(self, exc):
+                lost.set_result(None)
+
+        server, transport, _ = await _pair(loop, P)
+        transport.set_write_buffer_limits(high=8000)
+        transport.close()
+        await asyncio.wait_for(lost, 5)
+        await asyncio.sleep(0)
+        assert transport.get_write_buffer_limits() == (2000, 8000)
+        transport.set_write_buffer_limits(high=100, low=10)
+        assert transport.get_write_buffer_limits() == (10, 100)
+        with pytest.raises(ValueError):
+            transport.set_write_buffer_limits(high=1, low=2)
+        assert transport.get_write_buffer_limits() == (10, 100)
+        sock = transport.get_extra_info("socket")
+        assert type(sock).__name__ == "TransportSocket"
+        assert sock.fileno() == -1
+        assert sock.family == socket.AF_INET
+        assert transport.get_extra_info("socket") is sock
+        server.close()
+        await server.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 def test_is_reading_is_false_once_closing(loop):
     async def main():
         conns = []

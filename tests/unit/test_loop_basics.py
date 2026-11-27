@@ -689,7 +689,10 @@ def test_adaptive_spin_stops_spinning_while_spins_find_nothing():
     probes now and then."""
     fixed = _spins_over_sparse_sleeps(adaptive_spin=False)
     adaptive = _spins_over_sparse_sleeps(adaptive_spin=True)
-    assert fixed >= 128, fixed
+    # One spin per park, and nearly every sleep parks: on a loaded machine
+    # a sleep now and then has expired by the time the loop gets back to
+    # it and is not parked for at all (127 of 128 was seen in a full run).
+    assert fixed >= 120, fixed
     assert adaptive * 3 < fixed, (adaptive, fixed)
 
 

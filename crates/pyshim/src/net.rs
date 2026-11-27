@@ -43,7 +43,7 @@ use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 
 use crate::coreloop::CoreLoop;
 use crate::handles::Handle;
@@ -4017,7 +4017,7 @@ pub(crate) fn wire_stream(
         return Err(io_error(e));
     }
     let tid = core.with_net(|net, _| net.next_id())?;
-    let transport = Py::new(py, Transport::new(slf.clone().unbind(), tid, peer, name))?;
+    let transport = Py::new(py, Transport::new(slf.clone().unbind(), tid, peer, name, (high, low)))?;
     if let Some(server) = &server {
         // asyncio counts the connection from the transport's creation.
         core.guard_protocol_call(py, server.call_method0(py, intern!(py, "_attach")))?;
@@ -4301,6 +4301,13 @@ pub struct Transport {
     /// read from any thread.
     closing: AtomicBool,
     queued: AtomicUsize,
+    /// The write-buffer limits (low, high), kept here as well as on the
+    /// entry: asyncio's transports go on answering
+    /// `get_write_buffer_limits()` -- and taking
+    /// `set_write_buffer_limits()` -- after the connection is gone, and
+    /// the entry is gone with it.
+    low_water: AtomicUsize,
+    high_water: AtomicUsize,
 }
 
 /// `asyncio.trsock.TransportSocket`, looked up once.
@@ -4323,6 +4330,7 @@ impl Transport {
         tid: u64,
         peername: Option<Py<PyAny>>,
         sockname: Option<Py<PyAny>>,
+        (high_water, low_water): (usize, usize),
     ) -> Self {
         Transport {
             core,
@@ -4335,6 +4343,8 @@ impl Transport {
             sendfile: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             queued: AtomicUsize::new(0),
+            low_water: AtomicUsize::new(low_water),
+            high_water: AtomicUsize::new(high_water),
         }
     }
 
@@ -4374,6 +4384,28 @@ impl Transport {
         std::mem::replace(&mut *slot, protocol)
     }
 
+    /// A closed socket object of this connection's address family (read
+    /// off the shape of its addresses), or None if one cannot be made.
+    fn closed_socket(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let socket_mod = py.import("socket").ok()?;
+        let addr = self.sockname.as_ref().or(self.peername.as_ref()).map(|a| a.bind(py));
+        let family = match addr {
+            Some(a) if a.is_instance_of::<PyTuple>() => match a.len().ok()? {
+                4 => "AF_INET6",
+                _ => "AF_INET",
+            },
+            Some(_) if socket_mod.hasattr("AF_UNIX").ok()? => "AF_UNIX",
+            _ => "AF_INET",
+        };
+        let sock = socket_mod
+            .getattr(intern!(py, "socket"))
+            .ok()?
+            .call1((socket_mod.getattr(family).ok()?, socket_mod.getattr("SOCK_STREAM").ok()?))
+            .ok()?;
+        sock.call_method0(intern!(py, "close")).ok()?;
+        Some(sock.unbind())
+    }
+
     /// `get_extra_info("socket")`.
     ///
     /// Protocols and libraries reach for this through the standard
@@ -4395,8 +4427,18 @@ impl Transport {
         let found = core.with_net(|net, _| {
             net.transports.get(&self.tid).map(|e| (e.owner.as_ref().map(|o| o.clone_ref(py)), e.socket))
         })?;
-        // Gone before anyone asked: there is no socket left to describe.
-        let Some((owner, raw)) = found else { return Ok(None) };
+        // Gone before anyone asked. asyncio's transports still answer with
+        // their TransportSocket -- over a socket that is closed by now,
+        // fileno() -1 -- so code that asks for the socket and then for its
+        // family, or just logs it, works there. The same here: a closed
+        // socket of the connection's family stands in for the one that is
+        // gone.
+        let Some((owner, raw)) = found else {
+            let Some(sock) = self.closed_socket(py) else { return Ok(None) };
+            let ts = transport_socket(py, sock)?;
+            let _ = self.trsock.set(py, ts);
+            return Ok(self.trsock.get(py).map(|t| t.clone_ref(py)));
+        };
         let sock = match owner {
             Some(owner) => owner,
             None => {
@@ -4782,7 +4824,11 @@ impl Transport {
 
     fn get_write_buffer_limits(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
         let core = self.core_ref(py);
-        core.with_net(|net, _| net.transports.get(&self.tid).map_or((0, 0), |e| (e.low_water, e.high_water)))
+        let live =
+            core.with_net(|net, _| net.transports.get(&self.tid).map(|e| (e.low_water, e.high_water)))?;
+        Ok(live.unwrap_or_else(|| {
+            (self.low_water.load(Ordering::Relaxed), self.high_water.load(Ordering::Relaxed))
+        }))
     }
 
     #[pyo3(signature = (high=None, low=None))]
@@ -4818,6 +4864,8 @@ impl Transport {
         // Compared against whole byte counts, `floor(limit)` decides
         // exactly as the limit itself does (uvloop truncates too).
         let (high, low) = (byte_limit(&high)?, byte_limit(&low)?);
+        self.high_water.store(high, Ordering::Relaxed);
+        self.low_water.store(low, Ordering::Relaxed);
         // The queue already has a depth, so the pause decision is re-taken
         // against the new mark, as asyncio's _maybe_pause_protocol does:
         // lowering `high` under an existing backlog pauses now. Raising

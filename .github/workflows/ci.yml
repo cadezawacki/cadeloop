@@ -113,6 +113,17 @@ jobs:
         run: copy target\release\_core.dll python\cadeloop\_core.pyd
       - name: unit + conformance subset
         run: python -m pytest tests/unit tests/conformance -q --timeout=120
+      - name: generated differential scenarios (informational on Windows)
+        # tests/unit/test_differential.py compares cadeloop with asyncio's
+        # selector loop step by step. It is a required check on Linux,
+        # where it was developed; on Windows the two loops also differ in
+        # ways that are the platform's (a loopback send of any size is
+        # taken whole), so here it runs to collect evidence and cannot
+        # fail the job until those have been told apart.
+        continue-on-error: true
+        env:
+          CADELOOP_DIFF_WINDOWS: "1"
+        run: python -m pytest tests/unit/test_differential.py -q --timeout=120
       - name: CPython asyncio conformance suite (R-120)
         run: python tests/conformance/run_cpython_suite.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

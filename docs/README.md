@@ -17,6 +17,13 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Generated differential scenarios (on `claude/sleepy-ride-p2rndm`; Linux)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Tests | `tests/unit/test_differential.py`: a seed expands into a script of transport calls and peer actions (writes of every size, half-closes, resets, pauses, calls after close, wrong argument types), over four ways of making the connection and both protocol kinds; it runs on cadeloop and on asyncio's selector loop against a peer socket the test drives by hand, and the two traces of callbacks and call outcomes must be equal. Plain TCP and TLS. 100 seeds in the unit suite, 600 on every pull request and 3,000 nightly (`slow.yml`); the differences that are TCP's or the kernel's rather than a loop's are listed, with the reason for each, in `_reconcile` | |
+> | Net | Found by it: once its connection was lost a transport answered `get_write_buffer_limits()` with `(0, 0)` and ignored `set_write_buffer_limits()`, and `get_extra_info("socket")` asked for the first time after the loss returned None. asyncio's transport keeps its limits and its (closed) `TransportSocket`; now cadeloop's does too | |
+>
 > **Finalizers and other threads (on `claude/sleepy-ride-p2rndm`; reported from Windows, reproduced on Linux)**
 >
 > | Area | Fix | Commit |
