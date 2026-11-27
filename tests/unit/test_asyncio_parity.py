@@ -5,10 +5,15 @@ uvloop as a second opinion). Each test states the asyncio behaviour; the
 `loop` fixture runs it on cadeloop AND on asyncio's own loop, so a test
 that only passes on cadeloop is a test of the wrong behaviour. Tests that
 need cadeloop internals use `cade_loop` instead.
+
+asyncio's behaviour is the running interpreter's: where 3.12 or 3.13
+changed something, the test says so (`PY312`, `PY313`) and expects of both
+loops what that version does.
 """
 
 import asyncio
 import errno
+import inspect
 import os
 import signal
 import socket
@@ -19,6 +24,12 @@ import time
 
 import cadeloop
 import pytest
+
+PY312 = sys.version_info >= (3, 12)
+PY313 = sys.version_info >= (3, 13)
+# Later 3.12 patch releases word a bind failure with str(exc) rather than
+# exc.strerror; an early one (3.12.3 is what Ubuntu 24.04 ships) does not.
+_ASYNCIO_BIND_ERROR_HAS_CODE = "{str(exc).lower()}" in inspect.getsource(asyncio.base_events)
 
 
 def _new_loop(kind):
@@ -52,14 +63,18 @@ def cade_loop():
         lp.close()
 
 
-def _bind_failure_text(addr):
-    """The OS's own wording for "that address is taken", as the socket
-    module reports it -- the text asyncio's bind error message embeds."""
+def _bind_failure_text(addr, loop):
+    """What asyncio's bind error message says after the address. Through
+    3.11 that is the OS's own wording for "that address is taken"; later
+    patch releases of 3.12, and 3.13, embed str() of the OSError instead,
+    which leads with the error code. cadeloop words it the newer way on
+    every 3.12 and later; asyncio is asked which one it uses here."""
     probe = socket.socket()
     try:
         probe.bind(addr)
     except OSError as e:
-        return e.strerror
+        newer = PY312 and (isinstance(loop, cadeloop.Loop) or _ASYNCIO_BIND_ERROR_HAS_CODE)
+        return str(e) if newer else e.strerror
     finally:
         probe.close()
     raise AssertionError(f"{addr} was expected to be in use")
@@ -391,7 +406,7 @@ def test_bind_in_use_has_errno_and_names_the_address(loop):
         assert info.value.errno == errno.EADDRINUSE
         assert info.value.strerror == (
             f"error while attempting to bind on address ('127.0.0.1', {port}): "
-            + _bind_failure_text(("127.0.0.1", port)).lower()
+            + _bind_failure_text(("127.0.0.1", port), loop).lower()
         )
 
     try:
@@ -416,7 +431,7 @@ def test_local_addr_bind_failure_names_the_local_address(loop):
         assert info.value.errno == errno.EADDRINUSE
         assert info.value.strerror == (
             f"error while attempting to bind on address {taken!r}: "
-            + _bind_failure_text(taken).lower()
+            + _bind_failure_text(taken, loop).lower()
         )
         server.close()
         await server.wait_closed()
@@ -1196,6 +1211,8 @@ def test_pause_writing_failure_is_reported_with_the_transport(loop):
         assert ctx["protocol"] is protocol
         assert not transport.is_closing()
         transport.abort()
+        for conn in conns:
+            conn.abort()  # from 3.12 wait_closed() waits for these too
         server.close()
         await server.wait_closed()
 
@@ -1293,6 +1310,8 @@ def test_is_reading_is_false_once_closing(loop):
         transport.resume_reading()  # ignored once closing
         assert not transport.is_reading()
         transport.abort()
+        for conn in conns:
+            conn.abort()  # from 3.12 wait_closed() waits for these too
         server.close()
         await server.wait_closed()
 
@@ -1300,7 +1319,7 @@ def test_is_reading_is_false_once_closing(loop):
 
 
 # --------------------------------------------------------------------- #
-# 19. Server.wait_closed (Python 3.11 semantics)                        #
+# 19. Server.wait_closed (the interpreter's own semantics)              #
 # --------------------------------------------------------------------- #
 
 
@@ -1334,9 +1353,10 @@ def test_wait_closed_waits_for_live_connections(loop):
     loop.run_until_complete(main())
 
 
-def test_wait_closed_after_close_returns_at_once(loop):
-    """3.11's quirk, kept for parity: after close(), wait_closed() does
-    not wait for the remaining connections."""
+def test_wait_closed_after_close(loop):
+    """Where 3.11 and later versions part. 3.11's quirk, kept there for
+    parity: after close(), wait_closed() does not wait for the remaining
+    connections. From 3.12 it does."""
 
     async def main():
         conns = []
@@ -1352,8 +1372,14 @@ def test_wait_closed_after_close_returns_at_once(loop):
         while not conns:
             await asyncio.sleep(0.01)
         server.close()
-        await asyncio.wait_for(server.wait_closed(), 1)
-        conns[0].close()
+        if PY312:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(server.wait_closed(), 0.2)
+            conns[0].close()
+            await asyncio.wait_for(server.wait_closed(), 5)
+        else:
+            await asyncio.wait_for(server.wait_closed(), 1)
+            conns[0].close()
         transport.close()
 
     loop.run_until_complete(main())
@@ -1779,9 +1805,9 @@ def test_add_reader_refuses_a_transport_socket(loop):
 
 
 def test_udp_sendto_details(loop):
-    """3.11 sends no empty datagram; a host name is resolved as the
-    socket module's sendto() would; a datagram transport is an
-    asyncio.Transport."""
+    """An empty datagram is sent from 3.13 and not before; a host name is
+    resolved as the socket module's sendto() would; a datagram transport
+    is an asyncio.Transport."""
 
     async def main():
         got = asyncio.Queue()
@@ -1802,6 +1828,8 @@ def test_udp_sendto_details(loop):
         assert isinstance(tx, asyncio.Transport)
         tx.sendto(b"", ("127.0.0.1", port))
         tx.sendto(b"first", ("localhost", port))
+        if PY313:
+            assert await asyncio.wait_for(got.get(), 5) == b""
         assert await asyncio.wait_for(got.get(), 5) == b"first"
         with pytest.raises(TypeError):
             tx.sendto("text", ("127.0.0.1", port))
@@ -1843,7 +1871,8 @@ def test_write_takes_bytes_like_objects_only(loop):
                 got.extend(data)
 
         server, transport, _ = await _pair(loop, asyncio.Protocol, Sink)
-        with pytest.raises(TypeError, match="bytes-like"):
+        wording = "bytes, bytearray, or memoryview object" if PY313 else "bytes-like"
+        with pytest.raises(TypeError, match=wording):
             transport.write(array.array("b", [1, 2]))
         with pytest.raises(TypeError):
             transport.writelines([b"first", "second"])
@@ -2060,12 +2089,15 @@ def test_write_after_write_eof_raises_in_asyncio_order(loop):
     async def main():
         server, transport, _ = await _pair(loop, asyncio.Protocol)
         transport.write_eof()
-        for write in (
-            lambda: transport.write(b""),
-            lambda: transport.write(b"x"),
-            lambda: transport.writelines([]),
+        # From 3.12 writelines() is a method of its own and names itself.
+        lines = "writelines" if PY312 else "write"
+        for write, name in (
+            (lambda: transport.write(b""), "write"),
+            (lambda: transport.write(b"x"), "write"),
+            (lambda: transport.writelines([]), lines),
+            (lambda: transport.writelines([b"x"]), lines),
         ):
-            with pytest.raises(RuntimeError, match=r"Cannot call write\(\) after write_eof\(\)"):
+            with pytest.raises(RuntimeError, match=rf"Cannot call {name}\(\) after write_eof\(\)"):
                 write()
         transport.close()
         with pytest.raises(RuntimeError, match="after write_eof"):

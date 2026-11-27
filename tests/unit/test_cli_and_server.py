@@ -10,6 +10,11 @@ import threading
 import cadeloop
 import cadeloop.__main__ as cli
 import pytest
+
+# What gc.get_freeze_count() reads when nobody has frozen anything: zero,
+# except on CPython 3.12, whose collector keeps the interpreter's immortal
+# objects (a few hundred) in the permanent generation.
+from cadeloop.server import _FROZEN_BY_THE_INTERPRETER as OWN_FROZEN  # noqa: E402
 from cadeloop.server import load_app
 
 
@@ -331,11 +336,11 @@ def test_serve_restores_the_collector_it_reconfigured():
     collector ON for a caller who had deliberately turned it off."""
     import gc as _gc
 
-    assert _gc.get_freeze_count() == 0, "test needs a clean permanent generation"
+    assert _gc.get_freeze_count() <= OWN_FROZEN, "test needs a clean permanent generation"
 
     inside = _serve_briefly(cadeloop.Config(grace=0.0, gc_mode="freeze"))
-    assert inside["freeze"] > 0, "gc_mode='freeze' did not actually freeze anything"
-    assert _gc.get_freeze_count() == 0, (
+    assert inside["freeze"] > OWN_FROZEN, "gc_mode='freeze' did not actually freeze anything"
+    assert _gc.get_freeze_count() <= OWN_FROZEN, (
         "serve() left the startup heap permanently frozen after returning"
     )
 
@@ -359,11 +364,11 @@ def test_serve_does_not_extend_a_freeze_the_caller_already_owns():
     by Codex on PR #1."""
     import gc as _gc
 
-    assert _gc.get_freeze_count() == 0, "test needs a clean permanent generation"
+    assert _gc.get_freeze_count() <= OWN_FROZEN, "test needs a clean permanent generation"
     keepalive = [object() for _ in range(50)]
     _gc.freeze()
     caller_owned = _gc.get_freeze_count()
-    assert caller_owned > 0
+    assert caller_owned > OWN_FROZEN
     try:
         _serve_briefly(cadeloop.Config(grace=0.0, gc_mode="freeze"))
         # Not equality: freezing exempts objects from COLLECTION, not from

@@ -17,6 +17,15 @@ methodology: [benchmarks.md](benchmarks.md).*
 > items land. Newest first. (A row's commit id is filled in by the next
 > commit — a commit cannot contain its own hash.)
 >
+> **Python 3.12 and 3.13 (on `claude/sleepy-ride-p2rndm`)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Compat | CPython 3.12 and 3.13 are supported next to 3.11, a wheel for each. Where the three versions' asyncio differ -- `wait_closed()`, `writelines()`, error wording, exception-handler context, child-exit timing, empty datagrams, `serve_forever()` closing clients, `cleanup_socket` -- cadeloop does what the running interpreter's asyncio does: compile-time in the extension (PyO3's version cfgs), two constants in the Python layer. Newer arguments and methods (`shutdown_default_executor(timeout)`, `all_errors`, `keep_alive`, `cleanup_socket`, `Server.close_clients()`) are taken on every version. Each version's own CPython asyncio suite passes against it, and CI builds and tests all three on Linux and Windows (ADR-45) | `pending` |
+> | Server | `gc_mode="freeze"`, the default, silently did nothing on 3.12: its collector keeps 375 immortal objects in the permanent generation, which was taken for a freeze the caller owned | `pending` |
+> | Net | A datagram send that failed while the endpoint was closing was never reported to `error_received` (the endpoint was gone before the queued report was dispatched); after `abort()` nothing is reported, as before | `pending` |
+> | Net | A failed `create_connection()` left its exception in a reference cycle (lists held by frames its traceback keeps alive), so it and those frames waited for the cyclic collector | `pending` |
+>
 > **Name lookups (on `claude/sleepy-ride-p2rndm`)**
 >
 > | Area | Fix | Commit |

@@ -617,9 +617,12 @@ def test_sendfile_aborts_when_the_transport_closes(loop, tmp_path):
     big = tmp_path / "big.bin"
     big.write_bytes(b"x" * (8 << 20))
 
+    accepted = []
+
     class Paused(asyncio.Protocol):
         def connection_made(self, transport):
             transport.pause_reading()  # never drain: the sender stalls
+            accepted.append(transport)
 
     async def main():
         server = await loop.create_server(Paused, "127.0.0.1", 0)
@@ -649,6 +652,8 @@ def test_sendfile_aborts_when_the_transport_closes(loop, tmp_path):
             a.close()
             b.close()
             assert leaked == b"", "file bytes written into an unrelated socket"
+        for transport in accepted:
+            transport.abort()  # paused, so it never sees the peer go
         server.close()
         await server.wait_closed()
 
@@ -1052,7 +1057,9 @@ def test_create_unix_server_rebinds_stale_socket(loop, tmp_path):
         async def handler(reader, writer):
             writer.close()
 
-        server1 = await asyncio.start_unix_server(handler, sock_path)
+        # cleanup_socket=False: from 3.13 the server removes its own file
+        # on close; a crashed instance removes nothing on any version.
+        server1 = await loop.create_unix_server(asyncio.Protocol, sock_path, cleanup_socket=False)
         server1.close()
         await server1.wait_closed()
         assert os.path.exists(sock_path)  # the file itself outlives close()

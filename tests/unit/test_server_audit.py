@@ -26,6 +26,11 @@ import weakref
 import cadeloop
 import pytest
 
+# What gc.get_freeze_count() reads when nobody has frozen anything: zero,
+# except on CPython 3.12, whose collector keeps the interpreter's immortal
+# objects (a few hundred) in the permanent generation.
+from cadeloop.server import _FROZEN_BY_THE_INTERPRETER as OWN_FROZEN  # noqa: E402
+
 PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(cadeloop.__file__)))
 needs_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="fork worker model (POSIX)")
 needs_proc = pytest.mark.skipif(not os.path.isdir("/proc/self/task"), reason="/proc introspection")
@@ -1291,7 +1296,7 @@ def test_s23_warmup_freezes_what_the_first_requests_built():
     300k-entry cache took ~80 ms; frozen, 0.4 ms)."""
     import gc
 
-    if gc.get_freeze_count():
+    if gc.get_freeze_count() > OWN_FROZEN:
         pytest.skip("test needs a clean permanent generation")
     cache = {}
     seen = {}
@@ -1323,7 +1328,7 @@ def test_s23_warmup_freezes_what_the_first_requests_built():
     finally:
         t.join(30)
     assert seen["frozen"] - startup_frozen >= 50_000, (startup_frozen, seen)
-    assert gc.get_freeze_count() == 0, "serve() must still unfreeze on the way out"
+    assert gc.get_freeze_count() <= OWN_FROZEN, "serve() must still unfreeze on the way out"
 
 
 def test_s23_reuse_scope_is_gone():
@@ -1595,7 +1600,7 @@ def test_s30_worker_exit_statuses_are_decoded_in_logs():
 def _a_loop():
     import gc
 
-    if gc.get_freeze_count():
+    if gc.get_freeze_count() > OWN_FROZEN:
         pytest.skip("test needs a clean permanent generation")
     lp = cadeloop.new_event_loop()
     asyncio.set_event_loop(lp)
@@ -1641,12 +1646,12 @@ def test_gc_mode_refreeze_freezes_what_survives_a_slow_full_collection():
     watch.SLOW = 0.0  # every full collection counts as slow here
     kept = [{"n": i, "tags": [i]} for i in range(5000)]
     try:
-        assert gc.get_freeze_count() == 0
+        assert gc.get_freeze_count() <= OWN_FROZEN
         gc.collect(0)  # a young collection is never a reason to freeze
         lp.run_until_complete(asyncio.sleep(0))
-        assert gc.get_freeze_count() == 0 and watch.refreezes == 0
+        assert gc.get_freeze_count() <= OWN_FROZEN and watch.refreezes == 0
         gc.collect(2)
-        assert gc.get_freeze_count() == 0  # not from inside the collection
+        assert gc.get_freeze_count() <= OWN_FROZEN  # not from inside the collection
         lp.run_until_complete(asyncio.sleep(0))
         assert watch.refreezes == 1
         assert gc.get_freeze_count() >= 2 * len(kept)
@@ -1674,7 +1679,7 @@ def test_a_slow_full_collection_is_logged_once_a_minute(caplog):
                 lp.run_until_complete(asyncio.sleep(0))
         warnings = [r.getMessage() for r in caplog.records if "full garbage collection" in r.getMessage()]
         assert len(warnings) == 1 and "gc_mode='refreeze'" in warnings[0]
-        assert gc.get_freeze_count() == 0  # it reports; it does not freeze
+        assert gc.get_freeze_count() <= OWN_FROZEN  # it reports; it does not freeze
     finally:
         watch.close()
         asyncio.set_event_loop(None)
@@ -1688,7 +1693,7 @@ def test_gc_mode_refreeze_in_a_running_server_and_its_stats():
     import gc
     import json
 
-    if gc.get_freeze_count():
+    if gc.get_freeze_count() > OWN_FROZEN:
         pytest.skip("test needs a clean permanent generation")
     cache = []
     seen = {}
@@ -1730,7 +1735,7 @@ def test_gc_mode_refreeze_in_a_running_server_and_its_stats():
     assert after["collections"][2] >= before["collections"][2] + 2
     assert after["pause_ms_longest"][2] >= 10, after  # the one that walked the new state
     assert seen["second"] < after["pause_ms_longest"][2] / 1e3 / 2, (seen, after)
-    assert gc.get_freeze_count() == 0, "serve() must still unfreeze on the way out"
+    assert gc.get_freeze_count() <= OWN_FROZEN, "serve() must still unfreeze on the way out"
 
 
 def test_gc_mode_refreeze_is_a_setting_and_a_flag():

@@ -1169,7 +1169,8 @@ impl CoreLoop {
     /// rule for a multi-family resolution, where a host without IPv6
     /// still serves on IPv4.
     #[pyo3(signature = (ip, port, factory, backlog=1024, reuse_addr=true, reuse_port=false,
-                        accept_pool=64, start=true, flowinfo=0, scope_id=0, skip_unavailable=false))]
+                        accept_pool=64, start=true, flowinfo=0, scope_id=0, skip_unavailable=false,
+                        keep_alive=false))]
     #[allow(clippy::too_many_arguments)]
     fn tcp_listen(
         &self,
@@ -1185,9 +1186,11 @@ impl CoreLoop {
         flowinfo: u32,
         scope_id: u32,
         skip_unavailable: bool,
+        keep_alive: bool,
     ) -> PyResult<Option<(u64, Py<PyAny>, u64)>> {
         self.check_closed()?;
-        let spec = ListenSpec { backlog, reuse_addr, reuse_port, tfo: self.tfo, flowinfo, scope_id };
+        let spec =
+            ListenSpec { backlog, reuse_addr, reuse_port, keep_alive, tfo: self.tfo, flowinfo, scope_id };
         let sock = match bind_listen_socket(ip, port, &spec) {
             Ok(sock) => sock,
             Err(ListenError::Socket(_)) if skip_unavailable => return Ok(None),
@@ -1238,7 +1241,15 @@ impl CoreLoop {
             _ => PyDict::new(py).into_any().unbind(),
         };
         let secs_to_ns = |s: f64| if s > 0.0 { (s * 1e9) as u64 } else { 0 };
-        let spec = ListenSpec { backlog, reuse_addr, reuse_port, tfo: self.tfo, flowinfo, scope_id };
+        let spec = ListenSpec {
+            backlog,
+            reuse_addr,
+            reuse_port,
+            keep_alive: false,
+            tfo: self.tfo,
+            flowinfo,
+            scope_id,
+        };
         let sock = bind_listen_socket(ip, port, &spec).map_err(|e| e.into_pyerr(py, ip, port, &spec))?;
         let kind = net::ListenerKind::Http {
             app: app.unbind(),
@@ -1429,7 +1440,7 @@ impl CoreLoop {
     ) -> PyResult<()> {
         self.check_closed()?;
         let addr = addr.filter(|a| !a.is_none()).map(parse_addr_tuple).transpose()?;
-        self.with_net(|net, reactor| net::udp_sendto(net, reactor.backend_mut(), did, data, addr))?
+        self.with_net(|net, reactor| net::udp_sendto(py, net, reactor.backend_mut(), did, data, addr))?
             .map_err(net::io_error)?;
         self.drain_graveyards(py)
     }
@@ -1576,6 +1587,25 @@ impl CoreLoop {
         })
     }
 
+    /// The transports of the connections `server` accepted that are not
+    /// lost yet: what `Server.close_clients()` and `abort_clients()` act
+    /// on. Found by a walk of the transport table when asked -- shutdown
+    /// is the only caller -- instead of a set kept per server.
+    fn server_transports(
+        &self,
+        py: Python<'_>,
+        server: Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Py<net::Transport>>> {
+        let wanted = server.as_ptr();
+        self.with_net(|net, _| {
+            net.transports
+                .values()
+                .filter(|entry| entry.server.as_ref().is_some_and(|s| s.as_ptr() == wanted))
+                .filter_map(|entry| entry.pyobj.as_ref().map(|t| t.clone_ref(py)))
+                .collect()
+        })
+    }
+
     /// Give a listener its asyncio Server facade, so every connection it
     /// accepts is counted (`_attach`/`_detach`) for `Server.wait_closed()`.
     fn listener_set_server(&self, lid: u64, server: Bound<'_, PyAny>) -> PyResult<()> {
@@ -1713,7 +1743,7 @@ impl CoreLoop {
                 // Worded as create_connection words it, naming the local
                 // address: the caller may have offered several.
                 let Some(code) = e.raw_os_error() else { return Err(e.into()) };
-                let strerror = net::os_strerror(code).to_lowercase();
+                let strerror = bind_failure_text(code);
                 return Err(net::os_error_msg(
                     code,
                     format!("error while attempting to bind on address {}: {strerror}", local.repr()?),
@@ -2445,6 +2475,9 @@ struct ListenSpec {
     backlog: i32,
     reuse_addr: bool,
     reuse_port: bool,
+    /// SO_KEEPALIVE on the listening socket, which accepted connections
+    /// inherit: `create_server(keep_alive=True)`.
+    keep_alive: bool,
     tfo: bool,
     /// IPv6 sockaddr fields; both zero for IPv4 and unscoped IPv6.
     flowinfo: u32,
@@ -2486,7 +2519,7 @@ impl ListenError {
                     Ok(r) => r.to_string(),
                     Err(err) => return err,
                 };
-                let strerror = net::os_strerror(code).to_lowercase();
+                let strerror = bind_failure_text(code);
                 net::os_error_msg(
                     code,
                     format!("error while attempting to bind on address {repr}: {strerror}"),
@@ -2496,10 +2529,30 @@ impl ListenError {
     }
 }
 
+/// What follows the address in asyncio's "error while attempting to bind
+/// on address ...: " message. Through 3.11 it is the OS's text for the
+/// error, lower-cased; from 3.12 (in its later patch releases) it is the
+/// lower-cased `str()` of the OSError, which leads with the code.
+pub(crate) fn bind_failure_text(code: i32) -> String {
+    let strerror = net::os_strerror(code).to_lowercase();
+    #[cfg(not(Py_3_12))]
+    {
+        strerror
+    }
+    #[cfg(all(Py_3_12, not(windows)))]
+    {
+        format!("[errno {code}] {strerror}")
+    }
+    #[cfg(all(Py_3_12, windows))]
+    {
+        format!("[winerror {code}] {strerror}")
+    }
+}
+
 /// Create, bind, and listen a TCP socket (shared by tcp_listen /
 /// http_listen).
 fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> Result<RawSocket, ListenError> {
-    let ListenSpec { backlog, reuse_addr, reuse_port, tfo, flowinfo, scope_id } = *spec;
+    let ListenSpec { backlog, reuse_addr, reuse_port, keep_alive, tfo, flowinfo, scope_id } = *spec;
     let addr: std::net::IpAddr = ip
         .parse()
         .map_err(|_| ListenError::Invalid(PyValueError::new_err(format!("invalid IP address: {ip:?}"))))?;
@@ -2530,6 +2583,9 @@ fn bind_listen_socket(ip: &str, port: u16, spec: &ListenSpec) -> Result<RawSocke
         }
         if reuse_port {
             netsys::set_reuse_port(sock, true).map_err(ListenError::Setup)?;
+        }
+        if keep_alive {
+            netsys::set_keepalive(sock, true).map_err(ListenError::Setup)?;
         }
         if tfo {
             // R-038. Not best-effort: the option was asked for

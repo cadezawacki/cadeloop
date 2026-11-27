@@ -698,6 +698,11 @@ def _boom(x):
     raise ValueError(x)
 
 
+# From 3.13 asyncio prints a callback's arguments only in debug mode (they
+# may hold secrets), and "()" in their place otherwise.
+_ARGS_SHOWN = sys.version_info < (3, 13)
+
+
 def test_callback_errors_are_reported_in_asyncio_format(loop, caplog):
     loop.call_soon(_boom, 1)
     with caplog.at_level("ERROR", logger="asyncio"):
@@ -706,16 +711,18 @@ def test_callback_errors_are_reported_in_asyncio_format(loop, caplog):
     assert recs, "the default handler must log to asyncio's logger"
     msg = recs[0].getMessage()
     # asyncio's Handle._run: "Exception in callback <func>(<args>) at <file>:<line>"
-    assert msg.startswith("Exception in callback _boom(1) at "), msg
+    shown = "_boom(1)" if _ARGS_SHOWN else "_boom()"
+    assert msg.startswith(f"Exception in callback {shown} at "), msg
     assert __file__.rstrip("c") in msg
 
 
 def test_handle_repr_and_private_attributes_match_asyncio(loop):
     h = loop.call_soon(_boom, 1)
     assert h._callback is _boom and h._args == (1,)
-    assert repr(h).startswith("<Handle _boom(1) at ")
+    one, two = ("_boom(1)", "_boom(2)") if _ARGS_SHOWN else ("_boom()", "_boom()")
+    assert repr(h).startswith(f"<Handle {one} at ")
     t = loop.call_at(12345.5, _boom, 2)
-    assert repr(t).startswith("<TimerHandle when=12345.5 _boom(2) at ")
+    assert repr(t).startswith(f"<TimerHandle when=12345.5 {two} at ")
     t.cancel()
     assert repr(t) == "<TimerHandle cancelled when=12345.5>"
     assert t._callback is None and t._args is None
@@ -733,6 +740,8 @@ def test_debug_mode_source_traceback_points_at_the_caller(loop):
         "test_debug_mode_source_traceback_points_at_the_caller",
     )
     assert f"created at {frame[0]}:{lineno}" in repr(h)
+    # In debug mode the arguments are shown on every version.
+    assert repr(h).startswith("<Handle _boom(1) at ")
     h.cancel()
     # debug cancel() keeps the formatted callback, as asyncio's _repr does
     assert repr(h).startswith("<Handle cancelled _boom(1) at ")

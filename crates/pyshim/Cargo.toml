@@ -29,5 +29,10 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 # DoS resistance buys nothing and costs a hash per lookup on every op.
 rustc-hash = "2"
 
+[build-dependencies]
+# The same crate PyO3 itself builds with (build.rs): the interpreter's
+# version as cfgs.
+pyo3-build-config = { version = "0.29", features = ["resolve-config"] }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

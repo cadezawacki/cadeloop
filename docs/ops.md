@@ -245,9 +245,14 @@ warning, never a blocked release.
 
 ## Release wheels (R-110/R-111)
 
-`release.yml` builds three artifacts on tag push (or dispatch):
+`release.yml` builds three kinds of artifact on tag push (or dispatch),
+each once per supported CPython (3.11, 3.12, 3.13 -- `-py3.11` and so on
+is appended to the artifact names below; nine wheels and one sdist in
+all). A wheel is per version rather than abi3 because what differs
+between the versions' asyncio is compiled in or out of the extension
+(ADR-45):
 
-- `wheel-win-pgo-baseline` — the production cp311-win_amd64 wheel,
+- `wheel-win-pgo-baseline` — the production win_amd64 wheel,
   PGO-optimized: an instrumented build runs the repo's own scheduling +
   native-HTTP workload, profiles merge via llvm-profdata, and the final
   build compiles with `-Cprofile-use`.
@@ -323,12 +328,13 @@ Release asset, reachable only by explicit URL.
 the image lives under `/opt/python/<tag>/bin`, and the runner's
 `setup-python` is not mounted into the container, so a bare
 `maturin build` dies with *"Couldn't find any python interpreters from
-'python3'"*. The job passes
-`--interpreter /opt/python/cp311-cp311/bin/python` explicitly, which also
-pins the build to the single version `requires-python` allows rather than
-whatever `--find-interpreter` turns up in a future image. A follow-up step
-asserts the result is exactly one `cp311` + `manylinux2014`/`manylinux_2_17`
-wheel — a wheel tagged `linux_x86_64` or `manylinux_2_39` is not a crash,
+'python3'"*. The job names each interpreter explicitly
+(`--interpreter /opt/python/cp311-cp311/bin/python` and the same for
+cp312 and cp313), which also pins the build to the versions
+`requires-python` allows rather than whatever `--find-interpreter` turns
+up in a future image. A follow-up step asserts the result is exactly one
+`manylinux2014`/`manylinux_2_17` wheel for each of `cp311`, `cp312` and
+`cp313` — a wheel tagged `linux_x86_64` or `manylinux_2_39` is not a crash,
 it just installs nowhere, and without the check only a user running
 `pip install cadeloop` would find out.
 
@@ -374,11 +380,11 @@ every release.
 
 ### Why the Windows wheels carry a build tag
 
-Both Windows legs produce the same PEP 427 filename — same project,
-version, `cp311`, `win_amd64` — so they would collide in one Release and
-silently overwrite each other. The workflow retags them:
-`cadeloop-<ver>-2-cp311-...` (baseline) and `cadeloop-<ver>-1v3-cp311-...`
-(v3). Only the build tag differs; project name and version are untouched,
+Both Windows variants of one Python version produce the same PEP 427
+filename — same project, version, `cp311` (say), `win_amd64` — so they
+would collide in one Release and silently overwrite each other. The
+workflow retags them: `cadeloop-<ver>-2-cp311-...` (baseline) and
+`cadeloop-<ver>-1v3-cp311-...` (v3), and likewise for cp312 and cp313. Only the build tag differs; project name and version are untouched,
 so nothing disagrees with the wheel's own metadata.
 
 The numbering is deliberate. pip orders build tags as `(int, str)` with

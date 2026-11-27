@@ -914,6 +914,22 @@ def _serve_in_root_task(loop) -> None:
         root.remove_done_callback(_run_until_complete_cb)
 
 
+# What `gc.get_freeze_count()` can read without anybody having called
+# `gc.freeze()`. CPython 3.12's collector moves immortal objects -- the
+# constants of the interpreter's built-in frozen modules, 375 tuples in
+# 3.12.3 and 3.12.13 alike -- into the permanent generation on every full
+# collection, so there the count is never zero for long; 3.11 and 3.13
+# keep nothing there. A real freeze is of another size: `gc.freeze()` as
+# the first statement of a bare interpreter takes more than 4,000 objects.
+_FROZEN_BY_THE_INTERPRETER = 2048 if sys.version_info[:2] == (3, 12) else 0
+
+
+def _caller_froze_the_heap() -> bool:
+    """Has somebody other than the interpreter itself put objects in the
+    permanent generation?"""
+    return gc.get_freeze_count() > _FROZEN_BY_THE_INTERPRETER
+
+
 def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
     """R-075: tune the collector once startup is done. True when this froze
     the heap, which the caller must unfreeze on the way out.
@@ -933,7 +949,7 @@ def _gc_after_startup(config: Config, *, inherited: bool) -> bool:
         # the leak: our objects join theirs and stay there. With no way to
         # undo it, the honest choice is not to do it: skip the optimisation
         # and leave the caller's policy alone.
-        if inherited or gc.get_freeze_count() == 0:
+        if inherited or not _caller_froze_the_heap():
             gc.freeze()
             return True
         logger.info(
@@ -2023,7 +2039,7 @@ def _freeze_for_fork(config: Config) -> bool:
     gc_mode='default'). Frozen here, the inherited objects sit in the
     permanent generation, which no collection in a worker touches.
     """
-    if config.gc_mode not in ("freeze", "refreeze", "disable") or gc.get_freeze_count():
+    if config.gc_mode not in ("freeze", "refreeze", "disable") or _caller_froze_the_heap():
         return False  # 'default' opts out; an existing freeze is the caller's
     gc.collect()
     gc.freeze()

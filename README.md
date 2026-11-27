@@ -1,9 +1,9 @@
 # cadeloop
 
-**A fast asyncio event loop and ASGI web server for CPython 3.11, written in Rust.**
+**A fast asyncio event loop and ASGI web server for CPython 3.11, 3.12 and 3.13, written in Rust.**
 Runs on Windows and Linux.
 
-[![Python 3.11](https://img.shields.io/badge/python-3.11-5a9996?style=flat-square&labelColor=0B0D11)](https://pypi.org/project/cadeloop/)
+[![Python 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-5a9996?style=flat-square&labelColor=0B0D11)](https://pypi.org/project/cadeloop/)
 [![CI](https://img.shields.io/github/actions/workflow/status/cadezawacki/cadeloop/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0B0D11&color=5a9996)](https://github.com/cadezawacki/cadeloop/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-5a9996?style=flat-square&labelColor=0B0D11)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/cadeloop?style=flat-square&label=pypi&labelColor=0B0D11&color=5a9996)](https://pypi.org/project/cadeloop/)
@@ -69,12 +69,16 @@ pip install cadeloop
 
 | | |
 |---|---|
-| Python | CPython 3.11 |
+| Python | CPython 3.11, 3.12 or 3.13 |
 | OS | Windows 10 or 11, or Linux (glibc 2.17 or newer) |
 | CPU | x86-64 |
 
-Wheels are published for Windows x64 and Linux x64 (manylinux2014), with a
-source distribution for everything else. To check an install, print the
+Wheels are published for Windows x64 and Linux x64 (manylinux2014), one
+per Python version, with a source distribution for everything else. 3.11
+is the version cadeloop is developed and benchmarked on; 3.12 and 3.13 run
+the same test suites, and on each cadeloop behaves as that version's
+asyncio does where they differ
+([Python versions](docs/compatibility.md#python-versions)). To check an install, print the
 version and the backend the loop picked:
 
 ```bash

@@ -1152,3 +1152,78 @@ The default executor remains the right place for lookups in a program
 that wants them governed by its own executor; that is `resolver_threads=0`
 and it is what `Loop()` does.
 
+## ADR-45: Python 3.12 and 3.13: follow the interpreter's own asyncio, decided at build time
+cadeloop was written against 3.11, and its promise is asyncio's behavior:
+the parity tests and the differential suite hold it to the stdlib loop
+callback by callback. Supporting 3.12 and 3.13 raises the question the
+promise did not have to answer before: *which* asyncio. They differ --
+reading the three source trees side by side turns up some twenty changes
+a program can observe, from what `Server.wait_closed()` waits for to
+whether an empty datagram is sent.
+
+**cadeloop behaves as the asyncio of the interpreter it is running on.**
+The alternative, one behavior everywhere (3.11's, or the newest), would
+make cadeloop a drop-in for asyncio on one version and a source of
+surprises on the other two, in exactly the cases a porting guide warns
+about. The cost is that every difference is a branch:
+
+- **In Rust they are compile-time.** A wheel is built per interpreter
+  version (not abi3), and `crates/pyshim/build.rs` passes PyO3's version
+  cfgs through, so `#[cfg(Py_3_12)]` and `#[cfg(Py_3_13)]` select the
+  code: the wording of write errors and bind failures, `writelines()` as
+  its own method, `Handle.get_context()`, how a handle prints its
+  arguments, `SSLTransport.is_closing()`. The 3.11 extension contains
+  none of the newer code and checks no version while it runs.
+- **In the Python layer they are two module constants** (`_PY312`,
+  `_PY313`), consulted where the versions part: `wait_closed()`, the
+  context an exception handler runs in, when a child's exit reaches its
+  transport, `serve_forever()` closing clients, `cleanup_socket`'s
+  default, empty datagrams, `start_tls()` with buffered stream data.
+- **Arguments and methods a newer asyncio added are taken on every
+  version** -- `shutdown_default_executor(timeout)`,
+  `create_connection(all_errors=)`, `create_server(keep_alive=)`,
+  `create_unix_server(cleanup_socket=)`, `Server.close_clients()` /
+  `abort_clients()`. Accepting them changes nothing for a program that
+  does not pass them, and a second signature per version would be more
+  machinery than the difference deserves. Only a *default* that changed
+  (`cleanup_socket`) follows the version.
+
+The reference within a minor version is its latest patch release. A
+build cannot know the patch level it will run on, and behavior converges
+on the latest as installations update; 3.12.3 (Ubuntu 24.04's) differs
+from 3.12.13 in the wording of a bind failure, and cadeloop on any 3.12
+uses the later wording.
+
+What decides whether cadeloop got a version right is that version's own
+tests: CPython's `test_asyncio` suites for 3.12 and 3.13 run against
+cadeloop as 3.11's do (all twelve pass on each; three tests of stdlib
+internals and one of datagram flow control are skipped, with reasons, in
+`tests/conformance/skiplist.txt`), the parity tests state each
+version's expectation and are run against that version's asyncio as well
+as cadeloop, and the differential suite generates its scenarios against
+whichever asyncio is installed.
+
+Two stdlib accidents are not reproduced, and are listed in
+`docs/compatibility.md`: 3.12's `writelines()` on a lost connection
+raising `TypeError: 'NoneType' object is not callable`, which the
+differential suite found within its first hundred seeds, and 3.13 naming
+a task `"None"` when a task factory is given no name.
+
+Found on the way, and fixed for every version:
+
+- **`gc_mode="freeze"` did nothing on 3.12.** Its collector moves immortal
+  objects (375 constant tuples of the interpreter's frozen modules) into
+  the permanent generation on every full collection, so
+  `gc.get_freeze_count()` is never zero there, and the server took that
+  for a freeze the caller owned and left the heap unfrozen. It now asks
+  whether the count exceeds what the interpreter keeps there by itself.
+- **A datagram send that failed while its endpoint was closing never
+  reached `error_received`**: the failure was queued, the endpoint was
+  torn down as the last send finished, and the queued report found no
+  endpoint to deliver to. The report now carries the callback.
+- **A failed `create_connection()` left its error in a reference cycle**
+  through lists kept in frames the error's own traceback keeps alive.
+
+3.14 is not attempted: it removes the child watchers the POSIX subprocess
+support is built on, and deprecates the policy system.
+

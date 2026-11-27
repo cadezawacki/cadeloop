@@ -1436,8 +1436,25 @@ impl SslTransport {
         Ok(self.protocol(py, "_app_protocol")?.get().app_protocol(py))
     }
 
-    fn is_closing(&self) -> bool {
-        self.closed.load(Relaxed) || self.close_handed.load(Relaxed)
+    /// sslproto's `_SSLProtocolTransport.is_closing()`. From 3.12 it is
+    /// also true once the transport underneath is closing -- a peer's
+    /// reset, an abort -- and not only after this one's own close().
+    fn is_closing(&self, py: Python<'_>) -> PyResult<bool> {
+        if self.closed.load(Relaxed) || self.close_handed.load(Relaxed) {
+            return Ok(true);
+        }
+        #[cfg(Py_3_12)]
+        {
+            // The protocol is taken out of its slot before anything is
+            // called: no lock is held across Python.
+            let proto = self.protocol_slot().as_ref().map(|p| p.clone_ref(py));
+            if let Some(transport) = proto.and_then(|p| p.get().transport(py)) {
+                return transport.bind(py).call_method0(intern!(py, "is_closing"))?.is_truthy();
+            }
+        }
+        #[cfg(not(Py_3_12))]
+        let _ = py;
+        Ok(false)
     }
 
     /// Flush what is buffered, exchange close_notify alerts, close.

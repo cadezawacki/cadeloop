@@ -35,8 +35,8 @@ Where cadeloop differs as a loop:
   about 14 ms (see [timers on Windows](3-inside-cadeloop.md#timers-on-windows)).
 - **The same loop runs a native HTTP server**, so you can start with the loop
   under your existing server and move to `cadeloop.serve()` later.
-- **CPython 3.11 only**, today. uvloop and the others support more Python
-  versions.
+- **CPython 3.11, 3.12 and 3.13.** uvloop and the others also support
+  older and newer Python versions.
 
 ## As an ASGI server
 

@@ -22,6 +22,11 @@ test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_blocking_error
 test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_os_error_first_call  # calls the private _sock_sendfile_native_impl and reads _selector
 test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_os_error_next_call  # calls the private _sock_sendfile_native_impl and reads _selector
 test_unix_events.CadeloopUnixSockSendfileTests.test_sock_sendfile_exception  # calls the private _sock_sendfile_native_impl and reads _selector
+test_sslproto.SslProtoHandshakeTests.test_connection_lost_when_busy  # (3.12+) builds a transport of the selector loop's own with the private _make_socket_transport
+test_ssl.TestSSL.test_remote_shutdown_receives_trailing_data_on_slow_socket  # (3.12+) mock.patch.object() replaces the socket transport's write(); the attributes of a native transport are read-only
+
+# ---- not implemented ----------------------------------------------------
+test_events.CadeloopEventLoopTests.test_datagram_write_error_resumes_paused_protocol  # (3.13) datagram transports have no write flow control here (set_write_buffer_limits / pause_writing), on any Python version: docs/compatibility.md
 
 # ---- deliberate deviations (as in uvloop) -------------------------------
 test_events.CadeloopEventLoopTests.test_create_connection  # isinstance(transport, asyncio.Transport): a native type cannot subclass asyncio.Transport (instance-layout conflict); uvloop's transports are not instances either

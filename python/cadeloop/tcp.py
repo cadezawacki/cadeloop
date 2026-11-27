@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import collections.abc
 import errno
-import functools
 import itertools
 import os
 import socket
@@ -31,6 +30,13 @@ except ImportError:  # pragma: no cover
     ssl_module = None
 
 __all__ = ["TcpSurface", "Server"]
+
+# asyncio is not one thing: 3.12 and 3.13 each changed behavior a caller
+# can see (ADR-45). cadeloop follows the asyncio of the interpreter it is
+# running on, so these are consulted wherever the versions part ways. On
+# 3.11 both are False and every path below is the one it always was.
+_PY312 = sys.version_info >= (3, 12)
+_PY313 = sys.version_info >= (3, 13)
 
 
 def _fileno(fd):
@@ -122,6 +128,9 @@ class Server(asyncio.AbstractServer):
         self._waiters = []
         # The future serve_forever() parks on, so close() can wake it.
         self._serving_forever = None
+        # create_unix_server(cleanup_socket=True): (path, inode) of the
+        # socket file to remove when the server closes.
+        self._unix_cleanup = None
         for lid, _name, _fd in entries:
             loop._core.listener_set_server(lid, self)
 
@@ -139,7 +148,29 @@ class Server(asyncio.AbstractServer):
         waiters, self._waiters = self._waiters, None
         for waiter in waiters or ():
             if not waiter.done():
-                waiter.set_result(waiter)
+                waiter.set_result(None if _PY312 else waiter)
+
+    # -- the connections it accepted (asyncio's from 3.13) -----------------
+
+    def _client_transports(self):
+        # Asked of the core when wanted, rather than kept here: a set to
+        # maintain per accepted connection would be paid by every server
+        # for a call made once, at shutdown.
+        try:
+            return self._loop._core.server_transports(self)
+        except RuntimeError:
+            return []  # the loop is closed, and its connections with it
+
+    def close_clients(self):
+        """Close every connection this server accepted: buffered data is
+        still sent."""
+        for transport in self._client_transports():
+            transport.close()
+
+    def abort_clients(self):
+        """Close every connection this server accepted, immediately."""
+        for transport in self._client_transports():
+            transport.abort()
 
     # -- introspection ----------------------------------------------------
 
@@ -214,6 +245,10 @@ class Server(asyncio.AbstractServer):
         except asyncio.CancelledError:
             try:
                 self.close()
+                if _PY313:
+                    # 3.13 closes the connections too: wait_closed() now
+                    # waits for them, and nobody else is going to.
+                    self.close_clients()
                 await self.wait_closed()
             finally:
                 raise
@@ -235,6 +270,18 @@ class Server(asyncio.AbstractServer):
                 s.close()
         self._dups = None
         self._entries = []  # the raw descriptors are gone; do not reuse them
+        cleanup, self._unix_cleanup = self._unix_cleanup, None
+        if cleanup is not None:
+            # Only the file this server made: a path that has since been
+            # replaced by somebody else's socket is theirs.
+            path, inode = cleanup
+            try:
+                if os.stat(path).st_ino == inode:
+                    os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as err:
+                logger.error("Unable to clean up listening UNIX socket %r: %r", path, err)
         # Cancelled rather than resolved, matching the stdlib: serve_forever
         # raises CancelledError when its server is closed underneath it.
         fut, self._serving_forever = self._serving_forever, None
@@ -244,10 +291,13 @@ class Server(asyncio.AbstractServer):
             self._wakeup()
 
     async def wait_closed(self):
-        # Python 3.11's semantics, exactly: a call made before close()
-        # waits for close() AND for every connection the server accepted
-        # to be lost; a call made after close() returns at once.
-        if self._closed or self._waiters is None:
+        # The interpreter's own semantics. 3.12 and later: until the server
+        # is closed AND every connection it accepted is lost, in whichever
+        # order that happens. 3.11: the same for a call made before
+        # close(), but a call made after close() returns at once, live
+        # connections or not -- a quirk programs written for 3.11 may
+        # rely on, so it is kept there.
+        if self._waiters is None or (self._closed and not _PY312):
             return
         waiter = self._loop.create_future()
         self._waiters.append(waiter)
@@ -286,7 +336,9 @@ class TcpSurface:
         ssl_shutdown_timeout=None,
         happy_eyeballs_delay=None,
         interleave=None,
+        all_errors=False,
     ):
+        # all_errors: asyncio's from 3.12, taken on every version.
         if server_hostname is not None and not ssl:
             raise ValueError("server_hostname is only meaningful with ssl")
         if ssl:
@@ -364,14 +416,24 @@ class TcpSurface:
         # left that connection open for good.
         connected = []
 
+        # No frame may be left holding a list an error is in: a failed
+        # attempt's frames stay alive through the traceback of the error
+        # they raised, so a list kept in one makes that error reachable
+        # from itself -- a cycle only the collector can free, with the
+        # frames and whatever they hold. Hence the `= None`s below, the
+        # lambda (functools.partial would hold its arguments), and taking
+        # only the first item of what staggered_race returns.
         async def attempt(address, af):
             my_exceptions = []
             exceptions.append(my_exceptions)
             try:
-                fd = await self._connect_one(address, af, laddr_infos, my_exceptions)
-            except OSError as exc:
-                my_exceptions.append(exc)
-                raise
+                try:
+                    fd = await self._connect_one(address, af, laddr_infos, my_exceptions)
+                except OSError as exc:
+                    my_exceptions.append(exc)
+                    raise
+            finally:
+                my_exceptions = None
             connected.append(fd)
             return fd
 
@@ -389,14 +451,16 @@ class TcpSurface:
                 # address family no longer stalls every later candidate
                 # behind it — reuses stdlib's own racing logic, just racing
                 # the native tcp_connect fast path instead of a plain socket.
-                fd, _, _ = await staggered.staggered_race(
-                    (
-                        functools.partial(attempt, address, af)
-                        for af, _st, _pr, _cname, address in infos
-                    ),
-                    happy_eyeballs_delay,
-                    loop=self,
-                )
+                fd = (
+                    await staggered.staggered_race(
+                        (
+                            (lambda address=address, af=af: attempt(address, af))
+                            for af, _st, _pr, _cname, address in infos
+                        ),
+                        happy_eyeballs_delay,
+                        loop=self,
+                    )
+                )[0]
         finally:
             for other in connected:
                 if other != fd:
@@ -404,8 +468,14 @@ class TcpSurface:
         if fd is None:
             exceptions = [exc for sub in exceptions for exc in sub]
             try:
+                if all_errors:
+                    raise ExceptionGroup("create_connection failed", exceptions)
                 if len(exceptions) == 1:
                     raise exceptions[0]
+                if not exceptions and _PY313:
+                    # Nothing was collected: the attempts ran out of time
+                    # rather than failing (3.13's wording for it).
+                    raise TimeoutError("create_connection failed")
                 # If they all have the same str(), raise one.
                 model = str(exceptions[0])
                 if all(str(exc) == model for exc in exceptions):
@@ -436,27 +506,32 @@ class TcpSurface:
         carries the interface scope a link-local peer needs), bound to the
         first of `laddr_infos` of the same family that will bind."""
         fut = self.create_future()
-        if laddr_infos is None:
-            op = self._core.tcp_connect(address, fut, None)
-        else:
-            op = None
-            for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
-                if lfamily != af:
-                    continue
-                try:
-                    op = self._core.tcp_connect(address, fut, laddr)
-                    break
-                except OSError as exc:
-                    # The core words a bind failure as asyncio does; any
-                    # other failure (no socket of this family) ends the
-                    # attempt, as socket() failing does in base_events.
-                    if not (exc.strerror or "").startswith(_BIND_ERROR_PREFIX):
-                        raise
-                    my_exceptions.append(exc)
-            if op is None:
-                if my_exceptions:
-                    raise my_exceptions.pop()
-                raise OSError(f"no matching local address with family={af!r} found")
+        try:
+            if laddr_infos is None:
+                op = self._core.tcp_connect(address, fut, None)
+            else:
+                op = None
+                for lfamily, _lst, _lpr, _lcname, laddr in laddr_infos:
+                    if lfamily != af:
+                        continue
+                    try:
+                        op = self._core.tcp_connect(address, fut, laddr)
+                        break
+                    except OSError as exc:
+                        # The core words a bind failure as asyncio does; any
+                        # other failure (no socket of this family) ends the
+                        # attempt, as socket() failing does in base_events.
+                        if not (exc.strerror or "").startswith(_BIND_ERROR_PREFIX):
+                            raise
+                        my_exceptions.append(exc)
+                if op is None:
+                    if my_exceptions:
+                        raise my_exceptions.pop()
+                    raise OSError(f"no matching local address with family={af!r} found")
+        finally:
+            # This frame outlives the call in the traceback of what it
+            # raises; see create_connection.
+            my_exceptions = None
         try:
             return await fut
         except asyncio.CancelledError:
@@ -623,6 +698,18 @@ class TcpSurface:
             call_connection_made=False,
         )
         transport.pause_reading()
+        if _PY313 and server_side:
+            # 3.13 (gh-142352): what a StreamReader already read past the
+            # point of the upgrade is the start of the client's handshake,
+            # and belongs to the TLS layer, not to the application.
+            from asyncio.streams import StreamReaderProtocol
+
+            if isinstance(protocol, StreamReaderProtocol):
+                reader = getattr(protocol, "_stream_reader", None)
+                buffered = getattr(reader, "_buffer", None)
+                if buffered:
+                    ssl_protocol._incoming.write(buffered)
+                    buffered.clear()
         transport.set_protocol(ssl_protocol)
         conmade = self.call_soon(ssl_protocol.connection_made, transport)
         resume = self.call_soon(transport.resume_reading)
@@ -677,10 +764,12 @@ class TcpSurface:
         ssl=None,
         reuse_address=None,
         reuse_port=None,
+        keep_alive=None,
         ssl_handshake_timeout=None,
         ssl_shutdown_timeout=None,
         start_serving=True,
     ):
+        # keep_alive: asyncio's from 3.13, taken on every version.
         if ssl is not None and isinstance(ssl, bool):
             raise TypeError("ssl argument must be an SSLContext or None")
         if ssl_handshake_timeout is not None and ssl is None:
@@ -809,6 +898,7 @@ class TcpSurface:
                         flowinfo,
                         scope_id,
                         True,  # skip_unavailable
+                        **({"keep_alive": True} if keep_alive else {}),
                     )
                 except OSError as exc:
                     # EADDRNOTAVAIL: asyncio assumes the family is not
@@ -910,7 +1000,12 @@ class TcpSurface:
         ssl_handshake_timeout=None,
         ssl_shutdown_timeout=None,
         start_serving=True,
+        cleanup_socket=_PY313,
     ):
+        # cleanup_socket: remove the socket file when the server closes.
+        # asyncio's from 3.13, where it is on unless turned off; before
+        # that asyncio left the file behind, so there it is off unless
+        # asked for.
         if not hasattr(socket, "AF_UNIX"):
             raise NotImplementedError("Unix sockets are not supported on this platform")
         if isinstance(ssl, bool):
@@ -952,9 +1047,19 @@ class TcpSurface:
             if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
                 raise ValueError(f"A UNIX Domain Stream Socket was expected, got {sock!r}")
 
+        cleanup = None
+        if cleanup_socket:
+            bound = sock.getsockname()
+            # Not for the abstract namespace (no file); str and bytes paths.
+            if bound and bound[0] not in (0, "\x00"):
+                try:
+                    cleanup = (bound, os.stat(bound).st_ino)
+                except FileNotFoundError:
+                    pass
+
         sock.listen(backlog)  # create_server's sock= path expects this done already
         sock.setblocking(False)
-        return await self.create_server(
+        server = await self.create_server(
             protocol_factory,
             sock=sock,
             ssl=ssl,
@@ -962,6 +1067,8 @@ class TcpSurface:
             ssl_shutdown_timeout=ssl_shutdown_timeout,
             start_serving=start_serving,
         )
+        server._unix_cleanup = cleanup
+        return server
 
     # -- readiness callbacks (R-057) ---------------------------------------
 
@@ -1406,7 +1513,9 @@ class TcpSurface:
         finally:
             # stdlib convention: positioned after what was sent, and left
             # alone when nothing was (or there is no position to set).
-            if total and _seekable(file):
+            # From 3.13 it is positioned either way: at `offset` when
+            # nothing was sent.
+            if (total or _PY313) and _seekable(file):
                 file.seek(offset + total)
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
@@ -1523,8 +1632,8 @@ class _DatagramTransport(asyncio.DatagramTransport, asyncio.Transport):
     def sendto(self, data, addr=None):
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(f"data argument must be a bytes-like object, not {type(data).__name__!r}")
-        if not data:
-            return  # Python 3.11 sends no empty datagram
+        if not data and not _PY313:
+            return  # before 3.13 asyncio sends no empty datagram
         if self._closing:
             return
         if self._remote_addr is not None:

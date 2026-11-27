@@ -299,7 +299,7 @@ impl Handle {
         let repr = if self.debug {
             match self.callback_and_args(py) {
                 Ok(Some((cb, args))) => {
-                    let text = format_callback_source(py, cb.bind(py), args.bind(py))
+                    let text = format_callback_source(py, cb.bind(py), args.bind(py), true)
                         .unwrap_or_else(|_| "<callback>".to_owned());
                     Some(pyo3::types::PyString::new(py, &text).into_any().unbind())
                 }
@@ -374,7 +374,7 @@ impl Handle {
         if let Some(text) = saved {
             info.push(text.bind(py).str()?.to_string());
         } else if let Some((cb, args)) = self.callback_and_args(py)? {
-            info.push(format_callback_source(py, cb.bind(py), args.bind(py))?);
+            info.push(format_callback_source(py, cb.bind(py), args.bind(py), self.debug)?);
         }
         if let Some(tb) = tb {
             let tb = tb.bind(py);
@@ -442,6 +442,24 @@ impl Handle {
         self.is_cancelled()
     }
 
+    /// asyncio's `Handle.get_context()` (3.12): the context the callback
+    /// runs in, which `call_exception_handler` runs the handler in too.
+    ///
+    /// A callback scheduled without `context=` runs in a scratch context
+    /// holding a shared snapshot's variables (`ctxsnap`), so what is
+    /// returned for one is a copy of the snapshot: the same variables,
+    /// and nothing the caller does in it reaches the other callbacks that
+    /// share the snapshot. None once the loop is done with the handle.
+    #[cfg(Py_3_12)]
+    fn get_context(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let context = self.refs.with(py, |r| r.context.as_ref().map(|c| c.clone_ref(py)));
+        match context {
+            // SAFETY: a snapshot handle's context is a live Context.
+            Some(snap) if self.snapshot => unsafe { crate::ctxsnap::own_copy(py, snap.as_ptr()) }.map(Some),
+            other => Ok(other),
+        }
+    }
+
     // asyncio's private attributes, read by asyncio itself (the slow-
     // callback report's `_format_handle`, `_source_traceback` in debug
     // messages) and by introspection tools.
@@ -476,16 +494,31 @@ impl Handle {
 
 /// `asyncio.format_helpers._format_callback_source(callback, args)`: the
 /// callback's name with its arguments, plus its definition site.
+///
+/// From 3.13 asyncio prints the arguments only in debug mode -- they may
+/// hold secrets -- and `()` otherwise; `debug` is whether this handle was
+/// made in debug mode. Before 3.13 they are always printed.
 fn format_callback_source(
     py: Python<'_>,
     callback: &Bound<'_, PyAny>,
     args: &Bound<'_, PyAny>,
+    debug: bool,
 ) -> PyResult<String> {
     static FMT: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
     let f = FMT.get_or_try_init(py, || {
         Ok::<_, PyErr>(py.import("asyncio.format_helpers")?.getattr("_format_callback_source")?.unbind())
     })?;
-    f.call1(py, (callback, args))?.extract(py)
+    #[cfg(Py_3_13)]
+    {
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item(pyo3::intern!(py, "debug"), debug)?;
+        f.call(py, (callback, args), Some(&kwargs))?.extract(py)
+    }
+    #[cfg(not(Py_3_13))]
+    {
+        let _ = debug;
+        f.call1(py, (callback, args))?.extract(py)
+    }
 }
 
 /// asyncio.TimerHandle equivalent. Cancellation tombstones the heap entry

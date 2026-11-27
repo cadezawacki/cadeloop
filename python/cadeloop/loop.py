@@ -29,7 +29,7 @@ import time
 import traceback
 import warnings
 import weakref
-from asyncio import base_events, constants, events, format_helpers, futures, tasks
+from asyncio import base_events, constants, events, format_helpers, futures, tasks, timeouts
 
 # asyncio's own logger, as uvloop uses it too: "Task exception was never
 # retrieved", exception-handler output and slow-callback warnings are
@@ -38,7 +38,7 @@ from asyncio import base_events, constants, events, format_helpers, futures, tas
 from asyncio.log import logger
 
 from . import _core
-from .tcp import TcpSurface, _DatagramTransport, _fileno, _seekable
+from .tcp import _PY312, _PY313, TcpSurface, _DatagramTransport, _fileno, _seekable
 
 __all__ = ["Loop"]
 
@@ -678,16 +678,38 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             return await futures.wrap_future(pool.submit(socket.getnameinfo, sockaddr, flags), loop=self)
         return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
 
-    async def shutdown_default_executor(self):
+    async def shutdown_default_executor(self, timeout=None):  # noqa: ASYNC109 -- asyncio's signature
+        """Shut the default executor down, waiting for its threads.
+
+        `timeout` (asyncio's from 3.12, taken on every version): how long
+        to wait for them. Past it a RuntimeWarning is issued and the
+        executor is left to finish without being waited for.
+        """
         self._executor_shutdown_called = True
         if self._default_executor is None:
             return
         future = self.create_future()
         thread = threading.Thread(target=self._do_shutdown, args=(future,))
         thread.start()
+        if timeout is None and not _PY312:
+            # 3.11, as it always was: the thread is joined even when the
+            # wait is cancelled.
+            try:
+                await future
+            finally:
+                thread.join()
+            return
         try:
-            await future
-        finally:
+            async with timeouts.timeout(timeout):
+                await future
+        except TimeoutError:
+            warnings.warn(
+                f"The executor did not finishing joining its threads within {timeout} seconds.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._default_executor.shutdown(wait=False)
+        else:
             thread.join()
 
     def _do_shutdown(self, future):
@@ -807,7 +829,23 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 )
             return
         try:
-            self._exception_handler(self, context)
+            ctx = None
+            if _PY312:
+                # 3.12: the handler runs in the context of what failed --
+                # the task, else the future if it is one, else the handle
+                # -- so the context variables set where the work was
+                # started are the ones the handler reads.
+                thing = context.get("task")
+                if thing is None:
+                    thing = context.get("future")
+                if thing is None:
+                    thing = context.get("handle")
+                if thing is not None and hasattr(thing, "get_context"):
+                    ctx = thing.get_context()
+            if ctx is not None and hasattr(ctx, "run"):
+                ctx.run(self._exception_handler, self, context)
+            else:
+                self._exception_handler(self, context)
         except (SystemExit, KeyboardInterrupt):
             raise
         except BaseException as exc:
@@ -833,7 +871,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
 
     def _on_callback_error(self, handle, exc):
         # asyncio's Handle._run report, same message and keys.
-        cb = format_helpers._format_callback_source(handle._callback, handle._args)
+        if _PY313:
+            # The arguments only in debug mode, from 3.13 on.
+            cb = format_helpers._format_callback_source(
+                handle._callback, handle._args, debug=self.get_debug()
+            )
+        else:
+            cb = format_helpers._format_callback_source(handle._callback, handle._args)
         context = {
             "message": f"Exception in callback {cb}",
             "exception": exc,
@@ -997,7 +1041,11 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
                 )
             udp_sock = socket_module.socket(fam, socket_module.SOCK_DGRAM, proto)
             try:
-                if reuse_port:
+                # From 3.12 only for the internet families: Linux 6.12.9
+                # and later refuse SO_REUSEPORT on anything else.
+                if reuse_port and (
+                    not _PY312 or fam in (socket_module.AF_INET, socket_module.AF_INET6)
+                ):
                     if not hasattr(socket_module, "SO_REUSEPORT"):
                         raise ValueError("reuse_port not supported on this platform")
                     udp_sock.setsockopt(
@@ -1181,7 +1229,9 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             # stdlib convention: leave the file positioned after the bytes
             # actually sent -- and alone when none were (the fallback that
             # follows positions it itself) or it has no position (a pipe).
-            if total and _seekable(file):
+            # From 3.13 it is positioned either way: at `offset` when
+            # nothing was sent.
+            if (total or _PY313) and _seekable(file):
                 file.seek(offset + total)
 
     async def _sendfile_fallback(self, transport, file, offset, count):
@@ -1486,7 +1536,18 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         from asyncio import events as _events
         from asyncio import unix_events
 
-        with _events.get_child_watcher() as watcher:
+        if _PY312:
+            # Deprecated from 3.12 (gone in 3.14), and still what asyncio's
+            # own loop calls here -- quietly.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                manager = _events.get_child_watcher()
+        else:
+            manager = _events.get_child_watcher()
+        with manager as entered:
+            # 3.11 goes on with what __enter__ returned, 3.12 with the
+            # watcher itself (the same object for every real watcher).
+            watcher = manager if _PY312 else entered
             if not watcher.is_active():
                 raise RuntimeError(
                     "asyncio child watcher is not activated, "
@@ -1520,8 +1581,13 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         return transp
 
     def _child_watcher_callback(self, pid, returncode, transp):
-        # Thread-safe: the watcher reaps from its waiter thread.
-        self.call_soon_threadsafe(self.call_soon, transp._process_exited, returncode)
+        # Thread-safe: the watcher reaps from its waiter thread. Through
+        # 3.11 asyncio skips one loop iteration before the transport hears
+        # of the exit; from 3.12 it does not.
+        if _PY312:
+            self.call_soon_threadsafe(transp._process_exited, returncode)
+        else:
+            self.call_soon_threadsafe(self.call_soon, transp._process_exited, returncode)
 
     async def subprocess_shell(
         self,

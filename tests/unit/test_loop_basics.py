@@ -937,8 +937,15 @@ def test_a_context_that_cannot_be_entered_fails_one_callback_not_the_loop():
     finally:
         lp.close()
 
-    assert errors and isinstance(errors[0], RuntimeError), errors
-    assert "already entered" in str(errors[0])
+    if sys.version_info >= (3, 12):
+        # From 3.12 the exception handler is itself run in the handle's
+        # context -- the one that cannot be entered -- so asyncio reports
+        # that failure through the default handler instead, and so does
+        # cadeloop: the custom handler never hears of it.
+        assert errors == [], errors
+    else:
+        assert errors and isinstance(errors[0], RuntimeError), errors
+        assert "already entered" in str(errors[0])
     # The loop kept going: the callback after the failing one still ran.
     assert hits == ["b"], hits
 

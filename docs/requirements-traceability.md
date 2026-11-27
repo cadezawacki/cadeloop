@@ -8,7 +8,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-002 | Native HTTP/ASGI beating uvicorn | 📅 M2 gate | bench/http |
 | R-003 | Acceptance ratios (1.15x echo / 2.0x RPS / 0.6x p99) | 📅 M1–M3 gates | bench/harness |
 | R-004 | Public API (policy, factory, serve, CLI) | ✅ (name: `cadeloop` per owner) | python/cadeloop |
-| R-010 | CPython 3.11 only; GIL isolation module | ✅ | pyproject.toml; crates/pyshim/src/gil_boundary.rs |
+| R-010 | CPython 3.11 (extended to 3.12 and 3.13, ADR-45); GIL isolation module | ✅ | pyproject.toml; crates/pyshim/build.rs; crates/pyshim/src/gil_boundary.rs |
 | R-011 | Win32/Winsock2 only; msquic out of scope | ✅ | crates/core/src/backend |
 | R-012 | Rust core via PyO3 ≥0.21 + maturin | ✅ (pyo3 0.24) | crates/pyshim |
 | R-013 | Genuine AbstractEventLoop subclass | ✅ full surface incl. transports/TLS/sock_*/readers (drop-in: uvicorn+aiohttp interop tests) | python/cadeloop/loop.py, tcp.py |
@@ -58,7 +58,7 @@ Status: ✅ implemented · 🔶 partial · 📅 planned (milestone) · 📝 docu
 | R-101 | serve() + CLI 1:1 cfg mapping | ✅ functional: native listener, lifespan, signals, gc policy, multi-worker pool | server.py, __main__.py |
 | R-102 | Config: all tunables, TypeError on unknown, from_env | ✅ | config.py |
 | R-103 | loop.stats() introspection | ✅ (M0 counters incl. syscalls_saved_inline plumbing) | coreloop.rs |
-| R-110 | maturin cp311-win_amd64 wheels; v2/v3 variants | 🔶 packaging ✅; v3 variant ✅; Release assets on tag push ✅; PyPI 📅 M5 | pyproject.toml, ci.yml, release.yml |
+| R-110 | maturin win_amd64 wheels (cp311, cp312, cp313); v2/v3 variants | 🔶 packaging ✅; v3 variant ✅; Release assets on tag push ✅; PyPI 📅 M5 | pyproject.toml, ci.yml, release.yml |
 | R-111 | LTO/opt/codegen/panic; PGO wheels | 🔶 profile ✅; PGO 📅 M5 | Cargo.toml |
 | R-112 | Vendored llhttp + static OpenSSL | 🔶 llhttp pin/fetch ✅; OpenSSL 📅 M4 | vendor/llhttp |
 | R-113 | CI matrix: build/unit/conformance/stress/bench-regression/lints | ✅ wired | .github/workflows/ci.yml |

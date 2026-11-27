@@ -756,6 +756,15 @@ def _reconcile(ours, theirs):
       made on it afterwards (abort(), write()) die of an AttributeError on
       None. That is the stdlib's accident, not a contract; whatever
       cadeloop answers there stands.
+    * The same kind of accident, in 3.12 only: its selector transport sets
+      `_write_ready = None` when the connection is lost and its new
+      writelines() calls it without checking, so writelines() on a lost
+      transport dies of "TypeError: 'NoneType' object is not callable" --
+      after it has appended the data to the dead transport's buffer, which
+      then reports that size for good. (An early 3.12 clears the method
+      in close() instead, so there a transport lost to an error gets the
+      stuck buffer without the TypeError.) 3.11 and 3.13 drop the data
+      silently, and so does cadeloop on all three.
     """
     ours, theirs = _after_the_peer_left(ours), _after_the_peer_left(theirs)
     a, b = _first_error_loss(ours), _first_error_loss(theirs)
@@ -785,7 +794,7 @@ def _reconcile(ours, theirs):
     ours = [peer_record(ev) for ev in ours]
     theirs = [peer_record(ev) for ev in theirs]
 
-    lost = gone = False
+    lost = gone = stuck_buffer = False
     for i, ev in enumerate(theirs):
         if ev[0].endswith("connection_lost"):
             lost = True
@@ -793,8 +802,14 @@ def _reconcile(ours, theirs):
             gone = True
         elif i < len(ours) and ours[i][0] in ("returned", "raised"):
             stdlib_accident = lost and ev == ("raised", "AttributeError")
+            lost_writelines_312 = (
+                sys.version_info[:2] == (3, 12) and lost and theirs[i - 1] == ("call", "writelines")
+            )
+            writelines_312 = lost_writelines_312 and ev == ("raised", "TypeError")
             dead_socket = gone and ev == ("raised", "OSError") and theirs[i - 1] == ("call", "write_eof")
-            if stdlib_accident or dead_socket:
+            stuck_buffer = stuck_buffer or lost_writelines_312
+            stuck_size = stuck_buffer and ev[0] == "returned" and theirs[i - 1] == ("call", "buffer_size")
+            if stdlib_accident or writelines_312 or stuck_size or dead_socket:
                 theirs[i] = ours[i]
     return ours, theirs
 

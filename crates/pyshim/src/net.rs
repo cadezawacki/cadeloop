@@ -445,6 +445,9 @@ pub(crate) struct DatagramEntry {
     /// to deliver the completion that would retry, so the tick does.
     pub recv_starved: bool,
     pub closing: bool,
+    /// Closed by abort(): nothing more is reported to the protocol but
+    /// connection_lost, not even the failure of a send still in flight.
+    pub aborted: bool,
     pub conn_lost: bool,
 }
 
@@ -794,9 +797,18 @@ pub(crate) enum NetEvent {
         addr: Option<netsys::Addr>,
     },
     /// R-058: per-packet error surfaced to protocol.error_received.
+    ///
+    /// `callback`, for a failed send: the protocol's `error_received` as
+    /// of the failure. When that send was the last thing a close() was
+    /// waiting for, the endpoint is gone from the table before this event
+    /// is dispatched, and the error must still reach the protocol ahead
+    /// of connection_lost -- asyncio reports it from inside its write
+    /// loop. While the endpoint is still there its current protocol is
+    /// used instead (set_protocol() may have changed it).
     DgramError {
         did: u64,
         err: u32,
+        callback: Option<Py<PyAny>>,
     },
     /// R-058: datagram endpoint torn down. `close_after`: its socket
     /// object, closed once connection_lost has run; `immediate` as for
@@ -1676,6 +1688,7 @@ pub(crate) fn udp_wire(
             queued_bytes: 0,
             recv_starved: false,
             closing: false,
+            aborted: false,
             conn_lost: false,
         },
     );
@@ -1758,7 +1771,7 @@ fn on_dgram_recv_done(
         // Per-packet errors (e.g. ECONNREFUSED surfaced by a connected
         // socket after an ICMP unreachable): report and KEEP receiving —
         // asyncio semantics.
-        net.events.push(NetEvent::DgramError { did, err: os_error });
+        net.events.push(NetEvent::DgramError { did, err: os_error, callback: None });
     } else {
         return; // cancelled: teardown owns the endpoint
     }
@@ -1785,8 +1798,9 @@ fn on_dgram_send_done(
 ) {
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
     entry.send_op = None;
-    if os_error != 0 && !is_cancelled_error(os_error) {
-        net.events.push(NetEvent::DgramError { did, err: os_error });
+    if os_error != 0 && !is_cancelled_error(os_error) && !entry.aborted {
+        let callback = Some(entry.error_received.clone_ref(py));
+        net.events.push(NetEvent::DgramError { did, err: os_error, callback });
     }
     dgram_pump_send(py, net, backend, did);
 }
@@ -1810,7 +1824,7 @@ fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did
         // Mirrors the charge on the way in; the two must move together or
         // the cap drifts.
         entry.queued_bytes = entry.queued_bytes.saturating_sub(data.len() + DGRAM_PER_PACKET);
-        dgram_send_now(net, backend, did, &data, addr.as_ref());
+        dgram_send_now(py, net, backend, did, &data, addr.as_ref());
     }
     let Some(entry) = net.datagrams.get_mut(&did) else { return };
     if entry.closing && !entry.conn_lost && entry.send_op.is_none() {
@@ -1819,6 +1833,7 @@ fn dgram_pump_send(py: Python<'_>, net: &mut NetState, backend: Backend<'_>, did
 }
 
 fn dgram_send_now(
+    py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
     did: u64,
@@ -1829,14 +1844,19 @@ fn dgram_send_now(
     let sock = entry.socket;
     match backend.post_send_to(sock, data, addr) {
         Ok(op) => {
-            net.datagrams.get_mut(&did).unwrap().send_op = Some(op);
+            entry.send_op = Some(op);
             net.ops.insert(op, OpTarget::DgramSend(did));
         }
         Err(e) => {
             // Synchronous refusal: per-packet error, endpoint stays up.
             // The caller keeps draining -- no completion is coming for
             // this packet, so it must not be treated as "in flight".
-            net.events.push(NetEvent::DgramError { did, err: e.raw_os_error().unwrap_or(0) as u32 });
+            let callback = Some(entry.error_received.clone_ref(py));
+            net.events.push(NetEvent::DgramError {
+                did,
+                err: e.raw_os_error().unwrap_or(0) as u32,
+                callback,
+            });
         }
     }
 }
@@ -1844,6 +1864,7 @@ fn dgram_send_now(
 /// asyncio DatagramTransport.sendto: fire-and-forget; sends serialize
 /// through one in-flight op with a queue behind it.
 pub(crate) fn udp_sendto(
+    py: Python<'_>,
     net: &mut NetState,
     backend: Backend<'_>,
     did: u64,
@@ -1866,14 +1887,15 @@ pub(crate) fn udp_sendto(
             // Deterministic overflow policy: drop and report. Growing
             // without bound is the alternative, and a producer that can
             // outrun the socket would take the process down with it.
-            net.events.push(NetEvent::DgramError { did, err: ENOBUFS });
+            let callback = Some(entry.error_received.clone_ref(py));
+            net.events.push(NetEvent::DgramError { did, err: ENOBUFS, callback });
             return Ok(());
         }
         entry.queued_bytes += data.len() + DGRAM_PER_PACKET;
         entry.send_queue.push_back((data.to_vec(), addr));
         return Ok(());
     }
-    dgram_send_now(net, backend, did, data, addr.as_ref());
+    dgram_send_now(py, net, backend, did, data, addr.as_ref());
     Ok(())
 }
 
@@ -1913,7 +1935,19 @@ pub(crate) fn udp_close(py: Python<'_>, net: &mut NetState, backend: Backend<'_>
     }
     entry.closing = true;
     if abort {
+        entry.aborted = true;
         entry.send_queue.clear();
+        // Nothing more is reported after abort(): not the send failures
+        // already waiting to be dispatched, either.
+        for event in net.events.iter_mut() {
+            if let NetEvent::DgramError { did: of, callback, .. } = event {
+                if *of == did {
+                    if let Some(callback) = callback.take() {
+                        net.graveyard_py.push(callback);
+                    }
+                }
+            }
+        }
     }
     if entry.send_op.is_none() && entry.send_queue.is_empty() {
         udp_teardown(py, net, backend, did, None, false);
@@ -3488,12 +3522,20 @@ fn dispatch_one_event(py: Python<'_>, slf: &Bound<'_, CoreLoop>, event: NetEvent
                     core.guard_protocol_call(py, datagram_received.call1(py, (payload, addr_obj)))?;
                 }
             }
-            NetEvent::DgramError { did, err } => {
+            NetEvent::DgramError { did, err, callback } => {
                 // A closing endpoint still reports errors of the sends it
-                // drains, as asyncio's does; an aborted one reports nothing.
-                let error_received = core.with_net(|net, _| {
-                    net.datagrams.get(&did).filter(|e| !e.conn_lost).map(|e| e.error_received.clone_ref(py))
+                // drains, as asyncio's does -- the last of them after the
+                // endpoint itself is gone (`callback`); an aborted one
+                // reports nothing.
+                let live = core.with_net(|net, _| {
+                    net.datagrams
+                        .get(&did)
+                        .map(|e| (!e.aborted && !e.conn_lost).then(|| e.error_received.clone_ref(py)))
                 })?;
+                let error_received = match live {
+                    Some(current) => current, // still there: its protocol as of now
+                    None => callback,
+                };
                 if let Some(error_received) = error_received {
                     let exc_obj = os_err(py, err);
                     core.guard_protocol_call(py, error_received.call1(py, (exc_obj,)))?;
@@ -4575,9 +4617,12 @@ fn check_write_type(data: &Bound<'_, PyAny>) -> PyResult<()> {
         return Ok(());
     }
     let name = data.get_type().name().map(|n| n.to_string()).unwrap_or_else(|_| "?".to_owned());
-    Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "data argument must be a bytes-like object, not '{name}'"
-    )))
+    // asyncio reworded it in 3.13.
+    #[cfg(Py_3_13)]
+    let message = format!("data argument must be a bytes, bytearray, or memoryview object, not '{name}'");
+    #[cfg(not(Py_3_13))]
+    let message = format!("data argument must be a bytes-like object, not '{name}'");
+    Err(pyo3::exceptions::PyTypeError::new_err(message))
 }
 
 /// `_socket.socket.detach`, looked up once (see `detach_socket_object`).
@@ -4754,6 +4799,54 @@ impl Transport {
         Ok(())
     }
 
+    /// asyncio's `writelines()` from 3.12, where it stopped being
+    /// `write(b"".join(...))` and became a method of its own: it names
+    /// itself in its errors, returns for an empty list before looking at
+    /// anything else, and takes any object `memoryview()` takes.
+    #[cfg(Py_3_12)]
+    fn writelines(&self, py: Python<'_>, list_of_data: Bound<'_, PyAny>) -> PyResult<()> {
+        if self.eof.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("Cannot call writelines() after write_eof()"));
+        }
+        if self.sendfile.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("unable to writelines; sendfile is in progress"));
+        }
+        if !list_of_data.is_truthy()? {
+            return Ok(());
+        }
+        // 3.13 gives up on a lost connection here, before it has looked
+        // at the items; 3.12 looks at them first.
+        #[cfg(Py_3_13)]
+        {
+            let core = self.core_ref(py);
+            let lost = core.try_with_net(|net, _| net.transports.get(&self.tid).is_none_or(|e| e.conn_lost));
+            if lost == Some(true) {
+                return Ok(());
+            }
+        }
+        // All or nothing, as asyncio's (which converts every item before
+        // it queues one): a bad item must not leave the ones before it
+        // already queued.
+        let mut items = Vec::new();
+        for item in list_of_data.try_iter()? {
+            let item = item?;
+            if item.is_instance_of::<PyBytes>() {
+                items.push(item);
+            } else {
+                // memoryview(item): asyncio's own conversion, and its
+                // TypeError for an object with no buffer.
+                items.push(unsafe {
+                    Bound::from_owned_ptr_or_err(py, ffi::PyMemoryView_FromObject(item.as_ptr()))?
+                });
+            }
+        }
+        for item in items {
+            self.write(py, item)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(Py_3_12))]
     fn writelines(&self, py: Python<'_>, list_of_data: Bound<'_, PyAny>) -> PyResult<()> {
         // All or nothing, as asyncio's (which joins the items first): a
         // bad item must not leave the ones before it already queued.

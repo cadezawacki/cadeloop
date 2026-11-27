@@ -173,6 +173,16 @@ mod imp {
         Ok(())
     }
 
+    /// SO_KEEPALIVE. Set on a listening socket, it is inherited by the
+    /// connections accepted from it (`create_server(keep_alive=True)`).
+    pub fn set_keepalive(sock: RawSocket, on: bool) -> io::Result<()> {
+        let v: i32 = on as i32;
+        cvt(unsafe {
+            libc::setsockopt(sock as i32, libc::SOL_SOCKET, libc::SO_KEEPALIVE, (&v as *const i32).cast(), 4)
+        })?;
+        Ok(())
+    }
+
     pub fn set_v6only(sock: RawSocket, on: bool) -> io::Result<()> {
         let v: i32 = on as i32;
         cvt(unsafe {
@@ -250,7 +260,7 @@ mod imp {
     use windows_sys::Win32::Networking::WinSock::{
         bind as ws_bind, closesocket, getpeername, getsockname, listen as ws_listen, setsockopt, shutdown,
         WSAGetLastError, WSAIoctl, WSASocketW, IPPROTO_TCP, SD_SEND, SOCKADDR, SOCKET_ERROR, SOL_SOCKET,
-        TCP_NODELAY, WSAEINVAL, WSA_FLAG_OVERLAPPED,
+        SO_KEEPALIVE, TCP_NODELAY, WSAEINVAL, WSA_FLAG_OVERLAPPED,
     };
 
     fn wsa_err() -> io::Error {
@@ -406,6 +416,17 @@ mod imp {
         Ok(())
     }
 
+    /// SO_KEEPALIVE. Set on a listening socket, it is inherited by the
+    /// connections accepted from it (`create_server(keep_alive=True)`).
+    pub fn set_keepalive(sock: RawSocket, on: bool) -> io::Result<()> {
+        let v: u32 = on as u32;
+        let rc = unsafe { setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (&v as *const u32).cast(), 4) };
+        if rc == SOCKET_ERROR {
+            return Err(wsa_err());
+        }
+        Ok(())
+    }
+
     pub fn shutdown_send(sock: RawSocket) -> io::Result<()> {
         let rc = unsafe { shutdown(sock, SD_SEND) };
         if rc == SOCKET_ERROR {
@@ -452,8 +473,9 @@ mod imp {
 }
 
 pub use imp::{
-    bind, close, create_tcp, listen, peername, peername_any, set_fastopen, set_loopback_fast_path,
-    set_nodelay, set_reuse_addr, set_reuse_port, set_v6only, shutdown_send, sockname, sockname_any,
+    bind, close, create_tcp, listen, peername, peername_any, set_fastopen, set_keepalive,
+    set_loopback_fast_path, set_nodelay, set_reuse_addr, set_reuse_port, set_v6only, shutdown_send, sockname,
+    sockname_any,
 };
 
 /// Windows-only: the IOCP/RIO backends create accept sockets themselves,
