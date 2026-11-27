@@ -155,10 +155,19 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       at the wire boundary (TlsFlush); inbound records decrypt straight
       into the native HTTP/WS engine (https/wss schemes).
       `cadeloop.serve(ssl=ctx)` works (fork workers inherit the ctx;
-      spawn model rejects it explicitly). Client-side `ssl=` /
-      `start_tls` remain on the stdlib sslproto path (R-059's blessed
-      fallback). Tested against the stdlib client: HTTPS keep-alive,
-      WSS, plaintext-to-TLS-port drop, trustme certs
+      spawn model rejects it explicitly). Tested against the stdlib
+      client: HTTPS keep-alive, WSS, plaintext-to-TLS-port drop, trustme
+      certs
+- [x] Native TLS for the loop's own transports (R-059, ADR-38):
+      `create_connection(ssl=)`, `create_server(ssl=)` and `start_tls`
+      through a Rust port of asyncio.sslproto (`Loop(native_tls=True)`,
+      `CADELOOP_NATIVE_TLS=1`) -- same SSLObject/MemoryBIO, same state
+      machine, none of its Python frames and no 256 KiB buffer per
+      connection. Passes CPython's test_sslproto and test_ssl and the
+      generated TLS scenarios against asyncio. Opt-in for now; the
+      stdlib sslproto path is the default and the fallback
+- [ ] Flip `native_tls` on by default once it has run in production
+      (and on Windows hardware: CI covers it there, a soak has not)
 - [x] RFC 6455 WebSockets (R-087): upgrade via llhttp pause semantics,
       handshake validation + accept-key (inline SHA-1/base64, zero new
       deps), Rust frame codec (masking, fragmentation, control frames,

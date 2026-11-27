@@ -88,6 +88,13 @@ jobs:
           cp target/release/lib_core.so python/cadeloop/_core.so
           pip install pytest pytest-timeout uvicorn aiohttp trustme starlette fastapi
           PYTHONPATH=python python -m pytest tests/unit tests/conformance -q --timeout=90
+      - name: the same suites with native TLS on
+        # Loop(native_tls=True) is opt-in; this runs everything with it
+        # switched on for every loop, so the tests that were not written
+        # for it are held to it as well.
+        env:
+          CADELOOP_NATIVE_TLS: "1"
+        run: PYTHONPATH=python python -m pytest tests/unit tests/conformance -q --timeout=90
 
   build-windows:
     # R-113: the authoritative build/test platform.
@@ -126,6 +133,15 @@ jobs:
         run: python -m pytest tests/unit/test_differential.py -q --timeout=120
       - name: CPython asyncio conformance suite (R-120)
         run: python tests/conformance/run_cpython_suite.py
+      - name: CPython's TLS suites against native TLS
+        # The Rust port of sslproto (Loop(native_tls=True)), held to
+        # CPython's own tests of the original.
+        env:
+          CADELOOP_NATIVE_TLS: "1"
+        run: >
+          python tests/conformance/run_cpython_suite.py
+          test.test_asyncio.test_sslproto test.test_asyncio.test_ssl
+          test.test_asyncio.test_events test.test_asyncio.test_streams
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheel-${{ matrix.os }}

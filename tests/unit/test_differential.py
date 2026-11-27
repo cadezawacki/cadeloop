@@ -421,7 +421,13 @@ class BufferedRecorder(_RecorderBase, asyncio.BufferedProtocol):
         self.buf = bytearray(sc["bufsize"])
 
     def get_buffer(self, sizehint):
-        return self.buf
+        # A view, not the bytearray itself: over TLS, asyncio's sslproto
+        # fills the buffer through `buf[offset:]`, which copies a
+        # bytearray, and the protocol is then handed stale bytes for
+        # everything past the first record (CPython 3.11-3.13). cadeloop's
+        # native TLS does not have that bug -- test_native_tls.py holds it
+        # to that -- so the reference has to be kept off it here.
+        return memoryview(self.buf)
 
     def buffer_updated(self, nbytes):
         self._data(bytes(memoryview(self.buf)[:nbytes]))
@@ -481,9 +487,9 @@ async def _settle(peer, proto, trace):
         transport = proto.transport
         try:
             buffered = transport.get_write_buffer_size()
-            # Under stdlib TLS the application's transport only counts
-            # plaintext it has not encrypted yet; the ciphertext waits in
-            # the transport below it.
+            # Under TLS the application's transport only counts plaintext
+            # it has not encrypted yet; the ciphertext waits in the
+            # transport below it (sslproto's and the port's alike).
             below = getattr(getattr(transport, "_ssl_protocol", None), "_transport", None)
             if below is not None:
                 buffered += below.get_write_buffer_size()
@@ -794,7 +800,12 @@ def _reconcile(ours, theirs):
 
 
 def _run_on(kind, sc, tls_ctxs=None):
-    loop = cadeloop.new_event_loop() if kind == "cadeloop" else asyncio.SelectorEventLoop()
+    if kind == "cadeloop":
+        loop = cadeloop.Loop(native_tls=False)
+    elif kind == "cadeloop-native-tls":
+        loop = cadeloop.Loop(native_tls=True)
+    else:
+        loop = asyncio.SelectorEventLoop()
     asyncio.set_event_loop(loop)
     errors = []
     loop.set_exception_handler(lambda _loop, ctx: errors.append(str(ctx.get("message"))))
@@ -847,4 +858,16 @@ def test_tls_scenario_matches_asyncio(seed, tls_contexts):
     close_notify, or reset mid-record."""
     sc = generate(seed, tls=True)
     ours, theirs = _reconcile(_run_on("cadeloop", sc, tls_contexts), _run_on("asyncio", sc, tls_contexts))
+    assert ours == theirs, f"\n{describe(sc)}\n{_diff(ours, theirs)}"
+
+
+@pytest.mark.parametrize("seed", _seeds()[: max(1, len(_seeds()) // 2)])
+def test_native_tls_scenario_matches_asyncio(seed, tls_contexts):
+    """The TLS scripts again, with cadeloop's own TLS protocol (the Rust
+    port of sslproto, `Loop(native_tls=True)`) on cadeloop's side and the
+    standard library's still on asyncio's: the port is held to the
+    original, callback for callback."""
+    sc = generate(seed, tls=True)
+    ours = _run_on("cadeloop-native-tls", sc, tls_contexts)
+    ours, theirs = _reconcile(ours, _run_on("asyncio", sc, tls_contexts))
     assert ours == theirs, f"\n{describe(sc)}\n{_diff(ours, theirs)}"

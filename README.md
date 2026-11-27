@@ -798,6 +798,7 @@ server has its own settings, some with different names or defaults (see
 | `dns_cache` | `False` | Cache `getaddrinfo()` answers. Off by default, as in asyncio. |
 | `dns_cache_ttl` | `5.0` | How long a cached DNS answer is kept, in seconds. The record's own TTL is not used. |
 | `tfo` | `False` | TCP Fast Open on listening sockets. |
+| `native_tls` | `None` | Use cadeloop's own TLS layer for `create_connection(ssl=...)`, `create_server(ssl=...)` and `start_tls()` instead of the standard library's. `None` reads `CADELOOP_NATIVE_TLS` (`1` turns it on), else off. See [native TLS for your own connections](#native-tls-for-your-own-connections). |
 | `loopback_fast_path` | `True` | Windows `SIO_LOOPBACK_FAST_PATH` on loopback sockets. Only matters for traffic within one machine. |
 | `rio_cq_size`, `rio_rq_recv`, `rio_rq_send` | `65536`, `32`, `32` | Queue sizes for the experimental RIO backend on Windows. Ignored elsewhere. |
 
@@ -810,6 +811,44 @@ loop = cadeloop.Loop(
     dns_cache=True,
 )
 ```
+
+### Native TLS for your own connections
+
+TLS on connections your code opens -- an HTTPS request through aiohttp, a
+`wss://` client, a database driver over TLS, `start_tls()`, or a
+`create_server(ssl=...)` you run yourself -- normally goes through asyncio's
+own `sslproto` module, on any event loop. It is correct, and it is the
+slowest part of a TLS connection: a dozen Python calls around every message,
+and a 256 KiB buffer allocated for every connection.
+
+`native_tls=True` replaces it with a Rust port of the same code. OpenSSL
+still does the TLS, through the same `ssl.SSLContext` you pass in, so
+certificates, verification, ciphers and protocol versions behave exactly as
+before. What changes is the cost around it:
+
+| one worker, 64 connections, loopback, Linux | asyncio's `sslproto` on cadeloop | `native_tls=True` | uvloop |
+|---|---|---|---|
+| TLS echo, 1 KiB messages | 76k msg/s | 111k msg/s | 83k msg/s |
+| TLS echo, 16 KiB messages | 30k msg/s | 37k msg/s | 46k msg/s |
+| memory, 2,000 open TLS connections | 540 MiB | 83 MiB | 57 MiB |
+
+```python
+loop = cadeloop.Loop(native_tls=True)               # loop mode
+cadeloop.serve(app, native_tls=True)                # the server's loop
+```
+
+or, with no code change, `CADELOOP_NATIVE_TLS=1` in the environment.
+
+It is off by default in this release. It passes CPython's own `sslproto`
+and TLS test suites and is checked against asyncio, callback by callback,
+on generated scenarios; aiohttp, `websockets` and uvicorn are tested on it.
+What is still missing is time in production, so the standard library's path
+stays the default until it has had some. (`cadeloop.serve(ssl=...)` is not
+affected either way: the server terminates TLS in its own engine.)
+
+One behavior is deliberately different: a `BufferedProtocol` whose
+`get_buffer()` returns a `bytearray` receives correct data. On CPython
+3.11 to 3.13, asyncio hands such a protocol stale bytes over TLS.
 
 Apart from these, a `Loop` is an ordinary asyncio event loop. It supports
 `run_forever`, `run_until_complete`, `call_soon`, `call_later`, `call_at`,
@@ -953,6 +992,7 @@ Values are checked when the server starts, before anything binds or runs.
 | `stats_endpoint` | `None` | A port on which to serve `loop.stats()` as JSON, on `127.0.0.1` only. In a multi-worker server, one worker answers, and the payload says which. |
 | `dns_cache` | `True` | Cache `getaddrinfo()` answers for outgoing connections your app makes. On by default for servers, unlike loop mode. |
 | `dns_cache_ttl` | `5.0` | Seconds a cached answer is kept. |
+| `native_tls` | `False` | Use cadeloop's own TLS layer for the TLS connections your app opens (`create_connection(ssl=...)`, `start_tls()`); see [native TLS for your own connections](#native-tls-for-your-own-connections). Does not change `ssl=` on the server itself. |
 
 #### Windows only
 
@@ -1162,6 +1202,7 @@ server creates.
 | ready accepts per listener | `accept_pool` | `accept_pool` | `--accept-pool` |
 | DNS cache | `dns_cache` (off) | `dns_cache` (on) | `--dns-cache` |
 | TCP Fast Open | `tfo` | `tfo` | `--tfo` |
+| native TLS for connections the app opens | `native_tls` (off) | `native_tls` (off) | `--native-tls` |
 | everything HTTP: limits, timeouts, workers, logging | not applicable | see [settings](#settings) | |
 
 ---

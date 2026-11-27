@@ -109,12 +109,25 @@ def all_suites() -> list[str]:
     return seen
 
 
+NATIVE_TLS_ONLY = "[native-tls]"
+
+
+def native_tls_enabled() -> bool:
+    return os.environ.get("CADELOOP_NATIVE_TLS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_skiplist(path: pathlib.Path) -> set[str]:
     skips = set()
     if not path.exists():
         return skips
     for lineno, raw in enumerate(path.read_text().splitlines(), 1):
         entry, _, reason = raw.partition("#")
+        if entry.lstrip().startswith(NATIVE_TLS_ONLY):
+            # An entry for runs with the native TLS protocol only: on the
+            # default (stdlib sslproto) path the test is run as usual.
+            if not native_tls_enabled():
+                continue
+            entry = entry.lstrip()[len(NATIVE_TLS_ONLY) :]
         entry = entry.strip()
         if not entry:
             continue

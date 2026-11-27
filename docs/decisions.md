@@ -790,3 +790,71 @@ the noise of no logging. The tap's callable is stored next to the loop's
 own bound method, which is a reference cycle through the loop, so
 `__traverse__` reports both and `__clear__` lets the log go.
 
+## ADR-38: TLS on the loop's own transports is a port of sslproto, not a new design
+R-059 left client-side `ssl=`, `start_tls` and `create_server(ssl=)` on
+`asyncio.sslproto`, as uvloop's first versions did. Measured on a TLS echo
+(one worker, 64 connections, loopback) that path was slower than uvloop's:
+76k messages/s against 83k at 1 KiB, 30k against 46k at 16 KiB, and 256 KiB
+of memory for every connection, because sslproto allocates and zero-fills a
+receive buffer of that size in its constructor. Profiled, the interpreter
+was 37% of the server's CPU (15% under uvloop, whose sslproto is compiled):
+a dozen Python frames around four C calls per message.
+
+There were two ways to remove it. One was to extend the HTTP engine's TLS
+(ADR-11's phase-2 `tls_ingest`/`tls_flush_conn`) into the transport itself.
+That code is small because the engine's needs are small: it serves, it
+never connects; a failed handshake is dropped without telling anyone; there
+is no handshake or shutdown timeout, no flow control toward an application
+protocol, no `start_tls`, no buffered protocols. Everything it lacks is
+exactly what makes a general TLS transport hard, and what libraries depend
+on down to the exception type.
+
+The other was to port sslproto as it is: the same two objects (a protocol
+for the transport underneath, a transport for the application), the same
+five states, one function per method under the same name, driving the same
+`SSLObject` over the same pair of `MemoryBIO`s made by the caller's own
+`SSLContext`. That is what `crates/pyshim/src/tls.rs` is. TLS itself stays
+entirely OpenSSL's through Python's `ssl` module -- verification, protocol
+and cipher policy, SNI, sessions -- so nothing security-relevant is
+reimplemented; what moves to Rust is the bookkeeping between the calls.
+Being a protocol and a transport in the public sense, it sits on any
+transport and touches none of the native transport's internals: the plain
+TCP path is unchanged, and TLS inside TLS (an HTTPS proxy) works because
+the port's transport is itself something `start_tls` accepts.
+
+A port can be held to its original, and this one is, three ways: the
+generated scenarios of test_differential.py run with the port on cadeloop's
+side and sslproto on asyncio's (600 seeds: equal traces); the parity suite
+runs every test in a third column on a `native_tls` loop; and CPython's own
+test_sslproto, test_ssl, test_events and test_streams pass against it (two
+skips, both `isinstance(transport, asyncio.Transport)`, which no native
+transport satisfies).
+
+Where it differs from sslproto, on purpose:
+
+- It is a plain `data_received` protocol, not a buffered one: ciphertext
+  goes from the transport's bytes into the incoming BIO, so there is no
+  buffer to own. 2,000 connections: 83 MiB instead of 540.
+- `SSLObject.read()` is asked for 16 KiB, one record's worth, not 256 KiB;
+  `_ssl` allocates what it is asked for on every call.
+- After a read that returned data it does not call again just to be told
+  there is nothing (`SSLWantReadError`) when the incoming BIO is empty and
+  the SSL object holds no decrypted bytes. That exception was 1.4 us of a
+  4 us message (119k messages/s against 100k without the check).
+- `close()` and `abort()` from another thread are handed to the loop's
+  (ADR-36) instead of running the shutdown on the collector's thread.
+- It does not have sslproto's buffered-protocol bug. `_do_read__buffered`
+  fills the application's buffer through `buf[offset:]`; for a bytearray
+  that is a copy, so every record after the first of a read is lost and
+  the application is told stale bytes are its data (CPython 3.11-3.13,
+  found by the generated scenarios). The port slices a memoryview.
+
+Result: 111k messages/s at 1 KiB (+47%, and 35% ahead of uvloop), 37k at
+16 KiB (+22%; uvloop is still ahead there, where what is left is the
+MemoryBIO's own copying and the allocator, see the profile in the commit).
+
+It ships off by default (`Loop(native_tls=True)`, `Config.native_tls`,
+`CADELOOP_NATIVE_TLS=1`). sslproto has years of production behind it and
+this has none; the tests say they agree, and a release as an option is how
+that gets confirmed before it becomes what everyone runs.
+

@@ -88,6 +88,7 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
         tfo: bool = False,
         loopback_fast_path: bool = True,
         adaptive_spin: bool = True,
+        native_tls: bool | None = None,
     ):
         # Backend resolution: explicit arg > CADELOOP_BACKEND env (lets the
         # whole test/bench suite run against a chosen backend, e.g. "rio"
@@ -123,6 +124,14 @@ class Loop(TcpSurface, asyncio.AbstractEventLoop):
             adaptive_spin=adaptive_spin,
         )
         self._core = core
+        # R-059: TLS for create_connection/create_server/start_tls driven
+        # by the Rust port of asyncio.sslproto (cadeloop._core.SSLProtocol)
+        # instead of the standard library's. Explicit argument, else the
+        # CADELOOP_NATIVE_TLS environment variable, else off.
+        if native_tls is None:
+            asked = os.environ.get("CADELOOP_NATIVE_TLS", "")
+            native_tls = asked.strip().lower() in ("1", "true", "yes", "on")
+        self._native_tls = bool(native_tls)
         self._accept_pool = accept_pool  # R-032
         self._signal_handlers = {}
         self._signal_wakeup_pair = None  # R-052, made on first main-thread run

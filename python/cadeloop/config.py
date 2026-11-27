@@ -29,7 +29,7 @@ _BACKENDS = ("auto", "iocp", "rio", "epoll")
 _GC_MODES = ("default", "freeze", "disable")  # R-075
 _ACCESS_LOG_FORMATS = ("text", "json")  # R-140, the native access log
 
-_BOOL_FIELDS = ("loopback_fast_path", "tfo", "dns_cache", "eager_tasks", "pin", "access_log")
+_BOOL_FIELDS = ("loopback_fast_path", "tfo", "dns_cache", "eager_tasks", "pin", "access_log", "native_tls")
 _USIZE_MAX = sys.maxsize * 2 + 1
 _U32_MAX = 2**32 - 1
 # field: (minimum, maximum). The maxima are the native integer types these
@@ -123,6 +123,13 @@ class Config:
     # --- transports ---------------------------------------------------------
     write_high_water: int = 64 * 1024  # R-122 backpressure defaults
     write_low_water: int = 16 * 1024
+    # R-059: TLS on the transports the application opens itself --
+    # create_connection(ssl=...), start_tls(), create_server(ssl=...) --
+    # driven by the Rust port of asyncio.sslproto rather than the standard
+    # library's. (serve(ssl=...) terminates TLS in the engine either way.)
+    # Off by default while it proves itself; CADELOOP_NATIVE_TLS=1 turns
+    # it on for any cadeloop loop, served or not.
+    native_tls: bool = False
     # --- multi-process (§8) --------------------------------------------------
     workers: int = 0  # 0 -> one per CPU the process may run on (R-090)
     # R-091: pin each worker's loop thread to one CPU. Off by default:

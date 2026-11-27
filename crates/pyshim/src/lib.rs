@@ -9,6 +9,7 @@ mod handles;
 mod http;
 mod net;
 mod taskfast;
+mod tls;
 
 use pyo3::prelude::*;
 
@@ -25,6 +26,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<handles::Handle>()?;
     m.add_class::<handles::TimerHandle>()?;
     m.add_class::<net::Transport>()?;
+    m.add_class::<tls::SslProtocol>()?;
+    m.add_class::<tls::SslTransport>()?;
     m.add_class::<fastqueue::FastQueue>()?;
     m.add_class::<http::CompletedAwaitable>()?;
     m.add_class::<http::ValueAwaitable>()?;

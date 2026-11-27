@@ -23,6 +23,8 @@ from asyncio.base_events import _interleave_addrinfos, _ipaddr_info
 # asyncio's logger, where applications already route it.
 from asyncio.log import logger
 
+from . import _core
+
 try:
     import ssl as ssl_module
 except ImportError:  # pragma: no cover
@@ -644,8 +646,12 @@ class TcpSurface:
         return ssl
 
     def _make_ssl_protocol(self, app_protocol, sslcontext, waiter, **kwargs):
-        # R-059 compatibility path: stdlib sslproto (MemoryBIO) over native
-        # transports, exactly as uvloop does. Native engine: M4.
+        # R-059: the protocol that sits between the application's and the
+        # native transport. The standard library's sslproto by default;
+        # with `native_tls`, its Rust port -- the same state machine over
+        # the same SSLObject and MemoryBIO pair, without the Python frames
+        # or the 256 KiB receive buffer per connection (crates/pyshim/src/
+        # tls.rs).
         timeout = kwargs.pop("ssl_handshake_timeout", None)
         shutdown = kwargs.pop("ssl_shutdown_timeout", None)
         extra = {}
@@ -653,7 +659,8 @@ class TcpSurface:
             extra["ssl_handshake_timeout"] = timeout
         if shutdown is not None and sys.version_info >= (3, 11):
             extra["ssl_shutdown_timeout"] = shutdown
-        return sslproto.SSLProtocol(self, app_protocol, sslcontext, waiter, **kwargs, **extra)
+        cls = _core.SSLProtocol if self._native_tls else sslproto.SSLProtocol
+        return cls(self, app_protocol, sslcontext, waiter, **kwargs, **extra)
 
     # -- serving ----------------------------------------------------------
 

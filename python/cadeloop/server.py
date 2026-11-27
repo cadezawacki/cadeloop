@@ -713,6 +713,8 @@ def _serve_single(
         dns_cache_ttl=config.dns_cache_ttl,
         tfo=config.tfo,
         loopback_fast_path=config.loopback_fast_path,
+        # False means "not asked for": the environment may still turn it on.
+        native_tls=True if config.native_tls else None,
     )
     # Restored on the way out: serve() is an ordinary callable, and setting
     # None left an embedder's own current loop gone after it returned.

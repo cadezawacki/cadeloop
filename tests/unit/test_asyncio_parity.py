@@ -23,11 +23,16 @@ import pytest
 
 def _new_loop(kind):
     if kind == "cadeloop":
-        return cadeloop.new_event_loop()
+        return cadeloop.Loop(native_tls=False)
+    if kind == "cadeloop-native-tls":
+        # The same loop with TLS driven by the Rust port of sslproto
+        # (crates/pyshim/src/tls.rs) instead of the standard library's:
+        # every test here holds for it too.
+        return cadeloop.Loop(native_tls=True)
     return asyncio.SelectorEventLoop()
 
 
-@pytest.fixture(params=["cadeloop", "asyncio"])
+@pytest.fixture(params=["cadeloop", "cadeloop-native-tls", "asyncio"])
 def loop(request):
     lp = _new_loop(request.param)
     asyncio.set_event_loop(lp)
