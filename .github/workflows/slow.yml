@@ -107,6 +107,27 @@ jobs:
           PROPTEST_CASES: ${{ github.event_name == 'schedule' && '50000' || '5000' }}
         run: cargo test -p cadeloop-core --lib props
 
+  miri:
+    # The core crate's tests under Miri, which checks every unsafe
+    # operation they reach for undefined behavior: the buffer slab and the
+    # operation slab hand out raw pointers, and the ready queue is shared
+    # between threads. Left out are the modules Miri cannot run -- the HTTP
+    # parser (llhttp is C) and the epoll backend's socket I/O (sendmsg) --
+    # and the WebSocket codec, which has no unsafe code and takes Miri an
+    # hour. Few generated cases per property: the interpreter is slow, and
+    # the properties get their thousands of cases in the job above.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - name: miri
+        env:
+          PROPTEST_CASES: "6"
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo +nightly miri test -p cadeloop-core --lib -- \
+            buffers:: opslab:: timer:: time:: ready:: spin_gate:: accesslog:: reactor:: netsys::
+
   benchmark-regression:
     # R-113: fail on >5% regression vs stored baseline JSON. Until a
     # Windows baseline is recorded under bench/baselines/, the check
