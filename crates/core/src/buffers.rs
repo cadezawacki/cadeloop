@@ -240,8 +240,12 @@ impl Region {
             };
             assert!(ptr != libc::MAP_FAILED, "mmap({REGION_SIZE}) failed");
             // Advisory: a kernel without THP refuses it, and then there are
-            // no huge pages to avoid.
-            unsafe { libc::madvise(ptr, REGION_SIZE, libc::MADV_NOHUGEPAGE) };
+            // no huge pages to avoid. (Miri has no pages at all, and stops
+            // at advice it does not model.)
+            #[cfg(not(miri))]
+            unsafe {
+                libc::madvise(ptr, REGION_SIZE, libc::MADV_NOHUGEPAGE)
+            };
             Region { ptr: ptr.cast(), rio_buffer_id: None, large_pages: false, fresh_held: false }
         }
         #[cfg(not(any(windows, target_os = "linux")))]
@@ -304,7 +308,18 @@ fn page_out(ptr: *mut u8, len: usize) -> bool {
         // SAFETY: a whole free slot inside one of our private anonymous
         // mappings; nothing references it (refcount zero) until it is
         // handed out again.
-        unsafe { libc::madvise(ptr.cast(), len, libc::MADV_DONTNEED) == 0 }
+        #[cfg(not(miri))]
+        unsafe {
+            libc::madvise(ptr.cast(), len, libc::MADV_DONTNEED) == 0
+        }
+        // Under Miri, which does not model this advice, do what it does
+        // to a private anonymous mapping: the pages read as zero next
+        // time. The interpreter then checks the pool's use of them.
+        #[cfg(miri)]
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, len);
+            true
+        }
     }
     #[cfg(windows)]
     {
