@@ -27,7 +27,7 @@ methodology: [benchmarks.md](benchmarks.md).*
 >
 > | Area | Fix | Commit |
 > |---|---|---|
-> | Net | `permessage-deflate` (RFC 7692) for WebSockets, off unless `ws_compression` is set. Negotiated without context takeover in either direction, so it adds no memory per connection: one compressor and one decompressor per loop. Messages of 1 KiB to 1 MiB are compressed when that makes them smaller; an inbound message is bounded by what it inflates to (1009 past the message limit, checked as it inflates), and invalid data is 1007. JSON text echoed: 892 bytes on the wire instead of 7,742 for 30 us of CPU, 7,114 instead of 64,280 for 265 us (ADR-42) | |
+> | Net | `permessage-deflate` (RFC 7692) for WebSockets, off unless `ws_compression` is set. Negotiated without context takeover in either direction, so it adds no memory per connection: one compressor and one decompressor per loop. Messages of 1 KiB to 1 MiB are compressed when that makes them smaller; an inbound message is bounded by what it inflates to (1009 past the message limit, checked as it inflates), and invalid data is 1007. JSON text echoed: 892 bytes on the wire instead of 7,742 for 30 us of CPU, 7,114 instead of 64,280 for 265 us (ADR-42) | `e9b0b5f` |
 >
 > **Measured and not built**
 >
