@@ -10,6 +10,8 @@ cc = "1"
 
 [dependencies]
 crossbeam-queue.workspace = true
+# R-087 permessage-deflate (ws.rs). Pure Rust, no C, MIT/Zlib/Apache-2.0.
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

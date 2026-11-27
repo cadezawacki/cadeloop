@@ -10,7 +10,7 @@ usage documentation is in the [README](../README.md).
 | TLS: native termination (`serve(ssl=...)`, https/wss), client `ssl=` / `start_tls` | ✅ tested |
 | `sock_*`, `add_reader` / `add_writer`, signals | ✅ tested |
 | UDP (`create_datagram_endpoint`) | ✅ tested |
-| WebSockets (RFC 6455, native engine) | ✅ tested |
+| WebSockets (RFC 6455, native engine; `permessage-deflate` with `ws_compression`) | ✅ tested |
 | Native HTTP/1.1 + ASGI engine, lifespan, CLI | ✅ tested (Starlette, FastAPI) |
 | Multi-worker (`workers > 1`) | ✅ tested (fork + `SO_REUSEPORT`; spawn + shared listener on Windows) |
 | Subprocess (`create_subprocess_exec` / `shell`) | ✅ POSIX; Windows pipes in progress |

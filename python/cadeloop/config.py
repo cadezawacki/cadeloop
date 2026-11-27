@@ -29,7 +29,16 @@ _BACKENDS = ("auto", "iocp", "rio", "epoll")
 _GC_MODES = ("default", "freeze", "disable")  # R-075
 _ACCESS_LOG_FORMATS = ("text", "json")  # R-140, the native access log
 
-_BOOL_FIELDS = ("loopback_fast_path", "tfo", "dns_cache", "eager_tasks", "pin", "access_log", "native_tls")
+_BOOL_FIELDS = (
+    "loopback_fast_path",
+    "tfo",
+    "dns_cache",
+    "eager_tasks",
+    "pin",
+    "access_log",
+    "native_tls",
+    "ws_compression",
+)
 _USIZE_MAX = sys.maxsize * 2 + 1
 _U32_MAX = 2**32 - 1
 # field: (minimum, maximum). The maxima are the native integer types these
@@ -120,6 +129,11 @@ class Config:
     # one request into unbounded memory. Raise it, or set None explicitly,
     # for large-upload workloads; over the limit the client gets a 413.
     max_body: int | None = 16 * 1024 * 1024
+    # R-087: accept a WebSocket client's offer of permessage-deflate. Off by
+    # default: compression is CPU spent on the loop's thread for every
+    # message of 1 KiB to 1 MiB, in exchange for bandwidth. It is negotiated
+    # without context takeover, so it costs no memory per connection.
+    ws_compression: bool = False
     # --- transports ---------------------------------------------------------
     write_high_water: int = 64 * 1024  # R-122 backpressure defaults
     write_low_water: int = 16 * 1024

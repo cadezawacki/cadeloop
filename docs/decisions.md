@@ -970,3 +970,52 @@ Measured with Starlette's `FileResponse`, one worker, loopback: 16 KiB
 answers them itself), and zero-copy remains possible later for plaintext
 connections if file serving ever dominates a workload.
 
+## ADR-42: permessage-deflate: opt-in, and without context takeover
+The engine declined every WebSocket extension (legal: the client carries
+on uncompressed) and `WsRx` failed any frame with a reserved bit. Browsers
+and most client libraries offer `permessage-deflate` on every connection,
+so a deployment that wanted compression had no way to have it.
+
+It is now available behind `ws_compression`, off by default, in one
+configuration:
+
+- **No context takeover, either way.** The response to an accepted offer
+  always carries `server_no_context_takeover; client_no_context_takeover`
+  (a server may ask for the second even when the client did not offer it;
+  RFC 7692 7.1.1.2). With takeover each side keeps its compressor's window
+  between messages -- better ratios on small, similar messages -- and the
+  server keeps a compressor and a decompressor per connection, about a
+  quarter of a megabyte, idle or not. Without it every message stands
+  alone: one `Deflater` and one `Inflater` serve every connection of a
+  loop, reset before each message, and an idle WebSocket costs exactly
+  what it cost before. On JSON of a kilobyte and up the ratio is still
+  five- to nine-fold.
+- **Each message decides.** Outbound messages under 1 KiB are not
+  compressed (little to save), nor ones over 1 MiB (compression runs on
+  the loop's thread, and a megabyte is already milliseconds of it; the GIL
+  is released from 32 KiB), nor ones that do not come out smaller. The
+  extension lets a sender leave RSV1 off any message, so all three are
+  simply sent as they are.
+- **What comes out is what is bounded.** An inbound message is inflated in
+  steps, and fails with 1009 the moment it passes the message limit:
+  64 MiB of zeros arrives as a few tens of kilobytes, and never becomes
+  more than the limit plus a byte in memory. Invalid DEFLATE, or text
+  that is not UTF-8 once inflated, is 1007, and nothing behind a failed
+  message is delivered.
+- **Offers it takes.** `permessage-deflate` with any of
+  `client_max_window_bits`, the two takeover parameters, and
+  `server_max_window_bits=15`. One that asks the server for a smaller
+  window is passed over for the next offer (the compressor has one window
+  size), as is anything unknown or malformed.
+
+The codec (`miniz_oxide`, pure Rust; MIT/Zlib/Apache-2.0) and the
+negotiation are in `cadeloop_core::ws`, tested there against the RFC's own
+examples; the engine is tested with hand-built frames and with the
+`websockets` library, which compresses everything it sends.
+
+Cost, JSON text echoed (inflate on the way in, deflate on the way out):
+2.5 us of server CPU at 1 KiB, 30 us at 8 KiB, 265 us at 64 KiB, for
+892 bytes on the wire instead of 7,742 and 7,114 instead of 64,280. Off by
+default because that CPU is the loop's: it is worth spending only where
+bandwidth is what is scarce.
+

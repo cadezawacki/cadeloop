@@ -23,6 +23,12 @@ methodology: [benchmarks.md](benchmarks.md).*
 > |---|---|---|
 > | Perf | Starlette's and FastAPI's `FileResponse` read the file 64 KiB at a time, a worker-thread hop for the open, each read and the close: 285 requests/s for a 1 MiB file. The engine now declares the ASGI Path Send extension, so the framework sends the path (`http.response.pathsend`) and the server sends the file, through the ordinary body path -- pieces queued by reference, small files read in one piece on the loop thread, large ones 1 MiB at a time on a pool of their own. 16 KiB 1,243 -> 4,536 requests/s, 64 KiB 1,038 -> 3,949, 1 MiB 285 -> 1,181, 10 MiB 37 -> 183; the same over TLS and on Windows, no application change (ADR-41) | `4807084` |
 >
+> **WebSocket compression (on `claude/sleepy-ride-p2rndm`)**
+>
+> | Area | Fix | Commit |
+> |---|---|---|
+> | Net | `permessage-deflate` (RFC 7692) for WebSockets, off unless `ws_compression` is set. Negotiated without context takeover in either direction, so it adds no memory per connection: one compressor and one decompressor per loop. Messages of 1 KiB to 1 MiB are compressed when that makes them smaller; an inbound message is bounded by what it inflates to (1009 past the message limit, checked as it inflates), and invalid data is 1007. JSON text echoed: 892 bytes on the wire instead of 7,742 for 30 us of CPU, 7,114 instead of 64,280 for 265 us (ADR-42) | |
+>
 > **Measured and not built**
 >
 > | Area | Finding | Commit |

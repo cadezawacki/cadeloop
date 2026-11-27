@@ -7,6 +7,7 @@ import asyncio
 import base64
 import gc
 import hashlib
+import json
 import os
 import struct
 import threading
@@ -1270,3 +1271,212 @@ def test_send_rejects_a_text_that_is_not_a_str(loop):
     assert loop.run_until_complete(main()) == (0x1, b"still usable")
     assert errors, "a non-str text was accepted"
     loop._core.listener_close(lid)
+
+
+# --------------------------------------------------------------------- #
+# permessage-deflate (RFC 7692), opt-in: Config.ws_compression           #
+# --------------------------------------------------------------------- #
+
+OFFER = "sec-websocket-extensions: permessage-deflate; client_max_window_bits\r\n"
+ACCEPTED = (
+    b"sec-websocket-extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+)
+
+
+def _deflate(payload: bytes) -> bytes:
+    """A message payload the way a permessage-deflate sender makes it."""
+    import zlib
+
+    z = zlib.compressobj(wbits=-15)
+    out = z.compress(payload) + z.flush(zlib.Z_SYNC_FLUSH)
+    assert out.endswith(b"\x00\x00\xff\xff")
+    return out[:-4]
+
+
+def _inflate(payload: bytes) -> bytes:
+    import zlib
+
+    return zlib.decompressobj(wbits=-15).decompress(payload + b"\x00\x00\xff\xff")
+
+
+def _rsv1(frame: bytes) -> bytes:
+    return bytes([frame[0] | 0x40]) + frame[1:]
+
+
+async def _read_raw_frame(reader):
+    """(first byte, payload) of one server frame, reserved bits and all."""
+    h = await reader.readexactly(2)
+    n = h[1] & 0x7F
+    if n == 126:
+        n = struct.unpack(">H", await reader.readexactly(2))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", await reader.readexactly(8))[0]
+    return h[0], (await reader.readexactly(n) if n else b"")
+
+
+def test_compression_is_not_negotiated_unless_enabled(loop):
+    lid, port = listen(loop, ws_echo_app)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port, extra=OFFER)
+        assert b" 101 " in head.split(b"\r\n", 1)[0] and b"sec-websocket-extensions" not in head.lower()
+        # ...and so a compressed frame is a protocol error, as before.
+        writer.write(_rsv1(client_frame(0x1, _deflate(b"hello"))))
+        first, payload = await asyncio.wait_for(_read_raw_frame(reader), 5)
+        assert first & 0x0F == 0x8 and struct.unpack(">H", payload[:2])[0] == 1002
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+
+def test_compression_is_offered_back_and_used_in_both_directions(loop):
+    loop._core.set_ws_compression(True)
+    lid, port = listen(loop, ws_echo_app)
+    text = json.dumps([{"id": i, "name": f"item-{i}", "ok": i % 2 == 0} for i in range(200)])
+    noise = os.urandom(5000)
+
+    async def main():
+        reader, writer, _key, head = await handshake(port, extra=OFFER)
+        assert ACCEPTED in head.lower(), head
+        # A compressed text message in, the echo out: compressed too,
+        # since it is long enough and shrinks.
+        writer.write(_rsv1(client_frame(0x1, _deflate(text.encode()))))
+        first, payload = await asyncio.wait_for(_read_raw_frame(reader), 5)
+        assert first == 0x80 | 0x40 | 0x1, hex(first)
+        assert len(payload) < len(text) // 3
+        assert _inflate(payload).decode() == "echo:" + text
+        # Short messages are sent as they are, and may be received so.
+        writer.write(client_frame(0x1, b"hi"))
+        assert await asyncio.wait_for(_read_raw_frame(reader), 5) == (0x80 | 0x1, b"echo:hi")
+        writer.write(_rsv1(client_frame(0x1, _deflate(b"hi"))))
+        assert await asyncio.wait_for(_read_raw_frame(reader), 5) == (0x80 | 0x1, b"echo:hi")
+        # Data that does not compress is not sent compressed.
+        writer.write(client_frame(0x2, noise))
+        assert await asyncio.wait_for(_read_raw_frame(reader), 5) == (0x80 | 0x2, b"echo:" + noise)
+        # A compressed message may be fragmented; RSV1 is on the first
+        # frame only.
+        z = _deflate(text.encode())
+        writer.write(_rsv1(client_frame(0x1, z[:100], fin=False)) + client_frame(0x0, z[100:]))
+        first, payload = await asyncio.wait_for(_read_raw_frame(reader), 5)
+        assert first & 0x40 and _inflate(payload).decode() == "echo:" + text
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+
+def test_a_message_too_large_to_be_worth_compressing_is_sent_as_it_is(loop):
+    loop._core.set_ws_compression(True)
+    big = "x" * (1024 * 1024 + 1)  # compresses to nothing, and is over the size compressed on the loop
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.send", "text": big})
+        await send({"type": "websocket.send", "text": big[: 1024 * 1024]})
+        await receive()
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, _head = await handshake(port, extra=OFFER)
+        first, payload = await asyncio.wait_for(_read_raw_frame(reader), 10)
+        assert first == 0x80 | 0x1 and payload == big.encode()
+        first, payload = await asyncio.wait_for(_read_raw_frame(reader), 10)
+        assert first == 0x80 | 0x40 | 0x1 and len(payload) < 20_000
+        assert _inflate(payload) == big[: 1024 * 1024].encode()
+        writer.close()
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+
+def _deflate_many(payload: bytes, pieces: int) -> bytes:
+    """`payload` repeated `pieces` times, compressed without ever holding
+    the whole of it."""
+    import zlib
+
+    z = zlib.compressobj(wbits=-15)
+    out = b"".join(z.compress(payload) for _ in range(pieces)) + z.flush(zlib.Z_SYNC_FLUSH)
+    return out[:-4]
+
+
+@pytest.mark.parametrize(
+    ("make", "code"),
+    [
+        # 64 MiB of zeros in a few tens of kilobytes: the limit is on what
+        # a message inflates to, enforced while it inflates.
+        (lambda: _deflate_many(bytes(1 << 20), 64), 1009),
+        (lambda: b"\x07\x00\x00\x00", 1007),  # not DEFLATE (a reserved block type)
+        (lambda: _deflate(b"\xff\xfe not utf-8"), 1007),  # inflates, but is not text
+    ],
+    ids=["bomb", "garbage", "bad-utf8"],
+)
+def test_a_bad_compressed_message_fails_the_connection(loop, make, code):
+    loop._core.set_ws_compression(True)
+    got = []
+
+    async def app(scope, receive, send):
+        await receive()
+        await send({"type": "websocket.accept"})
+        while True:
+            msg = await receive()
+            got.append(msg)
+            if msg["type"] == "websocket.disconnect":
+                return
+
+    lid, port = listen(loop, app)
+
+    async def main():
+        reader, writer, _key, _head = await handshake(port, extra=OFFER)
+        payload = make()
+        assert len(payload) < 200_000
+        # A good message behind the bad one, in the same write: it must
+        # not be delivered.
+        writer.write(_rsv1(client_frame(0x1, payload)) + client_frame(0x1, b"after"))
+        first, close = await asyncio.wait_for(_read_raw_frame(reader), 10)
+        assert first & 0x0F == 0x8 and struct.unpack(">H", close[:2])[0] == code
+        await asyncio.sleep(0.05)
+        writer.close()
+
+    loop.run_until_complete(main())
+    assert got == [{"type": "websocket.disconnect", "code": code}]
+    loop._core.listener_close(lid)
+
+
+def test_the_websockets_library_negotiates_and_exchanges_compressed_messages(loop):
+    """A real client, which offers permessage-deflate by default and
+    compresses everything it sends."""
+    websockets = pytest.importorskip("websockets")
+    loop._core.set_ws_compression(True)
+    lid, port = listen(loop, ws_echo_app)
+    messages = ["hi", "x" * 5000, json.dumps(list(range(20000))), os.urandom(100_000), b"\x00" * 300_000]
+
+    async def main():
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws", max_size=None) as ws:
+            extensions = [type(e).__name__ for e in ws.protocol.extensions]
+            assert extensions == ["PerMessageDeflate"], extensions
+            for message in messages:
+                await ws.send(message)
+                echoed = await asyncio.wait_for(ws.recv(), 10)
+                prefix = "echo:" if isinstance(message, str) else b"echo:"
+                assert echoed == prefix + message
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+
+
+def test_the_websockets_library_still_works_without_compression(loop):
+    websockets = pytest.importorskip("websockets")
+    lid, port = listen(loop, ws_echo_app)
+
+    async def main():
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
+            assert ws.protocol.extensions == []
+            await ws.send("x" * 5000)
+            assert await asyncio.wait_for(ws.recv(), 10) == "echo:" + "x" * 5000
+
+    loop.run_until_complete(main())
+    loop._core.listener_close(lid)
+

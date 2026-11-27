@@ -972,6 +972,7 @@ Values are checked when the server starts, before anything binds or runs.
 | `write_high_water`, `write_low_water` | `65536`, `16384` | Backpressure: when a connection's unsent output passes the high mark, `send()` waits until it drains below the low mark. |
 | `accept_pool` | `64` | Accepts kept ready per listening socket. |
 | `tfo` | `False` | TCP Fast Open on the listening socket. |
+| `ws_compression` | `False` | Accept WebSocket clients' offers of `permessage-deflate` and compress messages of 1 KiB to 1 MiB. Costs CPU on the loop thread, saves bandwidth; see [WebSockets](#websockets). |
 
 #### Workers and shutdown
 
@@ -1168,6 +1169,28 @@ async def app(scope, receive, send):
                 break
             await send({"type": "websocket.send", "text": message["text"]})
 ```
+
+**Compression** is off unless you turn it on with `ws_compression=True`
+(`--ws-compression`). The server then accepts a client's offer of
+`permessage-deflate`, which browsers and most client libraries make by
+default, and messages between 1 KiB and 1 MiB are sent compressed when
+that makes them smaller. Shorter and longer ones, and data that does not
+compress, are sent as they are.
+
+| JSON text, echoed | extra server CPU per message | bytes on the wire, each way |
+|---|---|---|
+| 1 KiB | 2.5 µs | 175 instead of 937 |
+| 8 KiB | 30 µs | 892 instead of 7,742 |
+| 64 KiB | 265 µs | 7,114 instead of 64,280 |
+
+That CPU is spent on the loop thread, which is why it is a choice: on a
+fast network it buys nothing, and on a slow or metered one it buys a lot.
+It is negotiated without "context takeover", so it adds no memory per
+connection however many are open, and what a compressed message may
+inflate to is bounded by the same limit as any other message. If your
+payloads are already compressed (Arrow IPC with LZ4 or ZSTD, images,
+archives), leave it off: they will not shrink, and the server would only
+find that out by trying.
 
 ### Lifespan
 

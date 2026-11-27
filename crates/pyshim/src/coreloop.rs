@@ -86,6 +86,11 @@ pub struct CoreLoop {
     /// Context snapshot shared by callbacks scheduled without an explicit
     /// context (see `ctxsnap`).
     snaps: SnapCache,
+    /// The one compressor every compressed outbound WebSocket message of
+    /// this loop goes through (R-087; no context takeover, so it is reset
+    /// per message). Outside the state cell: a large message is
+    /// compressed with the GIL released. Made on first use.
+    pub(crate) ws_deflater: std::sync::Mutex<Option<cadeloop_core::ws::Deflater>>,
     waker: Arc<dyn Wakeup>,
     /// Shared with the reactor: cancellations of still-scheduled timers,
     /// absorbed into the heap's tombstone accounting each tick.
@@ -869,6 +874,7 @@ impl CoreLoop {
             state: StateCell::new(LoopState { reactor, net, completions_scratch: Vec::with_capacity(512) }),
             xqueue,
             snaps: SnapCache::default(),
+            ws_deflater: std::sync::Mutex::new(None),
             waker,
             timer_cancels,
             closed: AtomicBool::new(false),
@@ -1635,6 +1641,12 @@ impl CoreLoop {
     /// derives it from `latency_mode` (on for `spin`).
     fn set_immediate_flush(&self, enabled: bool) -> PyResult<()> {
         self.with_net(|net, _| net.flush_immediately = enabled)
+    }
+
+    /// R-087: accept a WebSocket client's offer of permessage-deflate
+    /// (`Config.ws_compression`). Applies to handshakes from here on.
+    fn set_ws_compression(&self, enabled: bool) -> PyResult<()> {
+        self.with_net(|net, _| net.ws_compression = enabled)
     }
 
     /// Live *native HTTP* connections -- the drain loop's convergence

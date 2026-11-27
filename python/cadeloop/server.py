@@ -775,6 +775,8 @@ def _serve_single(
                 )
             if config.immediate_flush:
                 loop._core.set_immediate_flush(True)
+            if config.ws_compression:
+                loop._core.set_ws_compression(True)
             hook = _RequestHook(loop)
             if config.access_log:
                 access_log = _AccessLog(logging.getLogger("cadeloop.access"))

@@ -259,6 +259,51 @@ pub(crate) struct WsConn {
     /// `NetState.recent_ws_closes` so a receive() that arrives after the
     /// connection is gone still reports what actually happened.
     pub(crate) close_code: Option<u16>,
+    /// The `Sec-WebSocket-Extensions` value to answer with, when the
+    /// client offered permessage-deflate in a form this server takes and
+    /// compression is enabled. Sent, and acted on, at accept.
+    pub(crate) deflate_response: Option<String>,
+    /// permessage-deflate is in effect: outbound messages may be sent
+    /// compressed, inbound ones may arrive so.
+    pub(crate) deflate: bool,
+}
+
+/// Outbound WebSocket messages shorter than this are not compressed: the
+/// saving is a few hundred bytes at most, for the same call overhead.
+const WS_DEFLATE_MIN: usize = 1024;
+/// ...nor are ones longer than this. Compression runs on the loop's
+/// thread, at something like 100-200 MB/s; a megabyte is already several
+/// milliseconds during which nothing else is served, and payloads of that
+/// size are usually binary data that is compressed already.
+const WS_DEFLATE_MAX: usize = 1024 * 1024;
+/// From this size the GIL is released while compressing.
+const WS_DEFLATE_DETACH: usize = 32 * 1024;
+
+/// `payload` as a WebSocket message frame, compressed if that is in
+/// effect for the connection, the size is in range, and it actually
+/// comes out smaller (random or already-compressed data does not, and is
+/// sent as it is: the extension lets each message choose).
+fn ws_frame_maybe_deflated(
+    py: Python<'_>,
+    core: &CoreLoop,
+    deflate: bool,
+    opcode: u8,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    use cadeloop_core::ws;
+    if !deflate || payload.len() < WS_DEFLATE_MIN || payload.len() > WS_DEFLATE_MAX {
+        return None;
+    }
+    // Busy only if a message is being compressed on another thread of
+    // this same loop, which does not happen; if it somehow is, send plain.
+    let mut slot = core.ws_deflater.try_lock().ok()?;
+    let deflater = slot.get_or_insert_with(ws::Deflater::new);
+    let deflated = if payload.len() >= WS_DEFLATE_DETACH {
+        py.detach(|| deflater.message(payload))
+    } else {
+        deflater.message(payload)
+    };
+    (deflated.len() < payload.len()).then(|| ws::frame_deflated(opcode, &deflated))
 }
 
 /// R-087: default cap on an assembled inbound message (1009 beyond it).
@@ -1762,9 +1807,10 @@ fn process_send(py: Python<'_>, core: &CoreLoop, tid: u64, message: &Bound<'_, P
     let mtype = mtype.cast::<PyString>().map_err(PyErr::from)?;
     let kind = mtype.to_str()?;
 
-    let is_ws = core.with_net(|net, _| net.http_conn_mut(tid).map(|c| c.ws.is_some()).unwrap_or(false))?;
-    if is_ws {
-        return ws_send(py, core, tid, kind, message).map(|()| Sent::Done);
+    // Some(permessage-deflate in effect) on a WebSocket connection.
+    let ws = core.with_net(|net, _| net.http_conn_mut(tid).and_then(|c| c.ws.as_ref().map(|w| w.deflate)))?;
+    if let Some(deflate) = ws {
+        return ws_send(py, core, tid, kind, message, deflate).map(|()| Sent::Done);
     }
 
     if kind == "http.response.start" {
@@ -2717,6 +2763,7 @@ fn ws_send(
     tid: u64,
     kind: &str,
     message: &Bound<'_, PyDict>,
+    deflate: bool,
 ) -> PyResult<()> {
     use cadeloop_core::ws;
     match kind {
@@ -2779,18 +2826,22 @@ fn ws_send(
                             String::from_utf8_lossy(&name)
                         )));
                     }
-                    // Extensions are negotiated, not declared, and this
-                    // engine negotiates none -- `WsRx` fails any frame
-                    // with an RSV bit set (RFC 6455 5.2). Forwarding an
-                    // app's `permessage-deflate` therefore told the client
-                    // to compress and then killed the connection with 1002
-                    // on its first data frame, which reads as a client
-                    // bug. Refuse at accept time instead.
+                    // Extensions are negotiated, not declared, and by the
+                    // server: it answers a client's offer of
+                    // permessage-deflate itself when `ws_compression` is
+                    // on, and negotiates nothing otherwise -- `WsRx` then
+                    // fails any frame with an RSV bit set (RFC 6455 5.2).
+                    // Forwarding an app's own header told the client to
+                    // compress and then killed the connection with 1002 on
+                    // its first data frame, which reads as a client bug.
+                    // Refuse at accept time instead.
                     if name.eq_ignore_ascii_case(b"sec-websocket-extensions") {
                         return Err(PyRuntimeError::new_err(
-                            "websocket.accept may not set 'sec-websocket-extensions'; this \
-                             engine negotiates no extensions, and a client that honoured the \
-                             header would be disconnected for setting a reserved bit",
+                            "websocket.accept may not set 'sec-websocket-extensions'; the \
+                             server negotiates extensions itself (permessage-deflate, with \
+                             the ws_compression setting), and a client that honoured an \
+                             application's header would be disconnected for setting a \
+                             reserved bit",
                         ));
                     }
                     extra.push((name, value));
@@ -2815,6 +2866,16 @@ fn ws_send(
                         head.extend_from_slice(b"sec-websocket-protocol: ");
                         head.extend_from_slice(sp.as_bytes());
                         head.extend_from_slice(b"\r\n");
+                    }
+                    if let Some(response) = wsc.deflate_response.take() {
+                        // The client offered permessage-deflate and it is
+                        // enabled: from the 101 on, either side may send
+                        // a message compressed.
+                        head.extend_from_slice(b"sec-websocket-extensions: ");
+                        head.extend_from_slice(response.as_bytes());
+                        head.extend_from_slice(b"\r\n");
+                        wsc.deflate = true;
+                        wsc.rx.allow_deflate();
                     }
                     for (n, v) in &extra {
                         head.extend_from_slice(n);
@@ -2850,18 +2911,27 @@ fn ws_send(
             let payload: Vec<u8> = match &text_obj {
                 Some(t) if !t.is_none() => {
                     let s = t.cast::<PyString>().map_err(PyErr::from)?;
-                    ws::frame(ws::OP_TEXT, s.to_str()?.as_bytes())
+                    let text = s.to_str()?.as_bytes();
+                    ws_frame_maybe_deflated(py, core, deflate, ws::OP_TEXT, text)
+                        .unwrap_or_else(|| ws::frame(ws::OP_TEXT, text))
                 }
                 _ => match &bytes_obj {
                     Some(b) if !b.is_none() => match b.cast::<PyBytes>() {
-                        Ok(pb) if pb.as_bytes().len() >= net::HTTP_BODY_RETAIN_MIN => {
-                            large = Some(pb);
-                            ws::frame_header(ws::OP_BINARY, pb.as_bytes().len())
+                        Ok(pb) => {
+                            let data = pb.as_bytes();
+                            match ws_frame_maybe_deflated(py, core, deflate, ws::OP_BINARY, data) {
+                                Some(frame) => frame,
+                                None if data.len() >= net::HTTP_BODY_RETAIN_MIN => {
+                                    large = Some(pb);
+                                    ws::frame_header(ws::OP_BINARY, data.len())
+                                }
+                                None => ws::frame(ws::OP_BINARY, data),
+                            }
                         }
-                        Ok(pb) => ws::frame(ws::OP_BINARY, pb.as_bytes()),
                         Err(_) => {
                             let v: Vec<u8> = b.extract()?;
-                            ws::frame(ws::OP_BINARY, &v)
+                            ws_frame_maybe_deflated(py, core, deflate, ws::OP_BINARY, &v)
+                                .unwrap_or_else(|| ws::frame(ws::OP_BINARY, &v))
                         }
                     },
                     _ => return Err(PyRuntimeError::new_err("websocket.send needs 'text' or 'bytes'")),
@@ -3003,8 +3073,32 @@ pub(crate) fn ws_ingest(
     let mut close_after = false;
     let mut wake = false;
     for ev in evs {
+        // A compressed message becomes the message it holds, or the
+        // reason the connection fails: too big once inflated (the limit
+        // is on what comes out), not DEFLATE, or text that is not UTF-8.
+        let ev = match ev {
+            WsEvent::Deflated { text, payload } => {
+                let inflater = net.ws_inflater.get_or_insert_with(ws::Inflater::new);
+                match inflater.message(&payload, WS_MAX_MESSAGE) {
+                    Ok(data) if !text => WsEvent::Binary(data),
+                    Ok(data) => match String::from_utf8(data) {
+                        Ok(s) => WsEvent::Text(s),
+                        Err(_) => WsEvent::Fail(1007, "text message not utf-8"),
+                    },
+                    Err((code, reason)) => WsEvent::Fail(code, reason),
+                }
+            }
+            other => other,
+        };
+        let failed = matches!(ev, WsEvent::Fail(..));
         let Some(conn) = net.http_conn_mut(tid) else { return };
         let wsc = conn.ws.as_mut().unwrap();
+        if failed {
+            // A failure the parser did not see (a message that would not
+            // inflate) leaves it parsing; nothing behind a failed message
+            // is to be delivered, from this read or a later one.
+            wsc.rx.end();
+        }
         match ev {
             WsEvent::Text(s) => {
                 let m = WsMsg::Text(s);
@@ -3045,6 +3139,11 @@ pub(crate) fn ws_ingest(
                 wake = true;
                 close_after = true;
             }
+            // Turned into the message it held, or a failure, above.
+            WsEvent::Deflated { .. } => {}
+        }
+        if failed {
+            break;
         }
     }
     for buf in enqueues {
@@ -3213,6 +3312,7 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
         // Pop the next request only when no request is active.
         let next = core.with_net(|net, reactor| {
             let logging = net.access_sink.is_some() || net.access.is_some();
+            let ws_compression = net.ws_compression;
             let now_ns = reactor.time_cached();
             let conn = net.http_conn_mut(tid)?;
             if conn.active {
@@ -3264,6 +3364,17 @@ pub(crate) fn pump_requests(py: Python<'_>, slf: &Bound<'_, CoreLoop>, tid: u64)
                             key: key.clone(),
                             offered: offered_subprotocols(&req),
                             close_code: None,
+                            deflate_response: if ws_compression {
+                                cadeloop_core::ws::negotiate_deflate(
+                                    req.headers
+                                        .iter()
+                                        .filter(|(n, _)| n.as_slice() == b"sec-websocket-extensions")
+                                        .map(|(_, v)| v.as_slice()),
+                                )
+                            } else {
+                                None
+                            },
+                            deflate: false,
                         }));
                     }
                     WsVerdict::Bad => {}

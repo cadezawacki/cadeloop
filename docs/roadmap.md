@@ -175,8 +175,9 @@ benchmark regression >5%, soak clean (R-113, §14 exit criteria).
       full ASGI websocket scope/accept/receive/send/close/disconnect on
       the native engine (same eager stepping as HTTP), 403 reject path,
       auto-pong, close handshake; Starlette WebSocketRoute green.
-      permessage-deflate is declined at negotiation (protocol-legal;
-      clients fall back to uncompressed) — a later refinement
+      permessage-deflate is opt-in (`ws_compression`, ADR-42): no
+      context takeover, so no memory per connection; declined otherwise
+      (protocol-legal; clients fall back to uncompressed)
 - [x] UDP endpoints (R-058): create_datagram_endpoint over native
       recv_from/send_to ops on both backends (WSARecvFrom/WSASendTo on
       IOCP — readiness probes would truncate datagrams there; recvfrom/

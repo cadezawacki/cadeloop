@@ -616,6 +616,13 @@ pub(crate) struct NetState {
     /// The native access log (`accesslog`): records formatted here, in
     /// the cell, and written by a thread that never takes the GIL.
     pub access: Option<Box<crate::accesslog::AccessLog>>,
+    /// R-087: offer permessage-deflate to WebSocket clients that ask for
+    /// it (`Config.ws_compression`).
+    pub ws_compression: bool,
+    /// The one decompressor every compressed inbound WebSocket message of
+    /// this loop goes through (no context takeover: reset per message).
+    /// Made on first use.
+    pub ws_inflater: Option<cadeloop_core::ws::Inflater>,
     pub stats_bytes_rx: u64,
     pub stats_bytes_tx: u64,
     pub stats_conns_accepted: u64,
