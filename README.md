@@ -35,8 +35,10 @@ cadeloop main:app --host 0.0.0.0 --port 8000
 
 On a plaintext benchmark on Windows 11, `cadeloop.serve()` answered 4.3 times
 as many requests per second as uvicorn on winloop, at a quarter of the CPU
-per request. On Linux it answered 4.8 times as many as `uvicorn[standard]`
-(httptools on uvloop) and 2.4 times as many as granian. Details are under
+per request. On Linux it answered 4.5 times as many as `uvicorn[standard]`
+(httptools on uvloop) and 2.9 times as many as granian. A bare benchmark app
+flatters every server; with a FastAPI route and a pydantic model in each
+request, the same lead is 1.5 to 1.6 times. Details are under
 [benchmarks](#benchmarks).
 
 New to event loops? [How cadeloop works](docs/learn/README.md) is a short,
@@ -333,8 +335,16 @@ identical conditions; they are not capacity numbers.
 In the tables, gold, silver and bronze badges numbered 1, 2 and 3 mark the
 three best results in each row (or in each column, for tables with one row
 per server). Equal results share a place, the last place never gets a badge,
-and when most entries tie for first, nothing is marked. How the runs were
-made, and every number as text:
+and when most entries tie for first, nothing is marked.
+
+The Linux numbers also say how sure they are. Each is the median of nine
+runs, and a server is placed ahead of another only when its whole 96%
+confidence interval is: two servers whose intervals overlap were not told
+apart by the runs, and share the place. The charts draw each interval as a
+whisker on its bar, and `≥` marks a result that the load generator capped,
+not the server. The Windows numbers are medians of three runs, ranked by
+the medians alone. How the runs were made, how far they can be trusted, and
+every number as text:
 [Linux](docs/benchmarks-linux.md), [Windows](docs/benchmarks-windows.md),
 [method](docs/benchmarks.md).
 
@@ -522,61 +532,124 @@ stopped after 12 s.
 
 ### Linux (epoll)
 
-Measured in October 2026 on a cloud VM with 4 vCPUs (Intel Xeon @ 2.10 GHz,
-16 GB), Linux 6.18, CPython 3.11.17, cadeloop revision `808d72d`; the raw
-data is in [`bench/baselines/linux-2026-10`](bench/baselines/linux-2026-10/).
+Measured in November 2026 on a cloud VM with 4 vCPUs (Intel Xeon @ 2.10 GHz,
+16 GB), Linux 6.18, CPython 3.11.18, cadeloop revision `2e2edee`; the raw
+data is in [`bench/baselines/linux-2026-11`](bench/baselines/linux-2026-11/).
 It is the same suite, load generator and app as on Windows, with the
 contenders common on Linux: uvicorn on uvloop with h11 and wsproto (set up as
 on Windows), `uvicorn[standard]` (httptools and websockets on uvloop, the
 usual production setup), and granian. The load generator shared the VM,
-limited to two threads so the server kept the other two cores. Each number is
-the median of three runs with the order of servers rotated. No run had a
-failed request.
+limited to two threads so the server kept the other two cores.
+
+Each number is the median of nine runs, spread over a session of under four
+hours with the order of servers rotated: 1,818 runs, none with a failed
+request. To measure the session's own noise, the same cadeloop build ran
+through every workload twice, under two names. The two copies' medians
+differed by 1.4% on the typical workload and by 5.5% on the worst, and their
+intervals overlapped on all 28. A difference between two servers smaller
+than that is not one these runs can show; the places in the tables are
+shared accordingly.
 
 #### HTTP
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-http-dark.svg">
-  <img alt="Linux HTTP requests per second by workload: cadeloop serve() leads every workload; granian comes closest with 64 KiB bodies and a 1 ms await" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-http.svg">
+  <img alt="Linux HTTP requests per second by workload, each bar with the confidence interval of its median: cadeloop serve() leads every workload; granian comes closest with a 1 ms await in the handler" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-http.svg">
 </picture>
 
 <!-- table:bench-linux-table-http -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-http-dark.svg">
-  <img alt="HTTP requests per second · Linux. plaintext: cadeloop serve() 117 K, 1st; granian 48.7 K, 2nd; uvicorn[standard] 24.5 K, 3rd; uvicorn + cadeloop 9.60 K; uvicorn + uvloop 6.39 K; uvicorn + asyncio 5.30 K; hypercorn 3.57 K. plaintext, 1 connection: cadeloop serve() 28.1 K, 1st; granian 7.95 K, 3rd; uvicorn[standard] 12.8 K, 2nd; uvicorn + cadeloop 5.59 K; uvicorn + uvloop 6.31 K; uvicorn + asyncio 5.34 K; hypercorn 3.33 K. JSON: cadeloop serve() 49.9 K, 1st; granian 27.4 K, 2nd; uvicorn[standard] 13.7 K, 3rd; uvicorn + cadeloop 7.87 K; uvicorn + uvloop 5.86 K; uvicorn + asyncio 5.44 K; hypercorn 3.38 K. 64 KiB body: cadeloop serve() 30.9 K, 1st; granian 28.7 K, 2nd; uvicorn[standard] 18.4 K, 3rd; uvicorn + cadeloop 6.94 K; uvicorn + uvloop 6.07 K; uvicorn + asyncio 5.41 K; hypercorn 3.48 K. 1 MiB stream (16 conns): cadeloop serve() 2.05 K, 1st; granian 1.76 K, 2nd; uvicorn[standard] 1.12 K, 3rd; uvicorn + cadeloop 1.03 K; uvicorn + uvloop 620; uvicorn + asyncio 591; hypercorn 395. 16 KiB upload: cadeloop serve() 61.7 K, 1st; granian 16.6 K, 2nd; uvicorn[standard] 15.4 K, 3rd; uvicorn + cadeloop 7.12 K; uvicorn + uvloop 5.26 K; uvicorn + asyncio 4.26 K; hypercorn 3.25 K. 1 ms await: cadeloop serve() 29.9 K, 1st; granian 28.9 K, 2nd; uvicorn[standard] 17.9 K, 3rd; uvicorn + cadeloop 9.52 K; uvicorn + uvloop 6.34 K; uvicorn + asyncio 5.23 K; hypercorn 3.81 K. conn per request (16): cadeloop serve() 16.9 K, 1st; granian 12.8 K, 2nd; uvicorn[standard] 10.5 K, 3rd; uvicorn + cadeloop 5.21 K; uvicorn + uvloop 4.13 K; uvicorn + asyncio 4.17 K; hypercorn 2.19 K. pipelined ×16: cadeloop serve() 320 K, 1st; granian 50.5 K, 2nd; uvicorn[standard] 21.7 K, 3rd; uvicorn + cadeloop 9.30 K; uvicorn + uvloop 6.63 K; uvicorn + asyncio 5.79 K; hypercorn 4.36 K." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-http.svg">
+  <img alt="HTTP requests per second · Linux. plaintext: cadeloop serve() 142 K, 1st; uvicorn[standard] 31.4 K, 3rd; uvicorn + uvloop 7.92 K; uvicorn + asyncio 7.63 K; uvicorn + cadeloop 11.8 K; granian 48.8 K, 2nd; hypercorn 4.70 K. plaintext, 1 connection: cadeloop serve() 27.8 K, 1st; uvicorn[standard] 15.0 K, 2nd; uvicorn + uvloop 7.88 K, 3rd; uvicorn + asyncio 7.22 K, 3rd; uvicorn + cadeloop 6.86 K; granian 7.99 K, 3rd; hypercorn 4.11 K. JSON: cadeloop serve() 62.6 K, 1st; uvicorn[standard] 18.0 K, 3rd; uvicorn + uvloop 7.11 K; uvicorn + asyncio 6.73 K; uvicorn + cadeloop 9.98 K; granian 30.6 K, 2nd; hypercorn 4.21 K. 64 KiB body: cadeloop serve() 46.8 K, 1st; uvicorn[standard] 21.6 K, 3rd; uvicorn + uvloop 7.18 K; uvicorn + asyncio 6.77 K; uvicorn + cadeloop 8.32 K; granian 32.4 K, 2nd; hypercorn 4.27 K. 1 MiB stream (16 conns): cadeloop serve() 2.76 K, 1st; uvicorn[standard] 1.35 K, 3rd; uvicorn + uvloop 677; uvicorn + asyncio 666; uvicorn + cadeloop 1.20 K; granian 1.91 K, 2nd; hypercorn 471. 16 KiB upload: cadeloop serve() 69.5 K, 1st; uvicorn[standard] 22.1 K, 2nd; uvicorn + uvloop 6.78 K; uvicorn + asyncio 6.17 K; uvicorn + cadeloop 8.68 K; granian 18.1 K, 3rd; hypercorn 3.97 K. 1 ms await: cadeloop serve() 31.3 K, 1st; uvicorn[standard] 19.2 K, 3rd; uvicorn + uvloop 7.70 K; uvicorn + asyncio 6.96 K; uvicorn + cadeloop 11.1 K; granian 29.8 K, 2nd; hypercorn 4.50 K. conn per request (16): cadeloop serve() 20.2 K ≥, 1st; uvicorn[standard] 13.8 K, 2nd; uvicorn + uvloop 4.99 K; uvicorn + asyncio 5.14 K; uvicorn + cadeloop 6.50 K; granian 14.9 K, 2nd; hypercorn 2.78 K. pipelined ×16: cadeloop serve() 402 K, 1st; uvicorn[standard] 24.8 K, 3rd; uvicorn + uvloop 8.21 K; uvicorn + asyncio 7.25 K; uvicorn + cadeloop 11.8 K; granian 53.0 K, 2nd; hypercorn 5.31 K." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-http.svg">
 </picture>
 <!-- /table -->
 
-`cadeloop.serve()` led every workload. On plaintext it handled 117 K requests
-per second: 4.8 times `uvicorn[standard]` and 2.4 times granian, at 8.4 µs of
-CPU per request against 40.3 and 31.5 µs. granian, which also does its HTTP
-work in Rust, came closest where the handler or the response dominates:
-within 4% with a 1 ms await in the handler (29.9 K against 28.9 K), within 8%
-on 64 KiB responses, and 14% behind on 1 MiB streams. With one connection,
-where each request waits for the previous answer, cadeloop answered in 32 µs
-at the median.
+`cadeloop.serve()` led every workload, each time by more than the runs'
+spread. On plaintext it handled 142 K requests per second: 4.5 times
+`uvicorn[standard]` and 2.9 times granian, at 6.9 µs of CPU per request
+against 31.5 and 31.3 µs. granian, which also does its HTTP work in Rust,
+came closest where the handler or the response dominates: 5% behind with a
+1 ms await in the handler (29.8 K against 31.3 K, a gap the intervals still
+separate) and about 30% behind on 64 KiB responses and 1 MiB streams. With
+one connection, where each request waits for the previous answer, cadeloop
+answered in 31 µs at the median. With a new connection per request it kept
+the load generator at its limit, so its 20.2 K is a floor.
 
 Keeping uvicorn and its h11 parser fixed and changing only the loop,
-cadeloop's loop made uvicorn 50% faster than on uvloop (9.6 K against 6.4 K
-requests per second) and 81% faster than on asyncio (5.3 K).
+cadeloop's loop made uvicorn 49% faster than on uvloop (11.8 K against 7.9 K
+requests per second) and 55% faster than on asyncio (7.6 K). Under h11,
+uvloop and asyncio themselves were not told apart.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-http-cpu-dark.svg">
-  <img alt="Server CPU per request on Linux: cadeloop 8.4 µs on plaintext against 31.5 µs for granian and 40.3 µs for uvicorn[standard]" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-http-cpu.svg">
+  <img alt="Server CPU per request on Linux: cadeloop 6.9 µs on plaintext against 31.3 µs for granian and 31.5 µs for uvicorn[standard]" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-http-cpu.svg">
 </picture>
 
 <!-- table:bench-linux-table-plaintext -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-plaintext-dark.svg">
-  <img alt="Plaintext HTTP in detail · Linux. cadeloop serve(): req/s 117 K, 1st; p50 479 µs, 1st; p99 1.28 ms, 1st; p99.9 2.33 ms, 1st; CPU / request 8.4 µs, 1st; peak memory 25 MiB; threads 1. granian: req/s 48.7 K, 2nd; p50 1.31 ms, 2nd; p99 2.92 ms, 2nd; p99.9 5.37 ms, 2nd; CPU / request 31.5 µs, 2nd; peak memory 25 MiB; threads 6. uvicorn[standard]: req/s 24.5 K, 3rd; p50 2.49 ms, 3rd; p99 4.92 ms, 3rd; p99.9 7.73 ms, 3rd; CPU / request 40.3 µs, 3rd; peak memory 24 MiB; threads 5. uvicorn + cadeloop: req/s 9.60 K; p50 6.42 ms; p99 10.49 ms; p99.9 15.99 ms; CPU / request 103.2 µs; peak memory 31 MiB; threads 1. uvicorn + uvloop: req/s 6.39 K; p50 9.31 ms; p99 15.20 ms; p99.9 22.81 ms; CPU / request 155.1 µs; peak memory 23 MiB, 3rd; threads 5. uvicorn + asyncio: req/s 5.30 K; p50 11.67 ms; p99 18.09 ms; p99.9 26.74 ms; CPU / request 187.1 µs; peak memory 21 MiB, 1st; threads 1. hypercorn: req/s 3.57 K; p50 16.52 ms; p99 26.48 ms; p99.9 33.29 ms; CPU / request 278.2 µs; peak memory 21 MiB, 1st; threads 1." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-plaintext.svg">
+  <img alt="Plaintext HTTP in detail · Linux. cadeloop serve(): req/s 142 K, 1st; p50 430 µs, 1st; p99 999 µs, 1st; p99.9 1.97 ms, 1st; CPU / request 6.9 µs, 1st; peak memory 25 MiB; threads 1. uvicorn[standard]: req/s 31.4 K, 3rd; p50 1.95 ms, 3rd; p99 4.13 ms, 3rd; p99.9 7.47 ms, 2nd; CPU / request 31.5 µs, 2nd; peak memory 25 MiB; threads 5. uvicorn + uvloop: req/s 7.92 K; p50 7.80 ms; p99 14.29 ms; p99.9 22.02 ms; CPU / request 124.9 µs; peak memory 23 MiB; threads 5. uvicorn + asyncio: req/s 7.63 K; p50 8.13 ms; p99 12.06 ms; p99.9 19.92 ms; CPU / request 129.9 µs; peak memory 21 MiB, 1st; threads 1. uvicorn + cadeloop: req/s 11.8 K; p50 5.24 ms; p99 8.26 ms; p99.9 11.40 ms; CPU / request 84.5 µs; peak memory 31 MiB; threads 1. granian: req/s 48.8 K, 2nd; p50 1.29 ms, 2nd; p99 2.82 ms, 2nd; p99.9 4.98 ms, 2nd; CPU / request 31.3 µs, 2nd; peak memory 21 MiB, 1st; threads 6. hypercorn: req/s 4.70 K; p50 13.24 ms; p99 22.02 ms; p99.9 31.72 ms; CPU / request 211.4 µs; peak memory 21 MiB, 1st; threads 1." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-plaintext.svg">
 </picture>
 <!-- /table -->
 
-cadeloop ran as one process with one thread and kept one core busy, a bit
-more than half of it in the kernel's socket calls. granian ran two processes
-(a supervisor and its worker) with six threads and used about 1.5 cores.
+cadeloop ran as one process with one thread and kept one core busy, about
+60% of it in the kernel's socket calls. granian ran two processes (a
+supervisor and its worker) with six threads and used about 1.5 cores.
 `pipelined ×16`, where one read carries 16 requests, shows the HTTP engine on
-its own: 320 K requests per second at 3.1 µs of CPU each.
+its own: 402 K requests per second at 2.5 µs of CPU each.
+
+#### A FastAPI app
+
+The workloads above are a bare ASGI app, which shows the servers and hides
+what most deployments run on them. This is a small FastAPI app
+([`bench/suite/fapp.py`](bench/suite/fapp.py)) on every server: a JSON route
+whose response goes through a pydantic model, the same route as a plain
+`def` (which FastAPI runs on a worker thread), and `FileResponse` at 64 KiB
+and 1 MiB.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-app-dark.svg">
+  <img alt="A FastAPI app on Linux, requests per second by route: cadeloop serve() leads the JSON route at 12.9 K against 8.3 K for granian and 8.0 K for uvicorn[standard]; cadeloop and granian tie on the worker-thread route; granian leads FileResponse at 64 KiB and 1 MiB" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-app.svg">
+</picture>
+
+<!-- table:bench-linux-table-app -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-app-dark.svg">
+  <img alt="A FastAPI app · Linux. JSON, async def: cadeloop serve() 12.9 K (8.06 ms), 1st; uvicorn[standard] 8.02 K (12.45 ms), 2nd; uvicorn + uvloop 4.92 K (20.71 ms); uvicorn + asyncio 4.67 K (21.50 ms); uvicorn + cadeloop 5.71 K (17.30 ms); granian 8.34 K (13.37 ms), 2nd; hypercorn 3.21 K (38.80 ms). JSON, def (worker thread): cadeloop serve() 2.26 K (48.76 ms), 1st; uvicorn[standard] 1.89 K (66.58 ms), 3rd; uvicorn + uvloop 1.61 K (73.40 ms); uvicorn + asyncio 1.41 K (78.64 ms); uvicorn + cadeloop 1.64 K (77.59 ms); granian 2.16 K (64.49 ms), 1st; hypercorn 1.29 K (89.13 ms). FileResponse, 64 KiB: cadeloop serve() 2.94 K (33.55 ms), 2nd; uvicorn[standard] 756 (118.49 ms), 3rd; uvicorn + uvloop 656 (134.22 ms); uvicorn + asyncio 564 (155.19 ms); uvicorn + cadeloop 697 (138.41 ms), 3rd; granian 3.50 K (46.14 ms), 1st; hypercorn 521 (178.26 ms). FileResponse, 1 MiB (16 conns): cadeloop serve() 1.17 K (23.59 ms), 2nd; uvicorn[standard] 258 (81.79 ms), 3rd; uvicorn + uvloop 229 (91.23 ms), 3rd; uvicorn + asyncio 196 (103.81 ms); uvicorn + cadeloop 242 (92.27 ms), 3rd; granian 1.51 K (20.45 ms), 1st; hypercorn 176 (116.39 ms)." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-app.svg">
+</picture>
+<!-- /table -->
+
+With FastAPI's routing and pydantic's validation in every request, the
+server is a smaller share of the work and the gaps close. cadeloop served the
+JSON route at 12.9 K requests per second, 1.5 times granian and 1.6 times
+`uvicorn[standard]` (8.3 K and 8.0 K, which the runs did not tell apart).
+On the `def` route every server waits on the same pool of 40 threads, and
+cadeloop and granian tied at about 2.2 K.
+
+Files are where granian led: 1.51 K requests per second against cadeloop's
+1.17 K at 1 MiB, and 3.50 K against 2.94 K at 64 KiB, where the two
+intervals only just separate. Both servers implement the ASGI path-send
+extension, so Starlette hands them the path instead of reading the file
+itself. uvicorn and hypercorn do not, read the file through worker threads,
+and served a quarter to a fifth as many.
+
+#### With the access log on
+
+<!-- table:bench-linux-table-log -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-log-dark.svg">
+  <img alt="With the access log on · Linux. cadeloop serve(), native log: log off 142 K; log on 128 K (1.08 ms), 1st; kept 90%, 1st; CPU / request, log on 8.1 µs, 1st. cadeloop serve(), logging module: log off 142 K; log on 25.9 K (11.80 ms), 2nd; kept 18%; CPU / request, log on 42.1 µs, 2nd. uvicorn[standard]: log off 31.4 K; log on 13.3 K (7.14 ms); kept 42%; CPU / request, log on 75.2 µs, 3rd. uvicorn + uvloop: log off 7.92 K; log on 6.54 K (14.16 ms); kept 83%, 2nd; CPU / request, log on 152.4 µs. uvicorn + asyncio: log off 7.63 K; log on 6.25 K (15.20 ms); kept 82%, 3rd; CPU / request, log on 158.7 µs. uvicorn + cadeloop: log off 11.8 K; log on 8.19 K (11.67 ms); kept 69%; CPU / request, log on 121.7 µs. granian: log off 48.8 K; log on 14.3 K (7.47 ms), 3rd; kept 29%; CPU / request, log on 103.7 µs. hypercorn: log off 4.70 K; log on 2.84 K (37.22 ms); kept 60%; CPU / request, log on 350.9 µs." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-log.svg">
+</picture>
+<!-- /table -->
+
+An access log is on in nearly every deployment and off in nearly every
+benchmark. With cadeloop's native log (`access_log_file`) writing a line per
+request to a file, `serve()` kept 90% of its plaintext throughput: 128 K
+requests per second. Sent through Python's `logging` instead
+(`access_log=True`), the same server managed 25.9 K, a fifth as many; that
+cost is what the native log is for. The other servers' own access logs,
+each written the way that server writes it by default, took
+`uvicorn[standard]` from 31.4 K to 13.3 K and granian from 48.8 K to 14.3 K.
 
 #### Memory
 
@@ -588,72 +661,113 @@ its own: 320 K requests per second at 3.1 µs of CPU each.
 <!-- table:bench-linux-table-idle -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-idle-dark.svg">
-  <img alt="Idle keep-alive connections · Linux. cadeloop serve(): at rest 23 MiB, 3rd; holding 5,000 64 MiB; per connection 7.2 KiB; after they close 33 MiB, 1st; fds / conn 1. granian: at rest –; holding 5,000 –; per connection –; after they close –; fds / conn –. uvicorn[standard]: at rest 24 MiB; holding 5,000 61 MiB, 3rd; per connection 6.2 KiB, 3rd; after they close 48 MiB, 3rd; fds / conn 1. uvicorn + cadeloop: at rest 28 MiB; holding 5,000 99 MiB; per connection 11.7 KiB; after they close 70 MiB; fds / conn 1. uvicorn + uvloop: at rest 23 MiB, 3rd; holding 5,000 57 MiB, 2nd; per connection 5.6 KiB, 2nd; after they close 45 MiB, 2nd; fds / conn 1. uvicorn + asyncio: at rest 20 MiB, 1st; holding 5,000 54 MiB, 1st; per connection 5.5 KiB, 1st; after they close 53 MiB; fds / conn 1. hypercorn: at rest 20 MiB, 1st; holding 5,000 88 MiB; per connection 11.2 KiB; after they close 88 MiB; fds / conn 0.94." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-idle.svg">
+  <img alt="Idle keep-alive connections · Linux. cadeloop serve(): at rest 23 MiB, 3rd; holding 5,000 62 MiB, 3rd; per connection 6.5 KiB; after they close 34 MiB, 1st; fds / conn 1. uvicorn[standard]: at rest 24 MiB; holding 5,000 62 MiB, 3rd; per connection 6.2 KiB, 3rd; after they close 48 MiB, 2nd; fds / conn 1. uvicorn + uvloop: at rest 23 MiB, 3rd; holding 5,000 57 MiB, 2nd; per connection 5.6 KiB, 2nd; after they close 48 MiB, 2nd; fds / conn 1. uvicorn + asyncio: at rest 20 MiB, 1st; holding 5,000 54 MiB, 1st; per connection 5.5 KiB, 1st; after they close 54 MiB; fds / conn 1. uvicorn + cadeloop: at rest 28 MiB; holding 5,000 102 MiB; per connection 12.4 KiB; after they close 72 MiB; fds / conn 1. granian: at rest –; holding 5,000 –; per connection –; after they close –; fds / conn –. hypercorn: at rest 20 MiB, 1st; holding 5,000 89 MiB; per connection 11.2 KiB; after they close 89 MiB; fds / conn 1." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-idle.svg">
 </picture>
 <!-- /table -->
 
 Memory on Linux is unique memory (USS): pages that belong to the server's
 processes alone. At rest, every server used 20 to 28 MiB. Holding 5,000 idle
 connections, uvicorn on asyncio and on uvloop used the least per connection
-(5.5 and 5.6 KiB), `uvicorn[standard]` 6.2 KiB and cadeloop 7.2 KiB. Once the
-connections closed, cadeloop handed back three quarters of its growth (it
-went from 64 MiB to 33 MiB), while uvicorn on asyncio and hypercorn kept
-nearly all of theirs. With its default settings, granian accepted 648 of the
+(5.5 and 5.6 KiB), `uvicorn[standard]` 6.2 KiB and cadeloop 6.5 KiB. Once the
+connections closed, cadeloop handed back nearly three quarters of its growth
+(it went from 62 MiB to 34 MiB), while uvicorn on asyncio and hypercorn kept
+all of theirs. With its default settings, granian accepted 648 of the
 5,000 connections and stopped there: 4,096 more waited unaccepted in the
 kernel's queue and the last 256 timed out while connecting. So it has no
-comparable figure at 5,000; at 1,000 connections it used 21.4 KiB each.
+comparable figure at 5,000; at 1,000 connections it used 21.2 KiB each.
+These are single measurements, not medians of nine.
 
 #### WebSocket
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-ws-dark.svg">
-  <img alt="WebSocket echo messages per second on Linux: cadeloop leads every workload" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-ws.svg">
+  <img alt="WebSocket echo messages per second on Linux, each bar with the confidence interval of its median: cadeloop leads four of the five workloads and is level with granian on 256 KiB messages" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-ws.svg">
 </picture>
 
 <!-- table:bench-linux-table-ws -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-ws-dark.svg">
-  <img alt="WebSocket echo · Linux. 64 B, 1 connection: cadeloop 27.7 K (91 µs), 1st; granian 6.80 K (328 µs); uvicorn[standard] 12.1 K (291 µs), 2nd; uvicorn + uvloop 10.3 K (260 µs), 3rd; uvicorn + asyncio 5.78 K (463 µs); hypercorn 6.49 K (467 µs). 64 B, 64 connections: cadeloop 114 K (1.28 ms), 1st; granian 50.6 K (2.95 ms), 2nd; uvicorn[standard] 19.2 K (5.70 ms); uvicorn + uvloop 22.6 K (5.31 ms), 3rd; uvicorn + asyncio 10.3 K (10.88 ms); hypercorn 11.6 K (8.78 ms). 16 KiB, 16 connections: cadeloop 42.1 K (967 µs), 1st; granian 27.5 K (1.47 ms), 2nd; uvicorn[standard] 16.4 K (1.87 ms), 3rd; uvicorn + uvloop 12.8 K (2.88 ms); uvicorn + asyncio 7.57 K (3.74 ms); hypercorn 7.38 K (3.70 ms). 1 KiB stream, 32 in flight ×16: cadeloop 380 K (4.59 ms), 1st; granian 35.4 K (22.02 ms), 3rd; uvicorn[standard] 39.7 K (21.76 ms), 2nd; uvicorn + uvloop 28.8 K (39.32 ms); uvicorn + asyncio 29.4 K (33.03 ms); hypercorn 23.0 K (43.52 ms)." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-ws.svg">
+  <img alt="WebSocket echo · Linux. 64 B, 1 connection: cadeloop 29.2 K (75 µs), 1st; uvicorn[standard] 14.2 K (145 µs), 2nd; uvicorn + uvloop 12.0 K (150 µs), 3rd; uvicorn + asyncio 9.86 K (197 µs); granian 7.19 K (262 µs); hypercorn 9.06 K (199 µs). 64 B, 64 connections: cadeloop 146 K (942 µs), 1st; uvicorn[standard] 22.8 K (4.26 ms); uvicorn + uvloop 29.2 K (3.74 ms), 3rd; uvicorn + asyncio 18.2 K (5.51 ms); granian 55.6 K (2.49 ms), 2nd; hypercorn 18.1 K (5.70 ms). 16 KiB, 16 connections: cadeloop 71.6 K (500 µs), 1st; uvicorn[standard] 19.0 K (1.38 ms), 3rd; uvicorn + uvloop 16.8 K (2.13 ms); uvicorn + asyncio 12.3 K (2.46 ms); granian 32.4 K (1.16 ms), 2nd; hypercorn 11.2 K (2.62 ms). 256 KiB, 8 connections: cadeloop 5.26 K (2.52 ms), 1st; uvicorn[standard] 4.04 K (2.98 ms), 3rd; uvicorn + uvloop 1.75 K (10.09 ms); uvicorn + asyncio 1.62 K (7.73 ms); granian 5.87 K (2.82 ms), 1st; hypercorn 1.35 K (8.91 ms). 1 KiB stream, 32 in flight ×16: cadeloop 456 K (3.18 ms), 1st; uvicorn[standard] 51.5 K (16.52 ms), 2nd; uvicorn + uvloop 38.8 K (28.31 ms), 3rd; uvicorn + asyncio 37.4 K (28.05 ms), 3rd; granian 41.1 K (19.14 ms), 3rd; hypercorn 28.3 K (30.15 ms)." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-ws.svg">
 </picture>
 <!-- /table -->
 
-cadeloop led every WebSocket workload: 2.3 times `uvicorn[standard]` with one
-connection (27.7 K against 12.1 K messages per second), 2.3 times granian with
-64 connections (114 K against 50.6 K), and 9.6 times `uvicorn[standard]` when
-each connection kept 32 messages in flight (380 K against 39.7 K).
+cadeloop led four of the five WebSocket workloads outright: 2.1 times
+`uvicorn[standard]` with one connection (29.2 K against 14.2 K messages per
+second), 2.6 times granian with 64 connections (146 K against 55.6 K), 2.2
+times granian at 16 KiB, and 8.9 times `uvicorn[standard]` when each
+connection kept 32 messages in flight (456 K against 51.5 K). With 256 KiB
+messages, where moving the payload is most of the work, cadeloop and granian
+were not told apart (5.3 K and 5.9 K, with overlapping intervals).
 
 #### TLS
 
 <!-- table:bench-linux-table-tls -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-tls-dark.svg">
-  <img alt="TLS · Linux. plaintext, 64 keep-alive conns: cadeloop 65.0 K (2.13 ms), 1st; granian 45.4 K (3.24 ms), 2nd; uvicorn[standard] 15.4 K (7.86 ms), 3rd; uvicorn + uvloop 5.88 K (16.52 ms); uvicorn + asyncio 5.21 K (19.92 ms). new connection per request (16): cadeloop 1.11 K (9.04 ms), 1st; granian 1.06 K (18.35 ms), 2nd; uvicorn[standard] 763 (5.96 ms), 3rd; uvicorn + uvloop 690 (6.16 ms); uvicorn + asyncio 753 (14.42 ms)." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-tls.svg">
+  <img alt="TLS · Linux. plaintext, 64 keep-alive conns: cadeloop 78.9 K (1.65 ms), 1st; uvicorn[standard] 20.8 K (5.44 ms), 3rd; uvicorn + uvloop 7.17 K (13.37 ms); uvicorn + asyncio 6.31 K (14.42 ms); granian 51.2 K (2.69 ms), 2nd. new connection per request, ECDSA key: cadeloop 2.58 K (4.33 ms), 2nd; uvicorn[standard] 1.50 K (4.39 ms), 3rd; uvicorn + uvloop 1.24 K (4.39 ms); uvicorn + asyncio 1.31 K (8.52 ms); granian 4.26 K (4.39 ms), 1st. new connection per request, RSA key: cadeloop 1.33 K (7.08 ms), 1st; uvicorn[standard] 973 (5.05 ms), 3rd; uvicorn + uvloop 836 (4.78 ms); uvicorn + asyncio 841 (11.53 ms); granian 1.20 K (15.99 ms), 2nd." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-tls.svg">
 </picture>
 <!-- /table -->
 
 granian handles TLS in Rust; every other server here uses Python's `ssl`
-module. Over keep-alive connections, cadeloop served 65.0 K requests per
-second against granian's 45.4 K. With a new connection and a full TLS 1.3
-handshake for every request, the two were within 5% of each other (1.11 K
-against 1.06 K), each spending about 0.9 ms of CPU per request, most of it on
-the handshake.
+module. Over keep-alive connections, cadeloop served 78.9 K requests per
+second against granian's 51.2 K.
+
+With a new connection and a full TLS 1.3 handshake for every request, the
+answer depends on the certificate. Under an RSA 2048 key, the handshake's
+signature is most of a request's cost on every server (0.7 to 1.2 ms of
+CPU), and cadeloop led narrowly: 1.33 K requests per second against
+granian's 1.20 K. Under an ECDSA P-256 key the signature is cheap, what each
+server does around the handshake shows instead, and granian led clearly:
+4.26 K against cadeloop's 2.58 K, at 0.22 ms of CPU per request against
+0.39 ms.
+
+#### TLS on the loop's own connections
+
+The servers above terminate TLS inside their HTTP engines. This is TLS on
+the loop's own transports: the echo protocol from the next section behind
+`create_server(ssl=...)`, which is what a database driver's or an HTTP
+client's TLS connections ride on. cadeloop appears twice: with the standard
+library's TLS state machine on its transports (the default), and with its
+own port of it ([`Loop(native_tls=True)`](#native-tls-for-your-own-connections)).
+rloop is missing because its `create_server()` does not take `ssl=`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-tlsecho-dark.svg">
+  <img alt="TLS echo messages per second on Linux, each bar with the confidence interval of its median: cadeloop with native TLS leads at 1 KiB with 109 K and shares the lead with uvloop at 16 KiB; cadeloop's default TLS is level with uvloop and rsloop at 1 KiB and behind them at 16 KiB; asyncio is last" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-tlsecho.svg">
+</picture>
+
+<!-- table:bench-linux-table-tlsecho -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-tlsecho-dark.svg">
+  <img alt="TLS echo, the loop alone · Linux. 1 KiB, 64 connections: cadeloop, stdlib TLS 67.6 K (1.88 ms), 2nd; cadeloop, native TLS 109 K (1.31 ms), 1st; uvloop 80.9 K (1.98 ms), 2nd; rsloop 69.8 K (3.54 ms), 2nd; asyncio 31.9 K (3.38 ms). 16 KiB, 16 connections: cadeloop, stdlib TLS 36.8 K (778 µs); cadeloop, native TLS 49.0 K (696 µs), 1st; uvloop 48.3 K (950 µs), 1st; rsloop 40.6 K (1.62 ms), 2nd; asyncio 29.4 K (1.41 ms)." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-tlsecho.svg">
+</picture>
+<!-- /table -->
+
+With 1 KiB messages, cadeloop's native TLS led at 109 K messages per second,
+clear of every other loop. cadeloop's default, uvloop and rsloop (68 K, 81 K
+and 70 K) were not told apart, mostly because uvloop's interval is wide
+(64 K to 85 K), and asyncio trailed at 32 K. With 16 KiB messages, native TLS and
+uvloop shared first place (49.0 K and 48.3 K), ahead of rsloop (40.6 K) and
+cadeloop's default (36.8 K). The default path is level with the other
+compiled loops on small messages and behind them on large ones; the opt-in
+native path is what closes that gap.
 
 #### Timers and wake-ups
 
 <!-- table:bench-linux-table-timers -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-timers-dark.svg">
-  <img alt="Timers and wake-ups · Linux. cadeloop: sleep(1 ms) +0.13 / 0.37 ms, 3rd; sleep(5 ms) +0.29 / 0.49 ms; sleep(10 ms) +0.32 / 1.89 ms; cross-thread wake-up 93 / 642 µs, 2nd. uvloop: sleep(1 ms) +0.16 / 0.98 ms; sleep(5 ms) +0.20 / 1.57 ms, 3rd; sleep(10 ms) +0.25 / 0.46 ms; cross-thread wake-up 95 / 617 µs. rloop: sleep(1 ms) +0.12 / 0.32 ms, 2nd; sleep(5 ms) +0.17 / 33.26 ms, 2nd; sleep(10 ms) +0.18 / 0.28 ms, 2nd; cross-thread wake-up 78 / 1034 µs, 1st. rsloop: sleep(1 ms) +0.07 / 0.27 ms, 1st; sleep(5 ms) +0.13 / 0.36 ms, 1st; sleep(10 ms) +0.14 / 0.31 ms, 1st; cross-thread wake-up 94 / 320 µs, 3rd. asyncio: sleep(1 ms) +0.16 / 0.28 ms; sleep(5 ms) +0.22 / 0.65 ms; sleep(10 ms) +0.24 / 0.46 ms, 3rd; cross-thread wake-up 123 / 599 µs." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-timers.svg">
+  <img alt="Timers and wake-ups · Linux. cadeloop: sleep(1 ms) +0.16 / 0.28 ms, 2nd; sleep(5 ms) +0.33 / 0.52 ms; sleep(10 ms) +0.33 / 0.51 ms; cross-thread wake-up 105 / 232 µs. uvloop: sleep(1 ms) +0.16 / 0.33 ms, 2nd; sleep(5 ms) +0.21 / 0.40 ms, 2nd; sleep(10 ms) +0.24 / 0.41 ms, 3rd; cross-thread wake-up 119 / 240 µs. rloop: sleep(1 ms) +0.15 / 0.32 ms, 1st; sleep(5 ms) +0.20 / 0.33 ms, 2nd; sleep(10 ms) +0.21 / 0.37 ms, 2nd; cross-thread wake-up 100 / 226 µs. rsloop: sleep(1 ms) +0.11 / 0.27 ms, 1st; sleep(5 ms) +0.15 / 0.28 ms, 1st; sleep(10 ms) +0.19 / 0.28 ms, 1st; cross-thread wake-up 108 / 239 µs. asyncio: sleep(1 ms) +0.18 / 0.37 ms; sleep(5 ms) +0.23 / 0.39 ms; sleep(10 ms) +0.26 / 0.39 ms, 3rd; cross-thread wake-up 144 / 281 µs." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-timers.svg">
 </picture>
 <!-- /table -->
 
 Linux wakes a sleeping thread on a fine-grained timer, so the Windows problem
-above doesn't arise: on every loop, a 1 ms sleep overshot by 0.07 to 0.16 ms
+above doesn't arise: on every loop, a 1 ms sleep overshot by 0.11 to 0.18 ms
 at the median. Longer sleeps overshot a little more, cadeloop's the most:
-0.29 ms at 5 ms and 0.32 ms at 10 ms, against 0.13 to 0.25 ms on the other
-loops. A `call_soon_threadsafe()` from another thread reached a
-sleeping loop in 78 to 123 µs at the median, with rloop fastest and cadeloop
-at 93 µs.
+0.33 ms at both 5 ms and 10 ms, against 0.15 to 0.26 ms on the other loops.
+A `call_soon_threadsafe()` from another thread reached a sleeping loop in
+100 to 108 µs at the median on rloop, cadeloop and rsloop, which the runs did
+not separate, in 119 µs on uvloop and in 144 µs on asyncio.
 
 #### TCP echo: the loop alone
 
@@ -665,38 +779,41 @@ at 93 µs.
 <!-- table:bench-linux-table-echo -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-echo-dark.svg">
-  <img alt="TCP echo, the loop alone · Linux. 1 KiB, 1 connection: cadeloop 33.7 K (76 µs), 1st; uvloop 24.2 K (85 µs), 3rd; rloop 23.6 K (88 µs); rsloop 24.6 K (85 µs), 2nd; asyncio 20.4 K (109 µs). 1 KiB, 64 connections: cadeloop 170 K (975 µs), 2nd; uvloop 149 K (1.05 ms); rloop 171 K (827 µs), 1st; rsloop 150 K (975 µs), 3rd; asyncio 115 K (1.46 ms). 1 KiB, 16 in flight ×64: cadeloop 352 K (14.94 ms); uvloop 366 K (18.09 ms), 3rd; rloop 366 K (18.87 ms), 3rd; rsloop 381 K (13.63 ms), 1st; asyncio 379 K (14.68 ms), 2nd. 64 KiB, 8 connections: cadeloop 31.9 K (803 µs); uvloop 39.1 K (483 µs), 2nd; rloop 42.0 K (401 µs), 1st; rsloop 36.1 K (406 µs); asyncio 37.7 K (541 µs), 3rd." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-echo.svg">
+  <img alt="TCP echo, the loop alone · Linux. 1 KiB, 1 connection: cadeloop 34.9 K (63 µs), 1st; uvloop 23.9 K (82 µs), 2nd; rloop 24.1 K (81 µs), 2nd; rsloop 24.1 K (81 µs), 2nd; asyncio 21.3 K (90 µs). 1 KiB, 64 connections: cadeloop 197 K (762 µs); uvloop 193 K (786 µs); rloop 197 K (721 µs); rsloop 191 K (705 µs); asyncio 154 K (958 µs). 1 KiB, 16 in flight ×64: cadeloop 493 K ≥ (9.04 ms); uvloop 503 K ≥ (10.49 ms); rloop 507 K ≥ (11.01 ms); rsloop 529 K ≥ (8.91 ms); asyncio 566 K ≥ (7.80 ms). 64 KiB, 8 connections: cadeloop 40.3 K (401 µs); uvloop 44.6 K (377 µs), 2nd; rloop 47.5 K (324 µs), 1st; rsloop 39.3 K (373 µs); asyncio 43.8 K (406 µs), 2nd." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-echo.svg">
 </picture>
 <!-- /table -->
 
 The same `asyncio.Protocol` echo server ran on each loop, so this compares
-the loops alone. With one connection, cadeloop answered fastest (33.7 K
-messages per second, 26 µs at the median), using more CPU per message than
-uvloop, rloop and rsloop because it keeps spinning while messages arrive back
-to back. With 64 connections, cadeloop and rloop were level at 170 K. With 16
-messages in flight, all five loops landed within 9% of each other, which
-suggests the two-thread load generator set the pace there rather than the
-loops. With 64 KiB messages cadeloop was the slowest of the five, at 31.9 K
-messages per second against rloop's 42.0 K: large messages are the weakest
-spot of cadeloop's Linux backend today.
+the loops alone. With one connection, cadeloop answered fastest (34.9 K
+messages per second and 25 µs at the median, against about 24 K for uvloop,
+rloop and rsloop), using more CPU per message than they do because it keeps
+spinning while messages arrive back to back. With 64 connections, cadeloop,
+rloop, uvloop and rsloop were within about 3% of each other (191 K to 197 K) and
+the runs did not separate them; asyncio was at 154 K. With 16 messages in
+flight, every loop kept the load generator at its limit, so that row says
+only that each of them can do at least 490 K messages per second.
+With 64 KiB messages cadeloop was behind: 40.3 K messages per second against
+rloop's 47.5 K, uvloop's 44.6 K and asyncio's 43.8 K, and level with rsloop.
+Large messages remain the weakest spot of cadeloop's Linux backend.
 
 #### Overload and recovery
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-overload-dark.svg">
-  <img alt="p99 latency per second on Linux through 10 seconds at 150 percent of each server's capacity: no server fails a request; granian, uvicorn on asyncio and cadeloop are back to normal 7, 8 and 14 seconds after the overload, the other uvicorn setups are still working off their backlog when the test ends" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-overload.svg">
+  <img alt="p99 latency per second on Linux through 10 seconds at 150 percent of each server's capacity: no server fails a request; uvicorn on asyncio, granian, uvicorn on uvloop and uvicorn on cadeloop are back to normal 8, 10, 11 and 13 seconds after the overload; cadeloop serve() and uvicorn[standard] are still working off their backlog when the test ends" src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-overload.svg">
 </picture>
 
 The same test as on Windows: 50% of each server's own measured capacity, then
 150% for 10 seconds, then 50% again, from 256 connections at a fixed rate.
-No server failed a request or stopped serving. How quickly each one recovered
-came down to how fast it worked through its backlog compared with the
-capacity measured beforehand with 64 connections. granian served 9% above
-that capacity while it had a backlog (45.5 K against 41.9 K requests per
-second) and was back to normal 7 seconds after the overload ended; uvicorn on
-asyncio served 5% above and took 8 seconds; cadeloop served 8% below (110 K
-against 120 K) and took 14 seconds. The other three uvicorn setups served 10
-to 15% below and were still working through their backlogs when the
+It is one run per server, not nine. No server failed a request or stopped
+serving. How quickly each one recovered came down to how fast it worked
+through its backlog compared with the capacity measured beforehand with 64
+connections. uvicorn on asyncio served 5% above that capacity while it had a
+backlog and was back to normal 8 seconds after the overload ended; granian
+served at its capacity (50.6 K requests per second) and took 10 seconds;
+uvicorn on uvloop and on cadeloop's loop took 11 and 13. cadeloop and
+`uvicorn[standard]` served 11% and 9% below their capacity (122 K against
+137 K for cadeloop) and were still working through their backlogs when the
 30 seconds ended.
 
 #### Scheduling microbenchmarks
@@ -709,16 +826,19 @@ to 15% below and were still working through their backlogs when the
 <!-- table:bench-linux-table-sched -->
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-sched-dark.svg">
-  <img alt="Scheduling microbenchmarks · Linux. task_fib: cadeloop 0.096, 1st; uvloop 0.081; rloop 0.088, 3rd; rsloop 0.090, 2nd; asyncio 0.056. call_soon_chain: cadeloop 3.412, 2nd; uvloop 1.345; rloop 3.456, 1st; rsloop 1.939, 3rd; asyncio 0.499. call_soon_burst: cadeloop 4.117, 1st; uvloop 1.102, 3rd; rloop 2.536, 2nd; rsloop 1.010; asyncio 0.710. timer_schedule_cancel: cadeloop 2.693, 1st; uvloop 0.427; rloop 1.683, 2nd; rsloop 1.127, 3rd; asyncio 0.492. timer_fire: cadeloop 2.219, 1st; uvloop 1.136, 3rd; rloop 1.344, 2nd; rsloop 0.988; asyncio 0.258. sleep0_chain: cadeloop 1.653, 1st; uvloop 0.846; rloop 1.496, 2nd; rsloop 0.961, 3rd; asyncio 0.368. task_spawn: cadeloop 0.262, 1st; uvloop 0.252; rloop 0.255, 2nd; rsloop 0.254, 3rd; asyncio 0.180. threadsafe_throughput: cadeloop 3.528, 2nd; uvloop 1.734; rloop 3.674, 1st; rsloop 3.439, 3rd; asyncio 0.060. future_chain: cadeloop 1.202, 1st; uvloop 0.514; rloop 0.869, 2nd; rsloop 0.610, 3rd; asyncio 0.210. gather_fanin: cadeloop 0.269, 1st; uvloop 0.231; rloop 0.243, 2nd; rsloop 0.242, 3rd; asyncio 0.153. queue_pingpong: cadeloop 1.134, 2nd; uvloop 1.051; rloop 1.150, 1st; rsloop 1.129, 3rd; asyncio 1.001. queue_pingpong_native: cadeloop 2.764, 2nd; uvloop 2.710, 3rd; rloop 2.887, 1st; rsloop 2.358; asyncio 2.041." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-sched.svg">
+  <img alt="Scheduling microbenchmarks · Linux. task_fib: cadeloop 0.093; uvloop 0.079; rloop 0.085; rsloop 0.090; asyncio 0.063. call_soon_chain: cadeloop 6.999, 1st; uvloop 1.986; rloop 4.620, 1st; rsloop 2.874, 3rd; asyncio 0.593. call_soon_burst: cadeloop 5.957, 1st; uvloop 1.116, 3rd; rloop 3.009, 2nd; rsloop 1.120, 3rd; asyncio 0.802. timer_schedule_cancel: cadeloop 4.221, 1st; uvloop 0.500; rloop 2.138, 2nd; rsloop 1.098, 3rd; asyncio 0.547. timer_fire: cadeloop 2.591, 1st; uvloop 1.282, 2nd; rloop 1.646, 2nd; rsloop 1.370, 2nd; asyncio 0.338. sleep0_chain: cadeloop 2.043, 1st; uvloop 1.102, 3rd; rloop 1.990, 1st; rsloop 1.431, 2nd; asyncio 0.432. task_spawn: cadeloop 0.310; uvloop 0.311; rloop 0.285; rsloop 0.305; asyncio 0.225. threadsafe_throughput: cadeloop 4.014, 1st; uvloop 2.034; rloop 4.743, 1st; rsloop 3.589, 2nd; asyncio 0.076. future_chain: cadeloop 1.602, 1st; uvloop 0.703, 3rd; rloop 1.250, 2nd; rsloop 0.888, 3rd; asyncio 0.242. gather_fanin: cadeloop 0.336; uvloop 0.312; rloop 0.296; rsloop 0.287; asyncio 0.195. queue_pingpong: cadeloop 1.412; uvloop 1.355; rloop 1.374; rsloop 1.306; asyncio 1.270. queue_pingpong_native: cadeloop 3.452; uvloop 3.245; rloop 3.375; rsloop 3.100; asyncio 2.681." src="https://raw.githubusercontent.com/cadezawacki/cadeloop/main/docs/assets/bench-linux-table-sched.svg">
 </picture>
 <!-- /table -->
 
-cadeloop was fastest on 8 of the 12 benchmarks, including `task_fib`, where
-one call to `fib(21)` grows a tree of 35,421 tasks (96 K calls per second,
-against 81 to 90 K for the other compiled loops and 56 K for asyncio). rloop
-led the other four, by 1 to 5%. On this VM a single pass of these benchmarks
-varies a lot (one pass's runs of cadeloop's `task_fib` spanned 50 K to 95 K),
-so each number is the median of 15 runs over three passes.
+cadeloop was first or shared first on 7 of the 12 benchmarks: alone on four
+(`call_soon_burst`, `timer_schedule_cancel`, `timer_fire` and `future_chain`)
+and level with rloop on three (`call_soon_chain`, `sleep0_chain` and
+`threadsafe_throughput`). On the other five, `task_fib` among them, where one
+call to `fib(21)` grows a tree of 35,421 tasks, the compiled loops were
+within the runs' spread of each other and nothing is marked. These
+benchmarks vary more from one run to the next than the load tests do, so
+each loop's nine runs were taken in turn with the other loops' instead of
+one loop at a time.
 
 ---
 

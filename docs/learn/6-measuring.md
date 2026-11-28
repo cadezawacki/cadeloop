@@ -61,11 +61,23 @@ session as it heats up or as background jobs come and go. On cloud VMs it
 drifts more: the same benchmark on the same kind of VM measured 66% apart
 between two sessions while this page was written. So:
 
-- Run every measurement several times. Report the median with the range.
+- Run every measurement several times, and report the median with how far
+  off it could be. With nine runs, the second lowest and the second highest
+  bracket the true median 96 times in 100, whatever shape the runs' spread
+  has. Three runs cannot promise more than 75%.
+- When two results' intervals overlap, the runs have not told them apart.
+  Say so instead of ranking them. In this repository's own earlier
+  three-run data, a quarter of the neighboring places in the tables (24 of
+  98) were in that state.
+- Measure your noise directly: run the same build twice under two names.
+  Whatever separates the two is the smallest difference the session can
+  show.
 - Rotate the order of the things you compare, so drift doesn't always favor
   whoever goes first.
 - Compare only numbers taken in the same session.
 - Restart the server for each run, and leave out a warmup period.
+- Check that the load generator had CPU to spare. If it was at its limit,
+  the number is the load generator's, and the server can do at least that.
 
 [`bench/suite`](../../bench/suite) does all of this. Its README lists the
 rules it follows.

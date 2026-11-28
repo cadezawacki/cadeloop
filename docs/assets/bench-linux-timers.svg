@@ -14,26 +14,26 @@
 <text x="346.0" y="76" font-size="12" fill="#52514e">asyncio</text>
 <text x="138" y="141.0" font-size="12" text-anchor="end" fill="#0b0b0b">sleep(1 ms)</text>
 <line x1="150" y1="89" x2="150" y2="181" stroke="#c3c2b7" stroke-width="1"/>
-<path d="M150.0,92.0 h222.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-222.9 z" fill="#13968e"/><rect x="150.0" y="91.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="382.9" y="105" font-size="11" fill="#52514e">0.13 ms</text>
-<path d="M150.0,110.0 h258.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-258.5 z" fill="#008300"/><rect x="150.0" y="109.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,128.0 h192.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-192.8 z" fill="#eda100"/><rect x="150.0" y="127.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,146.0 h120.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-120.5 z" fill="#e87ba4"/><rect x="150.0" y="145.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,164.0 h266.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-266.8 z" fill="#6250d6"/><rect x="150.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,92.0 h254.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-254.2 z" fill="#13968e"/><rect x="150.0" y="91.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="414.2" y="105" font-size="11" fill="#52514e">0.16 ms</text>
+<path d="M150.0,110.0 h248.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-248.3 z" fill="#008300"/><rect x="150.0" y="109.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,128.0 h243.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-243.7 z" fill="#eda100"/><rect x="150.0" y="127.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,146.0 h175.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-175.5 z" fill="#e87ba4"/><rect x="150.0" y="145.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,164.0 h285.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-285.3 z" fill="#6250d6"/><rect x="150.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
 <text x="138" y="247.0" font-size="12" text-anchor="end" fill="#0b0b0b">sleep(5 ms)</text>
 <line x1="150" y1="195" x2="150" y2="287" stroke="#c3c2b7" stroke-width="1"/>
-<path d="M150.0,198.0 h489.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-489.0 z" fill="#13968e"/><rect x="150.0" y="197.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="649.0" y="211" font-size="11" fill="#52514e">0.29 ms</text>
-<path d="M150.0,216.0 h328.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-328.5 z" fill="#008300"/><rect x="150.0" y="215.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,234.0 h278.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-278.1 z" fill="#eda100"/><rect x="150.0" y="233.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,252.0 h209.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-209.2 z" fill="#e87ba4"/><rect x="150.0" y="251.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,270.0 h359.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-359.6 z" fill="#6250d6"/><rect x="150.0" y="269.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,198.0 h526.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-526.2 z" fill="#13968e"/><rect x="150.0" y="197.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="686.2" y="211" font-size="11" fill="#52514e">0.33 ms</text>
+<path d="M150.0,216.0 h337.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-337.5 z" fill="#008300"/><rect x="150.0" y="215.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,234.0 h316.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-316.3 z" fill="#eda100"/><rect x="150.0" y="233.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,252.0 h241.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-241.8 z" fill="#e87ba4"/><rect x="150.0" y="251.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,270.0 h368.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-368.3 z" fill="#6250d6"/><rect x="150.0" y="269.0" width="0" height="0" fill="#fcfcfb"/>
 <text x="138" y="353.0" font-size="12" text-anchor="end" fill="#0b0b0b">sleep(10 ms)</text>
 <line x1="150" y1="301" x2="150" y2="393" stroke="#c3c2b7" stroke-width="1"/>
 <path d="M150.0,304.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#13968e"/><rect x="150.0" y="303.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="696.0" y="317" font-size="11" fill="#52514e">0.32 ms</text>
-<path d="M150.0,322.0 h423.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-423.8 z" fill="#008300"/><rect x="150.0" y="321.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,340.0 h294.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-294.1 z" fill="#eda100"/><rect x="150.0" y="339.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,358.0 h225.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-225.6 z" fill="#e87ba4"/><rect x="150.0" y="357.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,376.0 h396.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-396.9 z" fill="#6250d6"/><rect x="150.0" y="375.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="696.0" y="317" font-size="11" fill="#52514e">0.33 ms</text>
+<path d="M150.0,322.0 h386.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-386.3 z" fill="#008300"/><rect x="150.0" y="321.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,340.0 h343.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-343.9 z" fill="#eda100"/><rect x="150.0" y="339.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,358.0 h297.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-297.8 z" fill="#e87ba4"/><rect x="150.0" y="357.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M150.0,376.0 h417.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-417.1 z" fill="#6250d6"/><rect x="150.0" y="375.0" width="0" height="0" fill="#fcfcfb"/>
 </svg>

@@ -1,47 +1,92 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 540" width="760" height="540" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
-<rect width="760" height="540" fill="#fcfcfb" rx="8"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 558" width="760" height="558" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<rect width="760" height="558" fill="#fcfcfb" rx="8"/>
 <text x="24" y="34" font-size="16" font-weight="600" fill="#0b0b0b">TCP echo messages per second (Linux)</text>
-<text x="24" y="54" font-size="12" fill="#52514e">same asyncio.Protocol on every loop; higher is better</text>
-<rect x="24.0" y="66" width="12" height="12" rx="3" fill="#13968e"/>
-<text x="41.0" y="76" font-size="12" fill="#52514e">cadeloop</text>
-<rect x="111.8" y="66" width="12" height="12" rx="3" fill="#008300"/>
-<text x="128.8" y="76" font-size="12" fill="#52514e">uvloop</text>
-<rect x="186.4" y="66" width="12" height="12" rx="3" fill="#eda100"/>
-<text x="203.4" y="76" font-size="12" fill="#52514e">rloop</text>
-<rect x="254.4" y="66" width="12" height="12" rx="3" fill="#e87ba4"/>
-<text x="271.4" y="76" font-size="12" fill="#52514e">rsloop</text>
-<rect x="329.0" y="66" width="12" height="12" rx="3" fill="#6250d6"/>
-<text x="346.0" y="76" font-size="12" fill="#52514e">asyncio</text>
-<text x="138" y="141.0" font-size="12" text-anchor="end" fill="#0b0b0b">1 KiB, 1 conn</text>
-<line x1="150" y1="89" x2="150" y2="181" stroke="#c3c2b7" stroke-width="1"/>
-<path d="M150.0,92.0 h43.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-43.7 z" fill="#13968e"/><rect x="150.0" y="91.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="203.7" y="105" font-size="11" fill="#52514e">34K</text>
-<path d="M150.0,110.0 h30.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-30.3 z" fill="#008300"/><rect x="150.0" y="109.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,128.0 h29.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-29.4 z" fill="#eda100"/><rect x="150.0" y="127.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,146.0 h30.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-30.8 z" fill="#e87ba4"/><rect x="150.0" y="145.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,164.0 h24.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-24.9 z" fill="#6250d6"/><rect x="150.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="138" y="247.0" font-size="12" text-anchor="end" fill="#0b0b0b">1 KiB, 64 conns</text>
-<line x1="150" y1="195" x2="150" y2="287" stroke="#c3c2b7" stroke-width="1"/>
-<path d="M150.0,198.0 h236.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-236.5 z" fill="#13968e"/><rect x="150.0" y="197.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="396.5" y="211" font-size="11" fill="#52514e">170K</text>
-<path d="M150.0,216.0 h207.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-207.7 z" fill="#008300"/><rect x="150.0" y="215.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,234.0 h237.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-237.7 z" fill="#eda100"/><rect x="150.0" y="233.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,252.0 h208.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-208.5 z" fill="#e87ba4"/><rect x="150.0" y="251.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,270.0 h159.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-159.3 z" fill="#6250d6"/><rect x="150.0" y="269.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="138" y="353.0" font-size="12" text-anchor="end" fill="#0b0b0b">1 KiB, 16 in flight</text>
-<line x1="150" y1="301" x2="150" y2="393" stroke="#c3c2b7" stroke-width="1"/>
-<path d="M150.0,304.0 h494.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-494.9 z" fill="#13968e"/><rect x="150.0" y="303.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="654.9" y="317" font-size="11" fill="#52514e">352K</text>
-<path d="M150.0,322.0 h515.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-515.2 z" fill="#008300"/><rect x="150.0" y="321.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,340.0 h515.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-515.1 z" fill="#eda100"/><rect x="150.0" y="339.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,358.0 h536.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-536.0 z" fill="#e87ba4"/><rect x="150.0" y="357.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,376.0 h533.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-533.1 z" fill="#6250d6"/><rect x="150.0" y="375.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="138" y="459.0" font-size="12" text-anchor="end" fill="#0b0b0b">64 KiB, 8 conns</text>
-<line x1="150" y1="407" x2="150" y2="499" stroke="#c3c2b7" stroke-width="1"/>
-<path d="M150.0,410.0 h41.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-41.2 z" fill="#13968e"/><rect x="150.0" y="409.0" width="0" height="0" fill="#fcfcfb"/>
-<text x="201.2" y="423" font-size="11" fill="#52514e">32K</text>
-<path d="M150.0,428.0 h51.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-51.4 z" fill="#008300"/><rect x="150.0" y="427.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,446.0 h55.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-55.6 z" fill="#eda100"/><rect x="150.0" y="445.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,464.0 h47.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-47.2 z" fill="#e87ba4"/><rect x="150.0" y="463.0" width="0" height="0" fill="#fcfcfb"/>
-<path d="M150.0,482.0 h49.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-49.4 z" fill="#6250d6"/><rect x="150.0" y="481.0" width="0" height="0" fill="#fcfcfb"/>
+<text x="24" y="54" font-size="12" fill="#52514e">same asyncio.Protocol on every loop · median of 9 runs with its 96% confidence interval · higher is better</text>
+<text x="24" y="72" font-size="12" fill="#52514e">≥ marks a bar the load generator capped: the server can do at least this</text>
+<rect x="24.0" y="84" width="12" height="12" rx="3" fill="#13968e"/>
+<text x="41.0" y="94" font-size="12" fill="#52514e">cadeloop</text>
+<rect x="111.8" y="84" width="12" height="12" rx="3" fill="#008300"/>
+<text x="128.8" y="94" font-size="12" fill="#52514e">uvloop</text>
+<rect x="186.4" y="84" width="12" height="12" rx="3" fill="#eda100"/>
+<text x="203.4" y="94" font-size="12" fill="#52514e">rloop</text>
+<rect x="254.4" y="84" width="12" height="12" rx="3" fill="#e87ba4"/>
+<text x="271.4" y="94" font-size="12" fill="#52514e">rsloop</text>
+<rect x="329.0" y="84" width="12" height="12" rx="3" fill="#6250d6"/>
+<text x="346.0" y="94" font-size="12" fill="#52514e">asyncio</text>
+<text x="138" y="159.0" font-size="12" text-anchor="end" fill="#0b0b0b">1 KiB, 1 conn</text>
+<line x1="150" y1="107" x2="150" y2="199" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,110.0 h28.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-28.7 z" fill="#13968e"/><rect x="150.0" y="109.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M181.8,118.0 H183.4 M181.8,115.0 V121.0 M183.4,115.0 V121.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M181.8,118.0 H183.4 M181.8,115.0 V121.0 M183.4,115.0 V121.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="189.4" y="123" font-size="11" fill="#52514e">35K</text>
+<path d="M150.0,128.0 h18.4 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-18.4 z" fill="#008300"/><rect x="150.0" y="127.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M172.1,136.0 H173.2 M172.1,133.0 V139.0 M173.2,133.0 V139.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M172.1,136.0 H173.2 M172.1,133.0 V139.0 M173.2,133.0 V139.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,146.0 h18.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-18.6 z" fill="#eda100"/><rect x="150.0" y="145.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M172.0,154.0 H173.3 M172.0,151.0 V157.0 M173.3,151.0 V157.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M172.0,154.0 H173.3 M172.0,151.0 V157.0 M173.3,151.0 V157.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,164.0 h18.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-18.6 z" fill="#e87ba4"/><rect x="150.0" y="163.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M172.2,172.0 H173.1 M172.2,169.0 V175.0 M173.1,169.0 V175.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M172.2,172.0 H173.1 M172.2,169.0 V175.0 M173.1,169.0 V175.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,182.0 h16.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-16.0 z" fill="#6250d6"/><rect x="150.0" y="181.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M169.7,190.0 H170.6 M169.7,187.0 V193.0 M170.6,187.0 V193.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M169.7,190.0 H170.6 M169.7,187.0 V193.0 M170.6,187.0 V193.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="138" y="265.0" font-size="12" text-anchor="end" fill="#0b0b0b">1 KiB, 64 conns</text>
+<line x1="150" y1="213" x2="150" y2="305" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,216.0 h180.2 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-180.2 z" fill="#13968e"/><rect x="150.0" y="215.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M329.0,224.0 H344.0 M329.0,221.0 V227.0 M344.0,221.0 V227.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M329.0,224.0 H344.0 M329.0,221.0 V227.0 M344.0,221.0 V227.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="350.0" y="229" font-size="11" fill="#52514e">197K</text>
+<path d="M150.0,234.0 h176.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-176.7 z" fill="#008300"/><rect x="150.0" y="233.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M327.1,242.0 H335.7 M327.1,239.0 V245.0 M335.7,239.0 V245.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M327.1,242.0 H335.7 M327.1,239.0 V245.0 M335.7,239.0 V245.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,252.0 h180.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-180.7 z" fill="#eda100"/><rect x="150.0" y="251.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M332.2,260.0 H340.9 M332.2,257.0 V263.0 M340.9,257.0 V263.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M332.2,260.0 H340.9 M332.2,257.0 V263.0 M340.9,257.0 V263.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,270.0 h175.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-175.1 z" fill="#e87ba4"/><rect x="150.0" y="269.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M323.0,278.0 H331.9 M323.0,275.0 V281.0 M331.9,275.0 V281.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M323.0,278.0 H331.9 M323.0,275.0 V281.0 M331.9,275.0 V281.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,288.0 h140.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-140.6 z" fill="#6250d6"/><rect x="150.0" y="287.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M283.0,296.0 H300.1 M283.0,293.0 V299.0 M300.1,293.0 V299.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M283.0,296.0 H300.1 M283.0,293.0 V299.0 M300.1,293.0 V299.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="138" y="371.0" font-size="12" text-anchor="end" fill="#0b0b0b">1 KiB, 16 in flight</text>
+<line x1="150" y1="319" x2="150" y2="411" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,322.0 h457.9 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-457.9 z" fill="#13968e"/><rect x="150.0" y="321.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M597.9,330.0 H627.7 M597.9,327.0 V333.0 M627.7,327.0 V333.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M597.9,330.0 H627.7 M597.9,327.0 V333.0 M627.7,327.0 V333.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="633.7" y="335" font-size="11" fill="#52514e">≥ 493K</text>
+<path d="M150.0,340.0 h467.1 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-467.1 z" fill="#008300"/><rect x="150.0" y="339.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M609.8,348.0 H633.9 M609.8,345.0 V351.0 M633.9,345.0 V351.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M609.8,348.0 H633.9 M609.8,345.0 V351.0 M633.9,345.0 V351.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="639.9" y="353" font-size="11" fill="#52514e">≥ 503K</text>
+<path d="M150.0,358.0 h470.6 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-470.6 z" fill="#eda100"/><rect x="150.0" y="357.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M607.9,366.0 H652.3 M607.9,363.0 V369.0 M652.3,363.0 V369.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M607.9,366.0 H652.3 M607.9,363.0 V369.0 M652.3,363.0 V369.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="658.3" y="371" font-size="11" fill="#52514e">≥ 507K</text>
+<path d="M150.0,376.0 h491.3 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-491.3 z" fill="#e87ba4"/><rect x="150.0" y="375.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M607.9,384.0 H653.8 M607.9,381.0 V387.0 M653.8,381.0 V387.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M607.9,384.0 H653.8 M607.9,381.0 V387.0 M653.8,381.0 V387.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="659.8" y="389" font-size="11" fill="#52514e">≥ 529K</text>
+<path d="M150.0,394.0 h525.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-525.8 z" fill="#6250d6"/><rect x="150.0" y="393.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M659.1,402.0 H690.0 M659.1,399.0 V405.0 M690.0,399.0 V405.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M659.1,402.0 H690.0 M659.1,399.0 V405.0 M690.0,399.0 V405.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="696.0" y="407" font-size="11" fill="#52514e">≥ 566K</text>
+<text x="138" y="477.0" font-size="12" text-anchor="end" fill="#0b0b0b">64 KiB, 8 conns</text>
+<line x1="150" y1="425" x2="150" y2="517" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M150.0,428.0 h33.7 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-33.7 z" fill="#13968e"/><rect x="150.0" y="427.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M187.1,436.0 H189.1 M187.1,433.0 V439.0 M189.1,433.0 V439.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M187.1,436.0 H189.1 M187.1,433.0 V439.0 M189.1,433.0 V439.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<text x="195.1" y="441" font-size="11" fill="#52514e">40K</text>
+<path d="M150.0,446.0 h37.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-37.8 z" fill="#008300"/><rect x="150.0" y="445.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M191.3,454.0 H192.8 M191.3,451.0 V457.0 M192.8,451.0 V457.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M191.3,454.0 H192.8 M191.3,451.0 V457.0 M192.8,451.0 V457.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,464.0 h40.5 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-40.5 z" fill="#eda100"/><rect x="150.0" y="463.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M193.7,472.0 H195.3 M193.7,469.0 V475.0 M195.3,469.0 V475.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M193.7,472.0 H195.3 M193.7,469.0 V475.0 M195.3,469.0 V475.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,482.0 h32.8 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-32.8 z" fill="#e87ba4"/><rect x="150.0" y="481.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M185.7,490.0 H187.5 M185.7,487.0 V493.0 M187.5,487.0 V493.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M185.7,490.0 H187.5 M185.7,487.0 V493.0 M187.5,487.0 V493.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
+<path d="M150.0,500.0 h37.0 q4.0,0 4.0,4.0 v8.0 q0,4.0 -4.0,4.0 h-37.0 z" fill="#6250d6"/><rect x="150.0" y="499.0" width="0" height="0" fill="#fcfcfb"/>
+<path d="M189.4,508.0 H191.5 M189.4,505.0 V511.0 M191.5,505.0 V511.0" fill="none" stroke="#fcfcfb" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M189.4,508.0 H191.5 M189.4,505.0 V511.0 M191.5,505.0 V511.0" fill="none" stroke="#0b0b0b" stroke-width="1.25" stroke-linecap="round"/>
 </svg>

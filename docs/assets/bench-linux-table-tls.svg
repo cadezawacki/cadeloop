@@ -1,54 +1,77 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 956 188" width="956" height="188" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1006 254" width="1006" height="254" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title>TLS · Linux</title>
-<rect width="956" height="188" fill="#fcfcfb" rx="8"/>
+<rect width="1006" height="254" fill="#fcfcfb" rx="8"/>
 <text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">TLS · Linux</text>
-<text x="24" y="62" font-size="12" fill="#52514e">requests per second, p99 in small type · every server uses Python's ssl module, except granian (Rust)</text>
+<text x="24" y="62" font-size="12" fill="#52514e">requests per second, p99 in small type · every server uses Python's ssl module, except granian (Rust) · median of 9 runs</text>
 <text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">workload</text>
-<text x="375.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">cadeloop</text>
-<text x="514.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">granian</text>
-<text x="653.3" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn[standard]</text>
-<text x="782.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn + uvloop</text>
-<text x="917.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn + asyncio</text>
-<line x1="24" y1="106.0" x2="931.9" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="426.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">cadeloop</text>
+<text x="565.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn[standard]</text>
+<text x="694.0" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn + uvloop</text>
+<text x="829.9" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">uvicorn + asyncio</text>
+<text x="968.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">granian</text>
+<line x1="24" y1="106.0" x2="982.1" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
 <text x="38.0" y="125.5" font-size="13" fill="#0b0b0b">plaintext, 64 keep-alive conns</text>
-<rect x="263.8" y="110.0" width="120.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
-<circle cx="276.3" cy="121.0" r="6.5" fill="#eab53b"/>
-<text x="276.3" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
-<text x="375.9" y="125.5" font-size="11" text-anchor="end" fill="#72552b">2.13 ms</text>
-<text x="330.3" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">65.0 K</text>
-<rect x="402.1" y="110.0" width="120.1" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
-<circle cx="414.6" cy="121.0" r="6.5" fill="#afb5bc"/>
-<text x="414.6" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
-<text x="514.2" y="125.5" font-size="11" text-anchor="end" fill="#575b60">3.24 ms</text>
-<text x="468.6" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">45.4 K</text>
-<rect x="541.2" y="110.0" width="120.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
-<circle cx="553.7" cy="121.0" r="6.5" fill="#c6764d"/>
-<text x="553.7" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
-<text x="653.3" y="125.5" font-size="11" text-anchor="end" fill="#834e36">7.86 ms</text>
-<text x="607.7" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">15.4 K</text>
-<text x="782.1" y="125.5" font-size="11" text-anchor="end" fill="#898781">16.52 ms</text>
-<text x="730.3" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.88 K</text>
-<text x="917.9" y="125.5" font-size="11" text-anchor="end" fill="#898781">19.92 ms</text>
-<text x="866.2" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">5.21 K</text>
-<line x1="24" y1="136.0" x2="931.9" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
-<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">new connection per request (16)</text>
-<rect x="263.8" y="140.0" width="120.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
-<circle cx="276.3" cy="151.0" r="6.5" fill="#eab53b"/>
-<text x="276.3" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
-<text x="375.9" y="155.5" font-size="11" text-anchor="end" fill="#72552b">9.04 ms</text>
-<text x="330.3" y="155.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">1.11 K</text>
-<rect x="395.9" y="140.0" width="126.3" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
-<circle cx="408.4" cy="151.0" r="6.5" fill="#afb5bc"/>
-<text x="408.4" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
-<text x="514.2" y="155.5" font-size="11" text-anchor="end" fill="#575b60">18.35 ms</text>
-<text x="462.4" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">1.06 K</text>
-<rect x="558.6" y="140.0" width="102.7" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
-<circle cx="571.1" cy="151.0" r="6.5" fill="#c6764d"/>
-<text x="571.1" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
-<text x="653.3" y="155.5" font-size="11" text-anchor="end" fill="#834e36">5.96 ms</text>
-<text x="607.7" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">763</text>
-<text x="782.1" y="155.5" font-size="11" text-anchor="end" fill="#898781">6.16 ms</text>
-<text x="736.5" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">690</text>
-<text x="917.9" y="155.5" font-size="11" text-anchor="end" fill="#898781">14.42 ms</text>
-<text x="866.2" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">753</text>
+<rect x="314.0" y="110.0" width="120.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="326.5" cy="121.0" r="6.5" fill="#eab53b"/>
+<text x="326.5" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="426.1" y="125.5" font-size="11" text-anchor="end" fill="#72552b">1.65 ms</text>
+<text x="380.5" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">78.9 K</text>
+<rect x="453.1" y="110.0" width="120.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="465.6" cy="121.0" r="6.5" fill="#c6764d"/>
+<text x="465.6" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="565.2" y="125.5" font-size="11" text-anchor="end" fill="#834e36">5.44 ms</text>
+<text x="519.7" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">20.8 K</text>
+<text x="694.0" y="125.5" font-size="11" text-anchor="end" fill="#898781">13.37 ms</text>
+<text x="642.2" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.17 K</text>
+<text x="829.9" y="125.5" font-size="11" text-anchor="end" fill="#898781">14.42 ms</text>
+<text x="778.1" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">6.31 K</text>
+<rect x="856.0" y="110.0" width="120.1" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="868.5" cy="121.0" r="6.5" fill="#afb5bc"/>
+<text x="868.5" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="968.1" y="125.5" font-size="11" text-anchor="end" fill="#575b60">2.69 ms</text>
+<text x="922.5" y="125.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">51.2 K</text>
+<line x1="24" y1="136.0" x2="982.1" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">new connection per request, ECDSA key</text>
+<rect x="314.0" y="140.0" width="120.1" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="326.5" cy="151.0" r="6.5" fill="#afb5bc"/>
+<text x="326.5" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="426.1" y="155.5" font-size="11" text-anchor="end" fill="#575b60">4.33 ms</text>
+<text x="380.5" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">2.58 K</text>
+<rect x="453.1" y="140.0" width="120.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="465.6" cy="151.0" r="6.5" fill="#c6764d"/>
+<text x="465.6" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="565.2" y="155.5" font-size="11" text-anchor="end" fill="#834e36">4.39 ms</text>
+<text x="519.7" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">1.50 K</text>
+<text x="694.0" y="155.5" font-size="11" text-anchor="end" fill="#898781">4.39 ms</text>
+<text x="648.4" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.24 K</text>
+<text x="829.9" y="155.5" font-size="11" text-anchor="end" fill="#898781">8.52 ms</text>
+<text x="784.3" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">1.31 K</text>
+<rect x="856.0" y="140.0" width="120.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="868.5" cy="151.0" r="6.5" fill="#eab53b"/>
+<text x="868.5" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="968.1" y="155.5" font-size="11" text-anchor="end" fill="#72552b">4.39 ms</text>
+<text x="922.5" y="155.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">4.26 K</text>
+<line x1="24" y1="166.0" x2="982.1" y2="166.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#0b0b0b">new connection per request, RSA key</text>
+<rect x="314.0" y="170.0" width="120.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="326.5" cy="181.0" r="6.5" fill="#eab53b"/>
+<text x="326.5" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="426.1" y="185.5" font-size="11" text-anchor="end" fill="#72552b">7.08 ms</text>
+<text x="380.5" y="185.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">1.33 K</text>
+<rect x="470.5" y="170.0" width="102.7" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="483.0" cy="181.0" r="6.5" fill="#c6764d"/>
+<text x="483.0" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="565.2" y="185.5" font-size="11" text-anchor="end" fill="#834e36">5.05 ms</text>
+<text x="519.7" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">973</text>
+<text x="694.0" y="185.5" font-size="11" text-anchor="end" fill="#898781">4.78 ms</text>
+<text x="648.4" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">836</text>
+<text x="829.9" y="185.5" font-size="11" text-anchor="end" fill="#898781">11.53 ms</text>
+<text x="778.1" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">841</text>
+<rect x="849.9" y="170.0" width="126.3" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="862.4" cy="181.0" r="6.5" fill="#afb5bc"/>
+<text x="862.4" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="968.1" y="185.5" font-size="11" text-anchor="end" fill="#575b60">15.99 ms</text>
+<text x="916.4" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">1.20 K</text>
+<text x="24" y="218.0" font-size="11" fill="#898781">A place is shared when the 96% confidence intervals of two medians overlap: the runs did not tell those two apart.</text>
+<text x="24" y="236.0" font-size="11" fill="#898781">New connections: 16 at a time, a full TLS 1.3 handshake for each request, under an ECDSA P-256 certificate and under an RSA 2048 one.</text>
 </svg>

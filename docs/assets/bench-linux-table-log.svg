@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 723 404" width="723" height="404" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title>With the access log on · Linux</title>
+<rect width="723" height="404" fill="#fcfcfb" rx="8"/>
+<text x="24" y="42" font-size="16" font-weight="600" fill="#0b0b0b">With the access log on · Linux</text>
+<text x="24" y="62" font-size="12" fill="#52514e">plaintext, 64 connections · each server's own access log, written to a file · median of 9 runs</text>
+<text x="38.0" y="95.0" font-size="12" font-weight="600" fill="#52514e">server</text>
+<text x="312.2" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">log off</text>
+<text x="450.4" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">log on</text>
+<text x="523.6" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">kept</text>
+<text x="685.1" y="95.0" font-size="12" font-weight="600" text-anchor="end" fill="#52514e">CPU / request, log on</text>
+<line x1="24" y1="106.0" x2="699.1" y2="106.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="38.0" y="125.5" font-size="13" fill="#0b0b0b">cadeloop serve(), native log</text>
+<text x="312.2" y="125.5" font-size="13" text-anchor="end" fill="#0b0b0b">142 K</text>
+<rect x="342.5" y="110.0" width="116.0" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="355.0" cy="121.0" r="6.5" fill="#eab53b"/>
+<text x="355.0" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="450.4" y="125.5" font-size="11" text-anchor="end" fill="#72552b">1.08 ms</text>
+<text x="404.9" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">128 K</text>
+<rect x="470.4" y="110.0" width="61.1" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="482.9" cy="121.0" r="6.5" fill="#eab53b"/>
+<text x="482.9" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="523.6" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">90%</text>
+<rect x="618.6" y="110.0" width="74.5" height="22" rx="6" fill="#fbf0cf" stroke="#e3cfa1" stroke-width="1"/>
+<circle cx="631.1" cy="121.0" r="6.5" fill="#eab53b"/>
+<text x="631.1" y="124.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#311d03">1</text>
+<text x="685.1" y="125.5" font-size="13" text-anchor="end" font-weight="700" fill="#3f2903">8.1 µs</text>
+<line x1="24" y1="136.0" x2="699.1" y2="136.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="155.5" font-size="13" fill="#0b0b0b">cadeloop serve(), logging module</text>
+<text x="312.2" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">142 K</text>
+<rect x="332.2" y="140.0" width="126.3" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="344.7" cy="151.0" r="6.5" fill="#afb5bc"/>
+<text x="344.7" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="450.4" y="155.5" font-size="11" text-anchor="end" fill="#575b60">11.80 ms</text>
+<text x="398.7" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">25.9 K</text>
+<text x="523.6" y="155.5" font-size="13" text-anchor="end" fill="#0b0b0b">18%</text>
+<rect x="610.9" y="140.0" width="82.2" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="623.4" cy="151.0" r="6.5" fill="#afb5bc"/>
+<text x="623.4" y="154.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="685.1" y="155.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">42.1 µs</text>
+<line x1="24" y1="166.0" x2="699.1" y2="166.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="185.5" font-size="13" fill="#0b0b0b">uvicorn[standard]</text>
+<text x="312.2" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">31.4 K</text>
+<text x="450.4" y="185.5" font-size="11" text-anchor="end" fill="#898781">7.14 ms</text>
+<text x="404.9" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">13.3 K</text>
+<text x="523.6" y="185.5" font-size="13" text-anchor="end" fill="#0b0b0b">42%</text>
+<rect x="610.9" y="170.0" width="82.2" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="623.4" cy="181.0" r="6.5" fill="#c6764d"/>
+<text x="623.4" y="184.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="685.1" y="185.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">75.2 µs</text>
+<line x1="24" y1="196.0" x2="699.1" y2="196.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="215.5" font-size="13" fill="#0b0b0b">uvicorn + uvloop</text>
+<text x="312.2" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.92 K</text>
+<text x="450.4" y="215.5" font-size="11" text-anchor="end" fill="#898781">14.16 ms</text>
+<text x="398.7" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">6.54 K</text>
+<rect x="470.4" y="200.0" width="61.1" height="22" rx="6" fill="#eceff2" stroke="#c7cbd0" stroke-width="1"/>
+<circle cx="482.9" cy="211.0" r="6.5" fill="#afb5bc"/>
+<text x="482.9" y="214.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#171b1f">2</text>
+<text x="523.6" y="215.5" font-size="13" text-anchor="end" font-weight="600" fill="#25292e">83%</text>
+<text x="685.1" y="215.5" font-size="13" text-anchor="end" fill="#0b0b0b">152.4 µs</text>
+<line x1="24" y1="226.0" x2="699.1" y2="226.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="245.5" font-size="13" fill="#0b0b0b">uvicorn + asyncio</text>
+<text x="312.2" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">7.63 K</text>
+<text x="450.4" y="245.5" font-size="11" text-anchor="end" fill="#898781">15.20 ms</text>
+<text x="398.7" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">6.25 K</text>
+<rect x="470.4" y="230.0" width="61.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="482.9" cy="241.0" r="6.5" fill="#c6764d"/>
+<text x="482.9" y="244.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="523.6" y="245.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">82%</text>
+<text x="685.1" y="245.5" font-size="13" text-anchor="end" fill="#0b0b0b">158.7 µs</text>
+<line x1="24" y1="256.0" x2="699.1" y2="256.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="275.5" font-size="13" fill="#0b0b0b">uvicorn + cadeloop</text>
+<text x="312.2" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">11.8 K</text>
+<text x="450.4" y="275.5" font-size="11" text-anchor="end" fill="#898781">11.67 ms</text>
+<text x="398.7" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">8.19 K</text>
+<text x="523.6" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">69%</text>
+<text x="685.1" y="275.5" font-size="13" text-anchor="end" fill="#0b0b0b">121.7 µs</text>
+<line x1="24" y1="286.0" x2="699.1" y2="286.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="305.5" font-size="13" fill="#0b0b0b">granian</text>
+<text x="312.2" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">48.8 K</text>
+<rect x="338.3" y="290.0" width="120.1" height="22" rx="6" fill="#fce7d6" stroke="#e0bca2" stroke-width="1"/>
+<circle cx="350.8" cy="301.0" r="6.5" fill="#c6764d"/>
+<text x="350.8" y="304.4" font-size="9.5" font-weight="700" text-anchor="middle" fill="#2a140c">3</text>
+<text x="450.4" y="305.5" font-size="11" text-anchor="end" fill="#834e36">7.47 ms</text>
+<text x="404.9" y="305.5" font-size="13" text-anchor="end" font-weight="600" fill="#4f2611">14.3 K</text>
+<text x="523.6" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">29%</text>
+<text x="685.1" y="305.5" font-size="13" text-anchor="end" fill="#0b0b0b">103.7 µs</text>
+<line x1="24" y1="316.0" x2="699.1" y2="316.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="38.0" y="335.5" font-size="13" fill="#0b0b0b">hypercorn</text>
+<text x="312.2" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">4.70 K</text>
+<text x="450.4" y="335.5" font-size="11" text-anchor="end" fill="#898781">37.22 ms</text>
+<text x="398.7" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">2.84 K</text>
+<text x="523.6" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">60%</text>
+<text x="685.1" y="335.5" font-size="13" text-anchor="end" fill="#0b0b0b">350.9 µs</text>
+<text x="24" y="368.0" font-size="11" fill="#898781">A place is shared when the 96% confidence intervals of two medians overlap: the runs did not tell those two apart.</text>
+<text x="24" y="386.0" font-size="11" fill="#898781">kept: requests per second with the log on, as a share of the same server with it off.</text>
+</svg>
