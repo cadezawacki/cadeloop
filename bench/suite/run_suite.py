@@ -402,15 +402,30 @@ def suite_log(pkgs, reps, dur, warm):
             os.remove(os.path.join(OUT, name))
 
 
-def suite_tls(pkgs, reps, dur, warm, cert):
+def tls_contenders(pkgs):
     cand = pkgs.get("candidate", next(iter(pkgs.values())))
     cons = [(f"cadeloop[{n}]", ["--impl", "cadeloop"], p) for n, p in pkgs.items()]
     cons += [("uvicorn+asyncio", ["--impl", "uvicorn", "--loop", "asyncio"], cand),
              (f"uvicorn+{ALT_LOOP}", ["--impl", "uvicorn", "--loop", ALT_LOOP], cand)]
-    cons += linux_extras(cand)
+    return only(cons + linux_extras(cand))
+
+
+def suite_tls(pkgs, reps, dur, warm, cert):
     wl = [("tls-plaintext-c64", ["-path", "/", "-c", "64", "-tls", "-expect-len", "13"]),
           ("tls-churn-c16", ["-path", "/", "-c", "16", "-tls", "-churn", "-expect-len", "13"])]
-    run_matrix("tls", only(cons), wl, reps, dur, warm, mode="http", tls=cert)
+    run_matrix("tls", tls_contenders(pkgs), wl, reps, dur, warm, mode="http", tls=cert)
+
+
+def suite_tls_rsa(pkgs, reps, dur, warm, cert):
+    """The handshake-per-request workload again, under a second
+    certificate (--cert-rsa). What a full handshake costs the server is
+    mostly its signature, and an RSA 2048 signature costs many times an
+    ECDSA P-256 one: with an RSA key the handshake is nearly all of a
+    request's CPU on every server, with an ECDSA key what each server
+    does around the handshake shows. Keep-alive traffic does not depend
+    on the key, so only this workload is repeated."""
+    wl = [("tls-churn-rsa-c16", ["-path", "/", "-c", "16", "-tls", "-churn", "-expect-len", "13"])]
+    run_matrix("tls", tls_contenders(pkgs), wl, reps, dur, warm, mode="http", tls=cert)
 
 
 def suite_ws(pkgs, reps, dur, warm):
@@ -539,6 +554,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--workloads", default="")
     ap.add_argument("--cert", nargs=2)
+    ap.add_argument("--cert-rsa", nargs=2, help="certificate and key for the tlsrsa suite")
     ap.add_argument("--idle-counts", default="1000,5000")
     ap.add_argument("--overload-contenders", default="")
     ap.add_argument("--cadeloop-only", action="store_true", help="skip third-party contenders")
@@ -569,14 +585,16 @@ def main():
         ident = os.path.join(p, "IDENTITY.txt")
         meta["pkgs"][n] = {"path": p, "identity": open(ident).read() if os.path.exists(ident) else None}
     meta["versions"] = contender_versions()
-    # One meta.json per session: a later piece of it (--rep-offset) adds
-    # its command line and leaves the rest as the first piece wrote it.
+    # One meta.json per session: a later piece of it (the same --out and
+    # the same builds, whatever suites and rep numbers it runs) adds its
+    # command line and leaves the rest as the first piece wrote it.
     meta_path = os.path.join(OUT, "meta.json")
-    if a.rep_offset and os.path.exists(meta_path):
+    if os.path.exists(meta_path):
         with open(meta_path) as f:
             first = json.load(f)
-        first.setdefault("argv_continued", []).append(sys.argv)
-        meta = first
+        if first.get("pkgs") == meta["pkgs"]:
+            first.setdefault("argv_continued", []).append(sys.argv)
+            meta = first
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=1)
     wl = [w for w in a.workloads.split(",") if w]
@@ -589,6 +607,8 @@ def main():
             suite_ws(pkgs, a.reps, a.duration, a.warmup)
         elif suite == "tls":
             suite_tls(pkgs, a.reps, a.duration, a.warmup, a.cert)
+        elif suite == "tlsrsa":
+            suite_tls_rsa(pkgs, a.reps, a.duration, a.warmup, a.cert_rsa)
         elif suite == "app":
             suite_app(pkgs, a.reps, a.duration, a.warmup, wl)
         elif suite == "log":

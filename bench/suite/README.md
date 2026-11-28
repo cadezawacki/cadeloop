@@ -8,10 +8,11 @@ a native load generator, with no containers and no cross-compiled results.
 |---|---|
 | `../loadgen/` | The load generator (Go, standard library only): HTTP/1.1 keep-alive, pipelined, open-loop and connection-per-request; TCP echo; WebSocket echo; idle connections. It checks every response. |
 | `run_suite.py` | Runs the suites: a fresh server per contender per rep, readiness by a real request, the server's process tree sampled throughout, contender order rotated every rep, one JSON line per run. |
-| `servers.py` | Starts each contender on the same app (`app.py`) or the same echo protocol. |
+| `servers.py` | Starts each contender on the same app (`app.py` or `fapp.py`) or the same echo protocol, plain or behind TLS. |
 | `app.py` | The ASGI app every HTTP and WebSocket contender serves. |
+| `fapp.py` | A FastAPI app for the `app` suite: a pydantic-validated JSON route as `async def` and as `def`, and `FileResponse` at 64 KiB and 1 MiB. |
 | `latency.py` | Timer overshoot and cross-thread wake-up latency for each event loop. |
-| `report.py` | Turns runs into a summary JSON, Markdown tables, the README's table specs and the light/dark SVG charts. |
+| `report.py` | Turns runs into a summary JSON, Markdown tables, the README's table specs and the light/dark SVG charts, with a confidence interval for every median and the session's own measure of its noise. |
 | `winproc.py`, `linproc.py` | Process, thread and TCP accounting: ctypes on Windows, `/proc` on Linux. Neither needs administrator rights. |
 
 The contenders follow the platform. Both get cadeloop (`serve()`, and as the
@@ -35,31 +36,80 @@ cp target/release/lib_core.so stage/candidate/cadeloop/_core.so     # _core.pyd 
 pip install uvicorn uvloop httptools websockets wsproto hypercorn granian rloop rsloop
 ```
 
-Then the suites. TLS needs a certificate and key:
+Then the suites. TLS needs a certificate and key, and the `app` suite needs
+`pip install fastapi`:
 
 ```bash
-python bench/suite/run_suite.py --suite http,ws,tls,echo --reps 3 --duration 5 --warmup 1.5 \
-    --pkg candidate=stage/candidate --loadgen bench/loadgen/loadgen --out results/main \
-    --cert cert.pem key.pem
+python bench/suite/run_suite.py --suite http,app,log,ws,tls,tlsrsa,echo,tlsecho --reps 9 --duration 5 --warmup 1.5 \
+    --pkg control=stage/candidate --pkg candidate=stage/candidate \
+    --loadgen bench/loadgen/loadgen --out results/main --cert cert.pem key.pem --cert-rsa rsa-cert.pem rsa-key.pem
 python bench/suite/run_suite.py --suite idle,overload --idle-counts 1000,5000 \
     --overload-contenders "cadeloop[candidate],uvicorn+cadeloop,uvicorn+uvloop,uvicorn+asyncio" \
     --pkg candidate=stage/candidate --loadgen bench/loadgen/loadgen --out results/mem
-python bench/suite/latency.py --pkg candidate=stage/candidate --out results/timers.json
+python bench/suite/latency.py --pkg candidate=stage/candidate --reps 9 --out results/timers.json
 PYTHONPATH=stage/candidate python bench/harness/harness.py --suite sched \
-    --loops cadeloop,uvloop,rloop,rsloop,asyncio --out results/sched.json
+    --loops cadeloop,uvloop,rloop,rsloop,asyncio --measured 9 --out results/sched.json
 python bench/suite/report.py results/main results/mem --summary summary.json --markdown tables.md \
     --tables readme-tables.json --charts docs/assets --timers results/timers.json --sched results/sched.json
 python bench/harness/tables.py readme-tables.json --outdir docs/assets --readme README.md
 ```
 
+| suite | what runs |
+|---|---|
+| `http` | `app.py` on every server: plaintext, JSON, 64 KiB and 1 MiB responses, uploads, a 1 ms await, a connection per request, pipelining |
+| `app` | `fapp.py` (FastAPI) on every server |
+| `log` | plaintext with each server's access log on; cadeloop's native log and its `logging` one |
+| `ws` | WebSocket echo from 64 B to 256 KiB messages |
+| `tls` | HTTPS, keep-alive and a handshake per request |
+| `tlsrsa` | the handshake-per-request workload again under a second certificate (`--cert-rsa`): what a handshake costs is mostly its signature, so servers compare differently under an RSA key and an ECDSA one |
+| `echo`, `tlsecho` | the same `asyncio.Protocol` echo server on each event loop, plain and behind `create_server(ssl=...)` |
+| `idle`, `overload` | memory per idle connection; an open-loop run through 150% of capacity |
+
 On a machine with few cores, add `--loadgen-procs 2` so the load generator
 leaves cores for the server; the Linux numbers were taken that way, on 4
 vCPUs.
+
+A session can be run in pieces: the same `--out` with `--rep-offset N`
+numbers the runs from N and carries the rotation on, so three invocations
+of `--reps 3` with offsets 0, 3 and 6 are one nine-run session. Running the
+suites in such passes, instead of all nine runs of one suite and then the
+next, also spreads each workload's runs over the whole session.
 
 Two builds can be compared side by side by passing `--pkg` twice, for
 example `--pkg baseline=<dir> --pkg candidate=<dir2>`, and `--cadeloop-only`
 skips the third-party contenders. `report.py --with-baseline` then shows both
 builds in the charts.
+
+## How sure a number is
+
+One run of a benchmark on a shared machine is not a measurement: on the
+Linux VM two runs of the same server differ by 4 to 6% on a typical
+workload and by far more on a bad one. The suite is built to say how far
+its own numbers can be trusted.
+
+* **Nine runs, and an interval for the median.** `report.py` gives every
+  median a confidence interval that assumes nothing about how the runs are
+  distributed: between the k-th lowest and the k-th highest of n runs the
+  true median lies with a probability that depends only on n and k. For
+  nine runs the second lowest to the second highest is a 96% interval; for
+  six it takes the whole range; three runs cannot do better than 75%, and
+  the tables then say "range" and not "CI".
+* **The same build twice.** `--pkg control=X --pkg candidate=X` runs one
+  build under two names through every suite. Whatever separates the two is
+  noise, so it is the smallest difference between two servers the session
+  can show. `report.py` prints it ("How far to trust these numbers") and
+  writes it to `summary.json` as `resolution`.
+* **Places are shared when the runs cannot tell.** In the README's tables
+  a server is ahead of another only when its whole interval is; servers
+  whose intervals overlap share a place.
+* **A run limited by the load generator says so.** When the load generator
+  used 90% or more of the CPU it was allowed, the server was not the
+  bottleneck: the cell is a lower bound, marked `≥`. It can be placed ahead
+  of a server it clearly beat and is never placed behind one, since the runs
+  do not say how much more it could do.
+* **The hypervisor's share is recorded.** On a Linux guest each run records
+  how much CPU time the host withheld (`steal_pct`), so a noisy neighbor
+  shows in the data instead of in a server's result.
 
 ## What the runner guarantees
 
@@ -80,9 +130,16 @@ builds in the charts.
 * **Percentiles are never averaged.** Every run keeps its full latency
   histogram (log-linear, at most 1.6% bucket error), and a table's
   percentiles come from the merged histogram of all reps. Throughput is the
-  median rep, with its range kept.
+  median rep, with its interval and every run's rate kept.
+* **Every server's allocator starts in the same state.** glibc gives a
+  process's first large allocations back to the kernel one by one until the
+  process has freed one; Python's `ssl` allocates 256 KiB per read, so a
+  TLS server ran three times slower in that state than out of it, and which
+  state a server started in depended on what it happened to import
+  (`servers.py`, `settle_allocator`; `BENCH_COLD_ALLOCATOR=1` reproduces
+  the difference).
 * **Contender order rotates every rep**, so slow drift in the machine does
-  not favour whoever runs first.
+  not favor whoever runs first.
 
 ## Load generator notes
 

@@ -358,12 +358,31 @@ def spread(rows, servers=None):
 # ---- charts -------------------------------------------------------------------
 
 def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt, story="cadeloop",
-                 interval_of=None):
+                 interval_of=None, limited_of=None):
     """Rows = groups (workloads), one thin bar per server; one shared axis.
 
     `interval_of(group, server)`, when given, returns the (low, high)
     confidence interval of a bar's value, drawn as a whisker across the
-    bar's end: two bars whose whiskers overlap have not been told apart."""
+    bar's end: two bars whose whiskers overlap have not been told apart.
+    `limited_of(group, server)` says a bar is a lower bound (the load
+    generator was the limit): its value is always printed, behind a "≥",
+    and a second subtitle line says what that means. `story` names the
+    series whose bars are always labeled (one name, or several)."""
+    def capped(g, s):
+        return bool(limited_of and limited_of(g, s))
+
+    any_capped = any(capped(g, s) for g in groups for s in servers if value_of(g, s) is not None)
+    stories = {story} if isinstance(story, str) else set(story)
+    # The subtitle in as many lines as it needs at this width: its parts
+    # (separated by " · ") are never split, and never run off the edge.
+    sub_lines = [subtitle]
+    parts = subtitle.split(" · ")
+    if len(subtitle) > 120 and len(parts) > 1:
+        # Two lines, cut where they come out most alike in length.
+        cuts = [(" · ".join(parts[:i]), " · ".join(parts[i:])) for i in range(1, len(parts))]
+        sub_lines = list(min(cuts, key=lambda c: max(len(c[0]), len(c[1]))))
+    if any_capped:
+        sub_lines.append("≥ marks a bar the load generator capped: the server can do at least this")
     for mode in ("light", "dark"):
         ink = INK[mode]
         colors = COLORS[mode]
@@ -371,7 +390,7 @@ def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt
         width = 760
         bar, gap, group_air = BAR, 2, 16
         # Legend entries, wrapped onto further rows when one would overflow.
-        legend, lx, ly = [], 24.0, 66
+        legend, lx, ly = [], 24.0, 66 + 18 * (len(sub_lines) - 1)
         for srv in servers:
             w_item = 17 + 6.6 * len(disp(srv)) + 18
             if lx + w_item > width - 16 and lx > 24:
@@ -393,7 +412,8 @@ def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt
         h = top + len(groups) * (len(servers) * (bar + gap) + group_air) + 24
         p = svg_open(width, h, ink)
         p.append(f'<text x="24" y="34" font-size="16" font-weight="600" fill="{ink["primary"]}">{title}</text>')
-        p.append(f'<text x="24" y="54" font-size="12" fill="{ink["secondary"]}">{subtitle}</text>')
+        for i, line in enumerate(sub_lines):
+            p.append(f'<text x="24" y="{54 + 18 * i}" font-size="12" fill="{ink["secondary"]}">{line}</text>')
         for s, x, y in legend:
             p.append(f'<rect x="{x:.1f}" y="{y}" width="12" height="12" rx="3" fill="{colors[disp(s)]}"/>')
             p.append(f'<text x="{x + 17:.1f}" y="{y + 10}" font-size="12" fill="{ink["secondary"]}">{disp(s)}</text>')
@@ -426,9 +446,10 @@ def grouped_hbar(path_base, title, subtitle, groups, servers, value_of, unit_fmt
                         end = max(w, x1 - label_w)
                     # Every bar when there are few enough to label without
                     # clutter; otherwise the story series (tables carry all).
-                    if disp(s) == story or len(servers) <= 4:
+                    if disp(s) in stories or len(servers) <= 4 or capped(g, s):
+                        text = ("≥ " if capped(g, s) else "") + unit_fmt(v)
                         p.append(f'<text x="{label_w + end + 6:.1f}" y="{y + bar - 3}" font-size="11" '
-                                 f'fill="{ink["secondary"]}">{unit_fmt(v)}</text>')
+                                 f'fill="{ink["secondary"]}">{text}</text>')
                 y += bar + gap
             y += group_air
         p.append("</svg>")
@@ -541,6 +562,11 @@ APP_LABELS = [("fastapi-json-c64", "JSON, async def"), ("fastapi-sync-c64", "JSO
 TLSECHO_LABELS = [("tlsecho-1k-c64", "1 KiB, 64 connections"), ("tlsecho-16k-c16", "16 KiB, 16 connections")]
 TLS_LABELS = [("tls-plaintext-c64", "plaintext, 64 keep-alive conns"),
               ("tls-churn-c16", "new connection per request (16)")]
+# A session that ran the handshake workload under two certificates
+# (run_suite.py --suite tlsrsa) names the key in both rows.
+TLS_LABELS_BY_KEY = [("tls-plaintext-c64", "plaintext, 64 keep-alive conns"),
+                     ("tls-churn-c16", "new connection per request, ECDSA key"),
+                     ("tls-churn-rsa-c16", "new connection per request, RSA key")]
 ECHO_LABELS = [("echo-1k-c1", "1 KiB, 1 connection"), ("echo-1k-c64", "1 KiB, 64 connections"),
                ("echo-1k-w16-c64", "1 KiB, 16 in flight ×64"), ("echo-64k-c8", "64 KiB, 8 connections")]
 
@@ -659,13 +685,19 @@ def readme_specs(rows, idle, timers, sched, P):
         "title": f"WebSocket echo · {plat}",
         "subtitle": f"messages per second, p99 round trip in small type · {runs_phrase(rows, 'ws')}",
         **by_workload("ws", WS_LABELS, P["ws"], True, False)}
+    two_keys = ("tls", "tls-churn-rsa-c16") in {(r["suite"], r["workload"]) for r in rows}
+    tls_labels = TLS_LABELS_BY_KEY if two_keys else TLS_LABELS
     specs[f"bench-{tag}-table-tls"] = {
         "title": f"TLS · {plat}",
         "subtitle": ("requests per second, p99 in small type · every server uses Python's ssl module, "
                      "except granian (Rust)" if "granian" in P["tls"] else
                      "requests per second, p99 in small type · Python's ssl module in every server")
                     + f" · {runs_phrase(rows, 'tls')}",
-        **by_workload("tls", TLS_LABELS, P["tls"], True, False)}
+        **by_workload("tls", tls_labels, P["tls"], True, False)}
+    if two_keys:
+        specs[f"bench-{tag}-table-tls"].setdefault("notes", []).append(
+            "New connections: 16 at a time, a full TLS 1.3 handshake for each request, under an ECDSA P-256 "
+            "certificate and under an RSA 2048 one.")
     specs[f"bench-{tag}-table-echo"] = {
         "title": f"TCP echo, the loop alone · {plat}",
         "subtitle": "the same asyncio.Protocol on every loop · messages per second, p99 in small type · "
@@ -978,7 +1010,7 @@ def main():
     md.append("\n## WebSocket")
     md.append(table(rows, "ws", [w for w, _ in WS_LABELS], P["ws"]))
     md.append("\n## TLS")
-    md.append(table(rows, "tls", [w for w, _ in TLS_LABELS], P["tls"]))
+    md.append(table(rows, "tls", [w for w, _ in TLS_LABELS_BY_KEY], P["tls"]))
     md.append("\n## TCP echo (raw asyncio.Protocol)")
     md.append(table(rows, "echo", [w for w, _ in ECHO_LABELS], P["echo"]))
     md.append("\n## TLS echo (raw asyncio.Protocol behind create_server(ssl=...))")
@@ -1023,6 +1055,10 @@ def main():
             r = idx.get((suite, g[0], s))
             return (r["rate_ci_lo"], r["rate_ci_hi"]) if r and r["reps"] > 1 else None
 
+        def capped(g, s, suite="http"):
+            r = idx.get((suite, g[0], s))
+            return bool(r and r.get("client_limited"))
+
         def cpu(g, s, suite="http"):
             r = idx.get((suite, g[0], s))
             return r["server_cpu_us_per_op"] if r else None
@@ -1042,7 +1078,7 @@ def main():
 
         chart("http", f"HTTP/1.1 requests per second ({plat_name})",
               f"64 keep-alive connections (16 for conn per request) · {runs_and_interval('http')} · higher is better",
-              hw, P["http"], rate, lambda v: f"{v / 1e3:.1f}K", interval_of=rate_ci)
+              hw, P["http"], rate, lambda v: f"{v / 1e3:.1f}K", interval_of=rate_ci, limited_of=capped)
         chart("http-cpu", f"Server CPU per request ({plat_name})",
               "user + kernel time of the server's processes / successful requests · "
               f"{runs_and_interval('http')} · lower is better",
@@ -1054,20 +1090,20 @@ def main():
               f"ping-pong except 1 KiB stream (32 in flight per connection) · {runs_and_interval('ws')} · "
               "higher is better",
               ww, P["ws"], lambda g, s: rate(g, s, "ws"), lambda v: f"{v / 1e3:.0f}K",
-              interval_of=lambda g, s: rate_ci(g, s, "ws"))
+              interval_of=lambda g, s: rate_ci(g, s, "ws"), limited_of=lambda g, s: capped(g, s, "ws"))
         ew = [("echo-1k-c1", "1 KiB, 1 conn"), ("echo-1k-c64", "1 KiB, 64 conns"),
               ("echo-1k-w16-c64", "1 KiB, 16 in flight"), ("echo-64k-c8", "64 KiB, 8 conns")]
         chart("echo", f"TCP echo messages per second ({plat_name})",
               f"same asyncio.Protocol on every loop · {runs_and_interval('echo')} · higher is better",
               ew, P["echo"], lambda g, s: rate(g, s, "echo"), lambda v: f"{v / 1e3:.0f}K",
-              interval_of=lambda g, s: rate_ci(g, s, "echo"))
+              interval_of=lambda g, s: rate_ci(g, s, "echo"), limited_of=lambda g, s: capped(g, s, "echo"))
         if any(r["suite"] == "app" for r in rows):
             aw = [("fastapi-json-c64", "JSON, async def"), ("fastapi-sync-c64", "JSON, def"),
                   ("fastapi-file64k-c64", "file, 64 KiB"), ("fastapi-file1m-c16", "file, 1 MiB")]
             chart("app", f"A FastAPI app: requests per second ({plat_name})",
                   f"pydantic response model; FileResponse · {runs_and_interval('app')} · higher is better",
                   aw, P["http"], lambda g, s: rate(g, s, "app"), lambda v: f"{v / 1e3:.1f}K",
-                  interval_of=lambda g, s: rate_ci(g, s, "app"))
+                  interval_of=lambda g, s: rate_ci(g, s, "app"), limited_of=lambda g, s: capped(g, s, "app"))
         if any(r["suite"] == "tlsecho" for r in rows):
             tw = [("tlsecho-1k-c64", "1 KiB, 64 conns"), ("tlsecho-16k-c16", "16 KiB, 16 conns")]
             tcons = [c for c in P["tlsecho"] if any(("tlsecho", g[0], c) in idx for g in tw)]
@@ -1075,7 +1111,9 @@ def main():
                   f"create_server(ssl=...); cadeloop with the stdlib's TLS (default) and its own · "
                   f"{runs_and_interval('tlsecho')}",
                   tw, tcons, lambda g, s: rate(g, s, "tlsecho"), lambda v: f"{v / 1e3:.0f}K",
-                  interval_of=lambda g, s: rate_ci(g, s, "tlsecho"))
+                  story=("cadeloop", "cadeloop, native TLS"),
+                  interval_of=lambda g, s: rate_ci(g, s, "tlsecho"),
+                  limited_of=lambda g, s: capped(g, s, "tlsecho"))
         iw = sorted({(r["workload"], f"{r['requested']} idle") for r in idle}, key=lambda g: int(g[1].split()[0]))
         iidx = {(r["workload"], r["server"]): r for r in idle}
         mem_word = "private bytes" if tag == "win" else "unique memory (USS)"
